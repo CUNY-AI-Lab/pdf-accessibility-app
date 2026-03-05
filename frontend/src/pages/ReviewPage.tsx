@@ -116,7 +116,7 @@ export default function ReviewPage() {
         <div className="space-y-4 mb-8 stagger">
           {altTexts.map((altText) => (
             <AltTextEditor
-              key={altText.id}
+              key={`${altText.id}-${altText.edited_text ?? ""}-${altText.generated_text ?? ""}-${altText.status}`}
               altText={altText}
               onUpdate={handleUpdate}
               saving={savingFigure === altText.figure_index}

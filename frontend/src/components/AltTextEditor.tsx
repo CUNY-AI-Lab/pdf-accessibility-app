@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import type { AltText, AltTextStatus } from "../types";
 
 interface AltTextEditorProps {
@@ -16,11 +16,6 @@ export default function AltTextEditor({
     altText.edited_text || altText.generated_text || "",
   );
   const [isEditing, setIsEditing] = useState(false);
-
-  // Sync text when props change (e.g. after server roundtrip)
-  useEffect(() => {
-    setText(altText.edited_text || altText.generated_text || "");
-  }, [altText.edited_text, altText.generated_text]);
 
   const handleApprove = useCallback(() => {
     onUpdate(altText.figure_index, text, "approved");

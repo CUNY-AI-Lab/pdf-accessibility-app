@@ -1,10 +1,65 @@
-import type { ValidationReport as ValidationReportType } from "../types";
+import type { ValidationChange, ValidationReport as ValidationReportType } from "../types";
 
 interface ValidationReportProps {
   report: ValidationReportType;
 }
 
+function asNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function asBool(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function statusLabel(status: ValidationChange["remediation_status"]): string {
+  if (status === "auto_remediated") return "Auto Remediated";
+  if (status === "manual_remediated") return "Manual Remediated";
+  return "Needs Remediation";
+}
+
+function statusTone(status: ValidationChange["remediation_status"]): string {
+  if (status === "auto_remediated") return "bg-success-light text-success";
+  if (status === "manual_remediated") return "bg-info-light text-info";
+  return "bg-warning-light text-warning";
+}
+
 export default function ValidationReport({ report }: ValidationReportProps) {
+  const baseline =
+    report.baseline && typeof report.baseline === "object"
+      ? (report.baseline as Record<string, unknown>)
+      : {};
+  const baselineSummary =
+    baseline.summary && typeof baseline.summary === "object"
+      ? (baseline.summary as Record<string, unknown>)
+      : {};
+  const remediation =
+    report.remediation && typeof report.remediation === "object"
+      ? (report.remediation as Record<string, unknown>)
+      : {};
+  const fontRemediation =
+    remediation.font_remediation && typeof remediation.font_remediation === "object"
+      ? (remediation.font_remediation as Record<string, unknown>)
+      : {};
+
+  const baselineErrors = asNumber(baselineSummary.errors);
+  const baselineWarnings = asNumber(baselineSummary.warnings);
+  const postErrors = asNumber(remediation.post_errors) ?? asNumber(report.summary.errors);
+  const postWarnings = asNumber(remediation.post_warnings) ?? asNumber(report.summary.warnings);
+  const autoRemediated = asNumber(remediation.auto_remediated);
+  const needsRemediation = asNumber(remediation.needs_remediation);
+  const errorsReduced = asNumber(remediation.errors_reduced);
+  const fontAttempted = asBool(fontRemediation.attempted);
+  const fontApplied = asBool(fontRemediation.applied);
+  const changes = [...(report.changes ?? [])].sort((a, b) => {
+    const order = {
+      needs_remediation: 0,
+      manual_remediated: 1,
+      auto_remediated: 2,
+    };
+    return order[a.remediation_status] - order[b.remediation_status];
+  });
+
   return (
     <div className="space-y-4">
       {/* Summary card */}
@@ -49,6 +104,93 @@ export default function ValidationReport({ report }: ValidationReportProps) {
         </div>
       </div>
 
+      {(baselineErrors !== null || postErrors !== null) && (
+        <div className="rounded-xl border border-ink/6 bg-cream p-4">
+          <h4 className="text-sm font-semibold text-ink mb-3">
+            Before/After Validation
+          </h4>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+            <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
+              <p className="text-ink-muted text-xs">Baseline</p>
+              <p className="text-ink mt-0.5">
+                {baselineErrors ?? "n/a"} errors
+                {baselineWarnings !== null ? `, ${baselineWarnings} warnings` : ""}
+              </p>
+            </div>
+            <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
+              <p className="text-ink-muted text-xs">Remediated Output</p>
+              <p className="text-ink mt-0.5">
+                {postErrors ?? "n/a"} errors
+                {postWarnings !== null ? `, ${postWarnings} warnings` : ""}
+              </p>
+            </div>
+            <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
+              <p className="text-ink-muted text-xs">Delta</p>
+              <p className="text-ink mt-0.5">
+                {errorsReduced !== null ? `${errorsReduced >= 0 ? "+" : ""}${errorsReduced} errors reduced` : "n/a"}
+              </p>
+              {(autoRemediated !== null || needsRemediation !== null) && (
+                <p className="text-xs text-ink-muted mt-0.5">
+                  auto: {autoRemediated ?? "n/a"} | remaining: {needsRemediation ?? "n/a"}
+                </p>
+              )}
+              {fontAttempted && (
+                <p className="text-xs text-ink-muted mt-0.5">
+                  font lane: {fontApplied ? "applied" : "attempted (not applied)"}
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {changes.length > 0 && (
+        <div className="rounded-xl border border-ink/6 bg-cream overflow-hidden">
+          <div className="px-4 py-3 border-b border-ink/6 bg-paper-warm/50">
+            <h4 className="text-sm font-semibold text-ink">
+              Remediation Lifecycle
+            </h4>
+          </div>
+          <div className="divide-y divide-ink/5">
+            {changes.map((c, i) => (
+              <div key={`${c.rule_id}-${i}`} className="px-4 py-3">
+                <div className="flex items-start gap-2 justify-between">
+                  <div className="min-w-0">
+                    <p className="text-sm text-ink">{c.description}</p>
+                    {c.fix_hint && (
+                      <p className="text-xs text-ink-muted mt-1">
+                        Suggested fix: {c.fix_hint}
+                      </p>
+                    )}
+                  </div>
+                  <span className={`shrink-0 text-[11px] px-2 py-1 rounded-full ${statusTone(c.remediation_status)}`}>
+                    {statusLabel(c.remediation_status)}
+                  </span>
+                </div>
+                <div className="flex items-center gap-3 mt-1">
+                  <span className="text-xs font-mono text-ink-muted">
+                    {c.rule_id}
+                  </span>
+                  {c.category && (
+                    <span className="text-xs text-ink-muted capitalize">
+                      {c.category}
+                    </span>
+                  )}
+                  <span className="text-xs text-ink-muted">
+                    {c.baseline_count} &rarr; {c.post_count}
+                  </span>
+                  {c.location && (
+                    <span className="text-xs text-ink-muted truncate">
+                      {c.location}
+                    </span>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Violations list */}
       {report.violations.length > 0 && (
         <div className="rounded-xl border border-ink/6 bg-cream overflow-hidden">
@@ -70,10 +212,25 @@ export default function ValidationReport({ report }: ValidationReportProps) {
                 </span>
                 <div className="min-w-0 flex-1">
                   <p className="text-sm text-ink">{v.description}</p>
+                  {v.fix_hint && (
+                    <p className="text-xs text-ink-muted mt-1">
+                      Suggested fix: {v.fix_hint}
+                    </p>
+                  )}
                   <div className="flex items-center gap-3 mt-1">
                     <span className="text-xs font-mono text-ink-muted">
                       {v.rule_id}
                     </span>
+                    {v.category && (
+                      <span className="text-xs text-ink-muted capitalize">
+                        {v.category}
+                      </span>
+                    )}
+                    {v.remediation_status && (
+                      <span className={`text-xs px-1.5 py-0.5 rounded ${statusTone(v.remediation_status)}`}>
+                        {statusLabel(v.remediation_status)}
+                      </span>
+                    )}
                     {v.count > 1 && (
                       <span className="text-xs text-ink-muted">
                         {v.count} occurrences

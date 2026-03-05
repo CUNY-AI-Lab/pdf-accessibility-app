@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PipelineStep, ProgressEvent, StepName } from "../types";
 
 const INITIAL_STEPS: PipelineStep[] = [
@@ -11,37 +11,50 @@ const INITIAL_STEPS: PipelineStep[] = [
   { step_name: "validation", status: "pending" },
 ];
 
+function createInitialSteps(): PipelineStep[] {
+  return INITIAL_STEPS.map((step) => ({ ...step }));
+}
+
 export function useJobProgress(jobId: string, active = true) {
-  const [steps, setSteps] = useState<PipelineStep[]>(INITIAL_STEPS);
+  const [stepsByJob, setStepsByJob] = useState<Record<string, PipelineStep[]>>(
+    {},
+  );
   const [connected, setConnected] = useState(false);
   const queryClient = useQueryClient();
   const sourceRef = useRef<EventSource | null>(null);
 
-  // Reset steps when jobId changes
-  useEffect(() => {
-    setSteps(INITIAL_STEPS);
-  }, [jobId]);
+  const steps = useMemo(
+    () => stepsByJob[jobId] ?? createInitialSteps(),
+    [jobId, stepsByJob],
+  );
 
   const updateStep = useCallback((event: ProgressEvent) => {
     if (event.step === "review" || event.step === "error") return;
 
-    setSteps((prev) =>
-      prev.map((s) =>
+    setStepsByJob((prev) => {
+      const currentSteps = prev[jobId] ?? createInitialSteps();
+      const nextSteps = currentSteps.map((s) =>
         s.step_name === (event.step as StepName)
           ? {
               ...s,
               status: event.status as PipelineStep["status"],
               started_at: event.timestamp,
               completed_at:
-                event.status === "complete" || event.status === "failed"
+                event.status === "complete" || event.status === "failed" || event.status === "skipped"
                   ? event.timestamp
                   : undefined,
               error: event.status === "failed" ? event.message : undefined,
+              result: event.result,
             }
           : s,
-      ),
-    );
-  }, []);
+      );
+
+      return {
+        ...prev,
+        [jobId]: nextSteps,
+      };
+    });
+  }, [jobId]);
 
   useEffect(() => {
     if (!active) return;

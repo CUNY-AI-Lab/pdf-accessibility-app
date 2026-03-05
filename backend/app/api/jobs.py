@@ -1,4 +1,6 @@
 import asyncio
+import json
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
 from sqlalchemy import select
@@ -17,6 +19,16 @@ from app.services.job_manager import _DONE, JobManager, get_job_manager
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 PIPELINE_STEPS = ["classify", "ocr", "structure", "alt_text", "tagging", "validation"]
+PIPELINE_STEP_ORDER = {name: idx for idx, name in enumerate(PIPELINE_STEPS)}
+
+
+def _parse_result_json(raw: str | None):
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
 
 
 def job_to_response(job: Job) -> JobResponse:
@@ -38,8 +50,12 @@ def job_to_response(job: Job) -> JobResponse:
                 started_at=s.started_at,
                 completed_at=s.completed_at,
                 error=s.error,
+                result=_parse_result_json(s.result_json),
             )
-            for s in sorted(job.steps, key=lambda s: PIPELINE_STEPS.index(s.step_name))
+            for s in sorted(
+                job.steps,
+                key=lambda s: PIPELINE_STEP_ORDER.get(s.step_name, len(PIPELINE_STEPS)),
+            )
         ],
     )
 
@@ -52,7 +68,6 @@ async def create_jobs(
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
 
-    created_jobs = []
     for file in files:
         if not file.filename or not file.filename.lower().endswith(".pdf"):
             raise HTTPException(
@@ -60,27 +75,40 @@ async def create_jobs(
                 detail=f"File '{file.filename}' is not a PDF",
             )
 
-        stored_name, path, size = await save_upload(file)
+    created_jobs = []
+    uploaded_paths: list[Path] = []
+    try:
+        for file in files:
+            stored_name, path, size = await save_upload(file)
+            uploaded_paths.append(path)
 
-        job = Job(
-            filename=stored_name,
-            original_filename=file.filename,
-            input_path=str(path),
-            file_size_bytes=size,
-        )
-        db.add(job)
-        await db.flush()
+            job = Job(
+                filename=stored_name,
+                original_filename=file.filename,
+                input_path=str(path),
+                file_size_bytes=size,
+            )
+            db.add(job)
+            await db.flush()
 
-        # Create pipeline step records
-        for step_name in PIPELINE_STEPS:
-            db.add(JobStep(job_id=job.id, step_name=step_name))
+            # Create pipeline step records
+            for step_name in PIPELINE_STEPS:
+                db.add(JobStep(job_id=job.id, step_name=step_name))
 
-        await db.flush()
-        # Refresh to load steps relationship
-        await db.refresh(job, ["steps"])
-        created_jobs.append(job)
+            await db.flush()
+            # Refresh to load steps relationship
+            await db.refresh(job, ["steps"])
+            created_jobs.append(job)
 
-    await db.commit()
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        for uploaded_path in uploaded_paths:
+            try:
+                uploaded_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
 
     # Submit each job to the pipeline
     settings = get_settings()

@@ -1,7 +1,8 @@
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { useDeleteJob, useJob } from "../api/jobs";
+import { useDeleteJob, useJob, useValidation } from "../api/jobs";
 import DownloadButton from "../components/DownloadButton";
 import PipelineProgress from "../components/PipelineProgress";
+import ValidationReport from "../components/ValidationReport";
 import { useJobProgress } from "../hooks/useJobProgress";
 
 export default function JobDetailPage() {
@@ -11,9 +12,14 @@ export default function JobDetailPage() {
   const deleteJob = useDeleteJob();
   const isActive = job?.status === "processing" || job?.status === "queued";
   const { steps } = useJobProgress(id!, isActive);
+  const hasFinalOutput = job?.status === "complete" || job?.status === "needs_manual_review";
+  const { data: validationReport } = useValidation(id!, hasFinalOutput);
 
   // Use SSE steps when actively processing, otherwise use API data
   const displaySteps = isActive ? steps : job?.steps ?? [];
+  const taggingResult = displaySteps.find((s) => s.step_name === "tagging")?.result;
+  const asNumber = (value: unknown) =>
+    typeof value === "number" && Number.isFinite(value) ? value : null;
 
   if (isLoading) {
     return (
@@ -129,18 +135,85 @@ export default function JobDetailPage() {
         </div>
       )}
 
-      {job.status === "complete" && (
-        <div className="flex flex-wrap items-center gap-3 animate-slide-up">
-          <DownloadButton
-            jobId={job.id}
-            filename={job.original_filename}
-            type="pdf"
-          />
-          <DownloadButton
-            jobId={job.id}
-            filename={job.original_filename}
-            type="report"
-          />
+      {job.status === "needs_manual_review" && (
+        <div className="rounded-xl border border-warning/30 bg-warning-light/30 p-5 mb-6 animate-slide-up">
+          <h3 className="font-display text-lg text-ink mb-1">
+            Manual Accessibility Remediation Needed
+          </h3>
+          <p className="text-sm text-ink-muted">
+            Automated tagging finished, but validation found remaining issues.
+            Review the report and apply manual fixes before distribution.
+          </p>
+        </div>
+      )}
+
+      {hasFinalOutput && (
+        <div className="space-y-6 animate-slide-up">
+          <div className="flex flex-wrap items-center gap-3">
+            <DownloadButton
+              jobId={job.id}
+              filename={job.original_filename}
+              type="pdf"
+            />
+            <DownloadButton
+              jobId={job.id}
+              filename={job.original_filename}
+              type="report"
+            />
+          </div>
+
+          <div className="rounded-xl border border-ink/6 bg-cream p-5">
+            <h3 className="font-display text-lg text-ink mb-4">
+              Accessibility Metadata
+            </h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+              <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
+                <p className="text-ink-muted text-xs">Standard</p>
+                <p className="text-ink mt-0.5">
+                  {validationReport?.standard || "PDF/UA"}
+                  {validationReport?.profile ? ` (${validationReport.profile})` : ""}
+                </p>
+              </div>
+              <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
+                <p className="text-ink-muted text-xs">Validator</p>
+                <p className="text-ink mt-0.5">
+                  {validationReport?.validator || "unknown"}
+                </p>
+              </div>
+              <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
+                <p className="text-ink-muted text-xs">Links Tagged</p>
+                <p className="text-ink mt-0.5">
+                  {asNumber(taggingResult?.links_tagged) ?? "n/a"}
+                </p>
+              </div>
+              <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
+                <p className="text-ink-muted text-xs">Decorative Figures Artifacted</p>
+                <p className="text-ink mt-0.5">
+                  {asNumber(taggingResult?.decorative_figures_artifacted) ?? "n/a"}
+                </p>
+              </div>
+              <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
+                <p className="text-ink-muted text-xs">Bookmarks Added</p>
+                <p className="text-ink mt-0.5">
+                  {asNumber(taggingResult?.bookmarks_added) ?? "n/a"}
+                </p>
+              </div>
+              <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
+                <p className="text-ink-muted text-xs">Report Timestamp</p>
+                <p className="text-ink mt-0.5">
+                  {validationReport?.generated_at
+                    ? new Date(validationReport.generated_at).toLocaleString()
+                    : "n/a"}
+                </p>
+              </div>
+            </div>
+            <p className="text-xs text-ink-muted mt-4">
+              Automated validation is a strong signal but not a complete substitute
+              for manual assistive-technology testing.
+            </p>
+          </div>
+
+          {validationReport && <ValidationReport report={validationReport} />}
         </div>
       )}
 

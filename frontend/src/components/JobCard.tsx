@@ -24,6 +24,12 @@ const STATUS_CONFIG: Record<
     bg: "bg-warning-light",
     dot: "bg-warning",
   },
+  needs_manual_review: {
+    label: "Needs Manual Fix",
+    color: "text-warning",
+    bg: "bg-warning-light",
+    dot: "bg-warning",
+  },
   complete: {
     label: "Complete",
     color: "text-success",

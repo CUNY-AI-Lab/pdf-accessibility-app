@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class JobStepResponse(BaseModel):
@@ -10,6 +10,7 @@ class JobStepResponse(BaseModel):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     error: str | None = None
+    result: dict[str, Any] | None = None
 
 
 class JobResponse(BaseModel):
@@ -23,7 +24,7 @@ class JobResponse(BaseModel):
     error: str | None = None
     created_at: datetime
     updated_at: datetime
-    steps: list[JobStepResponse] = []
+    steps: list[JobStepResponse] = Field(default_factory=list)
 
 
 class JobCreateResponse(BaseModel):
@@ -55,12 +56,36 @@ class ValidationViolation(BaseModel):
     severity: str
     location: str | None = None
     count: int = 1
+    category: str | None = None
+    fix_hint: str | None = None
+    remediation_status: str | None = None
+
+
+class ValidationChange(BaseModel):
+    rule_id: str
+    description: str
+    severity: str
+    location: str | None = None
+    category: str | None = None
+    fix_hint: str | None = None
+    baseline_count: int = 0
+    post_count: int = 0
+    remediation_status: str
 
 
 class ValidationReportResponse(BaseModel):
     compliant: bool
-    violations: list[ValidationViolation] = []
-    summary: dict[str, int] = {}
+    profile: str | None = None
+    standard: str | None = None
+    validator: str | None = None
+    generated_at: str | None = None
+    baseline: dict[str, Any] = Field(default_factory=dict)
+    violations: list[ValidationViolation] = Field(default_factory=list)
+    changes: list[ValidationChange] = Field(default_factory=list)
+    summary: dict[str, int] = Field(default_factory=dict)
+    remediation: dict[str, Any] = Field(default_factory=dict)
+    tagging: dict[str, Any] = Field(default_factory=dict)
+    claims: dict[str, Any] = Field(default_factory=dict)
 
 
 class HealthResponse(BaseModel):

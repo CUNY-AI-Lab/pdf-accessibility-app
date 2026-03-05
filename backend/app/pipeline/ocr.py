@@ -21,6 +21,7 @@ async def run_ocr(
     input_path: Path,
     output_path: Path,
     language: str = "eng",
+    mode: str = "skip",
 ) -> OcrResult:
     """Run OCRmyPDF as a subprocess to add text layer to scanned PDFs.
 
@@ -28,19 +29,30 @@ async def run_ocr(
     """
     logger.info(f"Running OCR on {input_path.name} (language={language})")
 
-    proc = await asyncio.create_subprocess_exec(
+    args = [
         sys.executable,
         "-m",
         "ocrmypdf",
         "--language",
         language,
-        "--skip-text",  # Don't re-OCR pages that already have text
         "--output-type",
         "pdf",
         "--jobs",
-        "2",  # Use 2 parallel jobs
-        str(input_path),
-        str(output_path),
+        "2",
+        # Large-page academic PDFs can exceed Pillow's default decompression guard.
+        "--max-image-mpixels",
+        "1000",
+    ]
+    if mode == "redo":
+        args.append("--redo-ocr")
+    else:
+        # Default behavior for the primary OCR step.
+        args.append("--skip-text")
+
+    args.extend([str(input_path), str(output_path)])
+
+    proc = await asyncio.create_subprocess_exec(
+        *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -52,7 +64,7 @@ async def run_ocr(
     if proc.returncode == 0:
         logger.info(f"OCR complete: {output_path.name}")
         return OcrResult(success=True, output_path=output_path)
-    elif proc.returncode == 6:
+    elif proc.returncode == 6 and mode != "redo":
         # Exit code 6 = "file already has text" — not an error
         logger.info(f"OCR skipped (already has text): {input_path.name}")
         return OcrResult(

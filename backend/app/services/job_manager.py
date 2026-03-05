@@ -29,11 +29,22 @@ class JobManager:
 
         task = asyncio.create_task(coro, name=f"job-{job_id}")
         self._tasks[job_id] = task
-        task.add_done_callback(lambda t: self._on_task_done(job_id))
+        task.add_done_callback(lambda t: self._on_task_done(job_id, t))
         return task
 
-    def _on_task_done(self, job_id: str):
+    def _on_task_done(self, job_id: str, task: asyncio.Task):
         self._tasks.pop(job_id, None)
+        try:
+            if not task.cancelled():
+                exception = task.exception()
+                if exception:
+                    logger.error(
+                        f"Job {job_id} task failed with unhandled exception",
+                        exc_info=(type(exception), exception, exception.__traceback__),
+                    )
+        except asyncio.CancelledError:
+            pass
+
         # Signal all SSE subscribers that this job is done
         for queue in self._progress_channels.get(job_id, []):
             try:

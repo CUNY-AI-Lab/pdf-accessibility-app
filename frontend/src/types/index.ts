@@ -2,6 +2,7 @@ export type JobStatus =
   | "queued"
   | "processing"
   | "awaiting_review"
+  | "needs_manual_review"
   | "complete"
   | "failed";
 
@@ -28,6 +29,7 @@ export interface PipelineStep {
   started_at?: string;
   completed_at?: string;
   error?: string;
+  result?: Record<string, unknown>;
 }
 
 export interface Job {
@@ -59,12 +61,36 @@ export interface ValidationViolation {
   severity: "error" | "warning";
   location?: string;
   count: number;
+  category?: string;
+  fix_hint?: string;
+  remediation_status?: "needs_remediation" | "auto_remediated" | "manual_remediated";
+}
+
+export interface ValidationChange {
+  rule_id: string;
+  description: string;
+  severity: "error" | "warning";
+  location?: string;
+  category?: string;
+  fix_hint?: string;
+  baseline_count: number;
+  post_count: number;
+  remediation_status: "needs_remediation" | "auto_remediated" | "manual_remediated";
 }
 
 export interface ValidationReport {
   compliant: boolean;
+  profile?: string;
+  standard?: string;
+  validator?: string;
+  generated_at?: string;
+  baseline?: Record<string, unknown>;
   violations: ValidationViolation[];
+  changes?: ValidationChange[];
   summary: Record<string, number>;
+  remediation?: Record<string, unknown>;
+  tagging?: Record<string, unknown>;
+  claims?: Record<string, unknown>;
 }
 
 export interface StructureElement {

@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import AltTextEntry, Job
-from app.schemas import AltTextResponse, AltTextUpdateRequest
+from app.schemas import AltTextResponse, AltTextUpdateRequest, ValidationReportResponse
 
 router = APIRouter(prefix="/jobs/{job_id}", tags=["documents"])
 
@@ -26,6 +26,10 @@ async def get_structure(job_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.get("/alt-texts", response_model=list[AltTextResponse])
 async def list_alt_texts(job_id: str, db: AsyncSession = Depends(get_db)):
+    job_result = await db.execute(select(Job.id).where(Job.id == job_id))
+    if not job_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Job not found")
+
     result = await db.execute(
         select(AltTextEntry)
         .where(AltTextEntry.job_id == job_id)
@@ -119,7 +123,7 @@ async def download_pdf(job_id: str, db: AsyncSession = Depends(get_db)):
     )
 
 
-@router.get("/download/report")
+@router.get("/download/report", response_model=ValidationReportResponse)
 async def download_report(job_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Job).where(Job.id == job_id))
     job = result.scalar_one_or_none()
