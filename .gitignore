@@ -1,0 +1,63 @@
+# Data & runtime storage
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.venv/
+backend/.venv/
+.python-version
+
+# Node
+node_modules/
+frontend/dist/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+._*
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Docker
+docker-compose.override.yml
+
+# Docling model cache
+.docling/
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+
+# PDF test files (keep test fixtures but ignore user uploads)
+# test_*.pdf — uncomment if you want to track test PDFs
