@@ -582,7 +582,7 @@ def _base_font_name(font_dict) -> str:
     return ""
 
 
-def _simple_font_auto_unicode_policy(font_dict) -> str:
+def _simple_font_auto_unicode_policy(font_dict, font_bytes: bytes | None = None) -> str:
     import pikepdf
 
     encoding = font_dict.get("/Encoding")
@@ -595,6 +595,12 @@ def _simple_font_auto_unicode_policy(font_dict) -> str:
     base_font = FONT_NAME_RE.sub("", _base_font_name(font_dict))
     if base_font in SAFE_IMPLICIT_STANDARD_BASEFONTS:
         return "standard14"
+    if (
+        font_bytes
+        and font_dict.get("/Subtype") in (pikepdf.Name("/Type1"), pikepdf.Name("/MMType1"))
+        and _cff_builtin_encoding_map(font_bytes)
+    ):
+        return "embedded_cff"
     return "blocked"
 
 
@@ -642,6 +648,19 @@ def _inspect_unicode_repair_gate(pdf_path: Path, violations=None) -> dict[str, o
             except Exception:
                 return None
 
+        def _font_stream_bytes(descriptor) -> bytes | None:
+            if not isinstance(descriptor, pikepdf.Dictionary):
+                return None
+            for key in ("/FontFile", "/FontFile2", "/FontFile3"):
+                stream_obj = _resolve_dictionary(descriptor.get(key))
+                if stream_obj is None:
+                    continue
+                try:
+                    return bytes(stream_obj.read_bytes())
+                except Exception:
+                    continue
+            return None
+
         def _note_blocked_example(font_dict) -> None:
             examples = profile["blocked_examples"]
             if not isinstance(examples, list) or len(examples) >= 5:
@@ -686,9 +705,11 @@ def _inspect_unicode_repair_gate(pdf_path: Path, violations=None) -> dict[str, o
                     ):
                         continue
 
-                    policy = _simple_font_auto_unicode_policy(font_dict)
+                    descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
+                    font_bytes = _font_stream_bytes(descriptor)
+                    policy = _simple_font_auto_unicode_policy(font_dict, font_bytes=font_bytes)
                     has_tounicode = pikepdf.Name("/ToUnicode") in font_dict
-                    if policy in {"explicit", "standard14"}:
+                    if policy in {"explicit", "standard14", "embedded_cff"}:
                         if not has_tounicode or has_invalid_unicode_rules:
                             profile["safe_simple_candidates"] = int(profile["safe_simple_candidates"]) + 1
                     else:
@@ -1389,12 +1410,12 @@ def _simple_font_unicode_map(font_dict, font_bytes: bytes | None) -> dict[int, s
 
     # Stay conservative in the automatic lane: only use explicit PDF encoding data,
     # or the built-in Latin standard 14 fonts where StandardEncoding is deterministic.
-    if (
-        not mapping
-        and subtype in (pikepdf.Name("/Type1"), pikepdf.Name("/MMType1"))
-        and _simple_font_auto_unicode_policy(font_dict) == "standard14"
-    ):
-        mapping.update(_named_simple_encoding_map("/StandardEncoding"))
+    policy = _simple_font_auto_unicode_policy(font_dict, font_bytes=font_bytes)
+    if not mapping and subtype in (pikepdf.Name("/Type1"), pikepdf.Name("/MMType1")):
+        if policy == "standard14":
+            mapping.update(_named_simple_encoding_map("/StandardEncoding"))
+        elif policy == "embedded_cff" and font_bytes:
+            mapping.update(_cff_builtin_encoding_map(font_bytes))
 
     return {code: text for code, text in mapping.items() if 0 <= code <= 0xFF and _is_valid_unicode_text(text)}
 
@@ -1745,9 +1766,10 @@ def _inspect_font_diagnostics(
                     if isinstance(encoding, pikepdf.Dictionary)
                     else ""
                 )
+                font_bytes = _font_stream_bytes(descriptor)
                 auto_unicode_policy = ""
                 if subtype in ("/Type1", "/MMType1", "/TrueType"):
-                    auto_unicode_policy = _simple_font_auto_unicode_policy(font_dict)
+                    auto_unicode_policy = _simple_font_auto_unicode_policy(font_dict, font_bytes=font_bytes)
                 embedded = _has_embedded_font(descriptor)
                 local_embed_support = _local_embed_support_kind(font_dict, descendant_subtype=descendant_subtype)
                 local_font_program_available = False
@@ -2305,7 +2327,7 @@ def _repair_pdf_tounicode_sync(
                 descriptor = _resolve_object(font_dict.get("/FontDescriptor"))
                 font_bytes = _font_stream_bytes(descriptor)
                 generated_map = {}
-                if _simple_font_auto_unicode_policy(font_dict) != "blocked":
+                if _simple_font_auto_unicode_policy(font_dict, font_bytes=font_bytes) != "blocked":
                     generated_map = _simple_font_unicode_map(font_dict, font_bytes)
 
                 if _simple_font_zero_byte_repair_candidate(
@@ -2472,8 +2494,6 @@ def _repair_pdf_tounicode_sync(
         return True, len(merged_map), len(generated), invalid_entries, overwritten
 
     def _rebuild_simple_font_tounicode(pdf, font_dict) -> tuple[bool, int, int, int, int, int]:
-        if _simple_font_auto_unicode_policy(font_dict) == "blocked":
-            return False, 0, 0, 0, 0, 0
         font_key = _obj_key(font_dict)
         used_codes = used_simple_codes.get(font_key or (-1, -1), set())
         existing_stream = _resolve_object(font_dict.get("/ToUnicode"))
@@ -2492,6 +2512,8 @@ def _repair_pdf_tounicode_sync(
 
         descriptor = _resolve_object(font_dict.get("/FontDescriptor"))
         font_bytes = _font_stream_bytes(descriptor)
+        if _simple_font_auto_unicode_policy(font_dict, font_bytes=font_bytes) == "blocked":
+            return False, 0, 0, invalid_entries, 0, 0
         generated = _simple_font_unicode_map(font_dict, font_bytes)
         if not generated:
             return False, 0, 0, invalid_entries, 0, 0

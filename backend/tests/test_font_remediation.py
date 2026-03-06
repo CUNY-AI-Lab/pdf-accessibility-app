@@ -137,6 +137,38 @@ def test_simple_font_policy_blocks_implicit_nonstandard_fonts():
     assert _simple_font_auto_unicode_policy(font_dict) == "blocked"
 
 
+def test_simple_font_policy_allows_embedded_cff_when_builtin_encoding_decodes(monkeypatch):
+    font_dict = pikepdf.Dictionary({
+        "/Subtype": pikepdf.Name("/Type1"),
+        "/BaseFont": pikepdf.Name("/ABCDEE+TeX_CM_Maths_Symbols"),
+    })
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_cff_builtin_encoding_map",
+        lambda font_bytes: {14: "◦"} if font_bytes == b"cff" else {},
+    )
+
+    assert _simple_font_auto_unicode_policy(font_dict, font_bytes=b"cff") == "embedded_cff"
+
+
+def test_simple_type1_fonts_use_embedded_cff_encoding_when_available(monkeypatch):
+    font_dict = pikepdf.Dictionary({
+        "/Subtype": pikepdf.Name("/Type1"),
+        "/BaseFont": pikepdf.Name("/ABCDEE+TeX_CM_Maths_Symbols"),
+    })
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_cff_builtin_encoding_map",
+        lambda font_bytes: {14: "◦", 20: "≤"} if font_bytes == b"cff" else {},
+    )
+
+    mapping = _simple_font_unicode_map(font_dict, b"cff")
+
+    assert mapping == {14: "◦", 20: "≤"}
+
+
 def test_local_embed_support_includes_standard_type1_fonts():
     font_dict = pikepdf.Dictionary({
         "/Subtype": pikepdf.Name("/Type1"),
@@ -258,6 +290,28 @@ def test_simple_font_zero_byte_repair_candidate_only_allows_code_zero_residue():
         existing_map={},
         generated_map=generated_map,
     ) is False
+
+
+def test_simple_font_zero_byte_candidate_uses_embedded_cff_map(monkeypatch):
+    font_dict = pikepdf.Dictionary({
+        "/Subtype": pikepdf.Name("/Type1"),
+        "/BaseFont": pikepdf.Name("/ABCDEE+TeX_CM_Maths_Symbols"),
+    })
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_cff_builtin_encoding_map",
+        lambda font_bytes: {14: "◦", 20: "≤", 135: "+", 136: "="} if font_bytes == b"cff" else {},
+    )
+
+    generated_map = _simple_font_unicode_map(font_dict, b"cff")
+
+    assert _simple_font_zero_byte_repair_candidate(
+        font_dict,
+        used_codes={0, 14, 20, 135, 136},
+        existing_map={},
+        generated_map=generated_map,
+    ) is True
 
 
 def test_zero_byte_text_operand_sanitizer_strips_only_string_bytes():
