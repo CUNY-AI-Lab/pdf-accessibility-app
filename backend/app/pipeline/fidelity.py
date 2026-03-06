@@ -444,6 +444,31 @@ def assess_fidelity(
 
     font_remediation = validation_report.get("remediation", {}).get("font_remediation", {})
     unicode_gate = font_remediation.get("unicode_gate", {})
+    font_diagnostics = (
+        font_remediation.get("postflight_diagnostics")
+        or font_remediation.get("preflight_diagnostics")
+        or {}
+    )
+    font_diagnostics_summary = (
+        font_diagnostics.get("summary")
+        if isinstance(font_diagnostics, dict)
+        else {}
+    )
+    top_font_profiles = []
+    if isinstance(font_diagnostics, dict):
+        raw_profiles = font_diagnostics.get("profiles")
+        if isinstance(raw_profiles, list):
+            for profile in raw_profiles[:3]:
+                if not isinstance(profile, dict):
+                    continue
+                top_font_profiles.append({
+                    "base_font": str(profile.get("base_font") or ""),
+                    "subtype": str(profile.get("subtype") or ""),
+                    "issue_tags": profile.get("issue_tags") if isinstance(profile.get("issue_tags"), list) else [],
+                    "missing_used_code_count": int(profile.get("missing_used_code_count", 0) or 0),
+                    "invalid_tounicode_entries": int(profile.get("invalid_tounicode_entries", 0) or 0),
+                    "embedded": bool(profile.get("embedded", False)),
+                })
     remaining_font_errors = sum(
         (
             violation.get("count", 1) if isinstance(violation.get("count"), int) and violation.get("count", 1) > 0 else 1
@@ -470,6 +495,8 @@ def assess_fidelity(
             metadata={
                 "remaining_font_errors": remaining_font_errors,
                 "unicode_gate": unicode_gate,
+                "font_diagnostics_summary": font_diagnostics_summary,
+                "top_font_profiles": top_font_profiles,
             },
         )
         checks.append({
