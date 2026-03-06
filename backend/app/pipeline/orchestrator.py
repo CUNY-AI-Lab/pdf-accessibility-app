@@ -63,6 +63,54 @@ SYSTEM_FONT_DIRS = (
     Path("/usr/share/fonts"),
     Path("/usr/local/share/fonts"),
 )
+GHOSTSCRIPT_ALWAYS_EMBED_FONTS = (
+    "/Courier",
+    "/Courier-Bold",
+    "/Courier-Oblique",
+    "/Courier-BoldOblique",
+    "/Helvetica",
+    "/Helvetica-Bold",
+    "/Helvetica-Oblique",
+    "/Helvetica-BoldOblique",
+    "/Times-Roman",
+    "/Times-Bold",
+    "/Times-Italic",
+    "/Times-BoldItalic",
+    "/Symbol",
+    "/ZapfDingbats",
+)
+GHOSTSCRIPT_TYPE1_SUBSTITUTES = {
+    "timesroman": "NimbusRoman-Regular",
+    "timesbold": "NimbusRoman-Bold",
+    "timesitalic": "NimbusRoman-Italic",
+    "timesbolditalic": "NimbusRoman-BoldItalic",
+    "helvetica": "NimbusSans-Regular",
+    "helveticabold": "NimbusSans-Bold",
+    "helveticaoblique": "NimbusSans-Italic",
+    "helveticaboldoblique": "NimbusSans-BoldItalic",
+    "courier": "NimbusMonoPS-Regular",
+    "courierbold": "NimbusMonoPS-Bold",
+    "courieroblique": "NimbusMonoPS-Italic",
+    "courierboldoblique": "NimbusMonoPS-BoldItalic",
+    "symbol": "StandardSymbolsPS",
+    "zapfdingbats": "D050000L",
+}
+GHOSTSCRIPT_TYPE1_DESCRIPTOR_SPECS = {
+    "timesroman": {"afm": "n021003l.afm", "flags": 34},
+    "timesbold": {"afm": "n021004l.afm", "flags": 34},
+    "timesitalic": {"afm": "n021023l.afm", "flags": 98},
+    "timesbolditalic": {"afm": "n021024l.afm", "flags": 98},
+    "helvetica": {"afm": "n019003l.afm", "flags": 32},
+    "helveticabold": {"afm": "n019004l.afm", "flags": 32},
+    "helveticaoblique": {"afm": "n019023l.afm", "flags": 96},
+    "helveticaboldoblique": {"afm": "n019024l.afm", "flags": 96},
+    "courier": {"afm": "n022003l.afm", "flags": 33},
+    "courierbold": {"afm": "n022004l.afm", "flags": 33},
+    "courieroblique": {"afm": "n022023l.afm", "flags": 97},
+    "courierboldoblique": {"afm": "n022024l.afm", "flags": 97},
+    "symbol": {"afm": "s050000l.afm", "flags": 4},
+    "zapfdingbats": {"afm": "d050000l.afm", "flags": 4},
+}
 
 
 def _aggregate_violations(violations) -> dict[str, dict]:
@@ -442,6 +490,11 @@ def _local_embed_support_kind(font_dict, descendant_subtype=None) -> str:
     subtype = font_dict.get("/Subtype")
     if subtype == pikepdf.Name("/TrueType"):
         return "truetype"
+    if (
+        subtype in (pikepdf.Name("/Type1"), pikepdf.Name("/MMType1"))
+        and _normalize_font_name(_base_font_name(font_dict)) in GHOSTSCRIPT_TYPE1_SUBSTITUTES
+    ):
+        return "type1_standard14"
     if (
         subtype == pikepdf.Name("/Type0")
         and descendant_subtype == pikepdf.Name("/CIDFontType2")
@@ -866,6 +919,163 @@ def _system_font_program(font_name: str) -> tuple[bytes | None, str | None]:
             continue
 
     return None, None
+
+
+@lru_cache(maxsize=1)
+def _ghostscript_resource_font_dir() -> Path | None:
+    gs = shutil.which("gs")
+    if not gs:
+        return None
+
+    gs_path = Path(gs).resolve()
+    candidate_suffixes = (
+        Path("share/ghostscript/Resource/Font"),
+        Path("Resource/Font"),
+    )
+    for parent in (gs_path.parent,) + tuple(gs_path.parents):
+        for suffix in candidate_suffixes:
+            candidate = parent / suffix
+            if candidate.exists():
+                return candidate
+    return None
+
+
+@lru_cache(maxsize=1)
+def _ghostscript_font_metrics_dir() -> Path | None:
+    gs = shutil.which("gs")
+    if not gs:
+        return None
+
+    gs_path = Path(gs).resolve()
+    candidate_suffixes = (
+        Path("share/ghostscript/fonts"),
+        Path("fonts"),
+    )
+    for parent in (gs_path.parent,) + tuple(gs_path.parents):
+        for suffix in candidate_suffixes:
+            candidate = parent / suffix
+            if candidate.exists():
+                return candidate
+    return None
+
+
+@lru_cache(maxsize=64)
+def _ghostscript_type1_font_program(
+    font_name: str,
+) -> tuple[bytes | None, str | None, dict[str, int] | None]:
+    from fontTools import t1Lib
+
+    normalized = _normalize_font_name(font_name)
+    if not normalized:
+        return None, None, None
+
+    resource_name = GHOSTSCRIPT_TYPE1_SUBSTITUTES.get(normalized)
+    if not resource_name:
+        return None, None, None
+
+    resource_dir = _ghostscript_resource_font_dir()
+    if resource_dir is None:
+        return None, None, None
+
+    path = resource_dir / resource_name
+    if not path.exists():
+        return None, None, None
+
+    try:
+        raw = path.read_bytes()
+        chunks = t1Lib.findEncryptedChunks(raw)
+    except Exception:
+        return None, None, None
+
+    font_bytes = b"".join(chunk for _, chunk in chunks)
+    if not font_bytes:
+        return None, None, None
+
+    length1 = len(chunks[0][1]) if chunks else len(font_bytes)
+    length2 = sum(len(chunk) for encrypted, chunk in chunks if encrypted)
+    length3 = max(0, len(font_bytes) - length1 - length2)
+    lengths = {
+        "Length1": length1,
+        "Length2": length2,
+        "Length3": length3,
+    }
+    return font_bytes, path.name, lengths
+
+
+@lru_cache(maxsize=64)
+def _ghostscript_type1_descriptor(
+    font_name: str,
+) -> dict[str, object] | None:
+    from fontTools import afmLib
+
+    normalized = _normalize_font_name(font_name)
+    if not normalized:
+        return None
+
+    spec = GHOSTSCRIPT_TYPE1_DESCRIPTOR_SPECS.get(normalized)
+    metrics_dir = _ghostscript_font_metrics_dir()
+    if spec is None or metrics_dir is None:
+        return None
+
+    path = metrics_dir / spec["afm"]
+    if not path.exists():
+        return None
+
+    try:
+        afm = afmLib.AFM(str(path))
+    except Exception:
+        return None
+
+    attrs = afm._attrs
+    font_bbox = attrs.get("FontBBox")
+    if not isinstance(font_bbox, tuple) or len(font_bbox) != 4:
+        return None
+
+    widths_by_code = {
+        int(charnum): int(width)
+        for charnum, width, _ in afm._chars.values()
+        if isinstance(charnum, int) and 0 <= charnum <= 255
+    }
+    weight = str(attrs.get("Weight", "") or "").lower()
+    stem_v = 120 if any(token in weight for token in ("bold", "demi", "black")) else 80
+    descriptor = {
+        "Flags": int(spec["flags"]),
+        "ItalicAngle": int(attrs.get("ItalicAngle", 0) or 0),
+        "Ascent": int(attrs.get("Ascender", 0) or 0),
+        "Descent": int(attrs.get("Descender", 0) or 0),
+        "CapHeight": int(attrs.get("CapHeight", attrs.get("Ascender", 0)) or 0),
+        "StemV": stem_v,
+        "FontBBox": [int(value) for value in font_bbox],
+        "FirstChar": 0,
+        "LastChar": 255,
+        "Widths": [int(widths_by_code.get(code, 0)) for code in range(256)],
+        "MissingWidth": int(widths_by_code.get(0, widths_by_code.get(32, 0))),
+    }
+    return descriptor
+
+
+def _local_font_program(
+    font_dict,
+    font_name: str,
+    *,
+    descendant_subtype=None,
+) -> tuple[bytes | None, str | None, str | None, dict[str, int] | None]:
+    import pikepdf
+
+    support_kind = _local_embed_support_kind(font_dict, descendant_subtype=descendant_subtype)
+    if support_kind in {"truetype", "cidfonttype2"}:
+        font_bytes, matched_name = _system_font_program(font_name)
+        if not font_bytes:
+            return None, None, None, None
+        return font_bytes, matched_name, str(pikepdf.Name("/FontFile2")), {"Length1": len(font_bytes)}
+
+    if support_kind == "type1_standard14":
+        font_bytes, matched_name, lengths = _ghostscript_type1_font_program(font_name)
+        if not font_bytes or not lengths:
+            return None, None, None, None
+        return font_bytes, matched_name, str(pikepdf.Name("/FontFile")), lengths
+
+    return None, None, None, None
 
 
 def _repair_pdf_font_dicts_sync(
@@ -1542,7 +1752,13 @@ def _inspect_font_diagnostics(
                 local_embed_support = _local_embed_support_kind(font_dict, descendant_subtype=descendant_subtype)
                 local_font_program_available = False
                 if not embedded and local_embed_support and base_font:
-                    local_font_program_available = bool(_system_font_program(base_font)[0])
+                    local_font_program_available = bool(
+                        _local_font_program(
+                            font_dict,
+                            base_font,
+                            descendant_subtype=descendant_subtype,
+                        )[0]
+                    )
 
                 profile = {
                     "object_id": profile_key,
@@ -2605,7 +2821,50 @@ def _embed_system_fonts_sync(
             )
         )
 
-    def _embed_descriptor_font(descriptor, font_name: str) -> bool:
+    def _ensure_type1_descriptor(font_dict, descriptor, font_name: str):
+        if isinstance(descriptor, pikepdf.Dictionary):
+            return descriptor
+        if _local_embed_support_kind(font_dict) != "type1_standard14":
+            return descriptor
+
+        descriptor_data = _ghostscript_type1_descriptor(font_name)
+        if not descriptor_data:
+            return descriptor
+
+        descriptor = pikepdf.Dictionary({
+            "/Type": pikepdf.Name("/FontDescriptor"),
+            "/FontName": pikepdf.Name(f"/{_strip_subset_prefix(font_name)}"),
+            "/Flags": int(descriptor_data["Flags"]),
+            "/ItalicAngle": int(descriptor_data["ItalicAngle"]),
+            "/Ascent": int(descriptor_data["Ascent"]),
+            "/Descent": int(descriptor_data["Descent"]),
+            "/CapHeight": int(descriptor_data["CapHeight"]),
+            "/StemV": int(descriptor_data["StemV"]),
+            "/FontBBox": pikepdf.Array(descriptor_data["FontBBox"]),
+        })
+        font_dict[pikepdf.Name("/FontDescriptor")] = descriptor
+        return descriptor
+
+    def _apply_type1_width_metrics(font_dict, descriptor, font_name: str) -> None:
+        if _local_embed_support_kind(font_dict) != "type1_standard14":
+            return
+
+        descriptor_data = _ghostscript_type1_descriptor(font_name)
+        if not descriptor_data:
+            return
+
+        first_char = int(descriptor_data.get("FirstChar", 0) or 0)
+        last_char = int(descriptor_data.get("LastChar", 255) or 255)
+        widths = descriptor_data.get("Widths")
+        if isinstance(widths, list) and widths:
+            font_dict[pikepdf.Name("/FirstChar")] = first_char
+            font_dict[pikepdf.Name("/LastChar")] = last_char
+            font_dict[pikepdf.Name("/Widths")] = pikepdf.Array(int(width) for width in widths)
+        if isinstance(descriptor, pikepdf.Dictionary):
+            descriptor[pikepdf.Name("/MissingWidth")] = int(descriptor_data.get("MissingWidth", 0) or 0)
+
+    def _embed_descriptor_font(font_dict, descriptor, font_name: str, *, descendant_subtype=None) -> bool:
+        descriptor = _ensure_type1_descriptor(font_dict, descriptor, font_name)
         if not isinstance(descriptor, pikepdf.Dictionary):
             stats["fonts_unsupported"] += 1
             return False
@@ -2613,14 +2872,20 @@ def _embed_system_fonts_sync(
             stats["fonts_already_embedded"] += 1
             return False
 
-        font_bytes, matched_name = _system_font_program(font_name)
-        if not font_bytes:
+        font_bytes, matched_name, fontfile_key, length_info = _local_font_program(
+            font_dict,
+            font_name,
+            descendant_subtype=descendant_subtype,
+        )
+        if not font_bytes or not fontfile_key or not length_info:
             stats["fonts_missing"] += 1
             return False
 
         stream = pdf.make_stream(font_bytes)
-        stream[pikepdf.Name("/Length1")] = len(font_bytes)
-        descriptor[pikepdf.Name("/FontFile2")] = stream
+        for key, value in length_info.items():
+            stream[pikepdf.Name(f"/{key}")] = int(value)
+        descriptor[pikepdf.Name(fontfile_key)] = stream
+        _apply_type1_width_metrics(font_dict, descriptor, font_name)
         if pikepdf.Name("/FontName") not in descriptor and font_name:
             descriptor[pikepdf.Name("/FontName")] = pikepdf.Name(f"/{_strip_subset_prefix(font_name)}")
         stats["fonts_embedded"] += 1
@@ -2657,7 +2922,18 @@ def _embed_system_fonts_sync(
                         font_dict.get("/BaseFont")
                         or (descriptor.get("/FontName") if isinstance(descriptor, pikepdf.Dictionary) else "")
                     )
-                    _embed_descriptor_font(descriptor, font_name)
+                    _embed_descriptor_font(font_dict, descriptor, font_name)
+                    continue
+
+                if subtype in (pikepdf.Name("/Type1"), pikepdf.Name("/MMType1")):
+                    descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
+                    font_name = str(
+                        font_dict.get("/BaseFont")
+                        or (descriptor.get("/FontName") if isinstance(descriptor, pikepdf.Dictionary) else "")
+                    )
+                    changed = _embed_descriptor_font(font_dict, descriptor, font_name)
+                    if not changed and _local_embed_support_kind(font_dict) != "type1_standard14":
+                        stats["fonts_unsupported"] += 1
                     continue
 
                 if subtype != pikepdf.Name("/Type0"):
@@ -2678,7 +2954,12 @@ def _embed_system_fonts_sync(
 
                 descriptor = _resolve_dictionary(cid_font.get("/FontDescriptor"))
                 font_name = str(cid_font.get("/BaseFont") or font_dict.get("/BaseFont"))
-                changed = _embed_descriptor_font(descriptor, font_name)
+                changed = _embed_descriptor_font(
+                    font_dict,
+                    descriptor,
+                    font_name,
+                    descendant_subtype=cid_font.get("/Subtype"),
+                )
                 if changed and pikepdf.Name("/CIDToGIDMap") not in cid_font:
                     cid_font[pikepdf.Name("/CIDToGIDMap")] = pikepdf.Name("/Identity")
                     stats["cidtogid_added"] += 1
@@ -2724,7 +3005,7 @@ def _embed_system_fonts_sync(
             )
 
             if stats["fonts_embedded"] <= 0:
-                return False, "No embeddable local TrueType fonts were found", stats
+                return False, "No embeddable local fonts were found", stats
 
             pdf.save(str(output_path))
         return (
@@ -2749,13 +3030,12 @@ async def _embed_system_fonts(
     return await asyncio.to_thread(_embed_system_fonts_sync, input_path, output_path)
 
 
-async def _rewrite_pdf_with_ghostscript_embed(input_path: Path, output_path: Path) -> tuple[bool, str]:
-    """Rewrite PDF through Ghostscript with aggressive font embedding options."""
-    gs = shutil.which("gs")
-    if not gs:
-        return False, "Ghostscript not found in PATH"
-
-    proc = await asyncio.create_subprocess_exec(
+def _ghostscript_embed_command(gs: str, input_path: Path, output_path: Path) -> tuple[str, ...]:
+    always_embed = " ".join(GHOSTSCRIPT_ALWAYS_EMBED_FONTS)
+    distiller_params = (
+        f"<< /NeverEmbed [ ] /AlwaysEmbed [ {always_embed} ] >> setdistillerparams"
+    )
+    return (
         gs,
         "-q",
         "-dSAFER",
@@ -2763,10 +3043,25 @@ async def _rewrite_pdf_with_ghostscript_embed(input_path: Path, output_path: Pat
         "-dNOPAUSE",
         "-sDEVICE=pdfwrite",
         "-dEmbedAllFonts=true",
+        "-dEmbedSubstituteFonts=true",
         "-dSubsetFonts=true",
         "-o",
         str(output_path),
+        "-c",
+        distiller_params,
+        "-f",
         str(input_path),
+    )
+
+
+async def _rewrite_pdf_with_ghostscript_embed(input_path: Path, output_path: Path) -> tuple[bool, str]:
+    """Rewrite PDF through Ghostscript with aggressive font embedding options."""
+    gs = shutil.which("gs")
+    if not gs:
+        return False, "Ghostscript not found in PATH"
+
+    proc = await asyncio.create_subprocess_exec(
+        *_ghostscript_embed_command(gs, input_path, output_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

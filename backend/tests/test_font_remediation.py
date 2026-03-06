@@ -13,6 +13,9 @@ from app.pipeline.orchestrator import (
     FONT_LANE_REPAIR_TOUNICODE,
     _embed_lane_should_skip_local,
     _font_remediation_lanes,
+    _ghostscript_embed_command,
+    _local_embed_support_kind,
+    _local_font_program,
     _merge_tounicode_maps,
     _normalize_font_name,
     _sanitize_text_showing_zero_bytes,
@@ -134,6 +137,106 @@ def test_simple_font_policy_blocks_implicit_nonstandard_fonts():
     assert _simple_font_auto_unicode_policy(font_dict) == "blocked"
 
 
+def test_local_embed_support_includes_standard_type1_fonts():
+    font_dict = pikepdf.Dictionary({
+        "/Subtype": pikepdf.Name("/Type1"),
+        "/BaseFont": pikepdf.Name("/Times-Roman"),
+    })
+
+    assert _local_embed_support_kind(font_dict) == "type1_standard14"
+
+
+def test_local_font_program_uses_type1_fontfile_for_standard14(monkeypatch):
+    font_dict = pikepdf.Dictionary({
+        "/Subtype": pikepdf.Name("/Type1"),
+        "/BaseFont": pikepdf.Name("/Times-Roman"),
+    })
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_ghostscript_type1_font_program",
+        lambda font_name: (b"%!PS-AdobeFont-1.0", "NimbusRoman-Regular", {"Length1": 10, "Length2": 20, "Length3": 0}),
+    )
+
+    font_bytes, matched_name, fontfile_key, lengths = _local_font_program(font_dict, "Times-Roman")
+
+    assert font_bytes == b"%!PS-AdobeFont-1.0"
+    assert matched_name == "NimbusRoman-Regular"
+    assert fontfile_key == "/FontFile"
+    assert lengths == {"Length1": 10, "Length2": 20, "Length3": 0}
+
+
+def test_embed_system_fonts_creates_descriptor_for_standard_type1(tmp_path, monkeypatch):
+    input_pdf = tmp_path / "input.pdf"
+    output_pdf = tmp_path / "output.pdf"
+
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page()
+    page_obj = page.obj
+    font_dict = pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Font"),
+        "/Subtype": pikepdf.Name("/Type1"),
+        "/BaseFont": pikepdf.Name("/Times-Roman"),
+        "/Encoding": pikepdf.Name("/WinAnsiEncoding"),
+    })
+    page_obj["/Resources"] = pikepdf.Dictionary({
+        "/Font": pikepdf.Dictionary({
+            "/F1": font_dict,
+        })
+    })
+    pdf.save(str(input_pdf))
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_ghostscript_type1_descriptor",
+        lambda font_name: {
+            "Flags": 34,
+            "ItalicAngle": 0,
+            "Ascent": 700,
+            "Descent": -200,
+            "CapHeight": 680,
+            "StemV": 80,
+            "FontBBox": [-168, -281, 1000, 900],
+            "FirstChar": 0,
+            "LastChar": 3,
+            "Widths": [250, 333, 444, 555],
+            "MissingWidth": 250,
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_local_font_program",
+        lambda font_dict, font_name, descendant_subtype=None: (
+            b"%!PS-AdobeFont-1.0",
+            "NimbusRoman-Regular",
+            "/FontFile",
+            {"Length1": 10, "Length2": 20, "Length3": 0},
+        ),
+    )
+
+    ok, message, stats = orchestrator._embed_system_fonts_sync(input_pdf, output_pdf)
+
+    assert ok is True
+    assert "Local font embedding completed" in message
+    assert stats["fonts_embedded"] == 1
+
+    with pikepdf.open(str(output_pdf)) as repaired_pdf:
+        resources = repaired_pdf.pages[0].obj["/Resources"]
+        repaired_font = resources["/Font"]["/F1"]
+        descriptor = repaired_font["/FontDescriptor"]
+        assert descriptor["/FontName"] == pikepdf.Name("/Times-Roman")
+        assert pikepdf.Name("/FontFile") in descriptor
+        assert int(repaired_font["/FirstChar"]) == 0
+        assert int(repaired_font["/LastChar"]) == 3
+        assert [int(value) for value in repaired_font["/Widths"]] == [250, 333, 444, 555]
+        assert int(descriptor["/MissingWidth"]) == 250
+        font_stream = descriptor["/FontFile"]
+        assert bytes(font_stream.read_bytes()) == b"%!PS-AdobeFont-1.0"
+        assert int(font_stream["/Length1"]) == 10
+        assert int(font_stream["/Length2"]) == 20
+        assert int(font_stream["/Length3"]) == 0
+
+
 def test_simple_font_zero_byte_repair_candidate_only_allows_code_zero_residue():
     font_dict = pikepdf.Dictionary({
         "/Subtype": pikepdf.Name("/Type1"),
@@ -166,6 +269,25 @@ def test_zero_byte_text_operand_sanitizer_strips_only_string_bytes():
     assert bytes(new_operands[0][0]) == b"abc"
     assert new_operands[0][1] == -120
     assert bytes(new_operands[0][2]) == b"d"
+
+
+def test_ghostscript_embed_command_forces_standard_font_embedding():
+    cmd = _ghostscript_embed_command(
+        "/opt/homebrew/bin/gs",
+        Path("/tmp/input.pdf"),
+        Path("/tmp/output.pdf"),
+    )
+
+    assert "-dEmbedAllFonts=true" in cmd
+    assert "-dEmbedSubstituteFonts=true" in cmd
+    assert "-c" in cmd
+    distiller_params = cmd[cmd.index("-c") + 1]
+    assert "/NeverEmbed [ ]" in distiller_params
+    assert "/AlwaysEmbed [" in distiller_params
+    assert "/Times-Roman" in distiller_params
+    assert "/Helvetica" in distiller_params
+    assert "/ZapfDingbats" in distiller_params
+    assert cmd[-2:] == ("-f", "/tmp/input.pdf")
 
 
 def test_embed_lane_skips_local_when_no_supported_candidates():
