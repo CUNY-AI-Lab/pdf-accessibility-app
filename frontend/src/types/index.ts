@@ -19,7 +19,8 @@ export type StepName =
   | "structure"
   | "alt_text"
   | "tagging"
-  | "validation";
+  | "validation"
+  | "fidelity";
 
 export type AltTextStatus = "pending_review" | "approved" | "rejected";
 
@@ -53,6 +54,18 @@ export interface AltText {
   generated_text?: string;
   edited_text?: string;
   status: AltTextStatus;
+}
+
+export interface ReviewTask {
+  id: number;
+  task_type: string;
+  title: string;
+  detail: string;
+  severity: "high" | "medium" | "low";
+  blocking: boolean;
+  status: "pending_review" | "resolved";
+  source: string;
+  metadata: Record<string, unknown>;
 }
 
 export interface ValidationViolation {
@@ -89,6 +102,7 @@ export interface ValidationReport {
   changes?: ValidationChange[];
   summary: Record<string, number>;
   remediation?: Record<string, unknown>;
+  fidelity?: Record<string, unknown>;
   tagging?: Record<string, unknown>;
   claims?: Record<string, unknown>;
 }

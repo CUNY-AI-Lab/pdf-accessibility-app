@@ -31,6 +31,11 @@ const STEP_META: Record<StepName, { label: string; description: string; icon: st
     description: "Checking PDF/UA compliance",
     icon: "M9 12l2 2 4-4m6 2a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
   },
+  fidelity: {
+    label: "Fidelity",
+    description: "Checking content and reading fidelity",
+    icon: "M12 2l3 7 7 3-7 3-3 7-3-7-7-3 7-3 3-7z",
+  },
 };
 
 interface PipelineProgressProps {

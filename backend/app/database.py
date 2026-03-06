@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator
 
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import get_settings
@@ -32,8 +33,22 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db():
-    from app.models import Base
+    from app.models import Base, ReviewTask
 
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_ensure_schema, ReviewTask.__table__)
+
+
+def _ensure_schema(sync_conn, review_tasks_table) -> None:
+    inspector = inspect(sync_conn)
+    table_names = set(inspector.get_table_names())
+
+    if "jobs" in table_names:
+        columns = {column["name"] for column in inspector.get_columns("jobs")}
+        if "fidelity_json" not in columns:
+            sync_conn.execute(text("ALTER TABLE jobs ADD COLUMN fidelity_json TEXT"))
+
+    if "review_tasks" not in table_names:
+        review_tasks_table.create(bind=sync_conn, checkfirst=True)

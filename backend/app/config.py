@@ -1,8 +1,19 @@
 from pathlib import Path
+from urllib.parse import urlparse
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent  # pdf-accessibility-app/
+PLACEHOLDER_LLM_KEYS = {
+    "",
+    "ollama",
+    "changeme",
+    "your-api-key",
+    "your_openrouter_api_key",
+    "replace_me",
+}
+LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 class Settings(BaseSettings):
@@ -17,10 +28,12 @@ class Settings(BaseSettings):
     output_dir: Path = BASE_DIR / "data" / "output"
 
     # LLM (OpenAI-compatible)
-    llm_base_url: str = "http://localhost:11434/v1"
-    llm_api_key: str = "ollama"
-    llm_model: str = "llava"
+    llm_base_url: str = "https://openrouter.ai/api/v1"
+    llm_api_key: str = ""
+    llm_model: str = "google/gemini-3-flash-preview"
     llm_timeout: int = 120
+    llm_strict_validation: bool = True
+    auto_approve_generated_alt_text: bool = True
 
     # veraPDF
     verapdf_path: str = "verapdf"
@@ -28,9 +41,43 @@ class Settings(BaseSettings):
 
     # OCR
     ocr_language: str = "eng"
+    font_remediation_enable_force_ocr: bool = False
+    font_remediation_allow_ocr_on_digital: bool = False
+    font_remediation_ocr_max_pages: int = 40
 
     # Dev
     debug: bool = False
+
+    @model_validator(mode="after")
+    def validate_llm_settings(self):
+        base_url = self.llm_base_url.strip()
+        model = self.llm_model.strip()
+        api_key = self.llm_api_key.strip()
+
+        if not base_url:
+            raise ValueError("LLM_BASE_URL must be set")
+        if not model:
+            raise ValueError("LLM_MODEL must be set")
+
+        parsed = urlparse(base_url)
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError("LLM_BASE_URL must be a valid http(s) URL")
+
+        host = (parsed.hostname or "").lower()
+        is_local = host in LOCAL_LLM_HOSTS
+
+        if self.llm_strict_validation and not is_local:
+            if api_key.lower() in PLACEHOLDER_LLM_KEYS:
+                raise ValueError(
+                    "LLM_API_KEY is required for remote LLM endpoints "
+                    "(set a real API key in .env)"
+                )
+            if "gemini" not in model.lower():
+                raise ValueError(
+                    "Remote LLM endpoint must use a Gemini model "
+                    "(expected LLM_MODEL to contain 'gemini')"
+                )
+        return self
 
 
 _settings: Settings | None = None

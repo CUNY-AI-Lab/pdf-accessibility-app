@@ -7,8 +7,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import AltTextEntry, Job
-from app.schemas import AltTextResponse, AltTextUpdateRequest, ValidationReportResponse
+from app.models import AltTextEntry, Job, ReviewTask
+from app.schemas import (
+    AltTextResponse,
+    AltTextUpdateRequest,
+    ReviewTaskResponse,
+    ValidationReportResponse,
+)
 
 router = APIRouter(prefix="/jobs/{job_id}", tags=["documents"])
 
@@ -46,6 +51,34 @@ async def list_alt_texts(job_id: str, db: AsyncSession = Depends(get_db)):
             status=e.status,
         )
         for e in entries
+    ]
+
+
+@router.get("/review-tasks", response_model=list[ReviewTaskResponse])
+async def list_review_tasks(job_id: str, db: AsyncSession = Depends(get_db)):
+    job_result = await db.execute(select(Job.id).where(Job.id == job_id))
+    if not job_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    result = await db.execute(
+        select(ReviewTask)
+        .where(ReviewTask.job_id == job_id)
+        .order_by(ReviewTask.blocking.desc(), ReviewTask.created_at.asc())
+    )
+    tasks = result.scalars().all()
+    return [
+        ReviewTaskResponse(
+            id=task.id,
+            task_type=task.task_type,
+            title=task.title,
+            detail=task.detail,
+            severity=task.severity,
+            blocking=bool(task.blocking),
+            status=task.status,
+            source=task.source,
+            metadata=json.loads(task.metadata_json) if task.metadata_json else {},
+        )
+        for task in tasks
     ]
 
 

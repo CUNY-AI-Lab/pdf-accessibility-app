@@ -23,6 +23,12 @@ Generate concise but complete alt text for this image following WCAG guidelines:
 Respond with ONLY the alt text, nothing else."""
 
 
+def _caption_fallback(caption: str | None) -> str:
+    if not isinstance(caption, str):
+        return ""
+    return caption.strip()
+
+
 @dataclass
 class AltTextResult:
     figure_index: int
@@ -41,24 +47,40 @@ async def generate_alt_text(
         try:
             if not fig.path.exists():
                 logger.warning(f"Figure {fig.index} image not found: {fig.path}")
+                fallback = _caption_fallback(fig.caption)
                 results.append(AltTextResult(
                     figure_index=fig.index,
-                    generated_text="[Image file not found]",
+                    generated_text=fallback or "[Image file not found]",
                     status="pending_review",
                 ))
                 continue
 
+            suffix = fig.path.suffix.lower()
+            if suffix in {".jpg", ".jpeg"}:
+                mime_type = "image/jpeg"
+            elif suffix == ".webp":
+                mime_type = "image/webp"
+            else:
+                mime_type = "image/png"
             image_b64 = base64.b64encode(fig.path.read_bytes()).decode("ascii")
+            prompt = ALT_TEXT_PROMPT
+            caption = _caption_fallback(fig.caption)
+            if caption:
+                prompt += (
+                    "\n\nDocument caption/context:\n"
+                    f"{caption}\n\n"
+                    "Use the caption as supporting context when it matches the image."
+                )
             response = await llm_client.chat_completion(
                 messages=[
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": ALT_TEXT_PROMPT},
+                            {"type": "text", "text": prompt},
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": f"data:image/png;base64,{image_b64}",
+                                    "url": f"data:{mime_type};base64,{image_b64}",
                                 },
                             },
                         ],
@@ -80,9 +102,10 @@ async def generate_alt_text(
 
         except Exception as e:
             logger.error(f"Alt text generation failed for figure {fig.index}: {e}")
+            fallback = _caption_fallback(fig.caption)
             results.append(AltTextResult(
                 figure_index=fig.index,
-                generated_text=f"[Generation failed: {e}]",
+                generated_text=fallback or f"[Generation failed: {e}]",
                 status="pending_review",
             ))
 

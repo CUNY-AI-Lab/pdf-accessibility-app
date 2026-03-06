@@ -113,15 +113,14 @@ async def validate_pdf(
     verapdf_path: str = "verapdf",
     flavour: str = "ua1",
 ) -> ValidationResult:
-    """Run veraPDF PDF/UA validation and parse results.
-
-    Falls back to a basic check if veraPDF is not installed.
-    """
+    """Run veraPDF PDF/UA validation and parse results."""
     try:
         return await _validate_with_verapdf(pdf_path, verapdf_path, flavour)
-    except FileNotFoundError:
-        logger.warning("veraPDF not found, using basic validation")
-        return await _validate_basic(pdf_path)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"veraPDF executable not found at '{verapdf_path}'. "
+            "Install veraPDF or set VERAPDF_PATH."
+        ) from exc
 
 
 async def _validate_with_verapdf(
@@ -245,60 +244,3 @@ async def _validate_with_verapdf(
         raw_report=report,
     )
 
-
-async def _validate_basic(pdf_path: Path) -> ValidationResult:
-    """Basic PDF/UA check using pikepdf when veraPDF is not available."""
-
-    def _check():
-        import pikepdf
-
-        violations = []
-
-        with pikepdf.open(str(pdf_path)) as pdf:
-            # Check MarkInfo
-            mark_info = pdf.Root.get("/MarkInfo")
-            if not mark_info or not mark_info.get("/Marked"):
-                violations.append(Violation(
-                    rule_id="basic-1",
-                    description="PDF is not marked as tagged (missing MarkInfo/Marked)",
-                    severity="error",
-                ))
-
-            # Check Language
-            if "/Lang" not in pdf.Root:
-                violations.append(Violation(
-                    rule_id="basic-2",
-                    description="Document language not set",
-                    severity="error",
-                ))
-
-            # Check StructTreeRoot
-            if "/StructTreeRoot" not in pdf.Root:
-                violations.append(Violation(
-                    rule_id="basic-3",
-                    description="No structure tree (StructTreeRoot missing)",
-                    severity="error",
-                ))
-
-            # Check title
-            title = ""
-            try:
-                title = str(pdf.docinfo.get("/Title", "")).strip()
-            except Exception:
-                title = ""
-            if not title:
-                violations.append(Violation(
-                    rule_id="basic-4",
-                    description="Document title not set in metadata",
-                    severity="warning",
-                ))
-
-        compliant = len([v for v in violations if v.severity == "error"]) == 0
-
-        return ValidationResult(
-            compliant=compliant,
-            violations=violations,
-            raw_report={"validator": "basic-pikepdf", "checks": len(violations)},
-        )
-
-    return await asyncio.to_thread(_check)

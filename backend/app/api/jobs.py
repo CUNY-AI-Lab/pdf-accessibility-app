@@ -18,7 +18,7 @@ from app.services.job_manager import _DONE, JobManager, get_job_manager
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
-PIPELINE_STEPS = ["classify", "ocr", "structure", "alt_text", "tagging", "validation"]
+PIPELINE_STEPS = ["classify", "ocr", "structure", "alt_text", "tagging", "validation", "fidelity"]
 PIPELINE_STEP_ORDER = {name: idx for idx, name in enumerate(PIPELINE_STEPS)}
 
 

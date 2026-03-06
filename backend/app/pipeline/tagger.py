@@ -52,6 +52,7 @@ class TaggingResult:
     tables_tagged: int = 0
     lists_tagged: int = 0
     links_tagged: int = 0
+    annotations_tagged: int = 0
     decorative_figures_artifacted: int = 0
     bookmarks_added: int = 0
     title_set: bool = False
@@ -179,11 +180,9 @@ def _bbox_from_center(cx: float, cy: float, width: float, height: float) -> dict
     }
 
 
-def _region_bbox(region: "ContentRegion") -> dict[str, float]:
-    """Get region bbox with fallback to a center-derived rectangle."""
-    if region.bbox:
-        return region.bbox
-    return _bbox_from_center(region.cx, region.cy, region.width or 10.0, region.height or 10.0)
+def _region_bbox(region: "ContentRegion") -> dict[str, float] | None:
+    """Return explicit region bbox when available."""
+    return region.bbox
 
 
 def _bbox_tuple(bbox: dict[str, float]) -> tuple[float, float, float, float]:
@@ -585,6 +584,8 @@ def _matching_score(region: ContentRegion, element: dict) -> float:
     """Score a region-element pair using containment/IoU + text similarity."""
     rbbox = _region_bbox(region)
     ebbox = element.get("bbox")
+    if not rbbox or not ebbox:
+        return 0.0
 
     containment = _containment_ratio(rbbox, ebbox)
     reverse_containment = _containment_ratio(ebbox, rbbox)
@@ -604,21 +605,14 @@ def _candidate_element_positions(
     region_bbox: dict[str, float],
     spatial_index: rtree_index.Index,
     bbox_element_positions: list[int],
-    total_elements: int,
 ) -> list[int]:
-    """Query nearby candidate elements via R-tree; fallback to all if needed."""
+    """Query nearby candidate elements via R-tree with bounded expansion."""
     candidates = list(spatial_index.intersection(_bbox_tuple(_expand_bbox(region_bbox, 24))))
     if not candidates:
         candidates = list(spatial_index.intersection(_bbox_tuple(_expand_bbox(region_bbox, 96))))
     if not candidates:
         candidates = bbox_element_positions.copy()
-    # Keep the local R-tree candidates first, but include all elements to avoid
-    # hard misses when bboxes are noisy or missing.
-    all_positions = list(range(total_elements))
-    if not candidates:
-        return all_positions
-    merged = list(dict.fromkeys(candidates + all_positions))
-    return merged
+    return list(dict.fromkeys(candidates))
 
 
 def _optimal_match(
@@ -640,11 +634,12 @@ def _optimal_match(
     cost = np.full((len(regions), len(elements)), LARGE_COST, dtype=np.float64)
     for rpos, (_region_idx, region) in enumerate(regions):
         rbbox = _region_bbox(region)
+        if not rbbox:
+            continue
         candidates = _candidate_element_positions(
             rbbox,
             spatial_index,
             bbox_element_positions,
-            len(elements),
         )
         for epos in candidates:
             _elem_idx, elem = elements[epos]
@@ -713,6 +708,8 @@ def _refine_text_regions_with_docling_parse(
 
     for _, region in text_regions:
         rbbox = _region_bbox(region)
+        if not rbbox:
+            continue
         candidates = list(spatial_index.intersection(_bbox_tuple(_expand_bbox(rbbox, 24))))
         if not candidates:
             candidates = list(spatial_index.intersection(_bbox_tuple(_expand_bbox(rbbox, 96))))
@@ -1080,6 +1077,35 @@ class StructTreeBuilder:
         self._struct_elems_created += 1
         return True
 
+    def add_generic_annotation(self, page_ref: pikepdf.Object, annotation: pikepdf.Object) -> bool:
+        """Attach a generic /Annot StructElem to a non-link, non-widget annotation."""
+        try:
+            subtype = annotation.get("/Subtype")
+            if subtype in (pikepdf.Name("/Link"), pikepdf.Name("/Widget"), pikepdf.Name("/PrinterMark")):
+                return False
+            if not getattr(annotation, "is_indirect", False):
+                return False
+        except Exception:
+            return False
+
+        struct_parent_key = self._alloc_struct_parent_key()
+        annotation["/StructParent"] = struct_parent_key
+
+        annot_elem = self.pdf.make_indirect(pikepdf.Dictionary({
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Annot"),
+            "/P": self.doc_elem,
+            "/K": pikepdf.Dictionary({
+                "/Type": pikepdf.Name("/OBJR"),
+                "/Obj": annotation,
+                "/Pg": page_ref,
+            }),
+        }))
+        self._append_child(self.doc_elem, annot_elem)
+        self._object_parent_entries.append((struct_parent_key, annot_elem))
+        self._struct_elems_created += 1
+        return True
+
     def finalize(self):
         """Build the ParentTree NumberTree and set StructParents on pages."""
         parent_tree_nums = pikepdf.Array([])
@@ -1252,13 +1278,13 @@ def _emit_tagged_region(
             new_instructions.extend(region.instructions)
             new_instructions.append(_make_emc())
             return
-        fallback_alt = f"Image {fig_idx + 1}" if isinstance(fig_idx, int) else "Image"
         alt = (
             alt_lookup.get(fig_idx)
             or elem.get("caption")
             or elem.get("text")
-            or fallback_alt
         )
+        if isinstance(alt, str):
+            alt = alt.strip()
         mcid = builder.add_figure(page_index, page_ref, alt_text=alt or None)
         tag = "Figure"
     elif elem_type == "code":
@@ -1459,6 +1485,42 @@ def _tag_widget_annotations(
     return tagged
 
 
+def _tag_generic_annotations(
+    page: pikepdf.Page,
+    page_ref: pikepdf.Object,
+    builder: StructTreeBuilder,
+) -> int:
+    """Tag non-link, non-widget annotations as /Annot struct elements using OBJR."""
+    annots = page.get("/Annots")
+    if not isinstance(annots, pikepdf.Array):
+        return 0
+
+    tagged = 0
+    for idx, annotation in enumerate(annots):
+        try:
+            subtype = annotation.get("/Subtype")
+            if subtype in (
+                pikepdf.Name("/Link"),
+                pikepdf.Name("/Widget"),
+                pikepdf.Name("/PrinterMark"),
+            ):
+                continue
+        except Exception:
+            continue
+
+        if not getattr(annotation, "is_indirect", False):
+            try:
+                annotation = builder.pdf.make_indirect(pikepdf.Dictionary(annotation))
+                annots[idx] = annotation
+            except Exception:
+                continue
+
+        if builder.add_generic_annotation(page_ref, annotation):
+            tagged += 1
+
+    return tagged
+
+
 def _ensure_annotation_baseline(page: pikepdf.Page):
     """Apply baseline PDF/UA annotation requirements on a page."""
     annots = page.get("/Annots")
@@ -1562,6 +1624,7 @@ async def tag_pdf(
             tables_tagged = 0
             lists_tagged = 0
             links_tagged = 0
+            annotations_tagged = 0
             decorative_figures_artifacted = 0
 
             for page_index, page in enumerate(pdf.pages):
@@ -1596,6 +1659,7 @@ async def tag_pdf(
                 _ensure_annotation_baseline(page)
                 links_tagged += _tag_link_annotations(page, page.obj, builder)
                 _tag_widget_annotations(page, page.obj, builder)
+                annotations_tagged += _tag_generic_annotations(page, page.obj, builder)
 
             # 5. Finalize structure tree
             builder.finalize()
@@ -1611,6 +1675,7 @@ async def tag_pdf(
             f"({total_tags} tags, {headings_tagged} headings, "
             f"{figures_tagged} figures, {decorative_figures_artifacted} decorative figures, "
             f"{tables_tagged} tables, {links_tagged} links, "
+            f"{annotations_tagged} annotations, "
             f"{bookmarks_added} bookmarks)"
         )
 
@@ -1625,6 +1690,7 @@ async def tag_pdf(
             tables_tagged=tables_tagged,
             lists_tagged=lists_tagged,
             links_tagged=links_tagged,
+            annotations_tagged=annotations_tagged,
             decorative_figures_artifacted=decorative_figures_artifacted,
             bookmarks_added=bookmarks_added,
             title_set=title_set,

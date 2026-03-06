@@ -50,6 +50,24 @@ class AltTextUpdateRequest(BaseModel):
     status: Literal["pending_review", "approved", "rejected"] | None = None
 
 
+class ReviewTaskResponse(BaseModel):
+    id: int
+    task_type: str
+    title: str
+    detail: str
+    severity: Literal["high", "medium", "low"]
+    blocking: bool
+    status: str
+    source: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReviewTaskUpdateRequest(BaseModel):
+    status: Literal["pending_review", "resolved"] | None = None
+    resolution_note: str | None = None
+    evidence: dict[str, str] | None = None
+
+
 class ValidationViolation(BaseModel):
     rule_id: str
     description: str
@@ -84,6 +102,7 @@ class ValidationReportResponse(BaseModel):
     changes: list[ValidationChange] = Field(default_factory=list)
     summary: dict[str, int] = Field(default_factory=dict)
     remediation: dict[str, Any] = Field(default_factory=dict)
+    fidelity: dict[str, Any] = Field(default_factory=dict)
     tagging: dict[str, Any] = Field(default_factory=dict)
     claims: dict[str, Any] = Field(default_factory=dict)
 

@@ -45,6 +45,8 @@ async def run_ocr(
     ]
     if mode == "redo":
         args.append("--redo-ocr")
+    elif mode == "force":
+        args.append("--force-ocr")
     else:
         # Default behavior for the primary OCR step.
         args.append("--skip-text")
@@ -64,7 +66,7 @@ async def run_ocr(
     if proc.returncode == 0:
         logger.info(f"OCR complete: {output_path.name}")
         return OcrResult(success=True, output_path=output_path)
-    elif proc.returncode == 6 and mode != "redo":
+    elif proc.returncode == 6 and mode == "skip":
         # Exit code 6 = "file already has text" — not an error
         logger.info(f"OCR skipped (already has text): {input_path.name}")
         return OcrResult(

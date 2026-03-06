@@ -1,5 +1,5 @@
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { useDeleteJob, useJob, useValidation } from "../api/jobs";
+import { useDeleteJob, useJob, useReviewTasks, useValidation } from "../api/jobs";
 import DownloadButton from "../components/DownloadButton";
 import PipelineProgress from "../components/PipelineProgress";
 import ValidationReport from "../components/ValidationReport";
@@ -14,6 +14,7 @@ export default function JobDetailPage() {
   const { steps } = useJobProgress(id!, isActive);
   const hasFinalOutput = job?.status === "complete" || job?.status === "needs_manual_review";
   const { data: validationReport } = useValidation(id!, hasFinalOutput);
+  const { data: reviewTasks } = useReviewTasks(id!, job?.status === "needs_manual_review");
 
   // Use SSE steps when actively processing, otherwise use API data
   const displaySteps = isActive ? steps : job?.steps ?? [];
@@ -137,13 +138,29 @@ export default function JobDetailPage() {
 
       {job.status === "needs_manual_review" && (
         <div className="rounded-xl border border-warning/30 bg-warning-light/30 p-5 mb-6 animate-slide-up">
-          <h3 className="font-display text-lg text-ink mb-1">
-            Manual Accessibility Remediation Needed
-          </h3>
-          <p className="text-sm text-ink-muted">
-            Automated tagging finished, but validation found remaining issues.
-            Review the report and apply manual fixes before distribution.
-          </p>
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <h3 className="font-display text-lg text-ink mb-1">
+                Manual Accessibility Review Needed
+              </h3>
+              <p className="text-sm text-ink-muted">
+                {reviewTasks && reviewTasks.length > 0
+                  ? `${reviewTasks.length} review task${reviewTasks.length === 1 ? "" : "s"} were generated from compliance and fidelity checks.`
+                  : "Automated remediation stopped short of a trustworthy accessible output."}
+              </p>
+            </div>
+            <Link
+              to={`/jobs/${job.id}/review`}
+              className="
+                px-5 py-2.5 rounded-xl
+                bg-accent text-white text-sm font-medium
+                hover:bg-accent/90 shadow-sm
+                transition-all duration-200 no-underline
+              "
+            >
+              Review Tasks &rarr;
+            </Link>
+          </div>
         </div>
       )}
 

@@ -9,6 +9,7 @@ const INITIAL_STEPS: PipelineStep[] = [
   { step_name: "alt_text", status: "pending" },
   { step_name: "tagging", status: "pending" },
   { step_name: "validation", status: "pending" },
+  { step_name: "fidelity", status: "pending" },
 ];
 
 function createInitialSteps(): PipelineStep[] {

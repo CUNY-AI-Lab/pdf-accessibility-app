@@ -3,7 +3,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import type { AltText, Job, ValidationReport } from "../types";
+import type { AltText, Job, ReviewTask, ValidationReport } from "../types";
 import { apiFetch } from "./client";
 
 // ── Queries ──
@@ -40,6 +40,43 @@ export function useAltTexts(jobId: string, enabled = true) {
     queryKey: ["jobs", jobId, "alt-texts"],
     queryFn: () => apiFetch<AltText[]>(`/jobs/${jobId}/alt-texts`),
     enabled,
+  });
+}
+
+export function useReviewTasks(jobId: string, enabled = true) {
+  return useQuery({
+    queryKey: ["jobs", jobId, "review-tasks"],
+    queryFn: () => apiFetch<ReviewTask[]>(`/jobs/${jobId}/review-tasks`),
+    enabled,
+  });
+}
+
+export function useUpdateReviewTask(jobId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      taskId,
+      status,
+      resolutionNote,
+      evidence,
+    }: {
+      taskId: number;
+      status?: "pending_review" | "resolved";
+      resolutionNote?: string;
+      evidence?: Record<string, string>;
+    }) =>
+      apiFetch<ReviewTask>(`/jobs/${jobId}/review-tasks/${taskId}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          status,
+          resolution_note: resolutionNote,
+          evidence,
+        }),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
+    },
   });
 }
 
@@ -102,8 +139,11 @@ export function useApproveReview(jobId: string) {
       apiFetch<{ status: string }>(`/jobs/${jobId}/approve`, {
         method: "POST",
       }),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
+    },
   });
 }
 

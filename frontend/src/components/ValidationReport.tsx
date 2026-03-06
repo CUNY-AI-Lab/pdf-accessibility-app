@@ -12,6 +12,10 @@ function asBool(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
 }
 
+function asString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
 function statusLabel(status: ValidationChange["remediation_status"]): string {
   if (status === "auto_remediated") return "Auto Remediated";
   if (status === "manual_remediated") return "Manual Remediated";
@@ -37,10 +41,24 @@ export default function ValidationReport({ report }: ValidationReportProps) {
     report.remediation && typeof report.remediation === "object"
       ? (report.remediation as Record<string, unknown>)
       : {};
+  const fidelity =
+    report.fidelity && typeof report.fidelity === "object"
+      ? (report.fidelity as Record<string, unknown>)
+      : {};
   const fontRemediation =
     remediation.font_remediation && typeof remediation.font_remediation === "object"
       ? (remediation.font_remediation as Record<string, unknown>)
       : {};
+  const fidelitySummary =
+    fidelity.summary && typeof fidelity.summary === "object"
+      ? (fidelity.summary as Record<string, unknown>)
+      : {};
+  const fidelityChecks = Array.isArray(fidelity.checks)
+    ? (fidelity.checks as Array<Record<string, unknown>>)
+    : [];
+  const fidelityPassed = asBool(fidelity.passed);
+  const blockingTasks = asNumber(fidelitySummary.blocking_tasks);
+  const advisoryTasks = asNumber(fidelitySummary.advisory_tasks);
 
   const baselineErrors = asNumber(baselineSummary.errors);
   const baselineWarnings = asNumber(baselineSummary.warnings);
@@ -51,6 +69,13 @@ export default function ValidationReport({ report }: ValidationReportProps) {
   const errorsReduced = asNumber(remediation.errors_reduced);
   const fontAttempted = asBool(fontRemediation.attempted);
   const fontApplied = asBool(fontRemediation.applied);
+  const selectedLane = asString(fontRemediation.selected_lane);
+  const lanesPlanned = Array.isArray(fontRemediation.lanes_planned)
+    ? fontRemediation.lanes_planned.length
+    : 0;
+  const laneResults = Array.isArray(fontRemediation.lane_results)
+    ? fontRemediation.lane_results.length
+    : 0;
   const changes = [...(report.changes ?? [])].sort((a, b) => {
     const order = {
       needs_remediation: 0,
@@ -136,11 +161,93 @@ export default function ValidationReport({ report }: ValidationReportProps) {
               )}
               {fontAttempted && (
                 <p className="text-xs text-ink-muted mt-0.5">
-                  font lane: {fontApplied ? "applied" : "attempted (not applied)"}
+                  font lanes:{" "}
+                  {fontApplied
+                    ? `applied${selectedLane ? ` (${selectedLane})` : ""}`
+                    : "attempted (not applied)"}
+                  {lanesPlanned > 0 ? ` | planned: ${lanesPlanned}` : ""}
+                  {laneResults > 0 ? ` | attempts: ${laneResults}` : ""}
                 </p>
               )}
             </div>
           </div>
+        </div>
+      )}
+
+      {(fidelityPassed !== null || fidelityChecks.length > 0) && (
+        <div className="rounded-xl border border-ink/6 bg-cream p-4">
+          <h4 className="text-sm font-semibold text-ink mb-3">
+            Fidelity Gate
+          </h4>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+            <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
+              <p className="text-ink-muted text-xs">Status</p>
+              <p className="text-ink mt-0.5">
+                {fidelityPassed === null
+                  ? "n/a"
+                  : fidelityPassed
+                    ? "Passed"
+                    : "Manual review required"}
+              </p>
+            </div>
+            <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
+              <p className="text-ink-muted text-xs">Blocking Tasks</p>
+              <p className="text-ink mt-0.5">{blockingTasks ?? "n/a"}</p>
+            </div>
+            <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
+              <p className="text-ink-muted text-xs">Advisory Tasks</p>
+              <p className="text-ink mt-0.5">{advisoryTasks ?? "n/a"}</p>
+            </div>
+          </div>
+          {fidelityChecks.length > 0 && (
+            <div className="mt-4 space-y-2">
+              {fidelityChecks.map((check, index) => {
+                const status = asString(check.status) ?? "skip";
+                const message = asString(check.message) ?? "No detail available.";
+                const label = asString(check.check) ?? `check-${index}`;
+                const metrics =
+                  check.metrics && typeof check.metrics === "object"
+                    ? (check.metrics as Record<string, unknown>)
+                    : {};
+                return (
+                  <div
+                    key={`${label}-${index}`}
+                    className="rounded-lg bg-paper-warm/60 px-3 py-2"
+                  >
+                    <div className="flex items-center gap-2 justify-between">
+                      <p className="text-sm text-ink capitalize">
+                        {label.replaceAll("_", " ")}
+                      </p>
+                      <span
+                        className={`
+                          text-[11px] px-2 py-1 rounded-full
+                          ${
+                            status === "pass"
+                              ? "bg-success-light text-success"
+                              : status === "fail"
+                                ? "bg-error-light text-error"
+                                : status === "warning"
+                                  ? "bg-warning-light text-warning"
+                                  : "bg-paper-warm text-ink-muted"
+                          }
+                        `}
+                      >
+                        {status}
+                      </span>
+                    </div>
+                    <p className="text-xs text-ink-muted mt-1">{message}</p>
+                    {Object.keys(metrics).length > 0 && (
+                      <p className="text-xs text-ink-muted mt-1 font-mono">
+                        {Object.entries(metrics)
+                          .map(([key, value]) => `${key}=${String(value)}`)
+                          .join(" | ")}
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 
