@@ -1,21 +1,92 @@
 import json
+from io import BytesIO
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database import get_db
+from app.database import get_session_maker
 from app.models import AltTextEntry, Job, ReviewTask
+from app.pipeline.orchestrator import run_tagging_and_validation
 from app.schemas import (
     AltTextResponse,
     AltTextUpdateRequest,
     ReviewTaskResponse,
+    StructureUpdateRequest,
     ValidationReportResponse,
 )
+from app.services.pdf_preview import render_page_png_bytes
+from app.services.job_manager import get_job_manager
 
 router = APIRouter(prefix="/jobs/{job_id}", tags=["documents"])
+ALLOWED_STRUCTURE_TYPES = {
+    "heading",
+    "paragraph",
+    "figure",
+    "table",
+    "list_item",
+    "code",
+    "formula",
+    "artifact",
+}
+
+
+def _job_pdf_path(job: Job) -> Path:
+    candidate = Path(job.output_path or job.input_path)
+    if not candidate.exists():
+        raise HTTPException(status_code=404, detail="PDF file not found")
+    return candidate
+
+
+def _sanitize_structure_payload(structure: dict) -> dict:
+    sanitized = dict(structure)
+    raw_elements = structure.get("elements", [])
+    if not isinstance(raw_elements, list):
+        raise HTTPException(status_code=400, detail="Structure must include an elements list")
+
+    cleaned_elements: list[dict] = []
+    for index, raw_element in enumerate(raw_elements):
+        if not isinstance(raw_element, dict):
+            raise HTTPException(status_code=400, detail="All structure elements must be objects")
+
+        element = {
+            key: value
+            for key, value in raw_element.items()
+            if key not in {"review_id", "_manual_original_type"}
+        }
+
+        element_type = str(element.get("type") or "").strip()
+        if element_type and element_type not in ALLOWED_STRUCTURE_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported structure element type at index {index}: {element_type}",
+            )
+
+        page_value = element.get("page")
+        if page_value is not None and not isinstance(page_value, int):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid page value at element index {index}",
+            )
+
+        if element_type == "heading":
+            level = element.get("level", 1)
+            if isinstance(level, bool) or not isinstance(level, int):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid heading level at element index {index}",
+                )
+            element["level"] = max(1, min(6, level))
+
+        cleaned_elements.append(element)
+
+    sanitized["elements"] = cleaned_elements
+    return sanitized
 
 
 @router.get("/structure")
@@ -27,6 +98,54 @@ async def get_structure(job_id: str, db: AsyncSession = Depends(get_db)):
     if not job.structure_json:
         raise HTTPException(status_code=404, detail="Structure not yet extracted")
     return json.loads(job.structure_json)
+
+
+@router.put("/structure")
+async def update_structure(
+    job_id: str,
+    update: StructureUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Job).where(Job.id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status not in {"needs_manual_review", "complete"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Structure edits are not allowed while job status is {job.status}",
+        )
+
+    structure = _sanitize_structure_payload(update.structure)
+
+    job.structure_json = json.dumps(structure)
+    job.status = "processing"
+    await db.commit()
+
+    settings = get_settings()
+    session_maker = get_session_maker()
+    job_manager = get_job_manager()
+
+    async def _resume(jid, sm, s, jm, structure_payload):
+        async with sm() as resume_db:
+            await run_tagging_and_validation(
+                jid,
+                resume_db,
+                s,
+                jm,
+                structure_json=structure_payload,
+            )
+
+    await job_manager.submit_job(
+        job_id,
+        _resume(job_id, session_maker, settings, job_manager, structure),
+    )
+
+    return {
+        "status": "accepted",
+        "message": "Structure updated. Tagging and validation restarted.",
+    }
 
 
 @router.get("/alt-texts", response_model=list[AltTextResponse])
@@ -136,6 +255,39 @@ async def get_figure_image(
     return FileResponse(image_path, media_type="image/png")
 
 
+@router.get("/pages/{page_number}/preview")
+async def get_page_preview(
+    job_id: str,
+    page_number: int,
+    db: AsyncSession = Depends(get_db),
+):
+    if page_number < 1:
+        raise HTTPException(status_code=400, detail="Page number must be 1 or greater")
+
+    result = await db.execute(select(Job).where(Job.id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.page_count and page_number > job.page_count:
+        raise HTTPException(status_code=404, detail="Page number exceeds document length")
+
+    try:
+        preview_bytes = render_page_png_bytes(_job_pdf_path(job), page_number)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to render preview: {exc}") from exc
+
+    return StreamingResponse(
+        BytesIO(preview_bytes),
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @router.get("/download")
 async def download_pdf(job_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Job).where(Job.id == job_id))
@@ -145,12 +297,8 @@ async def download_pdf(job_id: str, db: AsyncSession = Depends(get_db)):
     if not job.output_path:
         raise HTTPException(status_code=404, detail="Accessible PDF not yet available")
 
-    output_path = Path(job.output_path)
-    if not output_path.exists():
-        raise HTTPException(status_code=404, detail="Output file not found")
-
     return FileResponse(
-        output_path,
+        _job_pdf_path(job),
         media_type="application/pdf",
         filename=f"accessible_{job.original_filename}",
     )

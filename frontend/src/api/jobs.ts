@@ -35,6 +35,23 @@ export function useStructure(jobId: string, enabled = true) {
   });
 }
 
+export function useUpdateStructure(jobId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ structure }: { structure: Record<string, unknown> }) =>
+      apiFetch<{ status: string; message: string }>(`/jobs/${jobId}/structure`, {
+        method: "PUT",
+        body: JSON.stringify({ structure }),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "structure"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
+    },
+  });
+}
+
 export function useAltTexts(jobId: string, enabled = true) {
   return useQuery({
     queryKey: ["jobs", jobId, "alt-texts"],
@@ -76,6 +93,121 @@ export function useUpdateReviewTask(jobId: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
       queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
+    },
+  });
+}
+
+export function useSuggestReviewTask(jobId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ taskId }: { taskId: number }) =>
+      apiFetch<ReviewTask>(`/jobs/${jobId}/review-tasks/${taskId}/suggest`, {
+        method: "POST",
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
+    },
+  });
+}
+
+export function useApplyFontActualText(jobId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      taskId,
+      pageNumber,
+      operatorIndex,
+      actualText,
+    }: {
+      taskId: number;
+      pageNumber: number;
+      operatorIndex: number;
+      actualText: string;
+    }) =>
+      apiFetch<{ status: string; message: string }>(
+        `/jobs/${jobId}/review-tasks/${taskId}/actualtext`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            page_number: pageNumber,
+            operator_index: operatorIndex,
+            actual_text: actualText,
+          }),
+        },
+      ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
+    },
+  });
+}
+
+export function useApplyFontActualTextBatch(jobId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      taskId,
+      targets,
+    }: {
+      taskId: number;
+      targets: Array<{
+        pageNumber: number;
+        operatorIndex: number;
+        actualText: string;
+      }>;
+    }) =>
+      apiFetch<{ status: string; message: string }>(
+        `/jobs/${jobId}/review-tasks/${taskId}/actualtext/batch`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            targets: targets.map((target) => ({
+              page_number: target.pageNumber,
+              operator_index: target.operatorIndex,
+              actual_text: target.actualText,
+            })),
+          }),
+        },
+      ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
+    },
+  });
+}
+
+export function useApplyFontUnicodeMapping(jobId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      taskId,
+      pageNumber,
+      operatorIndex,
+      unicodeText,
+    }: {
+      taskId: number;
+      pageNumber: number;
+      operatorIndex: number;
+      unicodeText: string;
+    }) =>
+      apiFetch<{ status: string; message: string }>(
+        `/jobs/${jobId}/review-tasks/${taskId}/font-map`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            page_number: pageNumber,
+            operator_index: operatorIndex,
+            unicode_text: unicodeText,
+          }),
+        },
+      ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
     },
   });
 }

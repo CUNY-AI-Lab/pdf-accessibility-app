@@ -68,6 +68,32 @@ class ReviewTaskUpdateRequest(BaseModel):
     evidence: dict[str, str] | None = None
 
 
+class StructureUpdateRequest(BaseModel):
+    structure: dict[str, Any]
+
+
+class FontActualTextRequest(BaseModel):
+    page_number: int
+    operator_index: int
+    actual_text: str
+
+
+class FontActualTextBatchItem(BaseModel):
+    page_number: int
+    operator_index: int
+    actual_text: str
+
+
+class FontActualTextBatchRequest(BaseModel):
+    targets: list[FontActualTextBatchItem]
+
+
+class FontUnicodeOverrideRequest(BaseModel):
+    page_number: int
+    operator_index: int
+    unicode_text: str
+
+
 class ValidationViolation(BaseModel):
     rule_id: str
     description: str

@@ -3,7 +3,11 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from app.api.review import _manual_review_completion_state, _validated_task_metadata
+from app.api.review import (
+    _manual_font_remediation_preservation,
+    _manual_review_completion_state,
+    _validated_task_metadata,
+)
 from app.schemas import ReviewTaskUpdateRequest
 
 
@@ -128,3 +132,43 @@ def test_required_evidence_is_persisted_in_metadata():
         "verification_method": "NVDA and text export",
         "pages_checked": "Pages 1-5",
     }
+
+
+def test_manual_font_remediation_preservation_keeps_suggestion_and_attempts():
+    task = SimpleNamespace(task_type="font_text_fidelity", source="validation")
+    preserved = _manual_font_remediation_preservation(
+        task=task,
+        task_metadata={
+            "llm_suggestion": {"summary": "triangle glyph"},
+            "manual_actualtext_attempts": [{"page_number": 2, "operator_index": 132, "actual_text": "pointer"}],
+        },
+        actualtext_attempts=[{"page_number": 2, "operator_index": 194, "actual_text": "pointer"}],
+    )
+
+    metadata = preserved[("font_text_fidelity", "validation")]
+    assert metadata["llm_suggestion"] == {"summary": "triangle glyph"}
+    assert metadata["manual_actualtext_attempts"] == [
+        {"page_number": 2, "operator_index": 132, "actual_text": "pointer"},
+        {"page_number": 2, "operator_index": 194, "actual_text": "pointer"},
+    ]
+
+
+def test_manual_font_remediation_preservation_keeps_font_mapping_attempts():
+    task = SimpleNamespace(task_type="font_text_fidelity", source="validation")
+    preserved = _manual_font_remediation_preservation(
+        task=task,
+        task_metadata={
+            "manual_font_mapping_attempts": [
+                {"page_number": 2, "operator_index": 132, "unicode_text": "►", "font_code_hex": "01"},
+            ],
+        },
+        font_mapping_attempts=[
+            {"page_number": 2, "operator_index": 194, "unicode_text": "►", "font_code_hex": "01"},
+        ],
+    )
+
+    metadata = preserved[("font_text_fidelity", "validation")]
+    assert metadata["manual_font_mapping_attempts"] == [
+        {"page_number": 2, "operator_index": 132, "unicode_text": "►", "font_code_hex": "01"},
+        {"page_number": 2, "operator_index": 194, "unicode_text": "►", "font_code_hex": "01"},
+    ]

@@ -9,6 +9,7 @@ from functools import lru_cache
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,9 +23,14 @@ from app.pipeline.ocr import run_ocr
 from app.pipeline.structure import extract_structure
 from app.pipeline.tagger import tag_pdf
 from app.pipeline.validator import validate_pdf
+from app.services.font_unicode_override import apply_unicode_override_to_context
 from app.services.file_storage import create_job_dir, get_output_path
 from app.services.job_manager import JobManager
 from app.services.llm_client import LlmClient
+from app.services.review_suggestions import (
+    generate_review_suggestion,
+    select_auto_font_map_override,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +47,7 @@ FONT_DICT_REPAIR_RULE_MARKERS = ("-7.21.3.2-", "-7.21.4.2-")
 FONT_SUBSET_RE = re.compile(r"^[A-Z]{6}\+.+")
 FONT_NAME_RE = re.compile(r"[^A-Za-z0-9]+")
 HEX_STR_RE = re.compile(r"<([0-9A-Fa-f]+)>")
+MAX_TOUNICODE_BFRANGE_SPAN = 65536
 SAFE_IMPLICIT_STANDARD_BASEFONTS = frozenset({
     "TimesRoman",
     "TimesBold",
@@ -197,6 +204,337 @@ def _warning_count(validation) -> int:
     return sum(_violation_weight(v) for v in validation.violations if v.severity != "error")
 
 
+def _build_validation_payload(
+    *,
+    baseline_validation,
+    selected_validation,
+    settings: Settings,
+    font_remediation: dict[str, object],
+    tagging_result,
+    llm_font_map_auto: dict[str, object] | None = None,
+) -> dict[str, object]:
+    baseline_has_verapdf_report = bool(baseline_validation.raw_report.get("report"))
+    baseline_validator_name = (
+        "veraPDF"
+        if baseline_has_verapdf_report
+        else baseline_validation.raw_report.get("validator", "unknown")
+    )
+    baseline_errors = _error_count(baseline_validation)
+    baseline_warnings = _warning_count(baseline_validation)
+
+    has_verapdf_report = bool(selected_validation.raw_report.get("report"))
+    validator_name = (
+        "veraPDF"
+        if has_verapdf_report
+        else selected_validation.raw_report.get("validator", "unknown")
+    )
+    post_errors = _error_count(selected_validation)
+    post_warnings = _warning_count(selected_validation)
+
+    changes, status_by_rule = _build_validation_changes(
+        baseline_validation.violations,
+        selected_validation.violations,
+    )
+    needs_remediation = len(
+        [c for c in changes if c["remediation_status"] == "needs_remediation"]
+    )
+    auto_remediated = len(
+        [c for c in changes if c["remediation_status"] == "auto_remediated"]
+    )
+    manual_remediated = len(
+        [c for c in changes if c["remediation_status"] == "manual_remediated"]
+    )
+
+    remediation_payload: dict[str, object] = {
+        "needs_remediation": needs_remediation,
+        "auto_remediated": auto_remediated,
+        "manual_remediated": manual_remediated,
+        "baseline_errors": baseline_errors,
+        "baseline_warnings": baseline_warnings,
+        "post_errors": post_errors,
+        "post_warnings": post_warnings,
+        "errors_reduced": baseline_errors - post_errors,
+        "warnings_reduced": baseline_warnings - post_warnings,
+        "font_remediation": font_remediation,
+    }
+    if isinstance(llm_font_map_auto, dict):
+        remediation_payload["llm_font_map_auto"] = llm_font_map_auto
+
+    claims_payload: dict[str, object] = {
+        "automated_validation_only": True,
+        "requires_manual_check_for_reading_experience": True,
+    }
+    if isinstance(llm_font_map_auto, dict):
+        claims_payload["llm_font_map_auto_attempted"] = bool(llm_font_map_auto.get("attempted"))
+        if bool(llm_font_map_auto.get("applied")):
+            claims_payload["llm_assisted_auto_remediation"] = True
+
+    return {
+        "compliant": selected_validation.compliant,
+        "profile": settings.verapdf_flavour,
+        "standard": "PDF/UA",
+        "validator": validator_name,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "baseline": {
+            "compliant": baseline_validation.compliant,
+            "validator": baseline_validator_name,
+            "violations_count": len(baseline_validation.violations),
+            "summary": {
+                "errors": baseline_errors,
+                "warnings": baseline_warnings,
+            },
+        },
+        "violations": [
+            {
+                "rule_id": v.rule_id,
+                "description": v.description,
+                "severity": v.severity,
+                "location": v.location,
+                "count": v.count,
+                "category": v.category,
+                "fix_hint": v.fix_hint,
+                "remediation_status": status_by_rule.get(v.rule_id, "needs_remediation"),
+            }
+            for v in selected_validation.violations
+        ],
+        "summary": {
+            "passed": len([v for v in selected_validation.violations if v.severity != "error"]),
+            "failed": len([v for v in selected_validation.violations if v.severity == "error"]),
+            "errors": post_errors,
+            "warnings": post_warnings,
+        },
+        "changes": changes,
+        "remediation": remediation_payload,
+        "tagging": {
+            "headings_tagged": tagging_result.headings_tagged,
+            "figures_tagged": tagging_result.figures_tagged,
+            "decorative_figures_artifacted": tagging_result.decorative_figures_artifacted,
+            "tables_tagged": tagging_result.tables_tagged,
+            "lists_tagged": tagging_result.lists_tagged,
+            "links_tagged": tagging_result.links_tagged,
+            "bookmarks_added": tagging_result.bookmarks_added,
+            "title_set": tagging_result.title_set,
+            "lang_set": tagging_result.lang_set,
+        },
+        "claims": claims_payload,
+    }
+
+
+def _blocking_task_count(review_tasks: list[dict[str, object]]) -> int:
+    return len([task for task in review_tasks if bool(task.get("blocking"))])
+
+
+def _merge_review_task_metadata(
+    review_tasks: list[dict[str, object]],
+    *,
+    task_type: str,
+    source: str,
+    metadata: dict[str, object],
+) -> list[dict[str, object]]:
+    if not metadata:
+        return review_tasks
+    for task in review_tasks:
+        if (
+            str(task.get("task_type") or "") == task_type
+            and str(task.get("source") or "fidelity") == source
+        ):
+            current = task.get("metadata", {})
+            if not isinstance(current, dict):
+                current = {}
+            task["metadata"] = {**current, **metadata}
+            break
+    return review_tasks
+
+
+def _summarize_llm_font_map_suggestion(suggestion: dict[str, object]) -> dict[str, object]:
+    summary: dict[str, object] = {}
+    for key in (
+        "task_type",
+        "summary",
+        "confidence",
+        "suggested_action",
+        "reason",
+        "generated_at",
+        "model",
+        "review_focus",
+        "actualtext_candidates",
+        "reviewer_checklist",
+    ):
+        if key in suggestion:
+            summary[key] = suggestion[key]
+    return summary
+
+
+def _fidelity_not_worse(candidate: dict[str, object], current: dict[str, object]) -> bool:
+    candidate_summary = candidate.get("summary") if isinstance(candidate, dict) else None
+    current_summary = current.get("summary") if isinstance(current, dict) else None
+    candidate_blocking = int(candidate_summary.get("blocking_tasks", 0) or 0) if isinstance(candidate_summary, dict) else 0
+    current_blocking = int(current_summary.get("blocking_tasks", 0) or 0) if isinstance(current_summary, dict) else 0
+    return candidate_blocking <= current_blocking
+
+
+async def _attempt_auto_llm_font_map(
+    *,
+    job: Job,
+    settings: Settings,
+    output_pdf: Path,
+    current_validation,
+    review_tasks: list[dict[str, object]],
+) -> tuple[dict[str, object], object | None, Path | None, dict[tuple[str, str], dict[str, object]]]:
+    audit: dict[str, object] = {
+        "enabled": bool(settings.auto_apply_llm_font_map),
+        "attempted": False,
+        "applied": False,
+        "reason": "",
+    }
+    metadata_overrides: dict[tuple[str, str], dict[str, object]] = {}
+
+    if not settings.auto_apply_llm_font_map:
+        audit["reason"] = "disabled"
+        return audit, None, None, metadata_overrides
+
+    task = next(
+        (
+            task
+            for task in review_tasks
+            if bool(task.get("blocking"))
+            and str(task.get("task_type") or "") == "font_text_fidelity"
+        ),
+        None,
+    )
+    if not isinstance(task, dict):
+        audit["reason"] = "no_eligible_font_review_task"
+        return audit, None, None, metadata_overrides
+
+    task_type = str(task.get("task_type") or "font_text_fidelity")
+    task_source = str(task.get("source") or "validation")
+    pseudo_task = SimpleNamespace(
+        task_type=task_type,
+        title=str(task.get("title") or ""),
+        detail=str(task.get("detail") or ""),
+        severity=str(task.get("severity") or "high"),
+        source=task_source,
+        metadata_json=json.dumps(task.get("metadata", {})),
+    )
+
+    llm_client = LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+        timeout=settings.llm_timeout,
+    )
+    audit["attempted"] = True
+    try:
+        suggestion = await generate_review_suggestion(
+            job=job,
+            task=pseudo_task,
+            llm_client=llm_client,
+        )
+    except Exception as exc:
+        audit["reason"] = f"suggestion_failed: {exc}"
+        return audit, None, None, metadata_overrides
+    finally:
+        await llm_client.close()
+
+    suggestion_summary = _summarize_llm_font_map_suggestion(suggestion)
+    metadata_overrides[(task_type, task_source)] = {
+        "llm_suggestion": suggestion_summary,
+    }
+    audit["suggestion"] = suggestion_summary
+
+    selected = select_auto_font_map_override(
+        job=job,
+        task=pseudo_task,
+        suggestion=suggestion,
+    )
+    if not isinstance(selected, dict):
+        audit["reason"] = "suggestion_not_eligible"
+        metadata_overrides[(task_type, task_source)]["llm_auto_font_map"] = {
+            "attempted": True,
+            "applied": False,
+            "reason": audit["reason"],
+        }
+        return audit, None, None, metadata_overrides
+
+    patched_output = get_output_path(
+        job.id,
+        f"accessible_auto_llm_fontmap_{job.original_filename}",
+    )
+    task_metadata = task.get("metadata", {})
+    raw_targets = task_metadata.get("font_review_targets") if isinstance(task_metadata, dict) else []
+    context_path = ""
+    if isinstance(raw_targets, list):
+        for target in raw_targets:
+            if not isinstance(target, dict):
+                continue
+            page = target.get("page")
+            operator_index = target.get("operator_index")
+            if not isinstance(page, int) or not isinstance(operator_index, int):
+                continue
+            if page == int(selected["page_number"]) and operator_index == int(selected["operator_index"]):
+                context_path = str(target.get("context_path") or "").strip()
+                break
+    if not context_path:
+        audit["reason"] = "missing_context_path"
+        metadata_overrides[(task_type, task_source)]["llm_auto_font_map"] = {
+            "attempted": True,
+            "applied": False,
+            "reason": audit["reason"],
+        }
+        return audit, None, None, metadata_overrides
+
+    try:
+        apply_unicode_override_to_context(
+            input_pdf=output_pdf,
+            output_pdf=patched_output,
+            context_path=context_path,
+            unicode_text=str(selected["unicode_text"]),
+        )
+    except Exception as exc:
+        audit["reason"] = f"apply_failed: {exc}"
+        metadata_overrides[(task_type, task_source)]["llm_auto_font_map"] = {
+            "attempted": True,
+            "applied": False,
+            "reason": audit["reason"],
+        }
+        return audit, None, None, metadata_overrides
+
+    candidate_validation = await validate_pdf(
+        pdf_path=patched_output,
+        verapdf_path=settings.verapdf_path,
+        flavour=settings.verapdf_flavour,
+    )
+    if not _is_better_validation(candidate_validation, current_validation):
+        audit["reason"] = "no_validation_improvement"
+        metadata_overrides[(task_type, task_source)]["llm_auto_font_map"] = {
+            "attempted": True,
+            "applied": False,
+            "reason": audit["reason"],
+        }
+        return audit, None, None, metadata_overrides
+
+    audit.update({
+        "applied": True,
+        "reason": "applied",
+        "font": str(selected.get("font") or ""),
+        "font_base_name": str(selected.get("font_base_name") or ""),
+        "font_code_hex": str(selected.get("font_code_hex") or ""),
+        "unicode_text": str(selected.get("unicode_text") or ""),
+        "target_count": int(selected.get("target_count", 1) or 1),
+        "suggested_action": str(suggestion.get("suggested_action") or ""),
+        "model": str(suggestion.get("model") or settings.llm_model),
+    })
+    metadata_overrides[(task_type, task_source)]["llm_auto_font_map"] = {
+        "attempted": True,
+        "applied": True,
+        "reason": "applied",
+        "font_code_hex": audit["font_code_hex"],
+        "unicode_text": audit["unicode_text"],
+        "target_count": audit["target_count"],
+    }
+    return audit, candidate_validation, patched_output, metadata_overrides
+
+
 def _font_only_errors(violations) -> bool:
     errors = [v for v in violations if v.severity == "error"]
     if not errors:
@@ -261,7 +599,7 @@ def _inspect_pdf_features(pdf_path: Path) -> dict[str, int | bool]:
             )
 
         def _walk_resources(resources) -> None:
-            if not isinstance(resources, pikepdf.Dictionary):
+            if not _is_pdf_mapping(resources):
                 return
             resources_key = _obj_key(resources)
             if resources_key and resources_key in seen_resources:
@@ -302,7 +640,7 @@ def _inspect_pdf_features(pdf_path: Path) -> dict[str, int | bool]:
                 return
             for _, xobject in xobjects.items():
                 xobject_dict = _resolve_dictionary(xobject)
-                if xobject_dict is None:
+                if not _is_pdf_mapping(xobject_dict):
                     continue
                 try:
                     subtype = xobject_dict.get("/Subtype")
@@ -314,7 +652,7 @@ def _inspect_pdf_features(pdf_path: Path) -> dict[str, int | bool]:
 
         def _walk_appearance_object(obj) -> None:
             appearance_obj = _resolve_dictionary(obj)
-            if not isinstance(appearance_obj, pikepdf.Dictionary):
+            if not _is_pdf_mapping(appearance_obj):
                 return
             appearance_key = _obj_key(appearance_obj)
             if appearance_key and appearance_key in seen_appearances:
@@ -451,7 +789,7 @@ def _walk_pdf_resource_graph(
 
     def _walk_field(field_obj) -> None:
         field = resolve_dictionary(field_obj)
-        if not isinstance(field, pikepdf.Dictionary):
+        if not _is_pdf_mapping(field):
             return
 
         field_key = getattr(field, "objgen", None)
@@ -476,12 +814,16 @@ def _walk_pdf_resource_graph(
                 walk_appearance_object(annot.get("/AP"))
 
     acroform = resolve_dictionary(pdf.Root.get("/AcroForm"))
-    if isinstance(acroform, pikepdf.Dictionary):
+    if _is_pdf_mapping(acroform):
         walk_resources(resolve_dictionary(acroform.get("/DR")))
         fields = acroform.get("/Fields")
         if isinstance(fields, pikepdf.Array):
             for field in fields:
                 _walk_field(field)
+
+
+def _is_pdf_mapping(obj) -> bool:
+    return obj is not None and hasattr(obj, "get") and hasattr(obj, "keys")
 
 
 def _local_embed_support_kind(font_dict, descendant_subtype=None) -> str:
@@ -604,7 +946,11 @@ def _simple_font_auto_unicode_policy(font_dict, font_bytes: bytes | None = None)
     return "blocked"
 
 
-def _inspect_unicode_repair_gate(pdf_path: Path, violations=None) -> dict[str, object]:
+def _unicode_repair_gate_from_diagnostics(
+    font_diagnostics: dict[str, object] | None,
+    *,
+    violations=None,
+) -> dict[str, object]:
     """Decide whether automatic ToUnicode repair is deterministic enough to run."""
     profile: dict[str, object] = {
         "allow_automatic": False,
@@ -620,143 +966,61 @@ def _inspect_unicode_repair_gate(pdf_path: Path, violations=None) -> dict[str, o
         v.severity == "error" and "7.21.7-2" in str(v.rule_id)
         for v in (violations or [])
     )
-    try:
-        import pikepdf
+    has_unicode_rule_family = any(
+        v.severity == "error"
+        and any(marker in str(v.rule_id) for marker in FONT_UNICODE_RULE_MARKERS)
+        for v in (violations or [])
+    )
+    raw_profiles = font_diagnostics.get("profiles") if isinstance(font_diagnostics, dict) else None
+    if not isinstance(raw_profiles, list):
+        profile["reason"] = "inspection_failed: missing font diagnostics"
+        return profile
 
-        seen_resources: set[tuple[int, int]] = set()
-        seen_fonts: set[tuple[int, int]] = set()
-        seen_appearances: set[tuple[int, int]] = set()
+    for item in raw_profiles:
+        if not isinstance(item, dict):
+            continue
+        subtype = str(item.get("subtype") or "")
+        if subtype == "/Type0":
+            descendant_subtype = str(item.get("descendant_subtype") or "")
+            if (
+                descendant_subtype == "/CIDFontType2"
+                and bool(item.get("embedded"))
+                and (
+                    has_unicode_rule_family
+                    or not bool(item.get("has_tounicode"))
+                    or has_invalid_unicode_rules
+                )
+            ):
+                profile["safe_type0_candidates"] = int(profile["safe_type0_candidates"]) + 1
+            continue
 
-        def _obj_key(obj) -> tuple[int, int] | None:
-            try:
-                obj_num, gen_num = obj.objgen
-                if isinstance(obj_num, int) and isinstance(gen_num, int) and obj_num > 0:
-                    return obj_num, gen_num
-            except Exception:
-                return None
-            return None
+        if subtype not in ("/Type1", "/MMType1", "/TrueType"):
+            continue
 
-        def _resolve_dictionary(obj):
-            if obj is None:
-                return None
-            try:
-                if isinstance(obj, pikepdf.Dictionary):
-                    return obj
-                if hasattr(obj, "keys") and hasattr(obj, "get"):
-                    return obj
-                return obj.get_object()
-            except Exception:
-                return None
+        needs_repair = (
+            not bool(item.get("has_tounicode"))
+            or int(item.get("invalid_tounicode_entries", 0) or 0) > 0
+            or int(item.get("missing_used_code_count", 0) or 0) > 0
+            or has_invalid_unicode_rules
+        )
+        if not needs_repair:
+            continue
 
-        def _font_stream_bytes(descriptor) -> bytes | None:
-            if not isinstance(descriptor, pikepdf.Dictionary):
-                return None
-            for key in ("/FontFile", "/FontFile2", "/FontFile3"):
-                stream_obj = _resolve_dictionary(descriptor.get(key))
-                if stream_obj is None:
-                    continue
-                try:
-                    return bytes(stream_obj.read_bytes())
-                except Exception:
-                    continue
-            return None
+        policy = str(item.get("auto_unicode_policy") or "")
+        repair_evidence = (
+            int(item.get("invalid_tounicode_entries", 0) or 0) > 0
+            or int(item.get("repairable_missing_used_codes", 0) or 0) > 0
+        )
+        if policy in {"explicit", "standard14", "embedded_cff"} and repair_evidence:
+            profile["safe_simple_candidates"] = int(profile["safe_simple_candidates"]) + 1
+            continue
 
-        def _note_blocked_example(font_dict) -> None:
-            examples = profile["blocked_examples"]
-            if not isinstance(examples, list) or len(examples) >= 5:
-                return
-            name = _base_font_name(font_dict) or "(unnamed)"
+        profile["blocked_simple_fonts"] = int(profile["blocked_simple_fonts"]) + 1
+        examples = profile["blocked_examples"]
+        if isinstance(examples, list) and len(examples) < 5:
+            name = str(item.get("base_font") or "(unnamed)")
             if name not in examples:
                 examples.append(name)
-
-        def _walk_resources(resources) -> None:
-            if not isinstance(resources, pikepdf.Dictionary):
-                return
-            resources_key = _obj_key(resources)
-            if resources_key and resources_key in seen_resources:
-                return
-            if resources_key:
-                seen_resources.add(resources_key)
-
-            fonts = _resolve_dictionary(resources.get("/Font"))
-            if isinstance(fonts, pikepdf.Dictionary):
-                for _, font_obj in fonts.items():
-                    font_dict = _resolve_dictionary(font_obj)
-                    if not isinstance(font_dict, pikepdf.Dictionary):
-                        continue
-
-                    font_key = _obj_key(font_dict)
-                    if font_key and font_key in seen_fonts:
-                        continue
-                    if font_key:
-                        seen_fonts.add(font_key)
-
-                    subtype = font_dict.get("/Subtype")
-                    if subtype == pikepdf.Name("/Type0"):
-                        has_tounicode = pikepdf.Name("/ToUnicode") in font_dict
-                        if not has_tounicode or has_invalid_unicode_rules:
-                            profile["safe_type0_candidates"] = int(profile["safe_type0_candidates"]) + 1
-                        continue
-
-                    if subtype not in (
-                        pikepdf.Name("/Type1"),
-                        pikepdf.Name("/MMType1"),
-                        pikepdf.Name("/TrueType"),
-                    ):
-                        continue
-
-                    descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
-                    font_bytes = _font_stream_bytes(descriptor)
-                    policy = _simple_font_auto_unicode_policy(font_dict, font_bytes=font_bytes)
-                    has_tounicode = pikepdf.Name("/ToUnicode") in font_dict
-                    if policy in {"explicit", "standard14", "embedded_cff"}:
-                        if not has_tounicode or has_invalid_unicode_rules:
-                            profile["safe_simple_candidates"] = int(profile["safe_simple_candidates"]) + 1
-                    else:
-                        profile["blocked_simple_fonts"] = int(profile["blocked_simple_fonts"]) + 1
-                        _note_blocked_example(font_dict)
-
-            xobjects = _resolve_dictionary(resources.get("/XObject"))
-            if not isinstance(xobjects, pikepdf.Dictionary):
-                return
-            for _, xobject in xobjects.items():
-                xobject_dict = _resolve_dictionary(xobject)
-                if xobject_dict is None:
-                    continue
-                try:
-                    subtype = xobject_dict.get("/Subtype")
-                except Exception:
-                    continue
-                if subtype != pikepdf.Name("/Form"):
-                    continue
-                _walk_resources(_resolve_dictionary(xobject_dict.get("/Resources")))
-
-        def _walk_appearance_object(obj) -> None:
-            appearance_obj = _resolve_dictionary(obj)
-            if not isinstance(appearance_obj, pikepdf.Dictionary):
-                return
-            appearance_key = _obj_key(appearance_obj)
-            if appearance_key and appearance_key in seen_appearances:
-                return
-            if appearance_key:
-                seen_appearances.add(appearance_key)
-
-            _walk_resources(_resolve_dictionary(appearance_obj.get("/Resources")))
-            for key in ("/N", "/R", "/D"):
-                child = appearance_obj.get(key)
-                if child is not None:
-                    _walk_appearance_object(child)
-
-        with pikepdf.open(str(pdf_path)) as pdf:
-            _walk_pdf_resource_graph(
-                pdf,
-                resolve_dictionary=_resolve_dictionary,
-                walk_resources=_walk_resources,
-                walk_appearance_object=_walk_appearance_object,
-            )
-    except Exception as exc:
-        profile["reason"] = f"inspection_failed: {exc}"
-        return profile
 
     safe_candidates = int(profile["safe_type0_candidates"]) + int(profile["safe_simple_candidates"])
     blocked_candidates = int(profile["blocked_simple_fonts"])
@@ -775,6 +1039,16 @@ def _inspect_unicode_repair_gate(pdf_path: Path, violations=None) -> dict[str, o
     else:
         profile["reason"] = "no deterministic ToUnicode candidates found"
     return profile
+
+
+def _inspect_unicode_repair_gate(pdf_path: Path, violations=None) -> dict[str, object]:
+    diagnostics = _inspect_font_diagnostics(
+        pdf_path,
+        violations,
+        profile_limit=512,
+        include_used_code_analysis=True,
+    )
+    return _unicode_repair_gate_from_diagnostics(diagnostics, violations=violations)
 
 
 def _font_name_metadata(ttfont) -> dict[str, str]:
@@ -1182,7 +1456,7 @@ def _repair_pdf_font_dicts_sync(
             seen_fonts.add(obj_key)
 
     def _walk_resources(resources) -> None:
-        if not isinstance(resources, pikepdf.Dictionary):
+        if not _is_pdf_mapping(resources):
             return
 
         resources_key = _obj_key(resources)
@@ -1213,7 +1487,7 @@ def _repair_pdf_font_dicts_sync(
             return
         for _, xobject in xobjects.items():
             xobject_dict = _resolve_dictionary(xobject)
-            if xobject_dict is None:
+            if not _is_pdf_mapping(xobject_dict):
                 continue
             try:
                 subtype = xobject_dict.get("/Subtype")
@@ -1226,7 +1500,7 @@ def _repair_pdf_font_dicts_sync(
 
     def _walk_appearance_object(obj) -> None:
         appearance_obj = _resolve_dictionary(obj)
-        if not isinstance(appearance_obj, pikepdf.Dictionary):
+        if not _is_pdf_mapping(appearance_obj):
             return
         appearance_key = _obj_key(appearance_obj)
         if appearance_key and appearance_key in seen_appearances:
@@ -1533,6 +1807,15 @@ def _parse_tounicode_map_details(stream_obj) -> tuple[dict[int, str], int]:
     mapping: dict[int, str] = {}
     invalid_entries = 0
     mode = ""
+
+    def _bounded_span(start: int, end: int) -> int | None:
+        if end < start:
+            return None
+        span = end - start + 1
+        if span > MAX_TOUNICODE_BFRANGE_SPAN:
+            return None
+        return span
+
     for raw_line in text.splitlines():
         line = raw_line.split("%", 1)[0].strip()
         if not line:
@@ -1575,7 +1858,10 @@ def _parse_tounicode_map_details(stream_obj) -> tuple[dict[int, str], int]:
             except ValueError:
                 continue
             targets = hex_groups[2:]
-            span = max(0, end - start + 1)
+            span = _bounded_span(start, end)
+            if span is None:
+                invalid_entries += 1
+                continue
             for offset, target in enumerate(targets[:span]):
                 decoded = _decode_tounicode_hex(target)
                 if decoded:
@@ -1596,11 +1882,14 @@ def _parse_tounicode_map_details(stream_obj) -> tuple[dict[int, str], int]:
         except Exception:
             continue
 
+        span = _bounded_span(start, end)
+        if span is None:
+            invalid_entries += 1
+            continue
         if len(seed_text) != 1:
-            invalid_entries += max(0, end - start + 1)
+            invalid_entries += 1
             continue
         seed_cp = ord(seed_text)
-        span = max(0, end - start + 1)
         for offset in range(span):
             cp = seed_cp + offset
             if cp > 0x10FFFF or cp in (0x0000, 0xFFFE, 0xFEFF) or (0xD800 <= cp <= 0xDFFF):
@@ -1616,6 +1905,7 @@ def _inspect_font_diagnostics(
     violations=None,
     *,
     profile_limit: int = 24,
+    include_used_code_analysis: bool = True,
 ) -> dict[str, object]:
     """Collect per-font diagnostics for remediation planning and reporting."""
     import pikepdf
@@ -1645,6 +1935,11 @@ def _inspect_font_diagnostics(
         getattr(v, "severity", "") == "error" and "7.21.7-2" in str(getattr(v, "rule_id", ""))
         for v in (violations or [])
     )
+    simple_unicode_rule_present = any(
+        getattr(v, "severity", "") == "error"
+        and any(marker in str(getattr(v, "rule_id", "")) for marker in FONT_UNICODE_RULE_MARKERS)
+        for v in (violations or [])
+    )
 
     try:
         seen_resources: set[tuple[int, int]] = set()
@@ -1653,6 +1948,7 @@ def _inspect_font_diagnostics(
         seen_content_streams: set[tuple[int, int]] = set()
         used_simple_codes: dict[tuple[int, int], set[int]] = {}
         profiles_by_key: dict[str, dict[str, object]] = {}
+        simple_font_candidates: dict[tuple[int, int], dict[str, object]] = {}
 
         def _obj_key(obj) -> tuple[int, int] | None:
             try:
@@ -1700,7 +1996,9 @@ def _inspect_font_diagnostics(
                 )
             )
 
-        def _collect_used_simple_font_codes(content_obj, resources) -> None:
+        def _collect_used_simple_font_codes(content_obj, resources, *, target_font_keys: set[tuple[int, int]]) -> None:
+            if not target_font_keys:
+                return
             if resources is None:
                 return
             resolved_obj = _resolve_dictionary(content_obj)
@@ -1714,6 +2012,18 @@ def _inspect_font_diagnostics(
 
             fonts = _resolve_dictionary(resources.get("/Font"))
             xobjects = _resolve_dictionary(resources.get("/XObject"))
+            target_font_in_scope = False
+            if isinstance(fonts, pikepdf.Dictionary):
+                for font_obj in fonts.values():
+                    font_dict = _resolve_dictionary(font_obj)
+                    font_key = _obj_key(font_dict) if isinstance(font_dict, pikepdf.Dictionary) else None
+                    if font_key and font_key in target_font_keys:
+                        target_font_in_scope = True
+                        break
+            has_form_xobjects = isinstance(xobjects, pikepdf.Dictionary) and bool(xobjects)
+            if not target_font_in_scope and not has_form_xobjects:
+                return
+
             current_font = None
             try:
                 instructions = pikepdf.parse_content_stream(resolved_obj)
@@ -1735,7 +2045,7 @@ def _inspect_font_diagnostics(
                     ):
                         continue
                     font_key = _obj_key(current_font)
-                    if not font_key:
+                    if not font_key or font_key not in target_font_keys:
                         continue
                     raw = _raw_text_bytes(op, operands)
                     if not raw:
@@ -1807,28 +2117,16 @@ def _inspect_font_diagnostics(
             existing_map, invalid_entries = _parse_tounicode_map_details(existing_stream)
             profile["invalid_tounicode_entries"] = invalid_entries
             profile["existing_tounicode_entries"] = len(existing_map)
-
             if font_key and profile["subtype"] in ("/Type1", "/MMType1", "/TrueType"):
-                used_codes = used_simple_codes.get(font_key, set())
-                profile["used_code_count"] = len(used_codes)
-                if used_codes:
-                    current_missing_codes = {
-                        code
-                        for code in used_codes
-                        if code not in existing_map or not _is_valid_unicode_text(existing_map[code])
-                    }
-                    font_bytes = _font_stream_bytes(descriptor)
-                    generated_map = {}
-                    if str(profile["auto_unicode_policy"]) != "blocked":
-                        generated_map = _simple_font_unicode_map(font_dict, font_bytes)
-                    repairable_missing = current_missing_codes & set(generated_map)
-                    unresolved_missing = current_missing_codes - set(generated_map)
-                    profile["missing_used_code_count"] = len(current_missing_codes)
-                    profile["repairable_missing_used_codes"] = len(repairable_missing)
-                    profile["unresolved_used_code_count"] = len(unresolved_missing)
+                simple_font_candidates[font_key] = {
+                    "profile": profile,
+                    "font_dict": font_dict,
+                    "font_bytes": _font_stream_bytes(descriptor),
+                    "existing_map": existing_map,
+                }
 
         def _walk_resources(resources) -> None:
-            if not isinstance(resources, pikepdf.Dictionary):
+            if not _is_pdf_mapping(resources):
                 return
             resources_key = _obj_key(resources)
             if resources_key and resources_key in seen_resources:
@@ -1871,7 +2169,7 @@ def _inspect_font_diagnostics(
                 return
             for _, xobject in xobjects.items():
                 xobject_dict = _resolve_dictionary(xobject)
-                if not isinstance(xobject_dict, pikepdf.Dictionary):
+                if not _is_pdf_mapping(xobject_dict):
                     continue
                 if xobject_dict.get("/Subtype") != pikepdf.Name("/Form"):
                     continue
@@ -1879,7 +2177,7 @@ def _inspect_font_diagnostics(
 
         def _walk_appearance_object(obj) -> None:
             appearance_obj = _resolve_dictionary(obj)
-            if not isinstance(appearance_obj, pikepdf.Dictionary):
+            if not _is_pdf_mapping(appearance_obj):
                 return
             appearance_key = _obj_key(appearance_obj)
             if appearance_key and appearance_key in seen_appearances:
@@ -1896,27 +2194,22 @@ def _inspect_font_diagnostics(
         with pikepdf.open(str(pdf_path)) as pdf:
             for page in pdf.pages:
                 page_resources = _resolve_dictionary(page.get("/Resources"))
-                _collect_used_simple_font_codes(page, page_resources)
                 _walk_resources(page_resources)
 
                 annots = page.get("/Annots")
                 if isinstance(annots, pikepdf.Array):
                     for annot in annots:
-                        _collect_used_simple_font_codes(
-                            annot.get("/AP"),
-                            _resolve_dictionary(annot.get("/Resources")),
-                        )
                         _walk_appearance_object(annot.get("/AP"))
 
             acroform = _resolve_dictionary(pdf.Root.get("/AcroForm"))
-            if isinstance(acroform, pikepdf.Dictionary):
+            if _is_pdf_mapping(acroform):
                 _walk_resources(_resolve_dictionary(acroform.get("/DR")))
 
                 seen_fields: set[tuple[int, int]] = set()
 
                 def _walk_field(field_obj) -> None:
                     field = _resolve_dictionary(field_obj)
-                    if not isinstance(field, pikepdf.Dictionary):
+                    if not _is_pdf_mapping(field):
                         return
                     field_key = _obj_key(field)
                     if field_key and field_key in seen_fields:
@@ -1926,7 +2219,6 @@ def _inspect_font_diagnostics(
 
                     field_resources = _resolve_dictionary(field.get("/DR"))
                     _walk_resources(field_resources)
-                    _collect_used_simple_font_codes(field.get("/AP"), field_resources)
                     _walk_appearance_object(field.get("/AP"))
 
                     kids = field.get("/Kids")
@@ -1938,6 +2230,89 @@ def _inspect_font_diagnostics(
                 if isinstance(fields, pikepdf.Array):
                     for field in fields:
                         _walk_field(field)
+
+            if include_used_code_analysis and simple_font_candidates:
+                target_simple_font_keys = {
+                    font_key
+                    for font_key, entry in simple_font_candidates.items()
+                    if (
+                        not bool(entry["profile"]["has_tounicode"])
+                        or int(entry["profile"]["invalid_tounicode_entries"]) > 0
+                        or simple_unicode_rule_present
+                    )
+                }
+                if target_simple_font_keys:
+                    seen_content_streams.clear()
+                    for page in pdf.pages:
+                        page_resources = _resolve_dictionary(page.get("/Resources"))
+                        _collect_used_simple_font_codes(
+                            page,
+                            page_resources,
+                            target_font_keys=target_simple_font_keys,
+                        )
+
+                        annots = page.get("/Annots")
+                        if isinstance(annots, pikepdf.Array):
+                            for annot in annots:
+                                _collect_used_simple_font_codes(
+                                    annot.get("/AP"),
+                                    _resolve_dictionary(annot.get("/Resources")),
+                                    target_font_keys=target_simple_font_keys,
+                                )
+
+                    if isinstance(acroform, pikepdf.Dictionary):
+                        seen_fields_for_codes: set[tuple[int, int]] = set()
+
+                        def _walk_field_codes(field_obj) -> None:
+                            field = _resolve_dictionary(field_obj)
+                            if not isinstance(field, pikepdf.Dictionary):
+                                return
+                            field_key = _obj_key(field)
+                            if field_key and field_key in seen_fields_for_codes:
+                                return
+                            if field_key:
+                                seen_fields_for_codes.add(field_key)
+
+                            field_resources = _resolve_dictionary(field.get("/DR"))
+                            _collect_used_simple_font_codes(
+                                field.get("/AP"),
+                                field_resources,
+                                target_font_keys=target_simple_font_keys,
+                            )
+
+                            kids = field.get("/Kids")
+                            if isinstance(kids, pikepdf.Array):
+                                for kid in kids:
+                                    _walk_field_codes(kid)
+
+                        fields = acroform.get("/Fields")
+                        if isinstance(fields, pikepdf.Array):
+                            for field in fields:
+                                _walk_field_codes(field)
+
+                    for font_key, entry in simple_font_candidates.items():
+                        profile = entry["profile"]
+                        used_codes = used_simple_codes.get(font_key, set())
+                        profile["used_code_count"] = len(used_codes)
+                        if not used_codes:
+                            continue
+                        existing_map = entry["existing_map"]
+                        current_missing_codes = {
+                            code
+                            for code in used_codes
+                            if code not in existing_map or not _is_valid_unicode_text(existing_map[code])
+                        }
+                        generated_map = {}
+                        if str(profile["auto_unicode_policy"]) != "blocked":
+                            generated_map = _simple_font_unicode_map(
+                                entry["font_dict"],
+                                entry["font_bytes"],
+                            )
+                        repairable_missing = current_missing_codes & set(generated_map)
+                        unresolved_missing = current_missing_codes - set(generated_map)
+                        profile["missing_used_code_count"] = len(current_missing_codes)
+                        profile["repairable_missing_used_codes"] = len(repairable_missing)
+                        profile["unresolved_used_code_count"] = len(unresolved_missing)
 
         profiles = list(profiles_by_key.values())
         for profile in profiles:
@@ -2268,7 +2643,7 @@ def _repair_pdf_tounicode_sync(
 
     def _collect_used_simple_font_codes_from_appearance(obj, fallback_resources) -> None:
         appearance_obj = _resolve_object(obj)
-        if not isinstance(appearance_obj, pikepdf.Dictionary):
+        if not _is_pdf_mapping(appearance_obj):
             return
         appearance_key = _obj_key(appearance_obj)
         if appearance_key and appearance_key in seen_collect_appearances:
@@ -2291,7 +2666,7 @@ def _repair_pdf_tounicode_sync(
     candidate_seen_appearances: set[tuple[int, int]] = set()
 
     def _collect_zero_byte_candidates(resources) -> None:
-        if not isinstance(resources, pikepdf.Dictionary):
+        if not _is_pdf_mapping(resources):
             return
         resources_key = _obj_key(resources)
         if resources_key and resources_key in candidate_seen_resources:
@@ -2343,7 +2718,7 @@ def _repair_pdf_tounicode_sync(
             return
         for _, xobject in xobjects.items():
             xobject_dict = _resolve_object(xobject)
-            if not isinstance(xobject_dict, pikepdf.Dictionary):
+            if not _is_pdf_mapping(xobject_dict):
                 continue
             if xobject_dict.get("/Subtype") != pikepdf.Name("/Form"):
                 continue
@@ -2352,7 +2727,7 @@ def _repair_pdf_tounicode_sync(
 
     def _collect_zero_byte_candidates_from_appearance(obj, fallback_resources) -> None:
         appearance_obj = _resolve_object(obj)
-        if not isinstance(appearance_obj, pikepdf.Dictionary):
+        if not _is_pdf_mapping(appearance_obj):
             return
         appearance_key = _obj_key(appearance_obj)
         if appearance_key and appearance_key in candidate_seen_appearances:
@@ -2437,7 +2812,7 @@ def _repair_pdf_tounicode_sync(
 
     def _sanitize_simple_font_zero_bytes_from_appearance(pdf, obj, fallback_resources) -> None:
         appearance_obj = _resolve_object(obj)
-        if not isinstance(appearance_obj, pikepdf.Dictionary):
+        if not _is_pdf_mapping(appearance_obj):
             return
         appearance_key = _obj_key(appearance_obj)
         if appearance_key and appearance_key in sanitized_appearance_streams:
@@ -2546,7 +2921,7 @@ def _repair_pdf_tounicode_sync(
         return True, len(target_map), len(target_map), invalid_entries, overwritten, stale_entries_removed
 
     def _walk_resources(pdf, resources) -> None:
-        if not isinstance(resources, pikepdf.Dictionary):
+        if not _is_pdf_mapping(resources):
             return
         resources_key = _obj_key(resources)
         if resources_key and resources_key in seen_resources:
@@ -2608,7 +2983,7 @@ def _repair_pdf_tounicode_sync(
             return
         for _, xobject in xobjects.items():
             xobject_dict = _resolve_object(xobject)
-            if xobject_dict is None:
+            if not _is_pdf_mapping(xobject_dict):
                 continue
             try:
                 subtype = xobject_dict.get("/Subtype")
@@ -2621,7 +2996,7 @@ def _repair_pdf_tounicode_sync(
 
     def _walk_appearance_object(pdf, obj) -> None:
         appearance_obj = _resolve_object(obj)
-        if not isinstance(appearance_obj, pikepdf.Dictionary):
+        if not _is_pdf_mapping(appearance_obj):
             return
         appearance_key = _obj_key(appearance_obj)
         if appearance_key and appearance_key in seen_appearances:
@@ -2649,7 +3024,7 @@ def _repair_pdf_tounicode_sync(
                         )
 
             acroform = _resolve_object(pdf.Root.get("/AcroForm"))
-            if isinstance(acroform, pikepdf.Dictionary):
+            if _is_pdf_mapping(acroform):
                 seen_fields: set[tuple[int, int]] = set()
 
                 def _walk_field(field_obj) -> None:
@@ -2691,7 +3066,7 @@ def _repair_pdf_tounicode_sync(
                 if isinstance(fields, pikepdf.Array):
                     for field in fields:
                         field_dict = _resolve_object(field)
-                        if isinstance(field_dict, pikepdf.Dictionary):
+                        if _is_pdf_mapping(field_dict):
                             _collect_zero_byte_candidates(_resolve_object(field_dict.get("/DR")))
                             _collect_zero_byte_candidates_from_appearance(
                                 field_dict.get("/AP"),
@@ -2916,7 +3291,7 @@ def _embed_system_fonts_sync(
         return True
 
     def _walk_resources(resources) -> None:
-        if not isinstance(resources, pikepdf.Dictionary):
+        if not _is_pdf_mapping(resources):
             return
         resources_key = _obj_key(resources)
         if resources_key and resources_key in seen_resources:
@@ -2991,7 +3366,7 @@ def _embed_system_fonts_sync(
             return
         for _, xobject in xobjects.items():
             xobject_dict = _resolve_dictionary(xobject)
-            if xobject_dict is None:
+            if not _is_pdf_mapping(xobject_dict):
                 continue
             try:
                 subtype = xobject_dict.get("/Subtype")
@@ -3003,7 +3378,7 @@ def _embed_system_fonts_sync(
 
     def _walk_appearance_object(obj) -> None:
         appearance_obj = _resolve_dictionary(obj)
-        if not isinstance(appearance_obj, pikepdf.Dictionary):
+        if not _is_pdf_mapping(appearance_obj):
             return
         appearance_key = _obj_key(appearance_obj)
         if appearance_key and appearance_key in seen_appearances:
@@ -3152,7 +3527,10 @@ async def _attempt_font_lane(
         remediation_input = repaired
         requires_retag = False
     elif lane == FONT_LANE_EMBED:
-        embed_diagnostics = _inspect_font_diagnostics(tagged_pdf)
+        embed_diagnostics = _inspect_font_diagnostics(
+            tagged_pdf,
+            include_used_code_analysis=False,
+        )
         if _embed_lane_should_skip_local(embed_diagnostics):
             preprocess_message = "Local font embedding skipped: no supported local candidates for unresolved unembedded fonts"
             preprocess_details = {
@@ -3640,9 +4018,22 @@ async def run_tagging_and_validation(
                 and any(marker in str(v.rule_id) for marker in FONT_UNICODE_RULE_MARKERS)
                 for v in validation.violations
             ):
-                unicode_gate = _inspect_unicode_repair_gate(
-                    Path(job.output_path or tagging_result.output_path),
-                    validation.violations,
+                gate_font_diagnostics = initial_font_diagnostics
+                summary = initial_font_diagnostics.get("summary") if isinstance(initial_font_diagnostics, dict) else None
+                profiles = initial_font_diagnostics.get("profiles") if isinstance(initial_font_diagnostics, dict) else None
+                if (
+                    isinstance(summary, dict)
+                    and isinstance(profiles, list)
+                    and int(summary.get("fonts_total", 0) or 0) > len(profiles)
+                ):
+                    gate_font_diagnostics = _inspect_font_diagnostics(
+                        Path(job.output_path or tagging_result.output_path),
+                        validation.violations,
+                        profile_limit=512,
+                    )
+                unicode_gate = _unicode_repair_gate_from_diagnostics(
+                    gate_font_diagnostics,
+                    violations=validation.violations,
                 )
             font_remediation["unicode_gate"] = unicode_gate
             planned_lanes, skipped_lanes = _font_remediation_lanes(
@@ -3758,101 +4149,20 @@ async def run_tagging_and_validation(
                 selected_validation.violations,
             )
 
-        baseline_has_verapdf_report = bool(baseline_validation.raw_report.get("report"))
-        baseline_validator_name = (
-            "veraPDF"
-            if baseline_has_verapdf_report
-            else baseline_validation.raw_report.get("validator", "unknown")
-        )
-        baseline_errors = _error_count(baseline_validation)
-        baseline_warnings = _warning_count(baseline_validation)
-
-        has_verapdf_report = bool(selected_validation.raw_report.get("report"))
-        validator_name = (
-            "veraPDF"
-            if has_verapdf_report
-            else selected_validation.raw_report.get("validator", "unknown")
-        )
-        post_errors = _error_count(selected_validation)
-        post_warnings = _warning_count(selected_validation)
-
-        changes, status_by_rule = _build_validation_changes(
-            baseline_validation.violations,
-            selected_validation.violations,
-        )
-        needs_remediation = len(
-            [c for c in changes if c["remediation_status"] == "needs_remediation"]
-        )
-        auto_remediated = len(
-            [c for c in changes if c["remediation_status"] == "auto_remediated"]
-        )
-        manual_remediated = len(
-            [c for c in changes if c["remediation_status"] == "manual_remediated"]
-        )
-
-        validation_payload = {
-            "compliant": selected_validation.compliant,
-            "profile": settings.verapdf_flavour,
-            "standard": "PDF/UA",
-            "validator": validator_name,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "baseline": {
-                "compliant": baseline_validation.compliant,
-                "validator": baseline_validator_name,
-                "violations_count": len(baseline_validation.violations),
-                "summary": {
-                    "errors": baseline_errors,
-                    "warnings": baseline_warnings,
-                },
-            },
-            "violations": [
-                {
-                    "rule_id": v.rule_id,
-                    "description": v.description,
-                    "severity": v.severity,
-                    "location": v.location,
-                    "count": v.count,
-                    "category": v.category,
-                    "fix_hint": v.fix_hint,
-                    "remediation_status": status_by_rule.get(v.rule_id, "needs_remediation"),
-                }
-                for v in selected_validation.violations
-            ],
-            "summary": {
-                "passed": len([v for v in selected_validation.violations if v.severity != "error"]),
-                "failed": len([v for v in selected_validation.violations if v.severity == "error"]),
-                "errors": post_errors,
-                "warnings": post_warnings,
-            },
-            "changes": changes,
-            "remediation": {
-                "needs_remediation": needs_remediation,
-                "auto_remediated": auto_remediated,
-                "manual_remediated": manual_remediated,
-                "baseline_errors": baseline_errors,
-                "baseline_warnings": baseline_warnings,
-                "post_errors": post_errors,
-                "post_warnings": post_warnings,
-                "errors_reduced": baseline_errors - post_errors,
-                "warnings_reduced": baseline_warnings - post_warnings,
-                "font_remediation": font_remediation,
-            },
-            "tagging": {
-                "headings_tagged": selected_tagging_result.headings_tagged,
-                "figures_tagged": selected_tagging_result.figures_tagged,
-                "decorative_figures_artifacted": selected_tagging_result.decorative_figures_artifacted,
-                "tables_tagged": selected_tagging_result.tables_tagged,
-                "lists_tagged": selected_tagging_result.lists_tagged,
-                "links_tagged": selected_tagging_result.links_tagged,
-                "bookmarks_added": selected_tagging_result.bookmarks_added,
-                "title_set": selected_tagging_result.title_set,
-                "lang_set": selected_tagging_result.lang_set,
-            },
-            "claims": {
-                "automated_validation_only": True,
-                "requires_manual_check_for_reading_experience": True,
-            },
+        llm_font_map_auto: dict[str, object] = {
+            "enabled": bool(settings.auto_apply_llm_font_map),
+            "attempted": False,
+            "applied": False,
+            "reason": "",
         }
+        validation_payload = _build_validation_payload(
+            baseline_validation=baseline_validation,
+            selected_validation=selected_validation,
+            settings=settings,
+            font_remediation=font_remediation,
+            tagging_result=selected_tagging_result,
+            llm_font_map_auto=llm_font_map_auto,
+        )
 
         await _update_step(db, job_id, "validation", "complete", result={
             "compliant": selected_validation.compliant,
@@ -3886,16 +4196,92 @@ async def run_tagging_and_validation(
                 for entry in reviewed_alt_entries
             ],
             validation_report=validation_payload,
+            raw_validation_report=selected_validation.raw_report,
             tagging_metrics=validation_payload["tagging"],
             classification=job.classification,
         )
 
+        review_task_metadata_overrides: dict[tuple[str, str], dict[str, object]] = {}
+        auto_audit, candidate_validation, candidate_output_pdf, metadata_overrides = await _attempt_auto_llm_font_map(
+            job=job,
+            settings=settings,
+            output_pdf=Path(job.output_path or tagging_result.output_path),
+            current_validation=selected_validation,
+            review_tasks=review_tasks,
+        )
+        llm_font_map_auto = auto_audit
+        review_task_metadata_overrides.update(metadata_overrides)
+        validation_payload = _build_validation_payload(
+            baseline_validation=baseline_validation,
+            selected_validation=selected_validation,
+            settings=settings,
+            font_remediation=font_remediation,
+            tagging_result=selected_tagging_result,
+            llm_font_map_auto=llm_font_map_auto,
+        )
+
+        if candidate_validation is not None and candidate_output_pdf is not None:
+            candidate_validation_payload = _build_validation_payload(
+                baseline_validation=baseline_validation,
+                selected_validation=candidate_validation,
+                settings=settings,
+                font_remediation=font_remediation,
+                tagging_result=selected_tagging_result,
+                llm_font_map_auto=llm_font_map_auto,
+            )
+            candidate_fidelity_report, candidate_review_tasks = assess_fidelity(
+                input_pdf=Path(job.input_path),
+                output_pdf=candidate_output_pdf,
+                structure_json=structure_json or {},
+                alt_entries=[
+                    {
+                        "figure_index": entry.figure_index,
+                        "generated_text": entry.generated_text,
+                        "edited_text": entry.edited_text,
+                        "status": entry.status,
+                    }
+                    for entry in reviewed_alt_entries
+                ],
+                validation_report=candidate_validation_payload,
+                raw_validation_report=candidate_validation.raw_report,
+                tagging_metrics=candidate_validation_payload["tagging"],
+                classification=job.classification,
+            )
+            if _fidelity_not_worse(candidate_fidelity_report, fidelity_report):
+                selected_validation = candidate_validation
+                job.output_path = str(candidate_output_pdf)
+                validation_payload = candidate_validation_payload
+                fidelity_report = candidate_fidelity_report
+                review_tasks = candidate_review_tasks
+            else:
+                llm_font_map_auto["applied"] = False
+                llm_font_map_auto["reason"] = "fidelity_regression"
+                validation_payload = _build_validation_payload(
+                    baseline_validation=baseline_validation,
+                    selected_validation=selected_validation,
+                    settings=settings,
+                    font_remediation=font_remediation,
+                    tagging_result=selected_tagging_result,
+                    llm_font_map_auto=llm_font_map_auto,
+                )
+
         validation_payload["fidelity"] = fidelity_report
+        if review_task_metadata_overrides:
+            for key, metadata in review_task_metadata_overrides.items():
+                review_tasks = _merge_review_task_metadata(
+                    review_tasks,
+                    task_type=key[0],
+                    source=key[1],
+                    metadata=metadata,
+                )
         job.validation_json = json.dumps(validation_payload)
         job.fidelity_json = json.dumps(fidelity_report)
 
         await db.execute(delete(ReviewTask).where(ReviewTask.job_id == job_id))
         for task in review_tasks:
+            metadata = task.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
             db.add(ReviewTask(
                 job_id=job_id,
                 task_type=str(task.get("task_type") or "manual_review"),
@@ -3905,10 +4291,10 @@ async def run_tagging_and_validation(
                 blocking=bool(task.get("blocking", True)),
                 status=str(task.get("status") or "pending_review"),
                 source=str(task.get("source") or "fidelity"),
-                metadata_json=json.dumps(task.get("metadata", {})),
+                metadata_json=json.dumps(metadata),
             ))
 
-        blocking_task_count = len([task for task in review_tasks if bool(task.get("blocking"))])
+        blocking_task_count = _blocking_task_count(review_tasks)
         await _update_step(db, job_id, "fidelity", "complete", result={
             "passed": bool(fidelity_report.get("passed", False)),
             "blocking_tasks": blocking_task_count,

@@ -10,6 +10,9 @@ from typing import Any
 
 from pdfminer.high_level import extract_text
 
+from app.services.pdf_operator_context import extract_operator_text_context
+from app.services.pdf_context import parse_verapdf_context_path
+
 FONT_RULE_FRAGMENT = "-7.21."
 TEXT_SAMPLE_MAX_PAGES = 10
 TEXT_SAMPLE_MAX_CHARS = 20000
@@ -18,11 +21,20 @@ STRUCTURE_FRAGMENT_LIMIT = 24
 STRUCTURE_FRAGMENT_MIN_LEN = 18
 NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 TABLE_KEYWORDS = ("table", "thead", "tbody", "tfoot", "tr", "th", "td")
+FONT_SUBSET_RE = re.compile(r"^[A-Z]{6}\+")
+USED_GLYPH_FONT_RE = re.compile(r"usedGlyphs\[\d+\]\(([^ )]+)")
 
 
 def _normalize_text(value: str | None) -> str:
     raw = str(value or "").lower()
     return " ".join(NORMALIZE_RE.sub(" ", raw).split())
+
+
+def _strip_subset_prefix(value: str | None) -> str:
+    raw = str(value or "").strip().lstrip("/")
+    if FONT_SUBSET_RE.match(raw):
+        return raw.split("+", 1)[1]
+    return raw
 
 
 def _extract_pdf_text_sample(path: Path) -> str:
@@ -131,6 +143,123 @@ def _task_for_violation(violation: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def _rule_id_from_summary(summary: dict[str, Any]) -> str:
+    specification = str(summary.get("specification") or "").strip()
+    clause = str(summary.get("clause") or "").strip()
+    test_number = str(summary.get("testNumber") or "").strip()
+    if not specification or not clause or not test_number:
+        return ""
+    return f"{specification}-{clause}-{test_number}"
+
+
+def _iter_verapdf_rule_summaries(raw_validation_report: dict[str, Any] | None):
+    report_root = raw_validation_report.get("report", {}) if isinstance(raw_validation_report, dict) else {}
+    jobs = report_root.get("jobs", []) if isinstance(report_root, dict) else []
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        validation_raw = job.get("validationResult", {})
+        validation_entries = validation_raw if isinstance(validation_raw, list) else [validation_raw]
+        for validation in validation_entries:
+            if not isinstance(validation, dict):
+                continue
+            details = validation.get("details", {})
+            if not isinstance(details, dict):
+                continue
+            rule_summaries = details.get("ruleSummaries", [])
+            if not isinstance(rule_summaries, list):
+                continue
+            for summary in rule_summaries:
+                if isinstance(summary, dict):
+                    yield summary
+
+
+def _extract_font_review_targets(
+    raw_validation_report: dict[str, Any] | None,
+    font_rule_ids: set[str],
+    *,
+    output_pdf: Path | None = None,
+) -> tuple[list[dict[str, Any]], list[int], list[str]]:
+    grouped: dict[tuple[str, int | None, str, int | None], dict[str, Any]] = {}
+    pages_seen: set[int] = set()
+    fonts_seen: set[str] = set()
+
+    for summary in _iter_verapdf_rule_summaries(raw_validation_report):
+        rule_id = _rule_id_from_summary(summary)
+        if not rule_id or rule_id not in font_rule_ids:
+            continue
+
+        checks = summary.get("checks", [])
+        if not isinstance(checks, list):
+            continue
+
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            if str(check.get("status") or "").lower() != "failed":
+                continue
+
+            context = str(check.get("context") or "").strip()
+            parsed_context = parse_verapdf_context_path(context)
+            page_number = parsed_context.get("page_number")
+            if not isinstance(page_number, int):
+                page_number = None
+            font_match = USED_GLYPH_FONT_RE.search(context)
+            font_name = _strip_subset_prefix(font_match.group(1)) if font_match else ""
+            content_stream_index = parsed_context.get("page_content_stream_index")
+            if not isinstance(content_stream_index, int):
+                content_stream_index = None
+            operator_index = parsed_context.get("operator_index")
+            if not isinstance(operator_index, int):
+                operator_index = None
+            key = (rule_id, page_number, font_name, operator_index)
+            entry = grouped.setdefault(
+                key,
+                {
+                    "rule_id": rule_id,
+                    "page": page_number,
+                    "font": font_name,
+                    "content_stream_index": content_stream_index,
+                    "operator_index": operator_index,
+                    "context_path": context,
+                    "count": 0,
+                    "sample_context": context[:240],
+                },
+            )
+            entry["count"] += 1
+            if page_number is not None:
+                pages_seen.add(page_number)
+            if font_name:
+                fonts_seen.add(font_name)
+
+    if output_pdf is not None and output_pdf.exists():
+        for entry in grouped.values():
+            context_path = str(entry.get("context_path") or "").strip()
+            if not context_path:
+                continue
+            try:
+                context_info = extract_operator_text_context(
+                    pdf_path=output_pdf,
+                    context_path=context_path,
+                )
+            except Exception:
+                continue
+            if isinstance(context_info, dict):
+                entry.update(context_info)
+
+    targets = sorted(
+        grouped.values(),
+        key=lambda item: (
+            item["page"] if isinstance(item.get("page"), int) else 10**9,
+            item["operator_index"] if isinstance(item.get("operator_index"), int) else 10**9,
+            -int(item.get("count", 0) or 0),
+            str(item.get("font") or "").lower(),
+            str(item.get("rule_id") or ""),
+        ),
+    )
+    return targets[:12], sorted(pages_seen), sorted(fonts_seen)
+
+
 def assess_fidelity(
     *,
     input_pdf: Path,
@@ -138,6 +267,7 @@ def assess_fidelity(
     structure_json: dict[str, Any],
     alt_entries: list[dict[str, Any]],
     validation_report: dict[str, Any],
+    raw_validation_report: dict[str, Any] | None = None,
     tagging_metrics: dict[str, Any],
     classification: str | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -479,6 +609,20 @@ def assess_fidelity(
             or FONT_RULE_FRAGMENT in str(violation.get("rule_id") or "")
         )
     )
+    font_rule_ids = sorted({
+        str(violation.get("rule_id") or "").strip()
+        for violation in unresolved_errors
+        if isinstance(violation, dict) and (
+            str(violation.get("category") or "").lower() == "fonts"
+            or FONT_RULE_FRAGMENT in str(violation.get("rule_id") or "")
+        )
+        and str(violation.get("rule_id") or "").strip()
+    })
+    font_review_targets, pages_to_check, fonts_to_check = _extract_font_review_targets(
+        raw_validation_report,
+        set(font_rule_ids),
+        output_pdf=output_pdf,
+    )
     if remaining_font_errors > 0 or (
         isinstance(unicode_gate, dict) and not unicode_gate.get("allow_automatic", True)
     ):
@@ -494,6 +638,10 @@ def assess_fidelity(
             blocking=True,
             metadata={
                 "remaining_font_errors": remaining_font_errors,
+                "font_rule_ids": font_rule_ids,
+                "pages_to_check": pages_to_check,
+                "fonts_to_check": fonts_to_check,
+                "font_review_targets": font_review_targets,
                 "unicode_gate": unicode_gate,
                 "font_diagnostics_summary": font_diagnostics_summary,
                 "top_font_profiles": top_font_profiles,
@@ -505,6 +653,8 @@ def assess_fidelity(
             "message": "Font-related compliance or Unicode-gate risk requires manual review.",
             "metrics": {
                 "remaining_font_errors": remaining_font_errors,
+                "review_pages": len(pages_to_check),
+                "review_fonts": len(fonts_to_check),
                 "automatic_unicode_allowed": bool(unicode_gate.get("allow_automatic", True))
                 if isinstance(unicode_gate, dict)
                 else True,

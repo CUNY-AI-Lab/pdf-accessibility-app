@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     llm_timeout: int = 120
     llm_strict_validation: bool = True
     auto_approve_generated_alt_text: bool = True
+    auto_apply_llm_font_map: bool = True
 
     # veraPDF
     verapdf_path: str = "verapdf"

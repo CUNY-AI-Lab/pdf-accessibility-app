@@ -14,14 +14,18 @@ from app.pipeline.orchestrator import (
     _embed_lane_should_skip_local,
     _font_remediation_lanes,
     _ghostscript_embed_command,
+    _inspect_font_diagnostics,
+    _attempt_auto_llm_font_map,
     _local_embed_support_kind,
     _local_font_program,
     _merge_tounicode_maps,
     _normalize_font_name,
+    _parse_tounicode_map_details,
     _sanitize_text_showing_zero_bytes,
     _simple_font_auto_unicode_policy,
     _simple_font_unicode_map,
     _simple_font_zero_byte_repair_candidate,
+    _unicode_repair_gate_from_diagnostics,
 )
 
 
@@ -36,6 +40,58 @@ def _settings(**overrides) -> Settings:
 
 def _violation(rule_id: str, severity: str = "error") -> SimpleNamespace:
     return SimpleNamespace(rule_id=rule_id, severity=severity)
+
+
+def _resolve_object(value):
+    try:
+        return value.get_object()
+    except Exception:
+        return value
+
+
+def _xobject_font_only_pdf(output_path: Path) -> None:
+    with pikepdf.open("backend/test_sample.pdf") as sample_pdf:
+        sample_page = sample_pdf.pages[0]
+        sample_resources = _resolve_object(sample_page.obj.get("/Resources"))
+        sample_fonts = _resolve_object(sample_resources.get("/Font"))
+        font_name = next(iter(sample_fonts.keys()))
+        font_dict = sample_fonts.get(font_name)
+
+        pdf = pikepdf.new()
+        page = pdf.add_blank_page()
+
+        imported_font = pdf.copy_foreign(font_dict)
+        form = pdf.make_stream(
+            pikepdf.unparse_content_stream(
+                [
+                    pikepdf.ContentStreamInstruction([], pikepdf.Operator("BT")),
+                    pikepdf.ContentStreamInstruction([font_name, 12], pikepdf.Operator("Tf")),
+                    pikepdf.ContentStreamInstruction([10, 20], pikepdf.Operator("Td")),
+                    pikepdf.ContentStreamInstruction([pikepdf.String("Nested only")], pikepdf.Operator("Tj")),
+                    pikepdf.ContentStreamInstruction([], pikepdf.Operator("ET")),
+                ]
+            )
+        )
+        form["/Type"] = pikepdf.Name("/XObject")
+        form["/Subtype"] = pikepdf.Name("/Form")
+        form["/BBox"] = pikepdf.Array([0, 0, 200, 50])
+        form["/Resources"] = pikepdf.Dictionary({
+            "/Font": pikepdf.Dictionary({font_name: imported_font}),
+        })
+
+        page.obj["/Resources"] = pikepdf.Dictionary({
+            "/XObject": pikepdf.Dictionary({"/Fx0": form}),
+        })
+        page["/Contents"] = pdf.make_stream(
+            pikepdf.unparse_content_stream(
+                [
+                    pikepdf.ContentStreamInstruction([], pikepdf.Operator("q")),
+                    pikepdf.ContentStreamInstruction([pikepdf.Name("/Fx0")], pikepdf.Operator("Do")),
+                    pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q")),
+                ]
+            )
+        )
+        pdf.save(str(output_path))
 
 
 def test_font_lanes_prioritize_tounicode_when_fonts_are_embedded():
@@ -198,6 +254,113 @@ def test_local_font_program_uses_type1_fontfile_for_standard14(monkeypatch):
     assert lengths == {"Length1": 10, "Length2": 20, "Length3": 0}
 
 
+def test_font_diagnostics_can_skip_used_code_analysis(tmp_path, monkeypatch):
+    input_pdf = tmp_path / "font_resources_only.pdf"
+
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page()
+    page.obj["/Resources"] = pikepdf.Dictionary({
+        "/Font": pikepdf.Dictionary({
+            "/F1": pikepdf.Dictionary({
+                "/Type": pikepdf.Name("/Font"),
+                "/Subtype": pikepdf.Name("/Type1"),
+                "/BaseFont": pikepdf.Name("/Times-Roman"),
+            }),
+        }),
+    })
+    pdf.save(str(input_pdf))
+
+    parse_calls = {"count": 0}
+    original_parse = pikepdf.parse_content_stream
+
+    def _count_parse(*args, **kwargs):
+        parse_calls["count"] += 1
+        return original_parse(*args, **kwargs)
+
+    monkeypatch.setattr(pikepdf, "parse_content_stream", _count_parse)
+
+    diagnostics = _inspect_font_diagnostics(
+        input_pdf,
+        include_used_code_analysis=False,
+    )
+
+    assert diagnostics["error"] is None
+    assert diagnostics["summary"]["fonts_total"] == 1
+    assert parse_calls["count"] == 0
+
+
+def test_parse_tounicode_map_details_caps_pathological_bfrange_span():
+    class _FakeStream:
+        def read_bytes(self):
+            return b"""
+            1 beginbfrange
+            <0000> <FFFFFFFF> <0041>
+            endbfrange
+            """
+
+    mapping, invalid_entries = _parse_tounicode_map_details(_FakeStream())
+
+    assert mapping == {}
+    assert invalid_entries == 1
+
+
+def test_unicode_gate_uses_font_diagnostics_for_safe_simple_candidates():
+    gate = _unicode_repair_gate_from_diagnostics(
+        {
+            "profiles": [
+                {
+                    "subtype": "/Type1",
+                    "base_font": "Univers",
+                    "has_tounicode": True,
+                    "auto_unicode_policy": "embedded_cff",
+                    "invalid_tounicode_entries": 12,
+                    "missing_used_code_count": 19,
+                    "repairable_missing_used_codes": 19,
+                }
+            ]
+        },
+        violations=[_violation("ISO 14289-1:2014-7.21.7-1")],
+    )
+
+    assert gate["allow_automatic"] is True
+    assert gate["safe_simple_candidates"] == 1
+
+
+def test_unicode_gate_uses_type0_candidates_for_embedded_cid_fonts():
+    gate = _unicode_repair_gate_from_diagnostics(
+        {
+            "profiles": [
+                {
+                    "subtype": "/Type0",
+                    "descendant_subtype": "/CIDFontType2",
+                    "embedded": True,
+                    "has_tounicode": True,
+                }
+            ]
+        },
+        violations=[_violation("ISO 14289-1:2014-7.21.7-1")],
+    )
+
+    assert gate["allow_automatic"] is True
+    assert gate["safe_type0_candidates"] == 1
+
+
+def test_inspect_font_diagnostics_counts_fonts_inside_form_xobjects(tmp_path):
+    input_pdf = tmp_path / "xobject_fonts.pdf"
+    _xobject_font_only_pdf(input_pdf)
+
+    diagnostics = _inspect_font_diagnostics(
+        input_pdf,
+        include_used_code_analysis=False,
+        profile_limit=10,
+    )
+
+    assert diagnostics["error"] is None
+    assert diagnostics["summary"]["fonts_total"] == 1
+    assert diagnostics["summary"]["simple_fonts"] == 1
+    assert diagnostics["profiles"][0]["base_font"] != "(unnamed)"
+
+
 def test_embed_system_fonts_creates_descriptor_for_standard_type1(tmp_path, monkeypatch):
     input_pdf = tmp_path / "input.pdf"
     output_pdf = tmp_path / "output.pdf"
@@ -342,6 +505,106 @@ def test_ghostscript_embed_command_forces_standard_font_embedding():
     assert "/Helvetica" in distiller_params
     assert "/ZapfDingbats" in distiller_params
     assert cmd[-2:] == ("-f", "/tmp/input.pdf")
+
+
+@pytest.mark.asyncio
+async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(tmp_path, monkeypatch):
+    source_pdf = tmp_path / "source.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\n% test\n")
+
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.model = "google/gemini-3-flash-preview"
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+    async def _generate_review_suggestion(**kwargs):
+        return {
+            "task_type": "font_text_fidelity",
+            "confidence": "high",
+            "suggested_action": "font_map_candidate",
+            "actualtext_candidates": [],
+            "model": "google/gemini-3-flash-preview",
+        }
+
+    monkeypatch.setattr(
+        orchestrator,
+        "generate_review_suggestion",
+        _generate_review_suggestion,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "select_auto_font_map_override",
+        lambda **kwargs: {
+            "page_number": 2,
+            "operator_index": 132,
+            "unicode_text": "►",
+            "font": "ExampleSymbolFont",
+            "font_base_name": "ExampleSymbolFont",
+            "font_code_hex": "01",
+            "target_count": 3,
+        },
+    )
+
+    def _copy_apply(*, input_pdf, output_pdf, context_path, unicode_text):
+        output_pdf.write_bytes(Path(input_pdf).read_bytes())
+
+    monkeypatch.setattr(orchestrator, "apply_unicode_override_to_context", _copy_apply)
+
+    current_validation = SimpleNamespace(
+        compliant=False,
+        violations=[SimpleNamespace(rule_id="ISO 14289-1:2014-7.21.7-1", severity="error", count=3)],
+        raw_report={},
+    )
+    improved_validation = SimpleNamespace(
+        compliant=True,
+        violations=[],
+        raw_report={},
+    )
+
+    async def _validate_pdf(**kwargs):
+        return improved_validation
+
+    monkeypatch.setattr(orchestrator, "validate_pdf", _validate_pdf)
+
+    job = SimpleNamespace(
+        id="job-1",
+        original_filename="sample.pdf",
+        input_path=str(source_pdf),
+        output_path=str(source_pdf),
+        structure_json="{}",
+    )
+    review_tasks = [
+        {
+            "task_type": "font_text_fidelity",
+            "title": "Verify font text fidelity",
+            "detail": "Manual review needed.",
+            "severity": "high",
+            "blocking": True,
+            "source": "validation",
+            "metadata": {
+                "font_review_targets": [
+                    {"page": 2, "operator_index": 132, "context_path": "ctx-1"},
+                ],
+            },
+        }
+    ]
+
+    audit, candidate_validation, candidate_output, metadata_overrides = await _attempt_auto_llm_font_map(
+        job=job,
+        settings=_settings(auto_apply_llm_font_map=True),
+        output_pdf=source_pdf,
+        current_validation=current_validation,
+        review_tasks=review_tasks,
+    )
+
+    assert audit["applied"] is True
+    assert audit["unicode_text"] == "►"
+    assert candidate_validation is improved_validation
+    assert candidate_output is not None and candidate_output.exists()
+    assert metadata_overrides[("font_text_fidelity", "validation")]["llm_auto_font_map"]["applied"] is True
 
 
 def test_embed_lane_skips_local_when_no_supported_candidates():
