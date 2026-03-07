@@ -1,7 +1,9 @@
+import logging
 from pathlib import Path
 
 from app.pipeline import fidelity
 from app.pipeline.fidelity import (
+    _collect_structural_fragments,
     _extract_font_review_targets,
     _reading_order_metrics,
     assess_fidelity,
@@ -159,6 +161,111 @@ def test_extract_font_review_targets_from_xobject_context_without_named_object()
     assert targets[0]["page"] == 6
     assert targets[0]["content_stream_index"] == 0
     assert targets[0]["operator_index"] == 136
+
+
+def test_extract_pdf_text_sample_suppresses_pdfminer_fontbbox_warning(monkeypatch, caplog):
+    pdfminer_logger = logging.getLogger("pdfminer.pdffont")
+
+    def _fake_extract_text(*args, **kwargs):
+        pdfminer_logger.warning(
+            "Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats"
+        )
+        pdfminer_logger.warning("Different pdfminer warning that should remain visible")
+        return "Sample body text"
+
+    monkeypatch.setattr(fidelity, "extract_text", _fake_extract_text)
+
+    with caplog.at_level(logging.WARNING):
+        result = fidelity._extract_pdf_text_sample(Path("sample.pdf"))
+
+    assert result == "sample body text"
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("Could not get FontBBox from font descriptor because" in message for message in messages)
+    assert any("Different pdfminer warning that should remain visible" in message for message in messages)
+
+
+def test_collect_structural_fragments_skips_toc_elements():
+    fragments = _collect_structural_fragments(
+        {
+            "elements": [
+                {"type": "toc_caption", "text": "Contents"},
+                {"type": "toc_item", "text": "1 Introduction ........ 3"},
+                {"type": "heading", "text": "Introduction"},
+                {"type": "paragraph", "text": "This paragraph should be used for reading-order checks."},
+            ]
+        }
+    )
+
+    assert fragments == [
+        "this paragraph should be used for reading order checks",
+    ]
+
+
+def test_scanned_fidelity_fails_when_visible_scan_has_no_ocr_text_or_structure(monkeypatch):
+    monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "")
+    monkeypatch.setattr(
+        fidelity,
+        "_sample_visual_ink",
+        lambda path: {
+            "sampled_pages": 1,
+            "pages_with_visible_ink": 1,
+            "mean_ink_ratio": 0.084,
+            "max_ink_ratio": 0.084,
+            "visually_blank": False,
+        },
+    )
+
+    report, tasks = assess_fidelity(
+        input_pdf=Path("scan.pdf"),
+        output_pdf=Path("out.pdf"),
+        structure_json={"elements": []},
+        alt_entries=[],
+        validation_report=_validation_report(compliant=True, violations=[]),
+        tagging_metrics={"tables_tagged": 0},
+        classification="scanned",
+    )
+
+    assert report["passed"] is False
+    assert any(
+        check["check"] == "ocr_coverage" and check["status"] == "fail"
+        for check in report["checks"]
+    )
+    assert any(
+        task["task_type"] == "content_fidelity" and task["blocking"]
+        for task in tasks
+    )
+
+
+def test_scanned_fidelity_skips_ocr_coverage_for_visually_blank_pages(monkeypatch):
+    monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "")
+    monkeypatch.setattr(
+        fidelity,
+        "_sample_visual_ink",
+        lambda path: {
+            "sampled_pages": 1,
+            "pages_with_visible_ink": 0,
+            "mean_ink_ratio": 0.0,
+            "max_ink_ratio": 0.0,
+            "visually_blank": True,
+        },
+    )
+
+    report, tasks = assess_fidelity(
+        input_pdf=Path("scan.pdf"),
+        output_pdf=Path("out.pdf"),
+        structure_json={"elements": []},
+        alt_entries=[],
+        validation_report=_validation_report(compliant=True, violations=[]),
+        tagging_metrics={"tables_tagged": 0},
+        classification="scanned",
+    )
+
+    assert report["passed"] is True
+    assert any(
+        check["check"] == "ocr_coverage" and check["status"] == "skip"
+        for check in report["checks"]
+    )
+    assert not tasks
 
 
 def test_extract_font_review_targets_from_annotation_appearance_context():
@@ -367,6 +474,23 @@ def test_reading_order_metrics_tolerate_single_outlier():
     assert metrics["matched_fragments"] == 8
     assert metrics["ordered_fragments"] == 7
     assert metrics["order_rate"] == 0.875
+
+
+def test_reading_order_metrics_fall_back_to_dense_matching_for_ocr_spacing():
+    fragments = [
+        "wa went tip toeing along a path amongst the trees back towards the end of the widow s garden",
+        "he listened some more then he come tip toeing down and stood right between us",
+    ]
+    output_text = (
+        "wa went tip toeing along a path amongstthe trees back towards the end of the widow s garden "
+        "he listened some more then hecome tip toeing down and stood right between us"
+    )
+
+    metrics = _reading_order_metrics(fragments, output_text)
+
+    assert metrics["matched_fragments"] == 2
+    assert metrics["ordered_fragments"] == 2
+    assert metrics["match_mode"] == "dense"
 
 
 def test_fidelity_does_not_block_on_single_reading_order_outlier(monkeypatch):

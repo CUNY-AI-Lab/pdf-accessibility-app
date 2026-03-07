@@ -2,32 +2,63 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from bisect import bisect_right
+from contextlib import contextmanager
 from difflib import SequenceMatcher
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+import pikepdf
+from PIL import Image
 from pdfminer.high_level import extract_text
 
 from app.services.pdf_operator_context import extract_operator_text_context
 from app.services.pdf_context import parse_verapdf_context_path
+from app.services.pdf_preview import render_page_png_bytes
 
 FONT_RULE_FRAGMENT = "-7.21."
 TEXT_SAMPLE_MAX_PAGES = 10
 TEXT_SAMPLE_MAX_CHARS = 20000
 TEXT_SAMPLE_MIN_CHARS = 300
+SCANNED_TEXT_MIN_CHARS = 40
+OCR_VISUAL_SAMPLE_MAX_PAGES = 3
+OCR_VISUAL_NONWHITE_THRESHOLD = 245
+OCR_VISUAL_MIN_INK_RATIO = 0.001
 STRUCTURE_FRAGMENT_LIMIT = 24
 STRUCTURE_FRAGMENT_MIN_LEN = 18
 NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 TABLE_KEYWORDS = ("table", "thead", "tbody", "tfoot", "tr", "th", "td")
 FONT_SUBSET_RE = re.compile(r"^[A-Z]{6}\+")
 USED_GLYPH_FONT_RE = re.compile(r"usedGlyphs\[\d+\]\(([^ )]+)")
+PDFMINER_FONTBBOX_WARNING = "Could not get FontBBox from font descriptor because"
+
+
+class _PdfMinerFontBBoxFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return PDFMINER_FONTBBOX_WARNING not in record.getMessage()
+
+
+@contextmanager
+def _suppress_pdfminer_fontbbox_warning():
+    logger = logging.getLogger("pdfminer.pdffont")
+    warning_filter = _PdfMinerFontBBoxFilter()
+    logger.addFilter(warning_filter)
+    try:
+        yield
+    finally:
+        logger.removeFilter(warning_filter)
 
 
 def _normalize_text(value: str | None) -> str:
     raw = str(value or "").lower()
     return " ".join(NORMALIZE_RE.sub(" ", raw).split())
+
+
+def _normalize_dense_text(value: str | None) -> str:
+    return _normalize_text(value).replace(" ", "")
 
 
 def _strip_subset_prefix(value: str | None) -> str:
@@ -39,13 +70,74 @@ def _strip_subset_prefix(value: str | None) -> str:
 
 def _extract_pdf_text_sample(path: Path) -> str:
     try:
-        text = extract_text(
-            str(path),
-            page_numbers=list(range(TEXT_SAMPLE_MAX_PAGES)),
-        )
+        with _suppress_pdfminer_fontbbox_warning():
+            text = extract_text(
+                str(path),
+                page_numbers=list(range(TEXT_SAMPLE_MAX_PAGES)),
+            )
     except Exception:
         return ""
     return _normalize_text(text)[:TEXT_SAMPLE_MAX_CHARS]
+
+
+def _meaningful_structure_element_count(structure_json: dict[str, Any]) -> int:
+    elements = structure_json.get("elements", [])
+    if not isinstance(elements, list):
+        return 0
+
+    count = 0
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        if str(element.get("type") or "") == "artifact":
+            continue
+        text = _normalize_text(element.get("text"))
+        if text or str(element.get("type") or "") in {"figure", "table"}:
+            count += 1
+    return count
+
+
+def _sample_visual_ink(path: Path) -> dict[str, Any]:
+    try:
+        with pikepdf.Pdf.open(path) as pdf:
+            page_total = len(pdf.pages)
+    except Exception:
+        return {
+            "sampled_pages": 0,
+            "pages_with_visible_ink": 0,
+            "mean_ink_ratio": 0.0,
+            "max_ink_ratio": 0.0,
+            "visually_blank": None,
+        }
+
+    ratios: list[float] = []
+    for page_number in range(1, min(page_total, OCR_VISUAL_SAMPLE_MAX_PAGES) + 1):
+        try:
+            page_png = render_page_png_bytes(path, page_number, dpi=72, max_width=900)
+        except Exception:
+            continue
+        with Image.open(BytesIO(page_png)) as image:
+            grayscale = image.convert("L")
+            histogram = grayscale.histogram()
+        total_pixels = sum(histogram)
+        if total_pixels <= 0:
+            ratios.append(0.0)
+            continue
+        nonwhite_pixels = sum(histogram[:OCR_VISUAL_NONWHITE_THRESHOLD])
+        ratios.append(nonwhite_pixels / total_pixels)
+
+    pages_with_visible_ink = sum(
+        1 for ratio in ratios if ratio >= OCR_VISUAL_MIN_INK_RATIO
+    )
+    mean_ratio = (sum(ratios) / len(ratios)) if ratios else 0.0
+    max_ratio = max(ratios, default=0.0)
+    return {
+        "sampled_pages": len(ratios),
+        "pages_with_visible_ink": pages_with_visible_ink,
+        "mean_ink_ratio": round(mean_ratio, 4),
+        "max_ink_ratio": round(max_ratio, 4),
+        "visually_blank": bool(ratios) and pages_with_visible_ink == 0,
+    }
 
 
 def _collect_structural_fragments(structure_json: dict[str, Any]) -> list[str]:
@@ -57,6 +149,9 @@ def _collect_structural_fragments(structure_json: dict[str, Any]) -> list[str]:
     seen: set[str] = set()
     for element in elements:
         if not isinstance(element, dict):
+            continue
+        elem_type = str(element.get("type") or "")
+        if elem_type == "artifact" or elem_type.startswith("toc_"):
             continue
         text = _normalize_text(element.get("text"))
         if len(text) < STRUCTURE_FRAGMENT_MIN_LEN:
@@ -82,12 +177,44 @@ def _longest_nondecreasing_subsequence_len(values: list[int]) -> int:
     return len(tails)
 
 
-def _reading_order_metrics(fragments: list[str], output_text: str) -> dict[str, float | int]:
+def _reading_order_positions(
+    fragments: list[str],
+    output_text: str,
+    *,
+    dense: bool,
+) -> list[int]:
+    if dense:
+        search_text = _normalize_dense_text(output_text)
+        normalized_fragments = [_normalize_dense_text(fragment) for fragment in fragments]
+    else:
+        search_text = output_text
+        normalized_fragments = fragments
+
     positions: list[int] = []
-    for fragment in fragments:
-        pos = output_text.find(fragment)
+    for fragment in normalized_fragments:
+        if not fragment:
+            continue
+        pos = search_text.find(fragment)
         if pos >= 0:
             positions.append(pos)
+    return positions
+
+
+def _reading_order_metrics(fragments: list[str], output_text: str) -> dict[str, float | int | str]:
+    exact_positions = _reading_order_positions(fragments, output_text, dense=False)
+    dense_positions = _reading_order_positions(fragments, output_text, dense=True)
+
+    positions = exact_positions
+    match_mode = "exact"
+    if len(dense_positions) > len(exact_positions):
+        positions = dense_positions
+        match_mode = "dense"
+    elif len(dense_positions) == len(exact_positions) and dense_positions:
+        exact_ordered = _longest_nondecreasing_subsequence_len(exact_positions)
+        dense_ordered = _longest_nondecreasing_subsequence_len(dense_positions)
+        if dense_ordered > exact_ordered:
+            positions = dense_positions
+            match_mode = "dense"
 
     hits = len(positions)
     hit_rate = hits / max(len(fragments), 1)
@@ -100,6 +227,7 @@ def _reading_order_metrics(fragments: list[str], output_text: str) -> dict[str, 
         "ordered_fragments": ordered_hits,
         "hit_rate": round(hit_rate, 4),
         "order_rate": round(order_rate, 4),
+        "match_mode": match_mode,
     }
 
 
@@ -364,6 +492,76 @@ def assess_fidelity(
 
     source_text = _extract_pdf_text_sample(input_pdf)
     output_text = _extract_pdf_text_sample(output_pdf)
+    meaningful_structure_elements = _meaningful_structure_element_count(structure_json)
+
+    if classification == "scanned":
+        ocr_metrics = _sample_visual_ink(input_pdf)
+        has_meaningful_ocr_text = len(output_text) >= SCANNED_TEXT_MIN_CHARS
+        has_meaningful_structure = meaningful_structure_elements > 0
+        sampled_pages = int(ocr_metrics.get("sampled_pages") or 0)
+        visually_blank = ocr_metrics.get("visually_blank")
+        status = "pass"
+        message = "Scanned-document OCR produced usable text or structure."
+
+        if sampled_pages == 0:
+            status = "skip"
+            message = "Skipped scanned OCR coverage check because page previews were unavailable."
+        elif visually_blank is True:
+            status = "skip"
+            message = "Sampled scanned pages appear visually blank; OCR coverage check skipped."
+        elif not has_meaningful_ocr_text and not has_meaningful_structure:
+            status = "fail"
+            message = (
+                "Scanned document appears to contain visible content, but OCR and structure extraction "
+                "did not produce usable text."
+            )
+            add_task(
+                "review:content_fidelity",
+                task_type="content_fidelity",
+                title="Verify OCR text coverage",
+                detail=(
+                    "The scanned PDF appears to contain visible page content, but OCR and structure extraction "
+                    "produced little or no usable text. Review the OCR result or rescan the source document."
+                ),
+                severity="high",
+                blocking=True,
+                metadata={
+                    "output_chars": len(output_text),
+                    "meaningful_structure_elements": meaningful_structure_elements,
+                    **ocr_metrics,
+                },
+            )
+        elif not has_meaningful_ocr_text:
+            status = "warning"
+            message = "Scanned document OCR produced limited extractable text; spot-check the result."
+            add_task(
+                "review:content_fidelity",
+                task_type="content_fidelity",
+                title="Spot-check OCR text coverage",
+                detail=(
+                    "The scanned PDF produced very little extractable text. Check whether the output text "
+                    "matches the visible content before distribution."
+                ),
+                severity="medium",
+                blocking=False,
+                metadata={
+                    "output_chars": len(output_text),
+                    "meaningful_structure_elements": meaningful_structure_elements,
+                    **ocr_metrics,
+                },
+            )
+
+        checks.append({
+            "check": "ocr_coverage",
+            "status": status,
+            "message": message,
+            "metrics": {
+                "output_chars": len(output_text),
+                "meaningful_structure_elements": meaningful_structure_elements,
+                **ocr_metrics,
+            },
+        })
+
     if len(source_text) >= TEXT_SAMPLE_MIN_CHARS and len(output_text) >= TEXT_SAMPLE_MIN_CHARS:
         similarity = SequenceMatcher(None, source_text, output_text).ratio()
         length_ratio = len(output_text) / max(len(source_text), 1)

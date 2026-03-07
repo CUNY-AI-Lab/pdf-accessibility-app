@@ -17,18 +17,15 @@ class OcrResult:
     message: str = ""
 
 
-async def run_ocr(
+def _build_ocrmypdf_args(
+    *,
     input_path: Path,
     output_path: Path,
-    language: str = "eng",
-    mode: str = "skip",
-) -> OcrResult:
-    """Run OCRmyPDF as a subprocess to add text layer to scanned PDFs.
-
-    OCRmyPDF is not thread-safe, so we run it as a separate process.
-    """
-    logger.info(f"Running OCR on {input_path.name} (language={language})")
-
+    language: str,
+    mode: str,
+    rotate_pages: bool,
+    deskew: bool,
+) -> list[str]:
     args = [
         sys.executable,
         "-m",
@@ -43,6 +40,10 @@ async def run_ocr(
         "--max-image-mpixels",
         "1000",
     ]
+    if rotate_pages:
+        args.append("--rotate-pages")
+    if deskew:
+        args.append("--deskew")
     if mode == "redo":
         args.append("--redo-ocr")
     elif mode == "force":
@@ -50,8 +51,33 @@ async def run_ocr(
     else:
         # Default behavior for the primary OCR step.
         args.append("--skip-text")
-
     args.extend([str(input_path), str(output_path)])
+    return args
+
+
+async def run_ocr(
+    input_path: Path,
+    output_path: Path,
+    language: str = "eng",
+    mode: str = "skip",
+    *,
+    rotate_pages: bool = True,
+    deskew: bool = True,
+) -> OcrResult:
+    """Run OCRmyPDF as a subprocess to add text layer to scanned PDFs.
+
+    OCRmyPDF is not thread-safe, so we run it as a separate process.
+    """
+    logger.info(f"Running OCR on {input_path.name} (language={language})")
+
+    args = _build_ocrmypdf_args(
+        input_path=input_path,
+        output_path=output_path,
+        language=language,
+        mode=mode,
+        rotate_pages=rotate_pages,
+        deskew=deskew,
+    )
 
     proc = await asyncio.create_subprocess_exec(
         *args,

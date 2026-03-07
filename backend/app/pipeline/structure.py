@@ -2,12 +2,22 @@
 
 import asyncio
 import logging
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+TOC_HEADING_TEXTS = {
+    "contents",
+    "table of contents",
+}
+TOC_TRAILING_PAGE_RE = re.compile(
+    r"(?:\.{2,}|\s{2,}|\t+)?\s*(?:\d+|[ivxlcdm]+)\s*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -142,10 +152,19 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
                 "bbox": bbox,
             })
 
-        elif label in ("text", "paragraph", "caption", "footnote", "reference"):
+        elif label in ("text", "paragraph", "caption", "reference"):
             if text.strip():
                 elements.append({
                     "type": "paragraph",
+                    "text": text,
+                    "page": page,
+                    "bbox": bbox,
+                })
+
+        elif label == "footnote":
+            if text.strip():
+                elements.append({
+                    "type": "note",
                     "text": text,
                     "page": page,
                     "bbox": bbox,
@@ -212,7 +231,218 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
                 "artifact_type": label,
             })
 
-    return elements
+    _mark_toc_sequences(elements)
+    return _expand_toc_item_tables(elements)
+
+
+def _mark_toc_sequences(elements: list[dict]) -> None:
+    """Convert obvious table-of-contents runs into TOC caption/item elements."""
+    toc_counter = 0
+    index = 0
+
+    while index < len(elements):
+        element = elements[index]
+        if element.get("type") != "heading":
+            index += 1
+            continue
+
+        heading_text = " ".join(str(element.get("text", "")).split()).strip().lower()
+        if heading_text not in TOC_HEADING_TEXTS:
+            index += 1
+            continue
+
+        entry_indexes: list[int] = []
+        cursor = index + 1
+        while cursor < len(elements):
+            candidate = elements[cursor]
+            candidate_type = candidate.get("type")
+            if candidate_type == "artifact":
+                cursor += 1
+                continue
+            if candidate_type in {"paragraph", "list_item", "heading"} and _looks_like_toc_entry(candidate.get("text", "")):
+                entry_indexes.append(cursor)
+                cursor += 1
+                continue
+            if candidate_type == "table" and _looks_like_toc_table(candidate):
+                entry_indexes.append(cursor)
+                cursor += 1
+                continue
+            break
+
+        if len(entry_indexes) >= 1:
+            toc_group_ref = f"toc-{toc_counter}"
+            toc_counter += 1
+            element["type"] = "toc_caption"
+            element["toc_group_ref"] = toc_group_ref
+            for toc_index in entry_indexes:
+                if elements[toc_index].get("type") == "table":
+                    elements[toc_index]["type"] = "toc_item_table"
+                else:
+                    elements[toc_index]["type"] = "toc_item"
+                elements[toc_index]["toc_group_ref"] = toc_group_ref
+
+        index = max(cursor, index + 1)
+
+
+def _expand_toc_item_tables(elements: list[dict]) -> list[dict]:
+    """Expand TOC tables into row-level toc_item elements.
+
+    Docling often emits a visible table of contents as one or more table blocks.
+    Treating each whole table as a single TOCI is too coarse for assistive
+    technology. We instead convert each logical row into its own toc_item while
+    keeping the group association created by TOC detection.
+    """
+    expanded: list[dict] = []
+    for element in elements:
+        if element.get("type") != "toc_item_table":
+            expanded.append(element)
+            continue
+
+        row_items = _toc_row_items_from_table(element)
+        if row_items:
+            expanded.extend(row_items)
+        else:
+            fallback = dict(element)
+            fallback["type"] = "toc_item"
+            fallback["text"] = _toc_table_text(element)
+            expanded.append(fallback)
+    return expanded
+
+
+def _toc_row_items_from_table(element: dict) -> list[dict]:
+    """Build row-level TOC entries from a table element."""
+    cells = element.get("cells") or []
+    if not isinstance(cells, list) or not cells:
+        return []
+
+    rows: dict[int, list[dict]] = {}
+    for cell in cells:
+        try:
+            row = int(cell.get("row", 0))
+        except Exception:
+            row = 0
+        rows.setdefault(row, []).append(cell)
+
+    if not rows:
+        return []
+
+    bbox = element.get("bbox")
+    min_row = min(rows)
+    max_row = max(rows)
+    row_span = max(max_row - min_row + 1, 1)
+    row_height = None
+    if isinstance(bbox, dict):
+        height = max(float(bbox.get("t", 0)) - float(bbox.get("b", 0)), 0.0)
+        if height > 0:
+            row_height = height / row_span
+
+    toc_items: list[dict] = []
+    for row_index in sorted(rows):
+        row_cells = sorted(
+            rows[row_index],
+            key=lambda cell: int(cell.get("col", 0) or 0),
+        )
+        texts = [" ".join(str(cell.get("text", "")).split()).strip() for cell in row_cells]
+        texts = [text for text in texts if text]
+        if not texts:
+            continue
+        row_text = " ".join(texts).strip()
+        if not _looks_like_toc_entry(row_text):
+            continue
+
+        row_bbox = None
+        if row_height and isinstance(bbox, dict):
+            row_offset = row_index - min_row
+            top = float(bbox.get("t", 0)) - (row_offset * row_height)
+            bottom = max(float(bbox.get("b", 0)), top - row_height)
+            row_bbox = {
+                "l": float(bbox.get("l", 0)),
+                "b": bottom,
+                "r": float(bbox.get("r", 0)),
+                "t": top,
+            }
+
+        toc_items.append({
+            "type": "toc_item",
+            "page": element.get("page"),
+            "bbox": row_bbox or bbox,
+            "text": row_text,
+            "toc_group_ref": element.get("toc_group_ref"),
+            "toc_row_index": row_index,
+            "toc_source": "table_row",
+        })
+
+    return toc_items
+
+
+def _toc_table_text(element: dict) -> str:
+    """Collapse a TOC table's visible rows into one fallback text string."""
+    cells = element.get("cells") or []
+    if not isinstance(cells, list) or not cells:
+        return ""
+
+    rows: dict[int, list[str]] = {}
+    for cell in cells:
+        try:
+            row = int(cell.get("row", 0))
+        except Exception:
+            row = 0
+        text = " ".join(str(cell.get("text", "")).split()).strip()
+        if text:
+            rows.setdefault(row, []).append(text)
+
+    parts: list[str] = []
+    for row_index in sorted(rows):
+        parts.append(" ".join(rows[row_index]))
+    return " ".join(parts).strip()
+
+
+def _looks_like_toc_entry(text: str) -> bool:
+    """Heuristic TOC entry detector: title-like text followed by a page marker."""
+    collapsed = " ".join(str(text or "").split()).strip()
+    if len(collapsed) < 4 or not re.search(r"[A-Za-z]", collapsed):
+        return False
+    match = TOC_TRAILING_PAGE_RE.search(collapsed)
+    if not match:
+        return False
+    prefix = collapsed[:match.start()].rstrip(" .\t")
+    if len(prefix.split()) < 1:
+        return False
+    return True
+
+
+def _looks_like_toc_table(element: dict) -> bool:
+    """Heuristic TOC table detector based on row-wise title/page patterns."""
+    cells = element.get("cells") or []
+    if not isinstance(cells, list) or len(cells) < 2:
+        return False
+
+    rows: dict[int, list[dict]] = {}
+    for cell in cells:
+        try:
+            row = int(cell.get("row", 0))
+        except Exception:
+            row = 0
+        rows.setdefault(row, []).append(cell)
+
+    if len(rows) < 2:
+        return False
+
+    matching_rows = 0
+    for row_cells in rows.values():
+        ordered = sorted(row_cells, key=lambda c: int(c.get("col", 0) or 0))
+        texts = [" ".join(str(c.get("text", "")).split()).strip() for c in ordered]
+        texts = [text for text in texts if text]
+        if len(texts) < 2:
+            continue
+        page_candidate = texts[-1]
+        title_candidate = " ".join(texts[:-1]).strip()
+        if not title_candidate or not re.search(r"[A-Za-z]", title_candidate):
+            continue
+        if re.fullmatch(r"(?:\d+(?:\.\d+)*)|(?:[ivxlcdm]+)", page_candidate, re.IGNORECASE):
+            matching_rows += 1
+
+    return matching_rows >= max(1, len(rows) // 2)
 
 
 def _get_caption_text(item: dict, doc_dict: dict) -> str | None:

@@ -35,7 +35,7 @@ from app.services.job_manager import JobManager
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 OUTPUT_ROOT = ROOT_DIR / "data" / "benchmarks"
-SCAN_ROOTS = [
+DEFAULT_SCAN_ROOTS = [
     Path("/Users/stephenzweibel/Downloads"),
     Path("/Users/stephenzweibel/Documents"),
     Path("/Users/stephenzweibel/Desktop"),
@@ -48,7 +48,7 @@ EXCLUDE_PARTS = {
     ".trash",
     "Library",
 }
-EXCLUDE_NAME_PATTERNS = (
+EXCLUDE_NAME_SUFFIXES = (
     "_tagged.pdf",
     "_fontfix_tagged.pdf",
     "_fontfix_ocred.pdf",
@@ -56,9 +56,10 @@ EXCLUDE_NAME_PATTERNS = (
     "_fontfix_repair_tounicode.pdf",
     ".gsfix.pdf",
     ".repaired.pdf",
-    "repaired_input.pdf",
-    "accessible_",
 )
+EXCLUDE_NAME_EXACT = {
+    "repaired_input.pdf",
+}
 FONT_LANE_EMBED = "embed_fonts"
 FONT_LANE_REPAIR_DICTS = "repair_font_dicts"
 FONT_LANE_REPAIR_TOUNICODE = "repair_tounicode"
@@ -116,6 +117,8 @@ class DocMetrics:
     elements_figures: int
     elements_tables: int
     elements_list_items: int
+    elements_toc_captions: int
+    elements_toc_items: int
     tags_total: int
     struct_elems_created: int
     headings_tagged: int
@@ -125,6 +128,10 @@ class DocMetrics:
     lists_tagged: int
     links_tagged: int
     bookmarks_added: int
+    toc_llm_assist_attempted: bool
+    toc_llm_assist_applied: bool
+    toc_llm_groups_considered: int
+    toc_llm_groups_applied: int
     heading_coverage: float
     figure_coverage: float
     table_coverage: float
@@ -138,15 +145,24 @@ def _should_skip(path: Path) -> bool:
         return True
 
     name = path.name.lower()
-    if any(pattern in name for pattern in EXCLUDE_NAME_PATTERNS):
+    if name.startswith("accessible_"):
+        return True
+    if name in EXCLUDE_NAME_EXACT:
+        return True
+    if any(name.endswith(pattern) for pattern in EXCLUDE_NAME_SUFFIXES):
         return True
 
     return False
 
 
-def discover_pdfs(exclude_wac: bool = False) -> list[Path]:
+def discover_pdfs(
+    *,
+    exclude_wac: bool = False,
+    scan_roots: list[Path] | None = None,
+) -> list[Path]:
+    roots = scan_roots if scan_roots is not None else list(DEFAULT_SCAN_ROOTS)
     found: dict[str, Path] = {}
-    for root in SCAN_ROOTS:
+    for root in roots:
         if not root.exists():
             continue
         for path in root.rglob("*.pdf"):
@@ -1139,6 +1155,8 @@ async def benchmark_one_workflow(
     elements_figures = 0
     elements_tables = 0
     elements_list_items = 0
+    elements_toc_captions = 0
+    elements_toc_items = 0
     tags_total = 0
     struct_elems_created = 0
     headings_tagged = 0
@@ -1148,6 +1166,10 @@ async def benchmark_one_workflow(
     lists_tagged = 0
     links_tagged = 0
     bookmarks_added = 0
+    toc_llm_assist_attempted = False
+    toc_llm_assist_applied = False
+    toc_llm_groups_considered = 0
+    toc_llm_groups_applied = 0
 
     job_id = str(uuid.uuid4())
 
@@ -1190,6 +1212,12 @@ async def benchmark_one_workflow(
                 elements_figures = sum(1 for e in elements if isinstance(e, dict) and e.get("type") == "figure")
                 elements_tables = sum(1 for e in elements if isinstance(e, dict) and e.get("type") == "table")
                 elements_list_items = sum(1 for e in elements if isinstance(e, dict) and e.get("type") == "list_item")
+                elements_toc_captions = sum(
+                    1 for e in elements if isinstance(e, dict) and e.get("type") == "toc_caption"
+                )
+                elements_toc_items = sum(
+                    1 for e in elements if isinstance(e, dict) and e.get("type") in {"toc_item", "toc_item_table"}
+                )
 
             steps_result = await db.execute(select(JobStep).where(JobStep.job_id == job_id))
             steps = {step.step_name: step for step in steps_result.scalars().all()}
@@ -1204,6 +1232,15 @@ async def benchmark_one_workflow(
             structure_secs = _step_duration_secs(structure_step)
             tagging_secs = _step_duration_secs(tagging_step)
             validation_secs = _step_duration_secs(validation_step)
+
+            structure_metrics = _parse_json(structure_step.result_json) if structure_step and structure_step.result_json else {}
+            if isinstance(structure_metrics, dict):
+                toc_assist = structure_metrics.get("toc_llm_assist", {})
+                if isinstance(toc_assist, dict):
+                    toc_llm_assist_attempted = bool(toc_assist.get("attempted", False))
+                    toc_llm_assist_applied = bool(toc_assist.get("applied", False))
+                    toc_llm_groups_considered = int(toc_assist.get("groups_considered", 0) or 0)
+                    toc_llm_groups_applied = int(toc_assist.get("groups_applied", 0) or 0)
 
             tagging_metrics = validation_json.get("tagging", {})
             if isinstance(tagging_metrics, dict):
@@ -1342,6 +1379,8 @@ async def benchmark_one_workflow(
         elements_figures=elements_figures,
         elements_tables=elements_tables,
         elements_list_items=elements_list_items,
+        elements_toc_captions=elements_toc_captions,
+        elements_toc_items=elements_toc_items,
         tags_total=tags_total,
         struct_elems_created=struct_elems_created,
         headings_tagged=headings_tagged,
@@ -1351,6 +1390,10 @@ async def benchmark_one_workflow(
         lists_tagged=lists_tagged,
         links_tagged=links_tagged,
         bookmarks_added=bookmarks_added,
+        toc_llm_assist_attempted=toc_llm_assist_attempted,
+        toc_llm_assist_applied=toc_llm_assist_applied,
+        toc_llm_groups_considered=toc_llm_groups_considered,
+        toc_llm_groups_applied=toc_llm_groups_applied,
         heading_coverage=round(_safe_ratio(headings_tagged, elements_headings), 3),
         figure_coverage=round(_safe_ratio(figures_tagged, elements_figures), 3),
         table_coverage=round(_safe_ratio(tables_tagged, elements_tables), 3),
@@ -1683,6 +1726,8 @@ def write_outputs(output_dir: Path, rows: list[DocMetrics], mode: str) -> None:
     non_compliant = [r for r in completed if not r.compliant]
     font_attempted = [r for r in completed if r.font_lane_attempted]
     font_applied = [r for r in completed if r.font_lane_applied]
+    toc_assist_attempted = [r for r in completed if r.toc_llm_assist_attempted]
+    toc_assist_applied = [r for r in completed if r.toc_llm_assist_applied]
     font_improved = [
         r
         for r in completed
@@ -1735,12 +1780,26 @@ def write_outputs(output_dir: Path, rows: list[DocMetrics], mode: str) -> None:
             f"- Font lane attempted/applied: {len(font_attempted)} / {len(font_applied)} "
             f"(improved {len(font_improved)})\n"
         )
+        f.write(
+            f"- TOC LLM assist attempted/applied: {len(toc_assist_attempted)} / {len(toc_assist_applied)}\n"
+        )
         f.write("\n## Top Link Coverage Gaps\n\n")
         if link_gaps:
             for row in link_gaps[:10]:
                 f.write(
                     f"- {Path(row.source_path).name}: "
                     f"{row.links_tagged}/{row.link_annots_in_source} ({row.link_coverage:.3f})\n"
+                )
+        else:
+            f.write("- None\n")
+        f.write("\n## TOC LLM Assist\n\n")
+        if toc_assist_attempted:
+            for row in toc_assist_attempted[:10]:
+                f.write(
+                    f"- {Path(row.source_path).name}: "
+                    f"applied={row.toc_llm_assist_applied}, "
+                    f"groups={row.toc_llm_groups_applied}/{row.toc_llm_groups_considered}, "
+                    f"toc_elements={row.elements_toc_captions + row.elements_toc_items}\n"
                 )
         else:
             f.write("- None\n")
@@ -1801,14 +1860,36 @@ async def main() -> None:
         action="store_true",
         help="Skip backend/test_wac.pdf from discovery.",
     )
+    parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help=(
+            "Additional PDF discovery root. May be passed multiple times. "
+            "Use with --no-default-roots for a focused corpus."
+        ),
+    )
+    parser.add_argument(
+        "--no-default-roots",
+        action="store_true",
+        help="Do not scan the default Desktop/Documents/Downloads roots.",
+    )
     args = parser.parse_args()
+
+    scan_roots: list[Path] = []
+    if not args.no_default_roots:
+        scan_roots.extend(DEFAULT_SCAN_ROOTS)
+    scan_roots.extend(Path(root).expanduser().resolve() for root in args.root)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = OUTPUT_ROOT / f"corpus_{ts}"
     run_dir = out_dir / "tagged_outputs"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    pdfs = discover_pdfs(exclude_wac=args.exclude_wac)
+    pdfs = discover_pdfs(
+        exclude_wac=args.exclude_wac,
+        scan_roots=scan_roots,
+    )
     print(f"Discovered {len(pdfs)} PDFs")
     if not pdfs:
         return

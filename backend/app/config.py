@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     llm_strict_validation: bool = True
     auto_approve_generated_alt_text: bool = True
     auto_apply_llm_font_map: bool = True
+    assist_toc_with_llm: bool = True
 
     # veraPDF
     verapdf_path: str = "verapdf"
@@ -42,6 +43,8 @@ class Settings(BaseSettings):
 
     # OCR
     ocr_language: str = "eng"
+    ocr_rotate_pages: bool = True
+    ocr_deskew: bool = True
     font_remediation_enable_force_ocr: bool = False
     font_remediation_allow_ocr_on_digital: bool = False
     font_remediation_ocr_max_pages: int = 40

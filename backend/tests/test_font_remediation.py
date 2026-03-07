@@ -432,6 +432,85 @@ def test_embed_system_fonts_creates_descriptor_for_standard_type1(tmp_path, monk
         assert int(font_stream["/Length3"]) == 0
 
 
+def test_embed_system_fonts_preserves_existing_type1_widths(tmp_path, monkeypatch):
+    input_pdf = tmp_path / "input.pdf"
+    output_pdf = tmp_path / "output.pdf"
+
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page()
+    page_obj = page.obj
+    descriptor = pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/FontDescriptor"),
+        "/FontName": pikepdf.Name("/Helvetica"),
+        "/Flags": 32,
+        "/ItalicAngle": 0,
+        "/Ascent": 718,
+        "/Descent": -207,
+        "/CapHeight": 718,
+        "/StemV": 80,
+        "/FontBBox": pikepdf.Array([-166, -225, 1000, 931]),
+    })
+    font_dict = pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Font"),
+        "/Subtype": pikepdf.Name("/Type1"),
+        "/BaseFont": pikepdf.Name("/Helvetica"),
+        "/Encoding": pikepdf.Dictionary({
+            "/Type": pikepdf.Name("/Encoding"),
+            "/BaseEncoding": pikepdf.Name("/WinAnsiEncoding"),
+            "/Differences": pikepdf.Array([1, pikepdf.Name("/A"), pikepdf.Name("/B"), pikepdf.Name("/C")]),
+        }),
+        "/FirstChar": 0,
+        "/LastChar": 3,
+        "/Widths": pikepdf.Array([278, 667, 722, 611]),
+        "/FontDescriptor": descriptor,
+    })
+    page_obj["/Resources"] = pikepdf.Dictionary({
+        "/Font": pikepdf.Dictionary({
+            "/F1": font_dict,
+        })
+    })
+    pdf.save(str(input_pdf))
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_ghostscript_type1_descriptor",
+        lambda font_name: {
+            "Flags": 32,
+            "ItalicAngle": 0,
+            "Ascent": 718,
+            "Descent": -207,
+            "CapHeight": 718,
+            "StemV": 80,
+            "FontBBox": [-166, -225, 1000, 931],
+            "FirstChar": 0,
+            "LastChar": 255,
+            "Widths": [278] + [0] * 255,
+            "MissingWidth": 278,
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_local_font_program",
+        lambda font_dict, font_name, descendant_subtype=None: (
+            b"%!PS-AdobeFont-1.0",
+            "NimbusSans-Regular",
+            "/FontFile",
+            {"Length1": 10, "Length2": 20, "Length3": 0},
+        ),
+    )
+
+    ok, _, _ = orchestrator._embed_system_fonts_sync(input_pdf, output_pdf)
+
+    assert ok is True
+
+    with pikepdf.open(str(output_pdf)) as repaired_pdf:
+        repaired_font = repaired_pdf.pages[0].obj["/Resources"]["/Font"]["/F1"]
+        assert [int(value) for value in repaired_font["/Widths"]] == [278, 667, 722, 611]
+        descriptor = repaired_font["/FontDescriptor"]
+        assert int(descriptor["/MissingWidth"]) == 278
+        assert pikepdf.Name("/FontFile") in descriptor
+
+
 def test_simple_font_zero_byte_repair_candidate_only_allows_code_zero_residue():
     font_dict = pikepdf.Dictionary({
         "/Subtype": pikepdf.Name("/Type1"),

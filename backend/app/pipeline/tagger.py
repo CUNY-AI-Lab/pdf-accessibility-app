@@ -12,6 +12,7 @@ non-sequential content stream ordering.
 import asyncio
 import logging
 import math
+import mimetypes
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
 TEXT_ELEMENT_TYPES = frozenset({
-    "heading", "paragraph", "list_item", "code", "artifact", "table", "formula",
+    "heading", "paragraph", "list_item", "code", "artifact", "table", "formula", "note", "toc_caption", "toc_item", "toc_item_table",
 })
 MATCH_ACCEPT_THRESHOLD = 0.05
 LARGE_COST = 1e6
@@ -794,6 +795,8 @@ class StructTreeBuilder:
         self._headings: list[dict] = []
         self._struct_elems_created = 0
         self._list_cache: dict[str, tuple[pikepdf.Object, list[int]]] = {}
+        self._note_counter = 0
+        self._toc_cache: dict[str, pikepdf.Object] = {}
 
     def setup(self):
         """Create StructTreeRoot and Document element."""
@@ -891,6 +894,87 @@ class StructTreeBuilder:
 
     def add_code(self, page_index: int, page_ref: pikepdf.Object) -> int:
         return self._add_struct_elem("Code", page_index, page_ref)
+
+    def add_formula(
+        self,
+        page_index: int,
+        page_ref: pikepdf.Object,
+        alt_text: str | None = None,
+    ) -> int:
+        return self._add_struct_elem("Formula", page_index, page_ref, alt_text=alt_text)
+
+    def add_note(self, page_index: int, page_ref: pikepdf.Object) -> int:
+        mcid = self._alloc_mcid(page_index)
+        self._note_counter += 1
+        note_elem = self.pdf.make_indirect(pikepdf.Dictionary({
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Note"),
+            "/P": self.doc_elem,
+            "/ID": pikepdf.String(f"note-{self._note_counter}"),
+            "/K": self._make_mcr(mcid, page_ref),
+        }))
+        self._register_mcid(page_index, mcid, note_elem)
+        self._append_child(self.doc_elem, note_elem)
+        self._struct_elems_created += 1
+        return mcid
+
+    def _get_or_create_toc(self, toc_group_ref: str | None) -> pikepdf.Object:
+        if toc_group_ref and toc_group_ref in self._toc_cache:
+            return self._toc_cache[toc_group_ref]
+
+        toc_elem = self.pdf.make_indirect(pikepdf.Dictionary({
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/TOC"),
+            "/P": self.doc_elem,
+            "/K": pikepdf.Array([]),
+        }))
+        self._append_child(self.doc_elem, toc_elem)
+        self._struct_elems_created += 1
+        if toc_group_ref:
+            self._toc_cache[toc_group_ref] = toc_elem
+        return toc_elem
+
+    def add_toc_caption(
+        self,
+        page_index: int,
+        page_ref: pikepdf.Object,
+        toc_group_ref: str | None,
+    ) -> int:
+        toc_elem = self._get_or_create_toc(toc_group_ref)
+        mcid = self._alloc_mcid(page_index)
+        caption_elem = self.pdf.make_indirect(pikepdf.Dictionary({
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Caption"),
+            "/P": toc_elem,
+            "/K": self._make_mcr(mcid, page_ref),
+        }))
+        toc_k = toc_elem.get("/K")
+        if isinstance(toc_k, pikepdf.Array):
+            toc_elem["/K"] = pikepdf.Array([caption_elem, *list(toc_k)])
+        else:
+            toc_elem["/K"] = pikepdf.Array([caption_elem])
+        self._register_mcid(page_index, mcid, caption_elem)
+        self._struct_elems_created += 1
+        return mcid
+
+    def add_toc_item(
+        self,
+        page_index: int,
+        page_ref: pikepdf.Object,
+        toc_group_ref: str | None,
+    ) -> int:
+        toc_elem = self._get_or_create_toc(toc_group_ref)
+        mcid = self._alloc_mcid(page_index)
+        toci_elem = self.pdf.make_indirect(pikepdf.Dictionary({
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/TOCI"),
+            "/P": toc_elem,
+            "/K": self._make_mcr(mcid, page_ref),
+        }))
+        self._append_child(toc_elem, toci_elem)
+        self._register_mcid(page_index, mcid, toci_elem)
+        self._struct_elems_created += 1
+        return mcid
 
     def add_table(self, page_index: int, page_ref: pikepdf.Object, table_data: dict) -> int:
         """Add a Table StructElem with rows and cells."""
@@ -1290,8 +1374,23 @@ def _emit_tagged_region(
     elif elem_type == "code":
         mcid = builder.add_code(page_index, page_ref)
         tag = "Code"
+    elif elem_type == "formula":
+        alt = elem.get("text")
+        if isinstance(alt, str):
+            alt = alt.strip()
+        mcid = builder.add_formula(page_index, page_ref, alt_text=alt or None)
+        tag = "Formula"
+    elif elem_type == "note":
+        mcid = builder.add_note(page_index, page_ref)
+        tag = "Note"
+    elif elem_type == "toc_caption":
+        mcid = builder.add_toc_caption(page_index, page_ref, elem.get("toc_group_ref"))
+        tag = "Caption"
+    elif elem_type in {"toc_item", "toc_item_table"}:
+        mcid = builder.add_toc_item(page_index, page_ref, elem.get("toc_group_ref"))
+        tag = "TOCI"
     else:
-        # paragraph, formula, or unknown → /P
+        # paragraph or unknown → /P
         mcid = builder.add_paragraph(page_index, page_ref)
         tag = "P"
 
@@ -1375,6 +1474,356 @@ def _set_pdfua_identification(pdf: pikepdf.Pdf):
             meta["{http://www.aiim.org/pdfua/ns/id/}part"] = "1"
     except Exception as e:
         logger.warning(f"Could not set PDF/UA identification metadata: {e}")
+
+
+def _normalize_optional_content_configs(pdf: pikepdf.Pdf) -> int:
+    """Normalize optional content configs to satisfy PDF/UA syntax requirements."""
+    ocprops = pdf.Root.get("/OCProperties")
+    if not isinstance(ocprops, pikepdf.Dictionary):
+        return 0
+
+    changes = 0
+
+    def _normalize_config(config, default_name: str) -> None:
+        nonlocal changes
+        if not isinstance(config, pikepdf.Dictionary):
+            return
+
+        try:
+            name = str(config.get("/Name", "")).strip()
+        except Exception:
+            name = ""
+        if not name:
+            config["/Name"] = pikepdf.String(default_name)
+            changes += 1
+        if "/AS" in config:
+            del config["/AS"]
+            changes += 1
+
+    _normalize_config(ocprops.get("/D"), "Default")
+
+    configs = ocprops.get("/Configs")
+    if isinstance(configs, pikepdf.Array):
+        for idx, config in enumerate(configs):
+            _normalize_config(config, f"Optional Content Config {idx + 1}")
+
+    return changes
+
+
+def _remove_dynamic_xfa(pdf: pikepdf.Pdf) -> bool:
+    """Strip dynamic XFA packets from AcroForm dictionaries."""
+    acroform = pdf.Root.get("/AcroForm")
+    if not isinstance(acroform, pikepdf.Dictionary):
+        return False
+    if "/XFA" not in acroform:
+        return False
+    del acroform["/XFA"]
+    return True
+
+
+def _normalize_embedded_file_specs(pdf: pikepdf.Pdf) -> int:
+    """Ensure embedded file specs carry non-empty F/UF filename keys."""
+    names = pdf.Root.get("/Names")
+    if not isinstance(names, pikepdf.Dictionary):
+        return 0
+
+    embedded_files = names.get("/EmbeddedFiles")
+    if not isinstance(embedded_files, pikepdf.Dictionary):
+        return 0
+
+    changes = 0
+
+    def _string_or_empty(value) -> str:
+        if value is None:
+            return ""
+        try:
+            text = str(value).strip()
+        except Exception:
+            return ""
+        return "" if text == "None" else text
+
+    def _walk_name_tree(node) -> list[tuple[str, pikepdf.Object]]:
+        results: list[tuple[str, pikepdf.Object]] = []
+        if not isinstance(node, pikepdf.Dictionary):
+            return results
+        kids = node.get("/Kids")
+        if isinstance(kids, pikepdf.Array):
+            for kid in kids:
+                results.extend(_walk_name_tree(kid))
+        names_array = node.get("/Names")
+        if isinstance(names_array, pikepdf.Array):
+            for idx in range(0, len(names_array) - 1, 2):
+                results.append((str(names_array[idx]), names_array[idx + 1]))
+        return results
+
+    for entry_name, file_spec in _walk_name_tree(embedded_files):
+        if not isinstance(file_spec, pikepdf.Dictionary):
+            continue
+        ef = file_spec.get("/EF")
+        if not isinstance(ef, pikepdf.Dictionary) or len(ef) == 0:
+            continue
+
+        candidate = ""
+        for value in (
+            file_spec.get("/UF"),
+            file_spec.get("/F"),
+            entry_name,
+            file_spec.get("/Desc"),
+            "attachment",
+        ):
+            candidate = _string_or_empty(value)
+            if candidate:
+                break
+        if not candidate:
+            candidate = "attachment"
+
+        if not _string_or_empty(file_spec.get("/F")):
+            file_spec["/F"] = pikepdf.String(candidate)
+            changes += 1
+        if not _string_or_empty(file_spec.get("/UF")):
+            file_spec["/UF"] = pikepdf.String(candidate)
+            changes += 1
+
+    return changes
+
+
+def _normalize_type1_font_charsets(pdf: pikepdf.Pdf) -> int:
+    """Remove stale CharSet entries from embedded Type1 font descriptors.
+
+    CharSet is optional. When present but incomplete it triggers PDF/UA font
+    failures, especially on subset fonts carried through OCR or producer
+    pipelines. Removing an invalid CharSet is safer than keeping incorrect
+    glyph metadata.
+    """
+    seen_resources: set[tuple[int, int]] = set()
+    seen_fonts: set[tuple[int, int]] = set()
+    seen_appearances: set[tuple[int, int]] = set()
+    changes = 0
+
+    def _is_mapping_like(obj) -> bool:
+        return isinstance(obj, pikepdf.Dictionary) or (hasattr(obj, "keys") and hasattr(obj, "get"))
+
+    def _obj_key(obj) -> tuple[int, int] | None:
+        try:
+            obj_num, gen_num = obj.objgen
+            if isinstance(obj_num, int) and isinstance(gen_num, int) and obj_num > 0:
+                return obj_num, gen_num
+        except Exception:
+            return None
+        return None
+
+    def _resolve_dictionary(obj):
+        if obj is None:
+            return None
+        try:
+            if isinstance(obj, pikepdf.Dictionary):
+                return obj
+            if hasattr(obj, "keys") and hasattr(obj, "get"):
+                return obj
+            return obj.get_object()
+        except Exception:
+            return None
+
+    def _has_embedded_font(descriptor) -> bool:
+        if not isinstance(descriptor, pikepdf.Dictionary):
+            return False
+        return any(
+            key in descriptor
+            for key in (
+                pikepdf.Name("/FontFile"),
+                pikepdf.Name("/FontFile2"),
+                pikepdf.Name("/FontFile3"),
+            )
+        )
+
+    def _walk_resources(resources) -> None:
+        nonlocal changes
+        resources = _resolve_dictionary(resources)
+        if not _is_mapping_like(resources):
+            return
+        resources_key = _obj_key(resources)
+        if resources_key and resources_key in seen_resources:
+            return
+        if resources_key:
+            seen_resources.add(resources_key)
+
+        fonts = _resolve_dictionary(resources.get("/Font"))
+        if _is_mapping_like(fonts):
+            for _, font_obj in fonts.items():
+                font_dict = _resolve_dictionary(font_obj)
+                if not _is_mapping_like(font_dict):
+                    continue
+                font_key = _obj_key(font_dict)
+                if font_key and font_key in seen_fonts:
+                    continue
+                if font_key:
+                    seen_fonts.add(font_key)
+
+                subtype = font_dict.get("/Subtype")
+                if subtype not in (pikepdf.Name("/Type1"), pikepdf.Name("/MMType1")):
+                    continue
+                descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
+                if not _has_embedded_font(descriptor):
+                    continue
+                if isinstance(descriptor, pikepdf.Dictionary) and pikepdf.Name("/CharSet") in descriptor:
+                    del descriptor[pikepdf.Name("/CharSet")]
+                    changes += 1
+
+        xobjects = _resolve_dictionary(resources.get("/XObject"))
+        if not _is_mapping_like(xobjects):
+            return
+        for _, xobject in xobjects.items():
+            xobject_dict = _resolve_dictionary(xobject)
+            if not _is_mapping_like(xobject_dict):
+                continue
+            if xobject_dict.get("/Subtype") != pikepdf.Name("/Form"):
+                continue
+            _walk_resources(xobject_dict.get("/Resources"))
+
+    def _walk_appearance_object(obj) -> None:
+        appearance_obj = _resolve_dictionary(obj)
+        if not _is_mapping_like(appearance_obj):
+            return
+        appearance_key = _obj_key(appearance_obj)
+        if appearance_key and appearance_key in seen_appearances:
+            return
+        if appearance_key:
+            seen_appearances.add(appearance_key)
+
+        _walk_resources(appearance_obj.get("/Resources"))
+        for key in ("/N", "/R", "/D"):
+            child = appearance_obj.get(key)
+            if child is not None:
+                _walk_appearance_object(child)
+
+    for page in pdf.pages:
+        _walk_resources(page.get("/Resources"))
+        annots = page.get("/Annots")
+        if isinstance(annots, pikepdf.Array):
+            for annot in annots:
+                ap = _resolve_dictionary(annot.get("/AP")) if hasattr(annot, "get") else None
+                if isinstance(ap, pikepdf.Dictionary):
+                    for key in ("/N", "/R", "/D"):
+                        child = ap.get(key)
+                        if child is not None:
+                            _walk_appearance_object(child)
+
+    acroform = _resolve_dictionary(pdf.Root.get("/AcroForm"))
+    if _is_mapping_like(acroform):
+        _walk_resources(acroform.get("/DR"))
+
+    return changes
+
+
+def _normalize_media_clip_data_dicts(pdf: pikepdf.Pdf) -> int:
+    """Backfill syntax-critical CT/Alt entries on media clip data dictionaries."""
+    changes = 0
+    seen: set[tuple[int, int]] = set()
+
+    def _string_or_empty(value) -> str:
+        if value is None:
+            return ""
+        try:
+            text = str(value).strip()
+        except Exception:
+            return ""
+        if text == "None":
+            return ""
+        if text.startswith("/"):
+            text = text[1:]
+        return re.sub(
+            r"#([0-9A-Fa-f]{2})",
+            lambda match: chr(int(match.group(1), 16)),
+            text,
+        )
+
+    def _is_mapping(obj) -> bool:
+        return isinstance(obj, (pikepdf.Dictionary, pikepdf.Stream))
+
+    def _derive_media_clip_label(media_clip) -> str:
+        label = _string_or_empty(media_clip.get("/N"))
+        if label:
+            return label
+        data = media_clip.get("/D")
+        if _is_mapping(data):
+            for key in ("/UF", "/F", "/Desc"):
+                label = _string_or_empty(data.get(key))
+                if label:
+                    return label
+        return "Embedded media"
+
+    def _derive_media_clip_type(media_clip) -> str | None:
+        data = media_clip.get("/D")
+        if not _is_mapping(data):
+            return "application/octet-stream"
+        try:
+            if data.get("/Subtype") == pikepdf.Name("/Form"):
+                return None
+        except Exception:
+            pass
+
+        subtype = _string_or_empty(data.get("/Subtype"))
+        if "/" in subtype:
+            return subtype
+
+        for key in ("/UF", "/F", "/Desc"):
+            guess = _string_or_empty(data.get(key))
+            if not guess:
+                continue
+            guessed_type, _ = mimetypes.guess_type(guess)
+            if guessed_type:
+                return guessed_type
+
+        ef = data.get("/EF")
+        if _is_mapping(ef):
+            for key in ("/UF", "/F"):
+                embedded_stream = ef.get(key)
+                if not _is_mapping(embedded_stream):
+                    continue
+                stream_subtype = _string_or_empty(embedded_stream.get("/Subtype"))
+                if "/" in stream_subtype:
+                    return stream_subtype
+
+        return "application/octet-stream"
+
+    def _walk(obj) -> None:
+        nonlocal changes
+        if isinstance(obj, pikepdf.Array):
+            for item in obj:
+                _walk(item)
+            return
+        if not _is_mapping(obj):
+            return
+
+        objgen = getattr(obj, "objgen", None)
+        if objgen and objgen != (0, 0):
+            if objgen in seen:
+                return
+            seen.add(objgen)
+
+        try:
+            is_media_clip_data = obj.get("/S") == pikepdf.Name("/MCD")
+        except Exception:
+            is_media_clip_data = False
+
+        if is_media_clip_data:
+            ct_value = _derive_media_clip_type(obj)
+            if ct_value and not _string_or_empty(obj.get("/CT")):
+                obj["/CT"] = pikepdf.String(ct_value)
+                changes += 1
+            alt = obj.get("/Alt")
+            if not isinstance(alt, pikepdf.Array) or len(alt) < 2:
+                obj["/Alt"] = pikepdf.Array([
+                    pikepdf.String(""),
+                    pikepdf.String(_derive_media_clip_label(obj)),
+                ])
+                changes += 1
+
+        for _, value in obj.items():
+            _walk(value)
+
+    _walk(pdf.Root)
+    return changes
 
 
 def _add_bookmarks(pdf: pikepdf.Pdf, headings: list[dict]):
@@ -1501,6 +1950,7 @@ def _tag_generic_annotations(
             subtype = annotation.get("/Subtype")
             if subtype in (
                 pikepdf.Name("/Link"),
+                pikepdf.Name("/TrapNet"),
                 pikepdf.Name("/Widget"),
                 pikepdf.Name("/PrinterMark"),
             ):
@@ -1521,8 +1971,45 @@ def _tag_generic_annotations(
     return tagged
 
 
+def _prune_incidental_annotations(page: pikepdf.Page) -> int:
+    """Remove annotation subtypes that PDF/UA does not permit as accessible content."""
+    annots = page.get("/Annots")
+    if not isinstance(annots, pikepdf.Array) or len(annots) == 0:
+        return 0
+
+    filtered = pikepdf.Array()
+    removed = 0
+    incidental_subtypes = {
+        pikepdf.Name("/TrapNet"),
+        pikepdf.Name("/PrinterMark"),
+    }
+
+    for annotation in annots:
+        try:
+            if annotation.get("/Subtype") in incidental_subtypes:
+                removed += 1
+                continue
+        except Exception:
+            pass
+        filtered.append(annotation)
+
+    if removed == 0:
+        return 0
+
+    if len(filtered) == 0:
+        try:
+            del page["/Annots"]
+        except Exception:
+            page["/Annots"] = pikepdf.Array()
+    else:
+        page["/Annots"] = filtered
+
+    return removed
+
+
 def _ensure_annotation_baseline(page: pikepdf.Page):
     """Apply baseline PDF/UA annotation requirements on a page."""
+    _prune_incidental_annotations(page)
     annots = page.get("/Annots")
     if not isinstance(annots, pikepdf.Array) or len(annots) == 0:
         return
@@ -1574,9 +2061,13 @@ async def tag_pdf(
         with pikepdf.open(str(input_path)) as pdf:
             # 1. Mark PDF as tagged
             if "/MarkInfo" not in pdf.Root:
-                pdf.Root["/MarkInfo"] = pikepdf.Dictionary({"/Marked": True})
+                pdf.Root["/MarkInfo"] = pikepdf.Dictionary({
+                    "/Marked": True,
+                    "/Suspects": False,
+                })
             else:
                 pdf.Root["/MarkInfo"]["/Marked"] = True
+                pdf.Root["/MarkInfo"]["/Suspects"] = False
             tags_added += 1
 
             # 2. Set document language
@@ -1588,6 +2079,11 @@ async def tag_pdf(
             title = _set_document_title(pdf, structure_json, original_filename)
             title_set = bool(title)
             _set_pdfua_identification(pdf)
+            _normalize_optional_content_configs(pdf)
+            _remove_dynamic_xfa(pdf)
+            _normalize_embedded_file_specs(pdf)
+            _normalize_type1_font_charsets(pdf)
+            _normalize_media_clip_data_dicts(pdf)
 
             # 4. Build structure tree
             builder = StructTreeBuilder(pdf)

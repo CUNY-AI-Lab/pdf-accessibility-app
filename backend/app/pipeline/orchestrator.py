@@ -31,6 +31,7 @@ from app.services.review_suggestions import (
     generate_review_suggestion,
     select_auto_font_map_override,
 )
+from app.services.toc_suggestions import enhance_toc_structure_with_llm
 
 logger = logging.getLogger(__name__)
 
@@ -3250,6 +3251,21 @@ def _embed_system_fonts_sync(
         if not descriptor_data:
             return
 
+        existing_widths = font_dict.get("/Widths")
+        existing_first_char = font_dict.get("/FirstChar")
+        existing_last_char = font_dict.get("/LastChar")
+        if (
+            isinstance(existing_widths, pikepdf.Array)
+            and len(existing_widths) > 0
+            and existing_first_char is not None
+            and existing_last_char is not None
+        ):
+            if isinstance(descriptor, pikepdf.Dictionary) and pikepdf.Name("/MissingWidth") not in descriptor:
+                descriptor[pikepdf.Name("/MissingWidth")] = int(
+                    descriptor_data.get("MissingWidth", 0) or 0
+                )
+            return
+
         first_char = int(descriptor_data.get("FirstChar", 0) or 0)
         last_char = int(descriptor_data.get("LastChar", 255) or 255)
         widths = descriptor_data.get("Widths")
@@ -3586,6 +3602,8 @@ async def _attempt_font_lane(
             output_path=ocr_output,
             language=settings.ocr_language,
             mode=mode,
+            rotate_pages=settings.ocr_rotate_pages,
+            deskew=settings.ocr_deskew,
         )
         preprocess_message = ocr_result.message
         preprocess_skipped = ocr_result.skipped
@@ -3728,7 +3746,13 @@ async def run_pipeline(
                 job_manager.emit_progress(job_id, step="ocr", status="running")
 
                 ocr_output = job_dir / "ocred.pdf"
-                ocr_result = await run_ocr(input_path, ocr_output, settings.ocr_language)
+                ocr_result = await run_ocr(
+                    input_path,
+                    ocr_output,
+                    settings.ocr_language,
+                    rotate_pages=settings.ocr_rotate_pages,
+                    deskew=settings.ocr_deskew,
+                )
 
                 if ocr_result.success:
                     working_pdf = ocr_result.output_path
@@ -3758,16 +3782,63 @@ async def run_pipeline(
             if structure.processed_pdf_path:
                 working_pdf = structure.processed_pdf_path
 
+            toc_llm_assist = {
+                "attempted": False,
+                "applied": False,
+                "reason": "disabled",
+                "groups_considered": 0,
+                "groups_applied": 0,
+            }
+            if settings.assist_toc_with_llm:
+                llm_client = LlmClient(
+                    base_url=settings.llm_base_url,
+                    api_key=settings.llm_api_key,
+                    model=settings.llm_model,
+                    timeout=settings.llm_timeout,
+                )
+                try:
+                    structure.document_json, toc_llm_assist = await enhance_toc_structure_with_llm(
+                        pdf_path=working_pdf,
+                        structure_json=structure.document_json,
+                        original_filename=job.original_filename or input_path.name,
+                        llm_client=llm_client,
+                    )
+                except Exception as exc:
+                    logger.warning(f"TOC LLM assist failed for {job.original_filename}: {exc}")
+                    toc_llm_assist = {
+                        "attempted": True,
+                        "applied": False,
+                        "reason": str(exc),
+                        "groups_considered": 0,
+                        "groups_applied": 0,
+                    }
+                finally:
+                    await llm_client.close()
+
+            elements = structure.document_json.get("elements", [])
+            headings_count = sum(1 for el in elements if el.get("type") == "heading")
+            tables_count = sum(1 for el in elements if el.get("type") == "table")
+            toc_caption_count = sum(1 for el in elements if el.get("type") == "toc_caption")
+            toc_item_count = sum(1 for el in elements if el.get("type") in {"toc_item", "toc_item_table"})
+
             job.structure_json = json.dumps(structure.document_json)
             await _update_step(db, job_id, "structure", "complete", result={
                 "page_count": structure.page_count,
-                "headings": structure.headings_count,
-                "tables": structure.tables_count,
+                "headings": headings_count,
+                "tables": tables_count,
                 "figures": structure.figures_count,
+                "toc_captions": toc_caption_count,
+                "toc_items": toc_item_count,
+                "toc_llm_assist": toc_llm_assist,
             })
             job_manager.emit_progress(
                 job_id, step="structure", status="complete",
-                result={"figures_found": structure.figures_count},
+                result={
+                    "figures_found": structure.figures_count,
+                    "toc_captions": toc_caption_count,
+                    "toc_items": toc_item_count,
+                    "toc_llm_assist_applied": bool(toc_llm_assist.get("applied", False)),
+                },
             )
 
             # ── Step 4: Alt Text Generation ──
