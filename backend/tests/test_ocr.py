@@ -33,3 +33,18 @@ def test_build_ocrmypdf_args_respects_mode_and_optional_flags():
     assert "--deskew" not in args
     assert "--redo-ocr" in args
     assert "--skip-text" not in args
+
+
+def test_build_ocrmypdf_args_omits_deskew_in_redo_mode():
+    args = _build_ocrmypdf_args(
+        input_path=Path("input.pdf"),
+        output_path=Path("output.pdf"),
+        language="eng",
+        mode="redo",
+        rotate_pages=True,
+        deskew=True,
+    )
+
+    assert "--rotate-pages" in args
+    assert "--redo-ocr" in args
+    assert "--deskew" not in args

@@ -558,6 +558,7 @@ def _inspect_pdf_features(pdf_path: Path) -> dict[str, int | bool]:
         "has_forms": False,
         "fonts_total": 0,
         "unembedded_fonts": 0,
+        "ocr_suspect_fonts": 0,
     }
     try:
         import pikepdf
@@ -624,17 +625,31 @@ def _inspect_pdf_features(pdf_path: Path) -> dict[str, int | bool]:
                     features["fonts_total"] = int(features["fonts_total"]) + 1
                     subtype = font_dict.get("/Subtype")
                     descriptor = None
+                    base_font_name = str(font_dict.get("/BaseFont") or "")
                     if subtype == pikepdf.Name("/Type0"):
                         descendants = font_dict.get("/DescendantFonts")
                         if isinstance(descendants, pikepdf.Array) and descendants:
                             cid_font = _resolve_dictionary(descendants[0])
                             if isinstance(cid_font, pikepdf.Dictionary):
                                 descriptor = _resolve_dictionary(cid_font.get("/FontDescriptor"))
+                                base_font_name = str(
+                                    cid_font.get("/BaseFont")
+                                    or font_dict.get("/BaseFont")
+                                    or ""
+                                )
                     else:
                         descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
+                        if isinstance(descriptor, pikepdf.Dictionary):
+                            base_font_name = str(
+                                font_dict.get("/BaseFont")
+                                or descriptor.get("/FontName")
+                                or ""
+                            )
 
                     if not _has_embedded_font(descriptor):
                         features["unembedded_fonts"] = int(features["unembedded_fonts"]) + 1
+                    if _looks_like_ocr_overlay_font(base_font_name):
+                        features["ocr_suspect_fonts"] = int(features["ocr_suspect_fonts"]) + 1
 
             xobjects = _resolve_dictionary(resources.get("/XObject"))
             if not isinstance(xobjects, pikepdf.Dictionary):
@@ -700,16 +715,21 @@ def _ocr_lane_skip_reasons(
 ) -> list[str]:
     reasons: list[str] = []
     classification_value = (classification or "").strip().lower()
+    ocr_suspect_fonts = int(pdf_features.get("ocr_suspect_fonts", 0) or 0)
     if (
         classification_value == "digital"
         and not settings.font_remediation_allow_ocr_on_digital
+        and ocr_suspect_fonts <= 0
     ):
         reasons.append("digital document")
     if bool(pdf_features.get("has_forms", False)):
         reasons.append("fillable forms present")
     page_count = int(pdf_features.get("pages", 0))
-    if page_count > settings.font_remediation_ocr_max_pages:
-        reasons.append(f"page count {page_count} > limit {settings.font_remediation_ocr_max_pages}")
+    page_limit = settings.font_remediation_ocr_max_pages
+    if ocr_suspect_fonts > 0:
+        page_limit = max(page_limit, settings.font_remediation_ocr_suspect_max_pages)
+    if page_count > page_limit:
+        reasons.append(f"page count {page_count} > limit {page_limit}")
     return reasons
 
 
@@ -916,6 +936,35 @@ def _strip_subset_prefix(font_name: str | None) -> str:
 
 def _normalize_font_name(font_name: str | None) -> str:
     return FONT_NAME_RE.sub("", _strip_subset_prefix(font_name)).lower()
+
+
+def _looks_like_ocr_overlay_font(font_name: str | None) -> bool:
+    normalized = _normalize_font_name(font_name)
+    if not normalized:
+        return False
+    return any(token in normalized for token in ("ocr", "glyphless", "hidden"))
+
+
+def _coerce_metric_int(value, default: int = 0) -> int:
+    """Parse AFM-style numeric values that may arrive as ints, floats, or numeric strings."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return default
+    try:
+        return int(text)
+    except ValueError:
+        try:
+            return int(float(text))
+        except ValueError:
+            return default
 
 
 def _base_font_name(font_dict) -> str:
@@ -1328,24 +1377,24 @@ def _ghostscript_type1_descriptor(
         return None
 
     widths_by_code = {
-        int(charnum): int(width)
+        _coerce_metric_int(charnum): _coerce_metric_int(width)
         for charnum, width, _ in afm._chars.values()
-        if isinstance(charnum, int) and 0 <= charnum <= 255
+        if isinstance(_coerce_metric_int(charnum, -1), int) and 0 <= _coerce_metric_int(charnum, -1) <= 255
     }
     weight = str(attrs.get("Weight", "") or "").lower()
     stem_v = 120 if any(token in weight for token in ("bold", "demi", "black")) else 80
     descriptor = {
         "Flags": int(spec["flags"]),
-        "ItalicAngle": int(attrs.get("ItalicAngle", 0) or 0),
-        "Ascent": int(attrs.get("Ascender", 0) or 0),
-        "Descent": int(attrs.get("Descender", 0) or 0),
-        "CapHeight": int(attrs.get("CapHeight", attrs.get("Ascender", 0)) or 0),
+        "ItalicAngle": _coerce_metric_int(attrs.get("ItalicAngle", 0), 0),
+        "Ascent": _coerce_metric_int(attrs.get("Ascender", 0), 0),
+        "Descent": _coerce_metric_int(attrs.get("Descender", 0), 0),
+        "CapHeight": _coerce_metric_int(attrs.get("CapHeight", attrs.get("Ascender", 0)), 0),
         "StemV": stem_v,
-        "FontBBox": [int(value) for value in font_bbox],
+        "FontBBox": [_coerce_metric_int(value, 0) for value in font_bbox],
         "FirstChar": 0,
         "LastChar": 255,
-        "Widths": [int(widths_by_code.get(code, 0)) for code in range(256)],
-        "MissingWidth": int(widths_by_code.get(0, widths_by_code.get(32, 0))),
+        "Widths": [_coerce_metric_int(widths_by_code.get(code, 0), 0) for code in range(256)],
+        "MissingWidth": _coerce_metric_int(widths_by_code.get(0, widths_by_code.get(32, 0)), 0),
     }
     return descriptor
 
@@ -3507,6 +3556,7 @@ async def _attempt_font_lane(
     preprocess_details: dict[str, object] = {}
     preprocess_skipped = False
     requires_retag = True
+    effective_structure_json = structure_json
 
     if lane == FONT_LANE_REPAIR_DICTS:
         repaired = job_dir / "fontfix_repair_dicts.pdf"
@@ -3617,6 +3667,43 @@ async def _attempt_font_lane(
                 "ocr_message": ocr_result.message,
             }
         remediation_input = ocr_result.output_path
+        if requires_retag:
+            try:
+                refresh_dir = job_dir / f"{lane}_structure"
+                refresh_dir.mkdir(parents=True, exist_ok=True)
+                refreshed_structure = await extract_structure(remediation_input, refresh_dir)
+                candidate_structure_json = refreshed_structure.document_json
+                if isinstance(candidate_structure_json, dict):
+                    original_elements = structure_json.get("elements", []) if isinstance(structure_json, dict) else []
+                    refreshed_elements = candidate_structure_json.get("elements", [])
+                    original_figures = sum(
+                        1
+                        for element in original_elements
+                        if isinstance(element, dict) and element.get("type") == "figure"
+                    )
+                    refreshed_figures = sum(
+                        1
+                        for element in refreshed_elements
+                        if isinstance(element, dict) and element.get("type") == "figure"
+                    )
+                    approved_alts = [
+                        entry for entry in reviewed_alts
+                        if isinstance(entry, dict) and entry.get("status") == "approved"
+                    ]
+                    if approved_alts and original_figures != refreshed_figures:
+                        preprocess_details["structure_refreshed"] = False
+                        preprocess_details["structure_refresh_skipped"] = "figure_count_changed"
+                        preprocess_details["original_figures"] = original_figures
+                        preprocess_details["refreshed_figures"] = refreshed_figures
+                    else:
+                        effective_structure_json = candidate_structure_json
+                        preprocess_details["structure_refreshed"] = True
+                        preprocess_details["structure_elements"] = len(
+                            refreshed_elements if isinstance(refreshed_elements, list) else []
+                        )
+            except Exception as exc:
+                preprocess_details["structure_refreshed"] = False
+                preprocess_details["structure_refresh_error"] = str(exc)
     else:
         return {
             "lane": lane,
@@ -3632,7 +3719,7 @@ async def _attempt_font_lane(
         tagging_result = await tag_pdf(
             input_path=remediation_input,
             output_path=remediation_output,
-            structure_json=structure_json,
+            structure_json=effective_structure_json,
             alt_texts=reviewed_alts,
             original_filename=job.original_filename or "",
         )
@@ -3658,6 +3745,7 @@ async def _attempt_font_lane(
         "details": preprocess_details,
         "requires_retag": requires_retag,
         "preprocessed_path": str(remediation_input),
+        "structure_json": effective_structure_json,
         "output_path": remediation_output,
         "tagging_result": tagging_result,
         "validation": validation,
@@ -4076,6 +4164,7 @@ async def run_tagging_and_validation(
             "ocr_message": "",
             "ocr_skipped": False,
         }
+        fidelity_source_pdf = Path(job.input_path)
 
         if not validation.compliant and _has_font_errors(validation.violations):
             initial_font_diagnostics = _inspect_font_diagnostics(
@@ -4126,6 +4215,7 @@ async def run_tagging_and_validation(
                     best_validation = selected_validation
                     best_tagging_result = selected_tagging_result
                     best_working_pdf = working_pdf
+                    best_structure_json = structure_json
                     best_tagged_pdf = Path(job.output_path or tagging_result.output_path)
                     best_output_path = str(best_tagged_pdf)
                     selected_lanes: list[str] = []
@@ -4139,7 +4229,7 @@ async def run_tagging_and_validation(
                             settings=settings,
                             working_pdf=best_working_pdf,
                             tagged_pdf=best_tagged_pdf,
-                            structure_json=structure_json,
+                            structure_json=best_structure_json,
                             reviewed_alts=reviewed_alts,
                             lane=lane,
                             current_tagging_result=best_tagging_result,
@@ -4183,10 +4273,14 @@ async def run_tagging_and_validation(
                                 requires_retag = bool(attempt.get("requires_retag", True))
                                 if requires_retag and isinstance(preprocessed_path, str) and preprocessed_path:
                                     best_working_pdf = Path(preprocessed_path)
+                                    fidelity_source_pdf = best_working_pdf
                                 if isinstance(attempt["output_path"], Path):
                                     best_tagged_pdf = attempt["output_path"]
                                 else:
                                     best_tagged_pdf = Path(str(attempt["output_path"]))
+                                candidate_structure_json = attempt.get("structure_json")
+                                if isinstance(candidate_structure_json, dict):
+                                    best_structure_json = candidate_structure_json
                                 best_output_path = str(best_tagged_pdf)
                                 selected_lanes.append(lane)
 
@@ -4208,8 +4302,13 @@ async def run_tagging_and_validation(
                         selected_validation = best_validation
                         selected_tagging_result = best_tagging_result
                         job.output_path = best_output_path
+                        if isinstance(best_structure_json, dict):
+                            structure_json = best_structure_json
+                            job.structure_json = json.dumps(best_structure_json)
                         font_remediation["selected_lane"] = selected_lanes[-1]
                         font_remediation["selected_lanes"] = selected_lanes
+                        if fidelity_source_pdf != Path(job.input_path):
+                            font_remediation["selected_preprocessed_path"] = str(fidelity_source_pdf)
                         font_remediation["applied"] = True
                 except Exception as exc:
                     logger.exception(f"Font remediation lane evaluation failed for job {job_id}")
@@ -4256,6 +4355,7 @@ async def run_tagging_and_validation(
         fidelity_report, review_tasks = assess_fidelity(
             input_pdf=Path(job.input_path),
             output_pdf=Path(job.output_path or tagging_result.output_path),
+            comparison_source_pdf=fidelity_source_pdf,
             structure_json=structure_json or {},
             alt_entries=[
                 {
@@ -4303,6 +4403,7 @@ async def run_tagging_and_validation(
             candidate_fidelity_report, candidate_review_tasks = assess_fidelity(
                 input_pdf=Path(job.input_path),
                 output_pdf=candidate_output_pdf,
+                comparison_source_pdf=fidelity_source_pdf,
                 structure_json=structure_json or {},
                 alt_entries=[
                     {

@@ -137,6 +137,42 @@ def test_ocr_lane_is_not_blocked_by_links_alone():
     assert skipped == []
 
 
+def test_ocr_lane_allowed_on_digital_pdf_with_ocr_suspect_fonts():
+    lanes, skipped = _font_remediation_lanes(
+        [_violation("ISO 14289-1:2014-7.21.8-1")],
+        classification="digital",
+        pdf_features={
+            "pages": 101,
+            "link_annots": 0,
+            "has_forms": False,
+            "unembedded_fonts": 0,
+            "ocr_suspect_fonts": 1,
+        },
+        settings=_settings(),
+    )
+
+    assert FONT_LANE_OCR_REDO in lanes
+    assert skipped == []
+
+
+def test_ocr_lane_still_respects_suspect_page_limit():
+    lanes, skipped = _font_remediation_lanes(
+        [_violation("ISO 14289-1:2014-7.21.8-1")],
+        classification="digital",
+        pdf_features={
+            "pages": 250,
+            "link_annots": 0,
+            "has_forms": False,
+            "unembedded_fonts": 0,
+            "ocr_suspect_fonts": 1,
+        },
+        settings=_settings(),
+    )
+
+    assert FONT_LANE_OCR_REDO not in lanes
+    assert skipped == ["OCR lanes skipped: page count 250 > limit 200"]
+
+
 def test_unicode_lane_is_skipped_when_gate_has_no_safe_candidates():
     lanes, skipped = _font_remediation_lanes(
         [_violation("ISO 14289-1:2014-7.21.7-1")],
@@ -252,6 +288,48 @@ def test_local_font_program_uses_type1_fontfile_for_standard14(monkeypatch):
     assert matched_name == "NimbusRoman-Regular"
     assert fontfile_key == "/FontFile"
     assert lengths == {"Length1": 10, "Length2": 20, "Length3": 0}
+
+
+def test_ghostscript_type1_descriptor_accepts_float_like_afm_metrics(tmp_path, monkeypatch):
+    class _FakeAFM:
+        def __init__(self, *_args, **_kwargs):
+            self._attrs = {
+                "FontBBox": ("-168.0", "-218.0", "1000.0", "898.0"),
+                "ItalicAngle": "0.0",
+                "Ascender": "718.0",
+                "Descender": "-207.0",
+                "CapHeight": "676.0",
+                "Weight": "Regular",
+            }
+            self._chars = {
+                "space": (32, "250.0", "space"),
+                "A": (65, "722.0", "A"),
+            }
+
+    from fontTools import afmLib
+
+    metrics_dir = tmp_path / "afm"
+    metrics_dir.mkdir()
+    (metrics_dir / "Times-Roman.afm").write_text("")
+    monkeypatch.setattr(orchestrator, "_ghostscript_font_metrics_dir", lambda: metrics_dir)
+    monkeypatch.setitem(
+        orchestrator.GHOSTSCRIPT_TYPE1_DESCRIPTOR_SPECS,
+        "timesroman",
+        {"afm": "Times-Roman.afm", "flags": 34},
+    )
+    monkeypatch.setattr(afmLib, "AFM", _FakeAFM)
+    orchestrator._ghostscript_type1_descriptor.cache_clear()
+
+    descriptor = orchestrator._ghostscript_type1_descriptor("Times-Roman")
+
+    assert descriptor is not None
+    assert descriptor["ItalicAngle"] == 0
+    assert descriptor["Ascent"] == 718
+    assert descriptor["Descent"] == -207
+    assert descriptor["CapHeight"] == 676
+    assert descriptor["FontBBox"] == [-168, -218, 1000, 898]
+    assert descriptor["Widths"][32] == 250
+    assert descriptor["Widths"][65] == 722
 
 
 def test_font_diagnostics_can_skip_used_code_analysis(tmp_path, monkeypatch):
@@ -816,3 +894,71 @@ async def test_embed_lane_skips_local_attempt_when_diagnostics_rule_it_out(tmp_p
     assert result["success"] is True
     assert result["requires_retag"] is True
     assert result["details"]["local_embed_skipped"] is True
+
+
+@pytest.mark.asyncio
+async def test_ocr_lane_refreshes_structure_before_retag(tmp_path, monkeypatch):
+    working_pdf = tmp_path / "working.pdf"
+    working_pdf.write_bytes(b"%PDF-1.7\n")
+    tagged_pdf = tmp_path / "tagged.pdf"
+    tagged_pdf.write_bytes(b"%PDF-1.7\n")
+    ocr_pdf = tmp_path / "redo.pdf"
+    ocr_pdf.write_bytes(b"%PDF-1.7\n")
+    captured = {}
+
+    async def fake_run_ocr(*args, **kwargs):
+        return SimpleNamespace(success=True, output_path=ocr_pdf, skipped=False, message="")
+
+    async def fake_extract_structure(input_path, job_dir):
+        return SimpleNamespace(document_json={"elements": [{"type": "paragraph", "text": "fresh", "page": 0}]})
+
+    async def fake_tag_pdf(*args, **kwargs):
+        captured["structure_json"] = kwargs["structure_json"]
+        output = kwargs["output_path"]
+        output.write_bytes(b"%PDF-1.7\n")
+        return SimpleNamespace(
+            output_path=output,
+            headings_tagged=0,
+            figures_tagged=0,
+            decorative_figures_artifacted=0,
+            tables_tagged=0,
+            lists_tagged=0,
+            links_tagged=0,
+            bookmarks_added=0,
+            tags_added=0,
+            struct_elems_created=1,
+            title_set=False,
+            lang_set=False,
+        )
+
+    async def fake_validate(pdf_path, verapdf_path, flavour):
+        return SimpleNamespace(
+            compliant=True,
+            violations=[],
+            raw_report={},
+            validated_path=Path(pdf_path),
+        )
+
+    monkeypatch.setattr(orchestrator, "create_job_dir", lambda job_id: tmp_path)
+    monkeypatch.setattr(orchestrator, "run_ocr", fake_run_ocr)
+    monkeypatch.setattr(orchestrator, "extract_structure", fake_extract_structure)
+    monkeypatch.setattr(orchestrator, "tag_pdf", fake_tag_pdf)
+    monkeypatch.setattr(orchestrator, "validate_pdf", fake_validate)
+
+    result = await orchestrator._attempt_font_lane(
+        job_id="job-ocr",
+        job=SimpleNamespace(original_filename="sample.pdf"),
+        settings=_settings(),
+        working_pdf=working_pdf,
+        tagged_pdf=tagged_pdf,
+        structure_json={"elements": [{"type": "paragraph", "text": "stale", "page": 0}]},
+        reviewed_alts=[],
+        lane=FONT_LANE_OCR_REDO,
+        current_tagging_result=SimpleNamespace(),
+    )
+
+    assert result["success"] is True
+    assert result["requires_retag"] is True
+    assert result["details"]["structure_refreshed"] is True
+    assert captured["structure_json"]["elements"][0]["text"] == "fresh"
+    assert result["structure_json"]["elements"][0]["text"] == "fresh"

@@ -40,16 +40,22 @@ def _build_ocrmypdf_args(
         "--max-image-mpixels",
         "1000",
     ]
-    if rotate_pages:
-        args.append("--rotate-pages")
-    if deskew:
-        args.append("--deskew")
     if mode == "redo":
+        if rotate_pages:
+            args.append("--rotate-pages")
         args.append("--redo-ocr")
     elif mode == "force":
+        if rotate_pages:
+            args.append("--rotate-pages")
+        if deskew:
+            args.append("--deskew")
         args.append("--force-ocr")
     else:
         # Default behavior for the primary OCR step.
+        if rotate_pages:
+            args.append("--rotate-pages")
+        if deskew:
+            args.append("--deskew")
         args.append("--skip-text")
     args.extend([str(input_path), str(output_path)])
     return args

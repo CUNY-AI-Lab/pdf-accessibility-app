@@ -392,6 +392,7 @@ def assess_fidelity(
     *,
     input_pdf: Path,
     output_pdf: Path,
+    comparison_source_pdf: Path | None = None,
     structure_json: dict[str, Any],
     alt_entries: list[dict[str, Any]],
     validation_report: dict[str, Any],
@@ -490,8 +491,15 @@ def assess_fidelity(
             "metrics": {"remaining_rules": 0, "remaining_errors": 0},
         })
 
-    source_text = _extract_pdf_text_sample(input_pdf)
+    comparison_pdf = comparison_source_pdf or input_pdf
+    using_alternate_source = comparison_pdf != input_pdf
+    source_text = _extract_pdf_text_sample(comparison_pdf)
     output_text = _extract_pdf_text_sample(output_pdf)
+    original_source_text = (
+        _extract_pdf_text_sample(input_pdf)
+        if using_alternate_source
+        else source_text
+    )
     meaningful_structure_elements = _meaningful_structure_element_count(structure_json)
 
     if classification == "scanned":
@@ -566,6 +574,32 @@ def assess_fidelity(
         similarity = SequenceMatcher(None, source_text, output_text).ratio()
         length_ratio = len(output_text) / max(len(source_text), 1)
         status = "pass"
+        original_similarity = None
+        original_length_ratio = None
+        if using_alternate_source and len(original_source_text) >= TEXT_SAMPLE_MIN_CHARS:
+            original_similarity = SequenceMatcher(None, original_source_text, output_text).ratio()
+            original_length_ratio = len(output_text) / max(len(original_source_text), 1)
+            if (
+                original_similarity < 0.82
+                or original_length_ratio < 0.7
+                or original_length_ratio > 1.45
+            ):
+                add_task(
+                    "review:content_fidelity:ocr_rescue",
+                    task_type="content_fidelity",
+                    title="Spot-check OCR rescue text fidelity",
+                    detail=(
+                        "OCR rescue replaced the original extractable text layer. "
+                        "Spot-check a few pages against the visible document before distribution."
+                    ),
+                    severity="medium",
+                    blocking=False,
+                    metadata={
+                        "comparison_source": "retag_input",
+                        "original_similarity": round(original_similarity, 4),
+                        "original_length_ratio": round(original_length_ratio, 4),
+                    },
+                )
         if similarity < 0.82 or length_ratio < 0.7 or length_ratio > 1.45:
             status = "fail"
             add_task(
@@ -603,12 +637,27 @@ def assess_fidelity(
         checks.append({
             "check": "text_drift",
             "status": status,
-            "message": "Compared source and remediated text samples.",
+            "message": (
+                "Compared the final PDF against the source used for the final tagging pass."
+                if using_alternate_source
+                else "Compared source and remediated text samples."
+            ),
             "metrics": {
                 "similarity": round(similarity, 4),
                 "length_ratio": round(length_ratio, 4),
                 "source_chars": len(source_text),
                 "output_chars": len(output_text),
+                "comparison_source": "retag_input" if using_alternate_source else "original_input",
+                **(
+                    {"original_similarity": round(original_similarity, 4)}
+                    if original_similarity is not None
+                    else {}
+                ),
+                **(
+                    {"original_length_ratio": round(original_length_ratio, 4)}
+                    if original_length_ratio is not None
+                    else {}
+                ),
             },
         })
     else:

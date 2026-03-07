@@ -268,6 +268,44 @@ def test_scanned_fidelity_skips_ocr_coverage_for_visually_blank_pages(monkeypatc
     assert not tasks
 
 
+def test_fidelity_uses_comparison_source_for_ocr_rescue(monkeypatch):
+    broken = "legacy broken text layer " * 20
+    clean = "clean recovered text for assistive access " * 20
+    samples = {
+        "input.pdf": broken,
+        "ocr.pdf": clean,
+        "out.pdf": clean,
+    }
+    monkeypatch.setattr(
+        fidelity,
+        "_extract_pdf_text_sample",
+        lambda path: samples.get(Path(path).name, ""),
+    )
+
+    report, tasks = assess_fidelity(
+        input_pdf=Path("input.pdf"),
+        output_pdf=Path("out.pdf"),
+        comparison_source_pdf=Path("ocr.pdf"),
+        structure_json={"elements": []},
+        alt_entries=[],
+        validation_report=_validation_report(compliant=True, violations=[]),
+        tagging_metrics={"tables_tagged": 0},
+        classification="digital",
+    )
+
+    text_drift = next(check for check in report["checks"] if check["check"] == "text_drift")
+    assert text_drift["status"] == "pass"
+    assert text_drift["metrics"]["comparison_source"] == "retag_input"
+    assert round(text_drift["metrics"]["original_similarity"], 4) < 0.82
+    assert report["passed"] is True
+    assert any(
+        task["task_type"] == "content_fidelity"
+        and task["blocking"] is False
+        and task["title"] == "Spot-check OCR rescue text fidelity"
+        for task in tasks
+    )
+
+
 def test_extract_font_review_targets_from_annotation_appearance_context():
     raw_report = {
         "report": {
