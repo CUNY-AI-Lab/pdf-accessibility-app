@@ -1,13 +1,19 @@
+import json
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.review import (
+    _garbled_text_followup_spec,
     _manual_font_remediation_preservation,
     _manual_review_completion_state,
+    _sync_llm_followup_tasks,
     _validated_task_metadata,
 )
+from app.models import Base, Job, ReviewTask
 from app.schemas import ReviewTaskUpdateRequest
 
 
@@ -172,3 +178,145 @@ def test_manual_font_remediation_preservation_keeps_font_mapping_attempts():
         {"page_number": 2, "operator_index": 132, "unicode_text": "►", "font_code_hex": "01"},
         {"page_number": 2, "operator_index": 194, "unicode_text": "►", "font_code_hex": "01"},
     ]
+
+
+def test_garbled_text_followup_spec_only_uses_blocking_hints():
+    parent_task = SimpleNamespace(id=17, task_type="reading_order")
+
+    spec = _garbled_text_followup_spec(
+        parent_task=parent_task,
+        suggestion={
+            "summary": "Broken extraction on the title page.",
+            "readable_text_hints": [
+                {
+                    "page": 1,
+                    "review_id": "review-2",
+                    "extracted_text": "D a t a  B o o k",
+                    "readable_text_hint": "Data Book",
+                    "issue_type": "spacing_only",
+                    "confidence": "high",
+                    "should_block_accessibility": True,
+                    "reason": "The visible title is tightly kerned, but extraction is split.",
+                },
+                {
+                    "page": 1,
+                    "review_id": "review-3",
+                    "readable_text_hint": "Not blocking",
+                    "should_block_accessibility": False,
+                },
+            ],
+        },
+    )
+
+    assert spec is not None
+    assert spec["task_type"] == "content_fidelity"
+    assert spec["blocking"] is True
+    assert spec["metadata"]["parent_task_id"] == 17
+    assert spec["metadata"]["pages_to_check"] == [1]
+    assert spec["metadata"]["flagged_blocks"] == [
+        {
+            "page": 1,
+            "review_id": "review-2",
+            "extracted_text": "D a t a  B o o k",
+            "readable_text_hint": "Data Book",
+            "issue_type": "spacing_only",
+            "confidence": "high",
+            "reason": "The visible title is tightly kerned, but extraction is split.",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_llm_followup_tasks_creates_and_removes_garbled_text_task():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_maker() as db:
+        job = Job(
+            id="job-1",
+            filename="sample.pdf",
+            original_filename="sample.pdf",
+            status="needs_manual_review",
+            input_path="/tmp/sample.pdf",
+        )
+        parent_task = ReviewTask(
+            job_id="job-1",
+            task_type="reading_order",
+            title="Review reading order",
+            detail="Check the reading order on flagged pages.",
+            severity="high",
+            blocking=True,
+            status="pending_review",
+            source="validation",
+            metadata_json=json.dumps({}),
+        )
+        db.add(job)
+        db.add(parent_task)
+        await db.commit()
+        await db.refresh(parent_task)
+
+        await _sync_llm_followup_tasks(
+            db=db,
+            job_id="job-1",
+            parent_task=parent_task,
+            suggestion={
+                "summary": "Garbled title extraction on page 1.",
+                "readable_text_hints": [
+                    {
+                        "page": 1,
+                        "review_id": "review-2",
+                        "extracted_text": "D a t a  B o o k",
+                        "readable_text_hint": "Data Book",
+                        "issue_type": "spacing_only",
+                        "confidence": "high",
+                        "should_block_accessibility": True,
+                        "reason": "Visible text and extracted text diverge.",
+                    }
+                ],
+            },
+        )
+        await db.commit()
+
+        result = await db.execute(
+            select(ReviewTask).where(
+                ReviewTask.job_id == "job-1",
+                ReviewTask.task_type == "content_fidelity",
+            )
+        )
+        followups = result.scalars().all()
+        assert len(followups) == 1
+        metadata = json.loads(followups[0].metadata_json or "{}")
+        assert metadata["llm_followup_kind"] == "garbled_text_hint"
+        assert metadata["parent_task_id"] == parent_task.id
+        assert metadata["flagged_blocks"][0]["readable_text_hint"] == "Data Book"
+
+        await _sync_llm_followup_tasks(
+            db=db,
+            job_id="job-1",
+            parent_task=parent_task,
+            suggestion={
+                "summary": "No remaining accessibility-significant garbling.",
+                "readable_text_hints": [
+                    {
+                        "page": 1,
+                        "review_id": "review-2",
+                        "readable_text_hint": "Data Book",
+                        "should_block_accessibility": False,
+                    }
+                ],
+            },
+        )
+        await db.commit()
+
+        result = await db.execute(
+            select(ReviewTask).where(
+                ReviewTask.job_id == "job-1",
+                ReviewTask.task_type == "content_fidelity",
+            )
+        )
+        assert result.scalars().all() == []
+
+    await engine.dispose()

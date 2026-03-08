@@ -37,7 +37,10 @@ from app.services.font_unicode_override import apply_unicode_override_to_context
 from app.services.job_manager import get_job_manager
 from app.services.llm_client import LlmClient
 from app.services.path_safety import safe_filename, validate_path_within_allowed_roots
-from app.services.pdf_preview import render_target_preview_png_bytes
+from app.services.pdf_preview import (
+    render_bbox_preview_png_bytes,
+    render_target_preview_png_bytes,
+)
 from app.services.review_suggestions import generate_review_suggestion
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,8 @@ TASK_EVIDENCE_REQUIREMENTS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
 }
 
+LLM_GARBLED_TEXT_FOLLOWUP_KIND = "garbled_text_hint"
+
 
 def _parse_json(raw: str | None) -> dict:
     if not raw:
@@ -88,6 +93,16 @@ def _allowed_font_targets(task_metadata: dict) -> dict[tuple[int, int], dict]:
         if isinstance(target, dict)
         and isinstance(target.get("page"), int)
         and isinstance(target.get("operator_index"), int)
+    }
+
+
+def _allowed_table_targets(task_metadata: dict) -> dict[str, dict]:
+    raw_targets = task_metadata.get("table_review_targets", [])
+    return {
+        str(target.get("table_review_id")).strip(): target
+        for target in raw_targets
+        if isinstance(target, dict)
+        and str(target.get("table_review_id") or "").strip()
     }
 
 
@@ -176,6 +191,135 @@ def _task_to_response(task: ReviewTask) -> ReviewTaskResponse:
         source=task.source,
         metadata=json.loads(task.metadata_json) if task.metadata_json else {},
     )
+
+
+def _garbled_text_followup_spec(*, parent_task: ReviewTask, suggestion: dict) -> dict | None:
+    if getattr(parent_task, "task_type", "") != "reading_order":
+        return None
+
+    raw_hints = suggestion.get("readable_text_hints", [])
+    if not isinstance(raw_hints, list):
+        return None
+
+    normalized_hints: list[dict[str, object]] = []
+    seen_pairs: set[tuple[int, str]] = set()
+    for raw_hint in raw_hints:
+        if not isinstance(raw_hint, dict):
+            continue
+        if not bool(raw_hint.get("should_block_accessibility", False)):
+            continue
+        page = raw_hint.get("page")
+        review_id = str(raw_hint.get("review_id") or "").strip()
+        if not isinstance(page, int) or page < 1 or not review_id:
+            continue
+        key = (page, review_id)
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        normalized_hints.append(
+            {
+                "page": page,
+                "review_id": review_id,
+                "extracted_text": str(raw_hint.get("extracted_text") or "").strip(),
+                "readable_text_hint": str(raw_hint.get("readable_text_hint") or "").strip(),
+                "issue_type": str(raw_hint.get("issue_type") or "uncertain").strip() or "uncertain",
+                "confidence": str(raw_hint.get("confidence") or "low").strip() or "low",
+                "reason": str(raw_hint.get("reason") or "").strip(),
+            }
+        )
+
+    if not normalized_hints:
+        return None
+
+    normalized_hints.sort(key=lambda item: (int(item["page"]), str(item["review_id"])))
+    pages_to_check = sorted({int(item["page"]) for item in normalized_hints})
+    issue_types = sorted({str(item["issue_type"]) for item in normalized_hints if str(item["issue_type"]).strip()})
+
+    page_label = ", ".join(str(page) for page in pages_to_check[:6])
+    if len(pages_to_check) > 6:
+        page_label += ", ..."
+
+    detail = (
+        f"Gemini flagged {len(normalized_hints)} text block(s) whose extracted text may not match "
+        f"what appears on the page. Review pages {page_label} and confirm what assistive technology "
+        "should announce before release."
+    )
+
+    return {
+        "task_type": "content_fidelity",
+        "title": "Verify readable text on flagged blocks",
+        "detail": detail,
+        "severity": "high",
+        "blocking": True,
+        "source": "fidelity",
+        "metadata": {
+            "llm_followup_kind": LLM_GARBLED_TEXT_FOLLOWUP_KIND,
+            "parent_task_id": int(parent_task.id),
+            "pages_to_check": pages_to_check,
+            "issue_types": issue_types,
+            "flagged_blocks": normalized_hints,
+            "llm_summary": str(suggestion.get("summary") or "").strip(),
+        },
+    }
+
+
+async def _sync_llm_followup_tasks(
+    *,
+    db: AsyncSession,
+    job_id: str,
+    parent_task: ReviewTask,
+    suggestion: dict,
+) -> None:
+    followup_spec = _garbled_text_followup_spec(parent_task=parent_task, suggestion=suggestion)
+
+    result = await db.execute(
+        select(ReviewTask).where(
+            ReviewTask.job_id == job_id,
+            ReviewTask.task_type == "content_fidelity",
+            ReviewTask.source == "fidelity",
+        )
+    )
+    candidate_tasks = result.scalars().all()
+
+    matching_tasks: list[ReviewTask] = []
+    for candidate in candidate_tasks:
+        metadata = _parse_json(candidate.metadata_json)
+        if (
+            metadata.get("llm_followup_kind") == LLM_GARBLED_TEXT_FOLLOWUP_KIND
+            and int(metadata.get("parent_task_id") or -1) == int(parent_task.id)
+        ):
+            matching_tasks.append(candidate)
+
+    if followup_spec is None:
+        for existing in matching_tasks:
+            await db.delete(existing)
+        return
+
+    primary = matching_tasks[0] if matching_tasks else None
+    if primary is None:
+        db.add(
+            ReviewTask(
+                job_id=job_id,
+                task_type=str(followup_spec["task_type"]),
+                title=str(followup_spec["title"]),
+                detail=str(followup_spec["detail"]),
+                severity=str(followup_spec["severity"]),
+                blocking=bool(followup_spec["blocking"]),
+                status="pending_review",
+                source=str(followup_spec["source"]),
+                metadata_json=json.dumps(followup_spec["metadata"]),
+            )
+        )
+    else:
+        primary.title = str(followup_spec["title"])
+        primary.detail = str(followup_spec["detail"])
+        primary.severity = str(followup_spec["severity"])
+        primary.blocking = bool(followup_spec["blocking"])
+        primary.status = "pending_review"
+        primary.metadata_json = json.dumps(followup_spec["metadata"])
+
+    for duplicate in matching_tasks[1:]:
+        await db.delete(duplicate)
 
 
 def _validated_task_metadata(
@@ -586,6 +730,12 @@ async def suggest_review_task(
 
     metadata["llm_suggestion"] = suggestion
     task.metadata_json = json.dumps(metadata) if metadata else None
+    await _sync_llm_followup_tasks(
+        db=db,
+        job_id=job_id,
+        parent_task=task,
+        suggestion=suggestion,
+    )
     await db.commit()
     await db.refresh(task)
     return _task_to_response(task)
@@ -640,6 +790,60 @@ async def get_font_target_preview(
         raise HTTPException(status_code=400, detail="Invalid preview request") from exc
     except Exception as exc:
         logger.exception("Failed to render font target preview")
+        raise HTTPException(status_code=502, detail="Failed to render preview") from exc
+
+    return StreamingResponse(BytesIO(image_bytes), media_type="image/png")
+
+
+@router.get("/review-tasks/{task_id}/table-target-preview")
+async def get_table_target_preview(
+    job_id: str,
+    task_id: int,
+    table_review_id: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db),
+):
+    job_result = await db.execute(select(Job).where(Job.id == job_id))
+    job = job_result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    task_result = await db.execute(
+        select(ReviewTask).where(
+            ReviewTask.job_id == job_id,
+            ReviewTask.id == task_id,
+        )
+    )
+    task = task_result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="Review task not found")
+    if task.task_type != "table_semantics":
+        raise HTTPException(status_code=400, detail="Table target previews are only supported for table review tasks")
+
+    task_metadata = _parse_json(task.metadata_json)
+    allowed_targets = _allowed_table_targets(task_metadata)
+    matched_target = allowed_targets.get(table_review_id.strip())
+    if matched_target is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Requested table target is not one of the task's flagged table targets",
+        )
+
+    page_number = matched_target.get("page")
+    bbox = matched_target.get("bbox")
+    if not isinstance(page_number, int) or page_number < 1 or not isinstance(bbox, dict):
+        raise HTTPException(status_code=400, detail="Task target did not include a usable page/bbox preview region")
+
+    pdf_path = _existing_job_pdf_path(job)
+    try:
+        image_bytes = render_bbox_preview_png_bytes(pdf_path, page_number, bbox)
+    except FileNotFoundError as exc:
+        logger.exception("PDF file not found for table target preview")
+        raise HTTPException(status_code=404, detail="PDF file not found") from exc
+    except ValueError as exc:
+        logger.exception("Invalid table target preview request")
+        raise HTTPException(status_code=400, detail="Invalid preview request") from exc
+    except Exception as exc:
+        logger.exception("Failed to render table target preview")
         raise HTTPException(status_code=502, detail="Failed to render preview") from exc
 
     return StreamingResponse(BytesIO(image_bytes), media_type="image/png")

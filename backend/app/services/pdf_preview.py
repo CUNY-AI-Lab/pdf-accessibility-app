@@ -5,6 +5,7 @@ import tempfile
 from io import BytesIO
 from pathlib import Path
 
+import pikepdf
 from PIL import Image, ImageDraw
 
 from app.services.pdf_operator_context import extract_operator_visual_context
@@ -78,6 +79,14 @@ def render_page_png_bytes(
 def render_page_png_data_url(pdf_path: Path, page_number: int) -> str:
     encoded = base64.b64encode(render_page_png_bytes(pdf_path, page_number)).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+
+def _page_dimensions_points(pdf_path: Path, page_number: int) -> tuple[float, float]:
+    with pikepdf.Pdf.open(pdf_path) as pdf:
+        if page_number < 1 or page_number > len(pdf.pages):
+            raise ValueError("page_number is out of range for this PDF")
+        mediabox = pdf.pages[page_number - 1].mediabox
+        return float(mediabox[2]) - float(mediabox[0]), float(mediabox[3]) - float(mediabox[1])
 
 
 def _clamp_box(box: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
@@ -254,4 +263,94 @@ def render_target_preview_png_bytes(
 
 def render_target_preview_png_data_url(pdf_path: Path, context_path: str) -> str:
     encoded = base64.b64encode(render_target_preview_png_bytes(pdf_path, context_path)).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def render_bbox_preview_png_bytes(
+    pdf_path: Path,
+    page_number: int,
+    bbox: dict[str, float],
+    *,
+    dpi: int = RENDER_DPI,
+    max_width: int = MAX_IMAGE_WIDTH,
+    crop_margin_points: float = 24.0,
+) -> bytes:
+    if not isinstance(bbox, dict):
+        raise ValueError("bbox must be a mapping")
+
+    page_width, page_height = _page_dimensions_points(pdf_path, page_number)
+    page_bytes = render_page_png_bytes(pdf_path, page_number, dpi=dpi, max_width=max_width)
+
+    scale_x = dpi / 72.0
+    scale_y = dpi / 72.0
+    if page_width * scale_x > max_width:
+        resize_scale = max_width / max(page_width * scale_x, 1.0)
+        scale_x *= resize_scale
+        scale_y *= resize_scale
+
+    margin_x = crop_margin_points * scale_x
+    margin_y = crop_margin_points * scale_y
+
+    with Image.open(BytesIO(page_bytes)) as image:
+        rendered = image.convert("RGB")
+        image_width, image_height = rendered.size
+        exact_box = _clamp_box(
+            (
+                int(round(float(bbox["l"]) * scale_x)),
+                int(round((page_height - float(bbox["t"])) * scale_y)),
+                int(round(float(bbox["r"]) * scale_x)),
+                int(round((page_height - float(bbox["b"])) * scale_y)),
+            ),
+            image_width,
+            image_height,
+        )
+        focus_box = _expand_focus_box(
+            exact_box,
+            width=image_width,
+            height=image_height,
+        )
+
+        x0 = max(0, int(round(focus_box[0] - margin_x)))
+        x1 = min(image_width, int(round(focus_box[2] + margin_x)))
+        y0 = max(0, int(round(focus_box[1] - margin_y)))
+        y1 = min(image_height, int(round(focus_box[3] + margin_y)))
+
+        if x1 <= x0 or y1 <= y0:
+            crop = _draw_target_focus(
+                rendered,
+                exact_box=exact_box,
+                focus_box=focus_box,
+            )
+        else:
+            exact_crop_box = (
+                exact_box[0] - x0,
+                exact_box[1] - y0,
+                exact_box[2] - x0,
+                exact_box[3] - y0,
+            )
+            focus_crop_box = (
+                focus_box[0] - x0,
+                focus_box[1] - y0,
+                focus_box[2] - x0,
+                focus_box[3] - y0,
+            )
+            crop = _draw_target_focus(
+                rendered.crop((x0, y0, x1, y1)),
+                exact_box=exact_crop_box,
+                focus_box=focus_crop_box,
+            )
+
+        output = BytesIO()
+        crop.save(output, format="PNG")
+        return output.getvalue()
+
+
+def render_bbox_preview_png_data_url(
+    pdf_path: Path,
+    page_number: int,
+    bbox: dict[str, float],
+) -> str:
+    encoded = base64.b64encode(
+        render_bbox_preview_png_bytes(pdf_path, page_number, bbox)
+    ).decode("ascii")
     return f"data:image/png;base64,{encoded}"

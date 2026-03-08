@@ -24,6 +24,24 @@ export type FontReviewTarget = {
   nearby_text?: string;
 };
 
+export type TableReviewTarget = {
+  table_review_id?: string;
+  page?: number;
+  num_rows?: number;
+  num_cols?: number;
+  text_excerpt?: string;
+  header_rows?: number[];
+  row_header_columns?: number[];
+  bbox?: {
+    l?: number;
+    t?: number;
+    r?: number;
+    b?: number;
+  };
+  risk_score?: number;
+  risk_reasons?: string[];
+};
+
 export type LlmSuggestion = {
   summary?: string;
   confidence?: string;
@@ -49,6 +67,35 @@ export type LlmSuggestion = {
     confidence?: string;
     reason?: string;
   }>;
+  proposed_page_orders?: Array<{
+    page?: number;
+    ordered_review_ids?: string[];
+    reason?: string;
+  }>;
+  proposed_element_updates?: Array<{
+    page?: number;
+    review_id?: string;
+    new_type?: string;
+    new_level?: number;
+    reason?: string;
+  }>;
+  proposed_table_updates?: Array<{
+    page?: number;
+    table_review_id?: string;
+    header_rows?: number[];
+    row_header_columns?: number[];
+    reason?: string;
+  }>;
+  readable_text_hints?: Array<{
+    page?: number;
+    review_id?: string;
+    extracted_text?: string;
+    readable_text_hint?: string;
+    issue_type?: string;
+    confidence?: string;
+    should_block_accessibility?: boolean;
+    reason?: string;
+  }>;
 };
 
 export type EditableStructureElement = Record<string, unknown> & {
@@ -56,6 +103,39 @@ export type EditableStructureElement = Record<string, unknown> & {
   page?: number;
   type?: string;
   text?: string;
+};
+
+export type ReadingOrderPageOrder = {
+  page: number;
+  ordered_review_ids: string[];
+  reason?: string;
+};
+
+export type ReadingOrderElementUpdate = {
+  page?: number;
+  review_id: string;
+  new_type: string;
+  new_level?: number;
+  reason?: string;
+};
+
+export type TableHeaderUpdate = {
+  page?: number;
+  table_review_id: string;
+  header_rows: number[];
+  row_header_columns: number[];
+  reason?: string;
+};
+
+export type ReadingOrderTextHint = {
+  page?: number;
+  review_id: string;
+  extracted_text?: string;
+  readable_text_hint?: string;
+  issue_type?: string;
+  confidence?: string;
+  should_block_accessibility?: boolean;
+  reason?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -120,7 +200,7 @@ export const TASK_EVIDENCE_FIELDS: Record<string, EvidenceField[]> = {
   ],
 };
 
-export const LLM_SUGGESTION_TASK_TYPES = new Set(["font_text_fidelity", "reading_order"]);
+export const LLM_SUGGESTION_TASK_TYPES = new Set(["font_text_fidelity", "reading_order", "table_semantics"]);
 
 export const STRUCTURE_TYPE_OPTIONS = [
   { value: "paragraph", label: "Paragraph" },
@@ -128,7 +208,7 @@ export const STRUCTURE_TYPE_OPTIONS = [
   { value: "list_item", label: "List Item" },
   { value: "code", label: "Code" },
   { value: "formula", label: "Formula" },
-  { value: "artifact", label: "Artifact" },
+  { value: "artifact", label: "Hide (Decorative)" },
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -266,12 +346,140 @@ export function fontReviewTargets(task: ReviewTask): FontReviewTarget[] {
     }));
 }
 
+export function tableReviewTargets(task: ReviewTask): TableReviewTarget[] {
+  const value = task.metadata?.table_review_targets;
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item))
+    .map((item) => ({
+      table_review_id: typeof item.table_review_id === "string" ? item.table_review_id : undefined,
+      page: typeof item.page === "number" ? item.page : undefined,
+      num_rows: typeof item.num_rows === "number" ? item.num_rows : undefined,
+      num_cols: typeof item.num_cols === "number" ? item.num_cols : undefined,
+      text_excerpt: typeof item.text_excerpt === "string" ? item.text_excerpt : undefined,
+      header_rows: Array.isArray(item.header_rows)
+        ? item.header_rows
+            .map((entry) => (typeof entry === "number" ? entry : Number(entry)))
+            .filter((entry) => Number.isFinite(entry) && entry >= 0)
+        : undefined,
+      row_header_columns: Array.isArray(item.row_header_columns)
+        ? item.row_header_columns
+            .map((entry) => (typeof entry === "number" ? entry : Number(entry)))
+            .filter((entry) => Number.isFinite(entry) && entry >= 0)
+        : undefined,
+      bbox: item.bbox && typeof item.bbox === "object" && !Array.isArray(item.bbox)
+        ? item.bbox as { l?: number; t?: number; r?: number; b?: number }
+        : undefined,
+      risk_score: typeof item.risk_score === "number" ? item.risk_score : undefined,
+      risk_reasons: Array.isArray(item.risk_reasons)
+        ? item.risk_reasons
+            .map((entry) => (typeof entry === "string" ? entry.trim() : String(entry ?? "").trim()))
+            .filter((entry) => entry.length > 0)
+        : undefined,
+    }));
+}
+
 export function llmSuggestionForTask(task: ReviewTask): LlmSuggestion | null {
   const value = task.metadata?.llm_suggestion;
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
   return value as LlmSuggestion;
+}
+
+export function readingOrderPageOrders(llmSuggestion: LlmSuggestion | null): ReadingOrderPageOrder[] {
+  const value = llmSuggestion?.proposed_page_orders;
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item))
+    .map((item) => ({
+      page: typeof item.page === "number" ? item.page : NaN,
+      ordered_review_ids: Array.isArray(item.ordered_review_ids)
+        ? item.ordered_review_ids
+            .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+            .filter((entry) => entry.length > 0)
+        : [],
+      reason: typeof item.reason === "string" ? item.reason : undefined,
+    }))
+    .filter((item) => Number.isFinite(item.page) && item.page > 0 && item.ordered_review_ids.length > 0);
+}
+
+export function readingOrderElementUpdates(llmSuggestion: LlmSuggestion | null): ReadingOrderElementUpdate[] {
+  const value = llmSuggestion?.proposed_element_updates;
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item))
+    .map((item) => ({
+      page: typeof item.page === "number" ? item.page : undefined,
+      review_id: typeof item.review_id === "string" ? item.review_id.trim() : "",
+      new_type: typeof item.new_type === "string" ? item.new_type.trim() : "",
+      new_level: typeof item.new_level === "number" ? item.new_level : undefined,
+      reason: typeof item.reason === "string" ? item.reason : undefined,
+    }))
+    .filter((item) => item.review_id.length > 0 && item.new_type.length > 0);
+}
+
+export function tableHeaderUpdates(llmSuggestion: LlmSuggestion | null): TableHeaderUpdate[] {
+  const value = llmSuggestion?.proposed_table_updates;
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item))
+    .map((item) => ({
+      page: typeof item.page === "number" ? item.page : undefined,
+      table_review_id: typeof item.table_review_id === "string" ? item.table_review_id.trim() : "",
+      header_rows: Array.isArray(item.header_rows)
+        ? item.header_rows
+            .map((entry) => (typeof entry === "number" ? entry : Number(entry)))
+            .filter((entry) => Number.isFinite(entry) && entry >= 0)
+        : [],
+      row_header_columns: Array.isArray(item.row_header_columns)
+        ? item.row_header_columns
+            .map((entry) => (typeof entry === "number" ? entry : Number(entry)))
+            .filter((entry) => Number.isFinite(entry) && entry >= 0)
+        : [],
+      reason: typeof item.reason === "string" ? item.reason : undefined,
+    }))
+    .filter((item) => item.table_review_id.length > 0);
+}
+
+export function tableHeaderUpdateForTarget(
+  llmSuggestion: LlmSuggestion | null,
+  tableReviewId: string | undefined,
+): TableHeaderUpdate | null {
+  if (!tableReviewId) {
+    return null;
+  }
+  return tableHeaderUpdates(llmSuggestion).find((item) => item.table_review_id === tableReviewId) ?? null;
+}
+
+export function readingOrderTextHints(llmSuggestion: LlmSuggestion | null): ReadingOrderTextHint[] {
+  const value = llmSuggestion?.readable_text_hints;
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item))
+    .map((item) => ({
+      page: typeof item.page === "number" ? item.page : undefined,
+      review_id: typeof item.review_id === "string" ? item.review_id.trim() : "",
+      extracted_text: typeof item.extracted_text === "string" ? item.extracted_text : undefined,
+      readable_text_hint: typeof item.readable_text_hint === "string" ? item.readable_text_hint : undefined,
+      issue_type: typeof item.issue_type === "string" ? item.issue_type : undefined,
+      confidence: typeof item.confidence === "string" ? item.confidence : undefined,
+      should_block_accessibility: typeof item.should_block_accessibility === "boolean"
+        ? item.should_block_accessibility
+        : undefined,
+      reason: typeof item.reason === "string" ? item.reason : undefined,
+    }))
+    .filter((item) => item.review_id.length > 0 && typeof item.readable_text_hint === "string" && item.readable_text_hint.trim().length > 0);
 }
 
 export function pagePreviewUrl(jobId: string, pageNumber: number): string {
@@ -291,6 +499,20 @@ export function fontTargetPreviewUrl(
     operator_index: String(target.operator_index),
   });
   return `/api/jobs/${jobId}/review-tasks/${taskId}/font-target-preview?${params.toString()}`;
+}
+
+export function tableTargetPreviewUrl(
+  jobId: string,
+  taskId: number,
+  target: TableReviewTarget,
+): string | null {
+  if (typeof target.table_review_id !== "string" || target.table_review_id.trim().length === 0) {
+    return null;
+  }
+  const params = new URLSearchParams({
+    table_review_id: target.table_review_id,
+  });
+  return `/api/jobs/${jobId}/review-tasks/${taskId}/table-target-preview?${params.toString()}`;
 }
 
 export function actualTextCandidateForTarget(
@@ -382,6 +604,12 @@ export function previewPagesForTask(task: ReviewTask, llmSuggestion: LlmSuggesti
     }
   }
 
+  for (const target of tableReviewTargets(task)) {
+    if (typeof target.page === "number" && target.page > 0) {
+      pages.add(target.page);
+    }
+  }
+
   return Array.from(pages).sort((a, b) => a - b).slice(0, 3);
 }
 
@@ -443,6 +671,241 @@ export function structureElementsForPage(
     );
 }
 
+function _applyReadingOrderElementUpdate(
+  element: EditableStructureElement,
+  update: ReadingOrderElementUpdate,
+): EditableStructureElement {
+  const nextType = update.new_type;
+  if (!nextType) {
+    return element;
+  }
+
+  if (nextType === "artifact") {
+    return {
+      ...element,
+      _manual_original_type:
+        typeof element.type === "string" && element.type.length > 0
+          ? element.type
+          : "paragraph",
+      type: "artifact",
+    };
+  }
+
+  const nextElement: EditableStructureElement = {
+    ...element,
+    type: nextType,
+  };
+  delete nextElement._manual_original_type;
+
+  if (nextType === "heading") {
+    nextElement.level =
+      typeof update.new_level === "number" && update.new_level >= 1 && update.new_level <= 6
+        ? update.new_level
+        : (typeof element.level === "number" && element.level >= 1 && element.level <= 6 ? element.level : 1);
+  } else {
+    delete nextElement.level;
+  }
+
+  return nextElement;
+}
+
+export function canApplyReadingOrderSuggestion(
+  structure: Record<string, unknown> | null,
+  llmSuggestion: LlmSuggestion | null,
+): boolean {
+  if (!structure || !Array.isArray(structure.elements)) {
+    return false;
+  }
+  const pageOrders = readingOrderPageOrders(llmSuggestion);
+  const elementUpdates = readingOrderElementUpdates(llmSuggestion);
+  if (pageOrders.length === 0 && elementUpdates.length === 0) {
+    return false;
+  }
+
+  for (const pageOrder of pageOrders) {
+    const pageEntries = structureElementsForPage(structure, pageOrder.page);
+    const currentIds = pageEntries.map(({ element }) => element.review_id);
+    if (currentIds.length === 0 || currentIds.length !== pageOrder.ordered_review_ids.length) {
+      return false;
+    }
+    const currentSet = new Set(currentIds);
+    if (new Set(pageOrder.ordered_review_ids).size !== pageOrder.ordered_review_ids.length) {
+      return false;
+    }
+    if (pageOrder.ordered_review_ids.some((reviewId) => !currentSet.has(reviewId))) {
+      return false;
+    }
+  }
+
+  const validTypes = new Set<string>(STRUCTURE_TYPE_OPTIONS.map((option) => option.value));
+  const elements = structure.elements as unknown[];
+  for (const update of elementUpdates) {
+    if (!validTypes.has(update.new_type)) {
+      return false;
+    }
+    const match = elements.find((rawElement) => {
+      if (!rawElement || typeof rawElement !== "object" || Array.isArray(rawElement)) {
+        return false;
+      }
+      const element = rawElement as EditableStructureElement;
+      return element.review_id === update.review_id;
+    });
+    if (!match) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+export function applyReadingOrderSuggestion(
+  structure: Record<string, unknown> | null,
+  llmSuggestion: LlmSuggestion | null,
+): Record<string, unknown> | null {
+  if (!canApplyReadingOrderSuggestion(structure, llmSuggestion) || !structure || !Array.isArray(structure.elements)) {
+    return null;
+  }
+
+  let nextElements = [...structure.elements];
+  const pageOrders = readingOrderPageOrders(llmSuggestion);
+  const elementUpdates = readingOrderElementUpdates(llmSuggestion);
+
+  for (const pageOrder of pageOrders) {
+    const pageEntries = structureElementsForPage({ ...structure, elements: nextElements }, pageOrder.page);
+    const replacementById = new Map(
+      pageEntries.map(({ element }) => [element.review_id, element]),
+    );
+    const replacements = pageOrder.ordered_review_ids.map((reviewId) => replacementById.get(reviewId));
+    if (replacements.some((element) => !element)) {
+      return null;
+    }
+    const replacementMap = new Map(
+      pageEntries.map(({ index }, position) => [index, replacements[position] as EditableStructureElement]),
+    );
+    nextElements = nextElements.map((rawElement, index) => replacementMap.get(index) ?? rawElement);
+  }
+
+  if (elementUpdates.length > 0) {
+    const updatesById = new Map(elementUpdates.map((update) => [update.review_id, update]));
+    nextElements = nextElements.map((rawElement) => {
+      if (!rawElement || typeof rawElement !== "object" || Array.isArray(rawElement)) {
+        return rawElement;
+      }
+      const element = rawElement as EditableStructureElement;
+      const update = updatesById.get(element.review_id);
+      if (!update) {
+        return rawElement;
+      }
+      return _applyReadingOrderElementUpdate(element, update);
+    });
+  }
+
+  return {
+    ...structure,
+    elements: nextElements,
+  };
+}
+
+export function canApplyTableSuggestion(
+  structure: Record<string, unknown> | null,
+  llmSuggestion: LlmSuggestion | null,
+): boolean {
+  if (!structure || !Array.isArray(structure.elements)) {
+    return false;
+  }
+  const updates = tableHeaderUpdates(llmSuggestion);
+  if (updates.length === 0) {
+    return false;
+  }
+
+  for (const update of updates) {
+    const match = (structure.elements as unknown[]).find((rawElement) => {
+      if (!rawElement || typeof rawElement !== "object" || Array.isArray(rawElement)) {
+        return false;
+      }
+      const element = rawElement as EditableStructureElement;
+      if (element.review_id !== update.table_review_id || element.type !== "table") {
+        return false;
+      }
+      const page = typeof element.page === "number" ? element.page + 1 : undefined;
+      return typeof update.page !== "number" || page === update.page;
+    });
+    if (!match || !Array.isArray((match as Record<string, unknown>).cells)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function canApplySingleTableSuggestion(
+  structure: Record<string, unknown> | null,
+  update: TableHeaderUpdate | null,
+): boolean {
+  if (!update) {
+    return false;
+  }
+  return canApplyTableSuggestion(structure, { proposed_table_updates: [update] });
+}
+
+export function applyTableSuggestion(
+  structure: Record<string, unknown> | null,
+  llmSuggestion: LlmSuggestion | null,
+): Record<string, unknown> | null {
+  if (!canApplyTableSuggestion(structure, llmSuggestion) || !structure || !Array.isArray(structure.elements)) {
+    return null;
+  }
+  const updatesById = new Map(tableHeaderUpdates(llmSuggestion).map((update) => [update.table_review_id, update]));
+  const nextElements = (structure.elements as unknown[]).map((rawElement) => {
+    if (!rawElement || typeof rawElement !== "object" || Array.isArray(rawElement)) {
+      return rawElement;
+    }
+    const element = rawElement as EditableStructureElement;
+    const update = updatesById.get(element.review_id);
+    if (!update || element.type !== "table" || !Array.isArray(element.cells)) {
+      return rawElement;
+    }
+
+    const headerRows = new Set(update.header_rows);
+    const rowHeaderColumns = new Set(update.row_header_columns);
+    const nextCells = (element.cells as unknown[]).map((rawCell) => {
+      if (!rawCell || typeof rawCell !== "object" || Array.isArray(rawCell)) {
+        return rawCell;
+      }
+      const cell = rawCell as Record<string, unknown>;
+      const row = typeof cell.row === "number" ? cell.row : Number(cell.row ?? -1);
+      const col = typeof cell.col === "number" ? cell.col : Number(cell.col ?? -1);
+      const columnHeader = Number.isFinite(row) && headerRows.has(row);
+      const rowHeader = Number.isFinite(col) && rowHeaderColumns.has(col);
+      return {
+        ...cell,
+        column_header: columnHeader,
+        row_header: rowHeader,
+        is_header: columnHeader || rowHeader,
+      };
+    });
+
+    return {
+      ...element,
+      cells: nextCells,
+    };
+  });
+
+  return {
+    ...structure,
+    elements: nextElements,
+  };
+}
+
+export function applySingleTableSuggestion(
+  structure: Record<string, unknown> | null,
+  update: TableHeaderUpdate | null,
+): Record<string, unknown> | null {
+  if (!update) {
+    return null;
+  }
+  return applyTableSuggestion(structure, { proposed_table_updates: [update] });
+}
+
 export function structureTypeLabel(type: string | undefined): string {
   const option = STRUCTURE_TYPE_OPTIONS.find((entry) => entry.value === type);
   return option?.label ?? String(type ?? "paragraph");
@@ -452,19 +915,19 @@ export function guidanceForTask(taskType: string): string[] {
   if (taskType === "reading_order") {
     return [
       "Read the document with a screen reader or exported text view.",
-      "Check that headings, paragraphs, lists, and sidebars follow the intended order.",
+      "Check that headings, paragraphs, lists, and sidebars are announced in the intended order.",
     ];
   }
   if (taskType === "font_text_fidelity") {
     return [
-      "Compare visible text against what copy/paste or a screen reader exposes.",
+      "Compare the visible text against what copy and paste or a screen reader exposes.",
       "Pay attention to symbols, ligatures, math, and unusual fonts.",
     ];
   }
   if (taskType === "table_semantics") {
     return [
-      "Verify header cells, spans, and reading order row by row.",
-      "Confirm that assistive technology can identify the headers for each data cell.",
+      "Check header cells, merged cells, and reading order row by row.",
+      "Confirm that a screen reader can identify the right headers for each data cell.",
     ];
   }
   if (taskType === "content_fidelity") {

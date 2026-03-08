@@ -1,7 +1,10 @@
 import type { ReviewTask } from "../types";
 import type { FontReviewTarget, LlmSuggestion } from "../pages/reviewHelpers";
 import {
+  canApplySingleTableSuggestion,
+  canApplyTableSuggestion,
   LLM_SUGGESTION_TASK_TYPES,
+  canApplyReadingOrderSuggestion,
   applicableActualTextCandidates,
   evidenceFieldsForTask,
   existingEvidenceForTask,
@@ -12,7 +15,14 @@ import {
   numberListMetadata,
   pagePreviewUrl,
   previewPagesForTask,
+  readingOrderElementUpdates,
+  readingOrderPageOrders,
+  readingOrderTextHints,
   stringListMetadata,
+  tableHeaderUpdateForTarget,
+  tableHeaderUpdates,
+  tableTargetPreviewUrl,
+  tableReviewTargets,
   structureElementsForPage,
   structurePages,
 } from "../pages/reviewHelpers";
@@ -82,6 +92,8 @@ export interface ReviewTaskCardProps {
   onApplyFontMap: (task: ReviewTask, target: FontReviewTarget) => void;
   onUseSuggestedActualText: (task: ReviewTask, target: FontReviewTarget, proposedText: string) => void;
   onApplySuggestedBatch: (task: ReviewTask, llmSuggestion: LlmSuggestion | null, targets: FontReviewTarget[]) => void;
+  onApplyReadingOrderSuggestion: (task: ReviewTask, llmSuggestion: LlmSuggestion | null) => void;
+  onApplyTableSuggestion: (task: ReviewTask, llmSuggestion: LlmSuggestion | null, tableReviewId?: string) => void;
   onUpdateTask: (task: ReviewTask, status: "pending_review" | "resolved") => void;
   onSuggestTask: (task: ReviewTask) => void;
   onSelectReadingOrderPage: (page: number) => void;
@@ -121,6 +133,8 @@ export default function ReviewTaskCard({
   onApplyFontMap,
   onUseSuggestedActualText,
   onApplySuggestedBatch,
+  onApplyReadingOrderSuggestion,
+  onApplyTableSuggestion,
   onUpdateTask,
   onSuggestTask,
   onSelectReadingOrderPage,
@@ -158,6 +172,17 @@ export default function ReviewTaskCard({
   const fontRuleIds = stringListMetadata(task, "font_rule_ids");
   const reviewTargets = fontReviewTargets(task);
   const llmSuggestion = llmSuggestionForTask(task);
+  const suggestedPageOrders = readingOrderPageOrders(llmSuggestion);
+  const suggestedElementUpdates = readingOrderElementUpdates(llmSuggestion);
+  const suggestedTextHints = readingOrderTextHints(llmSuggestion);
+  const suggestedTableUpdates = tableHeaderUpdates(llmSuggestion);
+  const tableTargets = tableReviewTargets(task);
+  const canApplyReadingOrder =
+    task.task_type === "reading_order"
+    && canApplyReadingOrderSuggestion(editingStructure, llmSuggestion);
+  const canApplyTable =
+    task.task_type === "table_semantics"
+    && canApplyTableSuggestion(editingStructure, llmSuggestion);
   const suggestedActualTextCandidates = applicableActualTextCandidates(llmSuggestion, reviewTargets);
   const supportsSuggestion = LLM_SUGGESTION_TASK_TYPES.has(task.task_type);
   const suggestionGeneratedAt = llmSuggestion?.generated_at
@@ -176,6 +201,7 @@ export default function ReviewTaskCard({
       ? structureElementsForPage(editingStructure, editorPage)
       : [];
   const hasUnsavedStructureEdits = structureHistoryLength > 0;
+  const pagePreviewTaskType = task.task_type === "table_semantics" ? "Specific table pages" : "Relevant pages";
 
   return (
     <div className="rounded-xl border border-ink/6 bg-cream p-5">
@@ -196,13 +222,13 @@ export default function ReviewTaskCard({
               }
             `}
           >
-            {task.blocking ? "Blocking" : "Advisory"}
+            {task.blocking ? "Must Fix" : "Optional Check"}
           </span>
           <span className="text-xs text-ink-muted capitalize">
             {task.severity} severity
           </span>
           <span className="text-xs text-ink-muted capitalize">
-            {task.source}
+            {task.source === "validation" ? "Compliance check" : task.source === "fidelity" ? "Content check" : task.source}
           </span>
         </div>
       </div>
@@ -249,7 +275,7 @@ export default function ReviewTaskCard({
       {/* Relevant page previews */}
       {previewPages.length > 0 && (
         <div className="mt-4">
-          <p className="text-xs font-semibold text-ink mb-2">Relevant pages</p>
+          <p className="text-xs font-semibold text-ink mb-2">{pagePreviewTaskType}</p>
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
             {previewPages.map((pageNumber) => (
               <a
@@ -315,7 +341,9 @@ export default function ReviewTaskCard({
           taskId={task.id}
           editablePages={editablePages}
           editorPage={editorPage}
+          editorPagePreviewUrl={editorPage ? pagePreviewUrl(jobId, editorPage) : null}
           pageElements={pageElements}
+          readableTextHints={suggestedTextHints.filter((hint) => hint.page === editorPage)}
           hasUnsavedEdits={hasUnsavedStructureEdits}
           structureHistoryLength={structureHistoryLength}
           structureFutureLength={structureFutureLength}
@@ -340,7 +368,7 @@ export default function ReviewTaskCard({
             <div>
               <p className="text-xs font-semibold text-ink">Gemini suggestion</p>
               <p className="text-xs text-ink-muted mt-1">
-                Proposal only. Review it, then apply remediation or manual verification yourself.
+                Proposal only. Review it, then choose whether to apply the suggested fix.
               </p>
             </div>
             {supportsSuggestion && (
@@ -398,10 +426,10 @@ export default function ReviewTaskCard({
                   <div className="flex items-start justify-between gap-3">
                     <div>
                       <p className="text-xs font-semibold text-ink">
-                        Suggested `ActualText` batch
+                        Suggested spoken-text batch
                       </p>
                       <p className="mt-1 text-xs text-ink-muted">
-                        Reviewer-approved batch apply. This rewrites all suggested localized targets and reruns validation once.
+                        Applies the suggested spoken text to all flagged locations in one pass, then reruns the checks once.
                       </p>
                     </div>
                     <button
@@ -415,7 +443,7 @@ export default function ReviewTaskCard({
                         disabled:opacity-50 disabled:cursor-not-allowed
                       "
                     >
-                      {applyingActualTextBatchTaskId === task.id ? "Applying..." : "Apply Suggested Batch"}
+                      {applyingActualTextBatchTaskId === task.id ? "Applying..." : "Apply Suggested Text"}
                     </button>
                   </div>
                   <div className="mt-3 space-y-2">
@@ -441,6 +469,308 @@ export default function ReviewTaskCard({
                   {applyFontActualTextBatchError && applyingActualTextBatchTaskId === task.id && (
                     <p className="mt-3 text-xs text-error">
                       {applyFontActualTextBatchError.message || "Failed to apply ActualText batch remediation"}
+                    </p>
+                  )}
+                </div>
+              )}
+              {task.task_type === "reading_order" && (
+                <div className="rounded-lg border border-accent-light bg-white/70 px-3 py-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-semibold text-ink">
+                        Suggested reading order changes
+                      </p>
+                      <p className="mt-1 text-xs text-ink-muted">
+                        Load Gemini&apos;s suggested page order and content-type changes into the editor, then review and save them explicitly.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onApplyReadingOrderSuggestion(task, llmSuggestion)}
+                      disabled={!canApplyReadingOrder || updateStructurePending}
+                      className="
+                        px-3 py-2 rounded-lg text-xs font-medium
+                        bg-accent text-white
+                        hover:bg-accent/90 transition-colors
+                        disabled:opacity-50 disabled:cursor-not-allowed
+                      "
+                    >
+                      Load into Editor
+                    </button>
+                  </div>
+                  <div className="mt-3 grid gap-3 md:grid-cols-2">
+                    <div className="rounded-lg bg-paper-warm/70 px-3 py-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                        Page reorders
+                      </p>
+                      {suggestedPageOrders.length > 0 ? (
+                        <div className="mt-2 space-y-2">
+                          {suggestedPageOrders.map((pageOrder) => (
+                            <div key={`${task.id}-page-order-${pageOrder.page}`} className="text-xs text-ink">
+                              <p className="font-medium">
+                                Page {pageOrder.page}: {pageOrder.ordered_review_ids.length} blocks
+                              </p>
+                              {pageOrder.reason && (
+                                <p className="mt-1 text-ink-muted">{pageOrder.reason}</p>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="mt-2 text-xs text-ink-muted">No page reorder proposed.</p>
+                      )}
+                    </div>
+                    <div className="rounded-lg bg-paper-warm/70 px-3 py-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                        Element updates
+                      </p>
+                      {suggestedElementUpdates.length > 0 ? (
+                        <div className="mt-2 space-y-2">
+                          {suggestedElementUpdates.map((update) => (
+                            <div
+                              key={`${task.id}-element-update-${update.review_id}`}
+                              className="text-xs text-ink"
+                            >
+                              <p className="font-medium">
+                                {update.review_id} -&gt; {update.new_type}
+                                {typeof update.new_level === "number" ? ` (H${update.new_level})` : ""}
+                              </p>
+                              <p className="mt-1 text-ink-muted">
+                                {update.page ? `Page ${update.page}` : "Page unknown"}
+                                {update.reason ? ` · ${update.reason}` : ""}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="mt-2 text-xs text-ink-muted">No type or heading-level changes proposed.</p>
+                      )}
+                    </div>
+                  </div>
+                  {!canApplyReadingOrder && (
+                    <p className="mt-3 text-xs text-warning">
+                      This suggestion does not line up cleanly with the current editable structure, so it cannot be applied automatically.
+                    </p>
+                  )}
+                </div>
+              )}
+              {task.task_type === "table_semantics" && (
+                <div className="rounded-lg border border-accent-light bg-white/70 px-3 py-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-semibold text-ink">
+                        Suggested table fixes
+                      </p>
+                      <p className="mt-1 text-xs text-ink-muted">
+                        Review each flagged table independently. Load one table at a time when you want targeted changes, or load all suggested table fixes together.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onApplyTableSuggestion(task, llmSuggestion)}
+                      disabled={!canApplyTable || updateStructurePending}
+                      className="
+                        px-3 py-2 rounded-lg text-xs font-medium
+                        bg-accent text-white
+                        hover:bg-accent/90 transition-colors
+                        disabled:opacity-50 disabled:cursor-not-allowed
+                      "
+                    >
+                      Load All Table Fixes
+                    </button>
+                  </div>
+                  <div className="mt-3 space-y-4">
+                    {tableTargets.length > 0 ? (
+                      tableTargets.map((target) => {
+                        const update = tableHeaderUpdateForTarget(llmSuggestion, target.table_review_id);
+                        const previewUrl = tableTargetPreviewUrl(jobId, task.id, target);
+                        const canApplyTarget = canApplySingleTableSuggestion(editingStructure, update);
+                        return (
+                          <div
+                            key={`${task.id}-table-target-${target.table_review_id}`}
+                            className="rounded-lg border border-ink/8 bg-paper-warm/60 px-3 py-3"
+                          >
+                            <div className="flex flex-col gap-3 lg:flex-row">
+                              <div className="lg:w-56 shrink-0">
+                                {previewUrl ? (
+                                  <a
+                                    href={previewUrl}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="block rounded-lg border border-ink/8 bg-white/70 p-2 no-underline"
+                                  >
+                                    <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                                      Table preview
+                                    </p>
+                                    <img
+                                      src={previewUrl}
+                                      alt={`Preview of table ${target.table_review_id ?? "target"}`}
+                                      loading="lazy"
+                                      className="mt-2 w-full rounded-md border border-ink/6 bg-paper-warm object-cover"
+                                    />
+                                  </a>
+                                ) : (
+                                  <div className="rounded-lg border border-ink/8 bg-white/70 p-3">
+                                    <p className="text-xs text-ink-muted">Preview unavailable for this table target.</p>
+                                  </div>
+                                )}
+                                {typeof target.page === "number" && (
+                                  <a
+                                    href={pagePreviewUrl(jobId, target.page)}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="mt-2 inline-flex text-xs font-medium text-accent no-underline hover:underline"
+                                  >
+                                    Open full page preview
+                                  </a>
+                                )}
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-start justify-between gap-3">
+                                  <div>
+                                    <p className="text-sm font-medium text-ink">
+                                      {target.table_review_id ?? "Table target"}
+                                      {typeof target.page === "number" ? ` · Page ${target.page}` : ""}
+                                      {typeof target.num_rows === "number" && typeof target.num_cols === "number"
+                                        ? ` · ${target.num_rows}x${target.num_cols}`
+                                        : ""}
+                                    </p>
+                                    {typeof target.risk_score === "number" && (
+                                      <p className="mt-1 text-xs text-ink-muted">
+                                        Risk score {target.risk_score.toFixed(1)}
+                                      </p>
+                                    )}
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => onApplyTableSuggestion(task, llmSuggestion, target.table_review_id)}
+                                    disabled={!canApplyTarget || updateStructurePending || !update}
+                                    className="
+                                      px-3 py-2 rounded-lg text-xs font-medium
+                                      bg-accent text-white
+                                      hover:bg-accent/90 transition-colors
+                                      disabled:opacity-50 disabled:cursor-not-allowed
+                                    "
+                                    >
+                                    Load This Table Fix
+                                  </button>
+                                </div>
+
+                                {target.risk_reasons && target.risk_reasons.length > 0 && (
+                                  <div className="mt-3">
+                                    <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                                      Why this table is risky
+                                    </p>
+                                    <div className="mt-2 flex flex-wrap gap-2">
+                                      {target.risk_reasons.map((reason, index) => (
+                                        <span
+                                          key={`${task.id}-${target.table_review_id}-risk-${index}`}
+                                          className="rounded-full bg-warning-light px-2 py-1 text-[11px] text-warning"
+                                        >
+                                          {reason}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                                <div className="mt-3 grid gap-3 md:grid-cols-2">
+                                  <div className="rounded-lg bg-white/70 px-3 py-3">
+                                    <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                                      Current header flags
+                                    </p>
+                                    <p className="mt-2 text-xs text-ink-muted">
+                                      Header rows: {target.header_rows && target.header_rows.length > 0 ? target.header_rows.join(", ") : "none"}
+                                    </p>
+                                    <p className="mt-1 text-xs text-ink-muted">
+                                      Row-header columns: {target.row_header_columns && target.row_header_columns.length > 0 ? target.row_header_columns.join(", ") : "none"}
+                                    </p>
+                                  </div>
+                                  <div className="rounded-lg bg-white/70 px-3 py-3">
+                                    <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                                      Gemini proposal
+                                    </p>
+                                    {update ? (
+                                      <>
+                                        <p className="mt-2 text-xs text-ink-muted">
+                                          Header rows: {update.header_rows.length > 0 ? update.header_rows.join(", ") : "none"}
+                                        </p>
+                                        <p className="mt-1 text-xs text-ink-muted">
+                                          Row-header columns: {update.row_header_columns.length > 0 ? update.row_header_columns.join(", ") : "none"}
+                                        </p>
+                                        {update.reason && (
+                                          <p className="mt-2 text-xs text-ink-muted">{update.reason}</p>
+                                        )}
+                                      </>
+                                    ) : (
+                                      <p className="mt-2 text-xs text-ink-muted">
+                                        No concrete header update was proposed for this table.
+                                      </p>
+                                    )}
+                                  </div>
+                                </div>
+
+                                {target.text_excerpt && (
+                                  <p className="mt-3 text-xs text-ink-muted">{target.text_excerpt}</p>
+                                )}
+
+                                {!canApplyTarget && update && (
+                                  <p className="mt-3 text-xs text-warning">
+                                    This table proposal does not line up cleanly with the current editable structure.
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })
+                    ) : suggestedTableUpdates.length > 0 ? (
+                      suggestedTableUpdates.map((update) => (
+                        <div
+                          key={`${task.id}-table-update-${update.table_review_id}`}
+                          className="rounded-lg bg-paper-warm/70 px-3 py-3"
+                        >
+                          <p className="text-sm font-medium text-ink">
+                            {update.table_review_id}
+                            {typeof update.page === "number" ? ` · Page ${update.page}` : ""}
+                          </p>
+                          <p className="mt-1 text-xs text-ink-muted">
+                            Header rows: {update.header_rows.length > 0 ? update.header_rows.join(", ") : "none"}
+                            {" · "}
+                            Row-header columns: {update.row_header_columns.length > 0 ? update.row_header_columns.join(", ") : "none"}
+                          </p>
+                          {update.reason && (
+                            <p className="mt-2 text-xs text-ink-muted">{update.reason}</p>
+                          )}
+                        </div>
+                      ))
+                    ) : (
+                      <p className="text-xs text-ink-muted">No concrete header update was proposed.</p>
+                    )}
+                  </div>
+                  {hasUnsavedStructureEdits && (
+                    <div className="mt-3 flex items-center justify-between gap-3 rounded-lg bg-white/70 px-3 py-3">
+                      <p className="text-xs text-ink-muted">
+                        Suggested table fixes are loaded as unsaved structure changes.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={onSaveStructure}
+                        disabled={updateStructurePending}
+                        className="
+                          px-3 py-2 rounded-lg text-xs font-medium
+                          bg-accent text-white
+                          hover:bg-accent/90 transition-colors
+                          disabled:opacity-50 disabled:cursor-not-allowed
+                        "
+                      >
+                        {updateStructurePending ? "Reprocessing..." : "Save Table Changes"}
+                      </button>
+                    </div>
+                  )}
+                  {!canApplyTable && llmSuggestion && (
+                    <p className="mt-3 text-xs text-warning">
+                      This suggestion does not line up cleanly with the current table structure, so it cannot be applied automatically.
                     </p>
                   )}
                 </div>

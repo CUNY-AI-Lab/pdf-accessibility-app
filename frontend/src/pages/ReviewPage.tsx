@@ -24,13 +24,19 @@ import { pluralize } from "../utils/format";
 import type { EditableStructureElement, FontReviewTarget, LlmSuggestion } from "./reviewHelpers";
 import {
   actualTextKeyForTarget,
+  applyReadingOrderSuggestion,
+  applySingleTableSuggestion,
+  applyTableSuggestion,
   applicableActualTextCandidates,
   ensureEditableStructure,
   evidenceFieldsForTask,
   existingEvidenceForTask,
   existingResolutionNote,
+  readingOrderElementUpdates,
+  readingOrderPageOrders,
   structureElementsForPage,
   structurePages,
+  tableHeaderUpdateForTarget,
 } from "./reviewHelpers";
 
 export default function ReviewPage() {
@@ -408,6 +414,57 @@ export default function ReviewPage() {
     }
   };
 
+  const handleApplyReadingOrderSuggestion = (
+    task: ReviewTask,
+    llmSuggestion: LlmSuggestion | null,
+  ) => {
+    let applied = false;
+    applyStructureMutation((current) => {
+      const next = applyReadingOrderSuggestion(current, llmSuggestion);
+      if (!next) {
+        return current;
+      }
+      applied = true;
+      return next;
+    });
+
+    if (!applied) {
+      return;
+    }
+
+    const firstSuggestedPage =
+      readingOrderPageOrders(llmSuggestion)[0]?.page
+      ?? readingOrderElementUpdates(llmSuggestion).find((update) => typeof update.page === "number")?.page
+      ?? null;
+
+    if (firstSuggestedPage) {
+      setSelectedReadingOrderPage(firstSuggestedPage);
+    } else if (task.metadata?.pages_to_check && Array.isArray(task.metadata.pages_to_check)) {
+      const firstTaskPage = task.metadata.pages_to_check
+        .map((value) => Number(value))
+        .find((value) => Number.isFinite(value) && value > 0);
+      if (firstTaskPage) {
+        setSelectedReadingOrderPage(firstTaskPage);
+      }
+    }
+  };
+
+  const handleApplyTableSuggestion = (
+    _task: ReviewTask,
+    llmSuggestion: LlmSuggestion | null,
+    tableReviewId?: string,
+  ) => {
+    applyStructureMutation((current) => {
+      const next = tableReviewId
+        ? applySingleTableSuggestion(
+            current,
+            tableHeaderUpdateForTarget(llmSuggestion, tableReviewId),
+          )
+        : applyTableSuggestion(current, llmSuggestion);
+      return next ?? current;
+    });
+  };
+
   // ---------------------------------------------------------------------------
   // Font remediation handlers
   // ---------------------------------------------------------------------------
@@ -624,7 +681,7 @@ export default function ReviewPage() {
           {isAltReview
             ? "Review each figure's generated alt text. You can approve it as-is, edit it for accuracy, or mark purely decorative images. All figures must be reviewed before finalizing."
             : isManualReview
-              ? "Review the blocking accessibility tasks before distributing this PDF. The fidelity gate found issues that need human judgment or manual remediation."
+              ? "Review the required accessibility tasks before distributing this PDF. The content checks found issues that need human judgment or a manual fix."
               : "This job is not currently waiting on review."}
         </p>
       </div>
@@ -720,6 +777,8 @@ export default function ReviewPage() {
                 onApplyFontMap={handleApplyFontMap}
                 onUseSuggestedActualText={handleUseSuggestedActualText}
                 onApplySuggestedBatch={handleApplySuggestedActualTextBatch}
+                onApplyReadingOrderSuggestion={handleApplyReadingOrderSuggestion}
+                onApplyTableSuggestion={handleApplyTableSuggestion}
                 onUpdateTask={handleUpdateTask}
                 onSuggestTask={handleSuggestTask}
                 onSelectReadingOrderPage={setSelectedReadingOrderPage}

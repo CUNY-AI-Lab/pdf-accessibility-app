@@ -121,10 +121,15 @@ async def test_tag_pdf_artifacts_visually_blank_image_only_pages(monkeypatch, tm
 
 
 @pytest.mark.asyncio
-async def test_tag_pdf_artifacts_ocr_noise_only_pages(tmp_path):
+async def test_tag_pdf_artifacts_ocr_noise_only_pages(monkeypatch, tmp_path):
     input_pdf = tmp_path / "ocr_noise_only.pdf"
     output_pdf = tmp_path / "tagged.pdf"
     _build_ocr_noise_only_pdf(input_pdf)
+
+    monkeypatch.setattr(
+        "app.pipeline.tagger._render_page_ink_ratio",
+        lambda *_args, **_kwargs: 0.0,
+    )
 
     await tag_pdf(
         input_path=input_pdf,
@@ -139,3 +144,28 @@ async def test_tag_pdf_artifacts_ocr_noise_only_pages(tmp_path):
         stream = bytes(pdf.pages[0].Contents.read_bytes())
         assert b"/Artifact BMC" in stream
         assert b"/Im0 Do" in stream
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_does_not_artifact_nonblank_ocr_noise_only_pages(monkeypatch, tmp_path):
+    input_pdf = tmp_path / "ocr_noise_only_nonblank.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_ocr_noise_only_pdf(input_pdf)
+
+    monkeypatch.setattr(
+        "app.pipeline.tagger._render_page_ink_ratio",
+        lambda *_args, **_kwargs: 0.02,
+    )
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={"elements": [], "title": "OCR Noise"},
+        alt_texts=[],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        stream = bytes(pdf.pages[0].Contents.read_bytes())
+        assert b"/Artifact BMC" not in stream

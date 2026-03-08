@@ -1,5 +1,7 @@
 """Step 3: Extract document structure using IBM Docling."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import re
@@ -9,6 +11,96 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Optional lingua-py language detection (Rust-backed, fast, offline).
+# Install with: uv add lingua-language-detector
+try:
+    from lingua import Language, LanguageDetectorBuilder  # type: ignore[import-untyped]
+
+    _LINGUA_DETECTOR = (
+        LanguageDetectorBuilder.from_all_languages()
+        .with_minimum_relative_distance(0.25)
+        .build()
+    )
+except ImportError:
+    _LINGUA_DETECTOR = None
+
+# Map lingua Language enum names to BCP-47 language tags.
+_LINGUA_TO_BCP47: dict[str, str] = {
+    "ENGLISH": "en", "SPANISH": "es", "FRENCH": "fr", "GERMAN": "de",
+    "ITALIAN": "it", "PORTUGUESE": "pt", "DUTCH": "nl", "RUSSIAN": "ru",
+    "JAPANESE": "ja", "CHINESE": "zh", "KOREAN": "ko", "ARABIC": "ar",
+    "TURKISH": "tr", "POLISH": "pl", "SWEDISH": "sv", "NORWEGIAN": "no",
+    "DANISH": "da", "FINNISH": "fi", "CZECH": "cs", "HUNGARIAN": "hu",
+    "ROMANIAN": "ro", "GREEK": "el", "HEBREW": "he", "HINDI": "hi",
+    "THAI": "th", "VIETNAMESE": "vi", "INDONESIAN": "id", "MALAY": "ms",
+    "UKRAINIAN": "uk", "CATALAN": "ca", "CROATIAN": "hr", "SERBIAN": "sr",
+    "SLOVENIAN": "sl", "SLOVAK": "sk", "BULGARIAN": "bg", "LATVIAN": "lv",
+    "LITHUANIAN": "lt", "ESTONIAN": "et",
+}
+
+_LANGUAGE_NAME_TO_BCP47 = {name.lower().replace("_", " "): code for name, code in _LINGUA_TO_BCP47.items()}
+_COMMON_ISO639_3_TO_BCP47: dict[str, str] = {
+    "eng": "en", "spa": "es", "fra": "fr", "fre": "fr", "deu": "de", "ger": "de",
+    "ita": "it", "por": "pt", "nld": "nl", "dut": "nl", "rus": "ru", "jpn": "ja",
+    "zho": "zh", "chi": "zh", "kor": "ko", "ara": "ar", "tur": "tr", "pol": "pl",
+    "swe": "sv", "nor": "no", "dan": "da", "fin": "fi", "ces": "cs", "cze": "cs",
+    "hun": "hu", "ron": "ro", "rum": "ro", "ell": "el", "gre": "el", "heb": "he",
+    "hin": "hi", "tha": "th", "vie": "vi", "ind": "id", "msa": "ms", "may": "ms",
+    "ukr": "uk", "cat": "ca", "hrv": "hr", "srp": "sr", "slv": "sl", "slk": "sk",
+    "slo": "sk", "bul": "bg", "lav": "lv", "lit": "lt", "est": "et",
+}
+_BCP47_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
+
+
+def _normalize_lang_tag(value: str | None) -> str | None:
+    """Normalise common language-name inputs to a safe BCP-47 tag."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    # Full language names from metadata, e.g. "English".
+    by_name = _LANGUAGE_NAME_TO_BCP47.get(raw.lower().replace("_", " "))
+    if by_name:
+        return by_name
+
+    candidate = raw.replace("_", "-").strip()
+    parts = [part for part in candidate.split("-") if part]
+    if not parts:
+        return None
+
+    primary = parts[0].lower()
+    primary = _COMMON_ISO639_3_TO_BCP47.get(primary, primary)
+    normalized = [primary]
+    for part in parts[1:]:
+        if len(part) == 2 and part.isalpha():
+            normalized.append(part.upper())
+        elif len(part) == 4 and part.isalpha():
+            normalized.append(part.title())
+        else:
+            normalized.append(part.lower())
+
+    tag = "-".join(normalized)
+    if not _BCP47_RE.match(tag):
+        return None
+    return tag
+
+
+def _detect_language(text: str) -> str | None:
+    """Detect the language of a text fragment.
+
+    Returns a BCP-47 tag (e.g. 'fr', 'es') or None if detection fails
+    or the text is too short to detect reliably.
+    """
+    if not _LINGUA_DETECTOR or not text or len(text.split()) < 8:
+        return None
+    try:
+        result = _LINGUA_DETECTOR.detect_language_of(text)
+        if result is not None:
+            return _LINGUA_TO_BCP47.get(result.name)
+    except Exception:
+        pass
+    return None
 
 TOC_HEADING_TEXTS = {
     "contents",
@@ -131,49 +223,81 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
         text = item.get("text", item.get("orig", ""))
         bbox = _extract_bbox(prov)
 
+        # Docling may provide per-element language via Watson NLP metadata
+        _docling_meta = item.get("meta") or item.get("metadata") or {}
+        _docling_lang = (
+            _docling_meta.get("language")
+            or _docling_meta.get("detected_language")
+            or item.get("language")
+        )
+        _item_lang = _normalize_lang_tag(_docling_lang)
+
         if label == "title":
-            elements.append({
+            elem_dict: dict = {
                 "type": "heading",
                 "level": 1,
                 "text": text,
                 "page": page,
                 "bbox": bbox,
                 "_is_title": True,  # internal flag for level inference
-            })
+            }
+            if _item_lang:
+                elem_dict["lang"] = _item_lang
+            elements.append(elem_dict)
 
         elif label == "section_header":
             level = item.get("level", 1)
             level = max(1, min(6, level))
-            elements.append({
+            elem_dict = {
                 "type": "heading",
                 "level": level,
                 "text": text,
                 "page": page,
                 "bbox": bbox,
-            })
+            }
+            if _item_lang:
+                elem_dict["lang"] = _item_lang
+            elements.append(elem_dict)
 
         elif label in ("text", "paragraph", "caption", "reference"):
             if text.strip():
-                elements.append({
+                elem_dict = {
                     "type": "paragraph",
                     "text": text,
                     "page": page,
                     "bbox": bbox,
-                })
+                }
+                if _item_lang:
+                    elem_dict["lang"] = _item_lang
+                elements.append(elem_dict)
 
         elif label == "footnote":
             if text.strip():
-                elements.append({
+                elem_dict = {
                     "type": "note",
                     "text": text,
                     "page": page,
                     "bbox": bbox,
-                })
+                }
+                if _item_lang:
+                    elem_dict["lang"] = _item_lang
+                elements.append(elem_dict)
 
         elif label == "list_item":
             parent_ref = item.get("parent", {}).get("$ref", "")
             parent = _resolve_ref(doc_dict, parent_ref)
             parent_label = parent.get("label", "") if parent else ""
+            list_group_ref = parent_ref if parent_label == "list" else None
+
+            # Detect nesting: if this list group's parent is also a list
+            # group, record it so the tagger can build nested /L elements.
+            parent_list_group_ref = None
+            if list_group_ref and parent:
+                gp_ref = parent.get("parent", {}).get("$ref", "")
+                gp = _resolve_ref(doc_dict, gp_ref)
+                if gp and gp.get("label") == "list":
+                    parent_list_group_ref = gp_ref
+
             elements.append({
                 "type": "list_item",
                 "text": text,
@@ -181,7 +305,8 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
                 "bbox": bbox,
                 "enumerated": item.get("enumerated", False),
                 "marker": item.get("marker", ""),
-                "list_group_ref": parent_ref if parent_label == "list" else None,
+                "list_group_ref": list_group_ref,
+                "parent_list_group_ref": parent_list_group_ref,
             })
 
         elif label in ("picture", "chart"):
@@ -230,6 +355,18 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
                 "page": page,
                 "artifact_type": label,
             })
+
+    # Detect per-element language via lingua-py for elements that
+    # don't already have language from Docling metadata.  Only runs
+    # on text-bearing elements with enough words for reliable detection.
+    if _LINGUA_DETECTOR is not None:
+        _lang_eligible = {"heading", "paragraph", "list_item", "note", "code"}
+        for elem in elements:
+            if elem.get("lang") or elem.get("type") not in _lang_eligible:
+                continue
+            detected = _detect_language(elem.get("text", ""))
+            if detected:
+                elem["lang"] = _normalize_lang_tag(detected) or detected
 
     _mark_toc_sequences(elements)
     return _expand_toc_item_tables(elements)

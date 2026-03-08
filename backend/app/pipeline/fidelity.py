@@ -20,6 +20,21 @@ from app.services.pdf_context import parse_verapdf_context_path
 from app.services.pdf_preview import render_page_png_bytes
 
 FONT_RULE_FRAGMENT = "-7.21."
+
+# Link text quality patterns (1A)
+_POOR_LINK_TEXT_EXACT = frozenset({
+    "click here", "here", "link", "read more", "learn more", "more",
+    "details", "more info", "more information", "this link", "go",
+    "click", "click this", "this", "page", "website", "site",
+})
+_POOR_LINK_TEXT_RE = re.compile(
+    r"^https?://\S+$"      # bare URL
+    r"|^.{0,1}$"            # single character or empty
+    r"|^[\d\s]+$"           # only digits/whitespace
+    r"|^link\s*to\s+https?://",  # "Link to http://..." (our inferred fallback)
+    re.IGNORECASE,
+)
+
 TEXT_SAMPLE_MAX_PAGES = 10
 TEXT_SAMPLE_MAX_CHARS = 20000
 TEXT_SAMPLE_MIN_CHARS = 300
@@ -34,6 +49,7 @@ TABLE_KEYWORDS = ("table", "thead", "tbody", "tfoot", "tr", "th", "td")
 FONT_SUBSET_RE = re.compile(r"^[A-Z]{6}\+")
 USED_GLYPH_FONT_RE = re.compile(r"usedGlyphs\[\d+\]\(([^ )]+)")
 PDFMINER_FONTBBOX_WARNING = "Could not get FontBBox from font descriptor because"
+TABLE_REVIEW_TARGET_LIMIT = 6
 
 
 class _PdfMinerFontBBoxFilter(logging.Filter):
@@ -166,6 +182,157 @@ def _collect_structural_fragments(structure_json: dict[str, Any]) -> list[str]:
     return fragments
 
 
+def _table_review_targets(structure_json: dict[str, Any], *, limit: int = 3) -> list[dict[str, Any]]:
+    elements = structure_json.get("elements", [])
+    if not isinstance(elements, list):
+        return []
+
+    targets: list[dict[str, Any]] = []
+    for index, element in enumerate(elements):
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        cells = element.get("cells")
+        if not isinstance(cells, list) or not cells:
+            continue
+        page_raw = element.get("page")
+        page = int(page_raw) + 1 if isinstance(page_raw, int) and page_raw >= 0 else None
+        if page is None:
+            continue
+        targets.append({
+            "table_review_id": str(element.get("review_id") or f"review-{index}"),
+            "page": page,
+            "bbox": element.get("bbox") if isinstance(element.get("bbox"), dict) else None,
+            "num_rows": int(element.get("num_rows", 0) or 0),
+            "num_cols": int(element.get("num_cols", 0) or 0),
+        })
+        if len(targets) >= limit:
+            break
+    return targets
+
+
+def _table_semantics_risk(structure_json: dict[str, Any]) -> dict[str, Any]:
+    elements = structure_json.get("elements", [])
+    if not isinstance(elements, list):
+        return {
+            "table_count": 0,
+            "complex_tables": 0,
+            "high_risk_tables": 0,
+            "risk_score": 0.0,
+            "targets": [],
+        }
+
+    targets: list[dict[str, Any]] = []
+    complex_tables = 0
+    high_risk_tables = 0
+    total_risk_score = 0.0
+
+    for index, element in enumerate(elements):
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        cells = element.get("cells")
+        if not isinstance(cells, list) or not cells:
+            continue
+
+        page_raw = element.get("page")
+        page = int(page_raw) + 1 if isinstance(page_raw, int) and page_raw >= 0 else None
+        if page is None:
+            continue
+
+        num_rows = int(element.get("num_rows", 0) or 0)
+        num_cols = int(element.get("num_cols", 0) or 0)
+        spans_present = False
+        header_rows: set[int] = set()
+        row_header_columns: set[int] = set()
+        header_cell_count = 0
+        nonempty_cells = 0
+
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+            row = cell.get("row")
+            col = cell.get("col")
+            if bool(cell.get("column_header", False)) and isinstance(row, int):
+                header_rows.add(row)
+                header_cell_count += 1
+            if bool(cell.get("row_header", False)) and isinstance(col, int):
+                row_header_columns.add(col)
+                header_cell_count += 1
+            row_span = int(cell.get("row_span", 1) or 1) if isinstance(cell.get("row_span"), int) else 1
+            col_span = int(cell.get("col_span", 1) or 1) if isinstance(cell.get("col_span"), int) else 1
+            if row_span > 1 or col_span > 1:
+                spans_present = True
+            if _normalize_text(cell.get("text")):
+                nonempty_cells += 1
+
+        dense_matrix = num_rows >= 8 and num_cols >= 6
+        very_dense_matrix = num_rows >= 12 and num_cols >= 8
+        weak_header_signal = header_cell_count == 0 or (
+            num_cols >= 4 and len(header_rows) == 0
+        )
+        multi_level_headers = len(header_rows) > 1 or len(row_header_columns) > 1
+        sparse_text = nonempty_cells < max(4, len(cells) * 0.35)
+
+        risk_score = 0.0
+        reasons: list[str] = []
+        if spans_present:
+            risk_score += 1.0
+            reasons.append("merged cells or spans present")
+        if dense_matrix:
+            risk_score += 1.0
+            reasons.append("large table matrix")
+        if very_dense_matrix:
+            risk_score += 1.0
+            reasons.append("very dense table")
+        if weak_header_signal:
+            risk_score += 1.5
+            reasons.append("weak header signal")
+        if multi_level_headers:
+            risk_score += 1.0
+            reasons.append("multi-level header pattern")
+        if sparse_text:
+            risk_score += 0.5
+            reasons.append("sparse cell text")
+
+        if risk_score <= 0:
+            continue
+
+        complex_tables += 1
+        if risk_score >= 2.5:
+            high_risk_tables += 1
+
+        total_risk_score += risk_score
+        if len(targets) < TABLE_REVIEW_TARGET_LIMIT:
+            targets.append({
+                "table_review_id": str(element.get("review_id") or f"review-{index}"),
+                "page": page,
+                "bbox": element.get("bbox") if isinstance(element.get("bbox"), dict) else None,
+                "num_rows": num_rows,
+                "num_cols": num_cols,
+                "risk_score": round(risk_score, 2),
+                "risk_reasons": reasons,
+                "header_rows": sorted(header_rows),
+                "row_header_columns": sorted(row_header_columns),
+                "text_excerpt": _normalize_text(element.get("text"))[:240],
+            })
+
+    targets.sort(
+        key=lambda item: (
+            -float(item.get("risk_score", 0.0)),
+            int(item.get("page", 0)),
+            str(item.get("table_review_id", "")),
+        )
+    )
+    return {
+        "table_count": sum(
+            1 for element in elements if isinstance(element, dict) and element.get("type") == "table"
+        ),
+        "complex_tables": complex_tables,
+        "high_risk_tables": high_risk_tables,
+        "risk_score": round(total_risk_score, 2),
+        "targets": targets,
+    }
+
+
 def _longest_nondecreasing_subsequence_len(values: list[int]) -> int:
     tails: list[int] = []
     for value in values:
@@ -229,6 +396,176 @@ def _reading_order_metrics(fragments: list[str], output_text: str) -> dict[str, 
         "order_rate": round(order_rate, 4),
         "match_mode": match_mode,
     }
+
+
+def _is_poor_link_text(text: str) -> bool:
+    """Return True if *text* is a known non-descriptive link label."""
+    normalised = text.strip().lower()
+    if normalised in _POOR_LINK_TEXT_EXACT:
+        return True
+    return bool(_POOR_LINK_TEXT_RE.match(normalised))
+
+
+def _canonical_named_destination(value) -> str | None:
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+    if not text or text == "None":
+        return None
+    return text[1:] if text.startswith("/") else text
+
+
+def _iter_name_tree_entries(node) -> list[tuple[str, Any]]:
+    entries: list[tuple[str, Any]] = []
+    if not isinstance(node, pikepdf.Dictionary):
+        return entries
+
+    names = node.get("/Names")
+    if isinstance(names, pikepdf.Array):
+        for index in range(0, len(names) - 1, 2):
+            key = _canonical_named_destination(names[index])
+            if key:
+                entries.append((key, names[index + 1]))
+
+    kids = node.get("/Kids")
+    if isinstance(kids, pikepdf.Array):
+        for kid in kids:
+            try:
+                entries.extend(_iter_name_tree_entries(kid))
+            except Exception:
+                continue
+
+    return entries
+
+
+def _is_generated_link_contents(text: str, *, uri: str = "", has_dest: bool = False) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return False
+    if normalized == "Link":
+        return True
+    if has_dest and normalized == "Link to destination":
+        return True
+    if uri and normalized == f"Link to {uri}":
+        return True
+    return False
+
+
+def _check_link_text_quality(output_pdf: Path) -> list[dict[str, Any]]:
+    """Scan output PDF for links whose /Contents text is non-descriptive."""
+    poor_links: list[dict[str, Any]] = []
+    try:
+        with pikepdf.Pdf.open(output_pdf) as pdf:
+            for page_idx, page in enumerate(pdf.pages, start=1):
+                annots = page.get("/Annots")
+                if not isinstance(annots, pikepdf.Array):
+                    continue
+                for annotation in annots:
+                    try:
+                        subtype = annotation.get("/Subtype")
+                        if subtype != pikepdf.Name("/Link"):
+                            continue
+                        contents = str(annotation.get("/Contents", "")).strip()
+                        uri = ""
+                        action = annotation.get("/A")
+                        if action is not None and hasattr(action, "get"):
+                            uri = str(action.get("/URI", "")).strip()
+                        has_dest = annotation.get("/Dest") is not None or (
+                            action is not None and hasattr(action, "get") and str(action.get("/S", "")) == "/GoTo"
+                        )
+                        if _is_generated_link_contents(contents, uri=uri, has_dest=has_dest):
+                            continue
+                        if not contents or _is_poor_link_text(contents):
+                            poor_links.append({
+                                "page": page_idx,
+                                "text": contents or "(empty)",
+                                "uri": uri,
+                            })
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return poor_links
+
+
+def _check_internal_link_destinations(output_pdf: Path) -> list[dict[str, Any]]:
+    """Find internal links whose destinations do not resolve."""
+    broken: list[dict[str, Any]] = []
+    try:
+        with pikepdf.Pdf.open(output_pdf) as pdf:
+            named_dests: set[str] = set()
+            dests = pdf.Root.get("/Dests")
+            if isinstance(dests, pikepdf.Dictionary):
+                for key in dests.keys():
+                    canonical = _canonical_named_destination(key)
+                    if canonical:
+                        named_dests.add(canonical)
+            names = pdf.Root.get("/Names")
+            if isinstance(names, pikepdf.Dictionary):
+                dest_tree = names.get("/Dests")
+                if isinstance(dest_tree, pikepdf.Dictionary):
+                    for key, _ in _iter_name_tree_entries(dest_tree):
+                        named_dests.add(key)
+
+            for page_idx, page in enumerate(pdf.pages, start=1):
+                annots = page.get("/Annots")
+                if not isinstance(annots, pikepdf.Array):
+                    continue
+                for annotation in annots:
+                    try:
+                        subtype = annotation.get("/Subtype")
+                        if subtype != pikepdf.Name("/Link"):
+                            continue
+                        # Check /Dest
+                        dest = annotation.get("/Dest")
+                        if dest is not None:
+                            dest_name = _canonical_named_destination(dest)
+                            if dest_name is not None:
+                                if dest_name not in named_dests:
+                                    broken.append({
+                                        "page": page_idx,
+                                        "dest": dest_name,
+                                        "reason": "Named destination not found",
+                                    })
+                                continue
+                            if isinstance(dest, pikepdf.Array) and len(dest) >= 1:
+                                # Direct page reference — verify page object exists
+                                continue  # Direct references are generally valid
+                        # Check /A GoTo action
+                        action = annotation.get("/A")
+                        if action is not None and hasattr(action, "get"):
+                            action_type = str(action.get("/S", ""))
+                            if action_type == "/GoTo":
+                                goto_dest = action.get("/D")
+                                dest_name = _canonical_named_destination(goto_dest)
+                                if dest_name is not None:
+                                    if dest_name not in named_dests:
+                                        broken.append({
+                                            "page": page_idx,
+                                            "dest": dest_name,
+                                            "reason": "GoTo destination not found",
+                                        })
+                                elif isinstance(goto_dest, pikepdf.Array) and len(goto_dest) >= 1:
+                                    # Direct page ref in array — try to resolve
+                                    try:
+                                        page_ref = goto_dest[0]
+                                        if isinstance(page_ref, pikepdf.Object) and hasattr(page_ref, "objgen"):
+                                            # Verify the referenced object exists
+                                            _ = page_ref.get("/Type")
+                                    except Exception:
+                                        broken.append({
+                                            "page": page_idx,
+                                            "dest": str(goto_dest),
+                                            "reason": "GoTo page reference unresolvable",
+                                        })
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return broken
 
 
 def _severity_rank(severity: str) -> int:
@@ -739,6 +1076,7 @@ def assess_fidelity(
         coverage = tagged_table_count / table_count
         status = "pass" if tagged_table_count >= table_count else "warning"
         if tagged_table_count < table_count:
+            table_targets = _table_review_targets(structure_json)
             add_task(
                 "review:table_semantics",
                 task_type="table_semantics",
@@ -753,6 +1091,12 @@ def assess_fidelity(
                     "detected_tables": table_count,
                     "tagged_tables": tagged_table_count,
                     "coverage": round(coverage, 4),
+                    "pages_to_check": sorted({
+                        int(target["page"])
+                        for target in table_targets
+                        if isinstance(target.get("page"), int)
+                    }),
+                    "table_review_targets": table_targets,
                 },
             )
         checks.append({
@@ -765,12 +1109,86 @@ def assess_fidelity(
                 "coverage": round(coverage, 4),
             },
         })
+
+        table_risk = _table_semantics_risk(structure_json)
+        if table_risk["complex_tables"] > 0:
+            risk_targets = table_risk["targets"]
+            risk_status = "warning"
+            blocking = False
+            severity = "medium"
+            detail = (
+                "Some detected tables look semantically risky for assistive technology. "
+                "Review header rows, row headers, and merged cells."
+            )
+
+            if table_risk["high_risk_tables"] > 0:
+                risk_status = "fail"
+                blocking = True
+                severity = "high"
+                detail = (
+                    "Complex tables with dense layouts, weak header signals, or merged cells need manual review "
+                    "to confirm accessible table semantics."
+                )
+
+            add_task(
+                "review:table_semantics_risk",
+                task_type="table_semantics",
+                title="Review complex table semantics",
+                detail=detail,
+                severity=severity,
+                blocking=blocking,
+                metadata={
+                    "detected_tables": table_count,
+                    "tagged_tables": tagged_table_count,
+                    "complex_tables": table_risk["complex_tables"],
+                    "high_risk_tables": table_risk["high_risk_tables"],
+                    "risk_score": table_risk["risk_score"],
+                    "pages_to_check": sorted({
+                        int(target["page"])
+                        for target in risk_targets
+                        if isinstance(target.get("page"), int)
+                    }),
+                    "table_review_targets": risk_targets,
+                },
+            )
+
+            checks.append({
+                "check": "table_risk",
+                "status": risk_status,
+                "message": "Flagged tables with complex structure, weak header signals, or merged cells.",
+                "metrics": {
+                    "complex_tables": table_risk["complex_tables"],
+                    "high_risk_tables": table_risk["high_risk_tables"],
+                    "risk_score": table_risk["risk_score"],
+                },
+            })
+        else:
+            checks.append({
+                "check": "table_risk",
+                "status": "pass",
+                "message": "No semantically risky tables detected from structure metadata.",
+                "metrics": {
+                    "complex_tables": 0,
+                    "high_risk_tables": 0,
+                    "risk_score": 0.0,
+                },
+            })
     else:
         checks.append({
             "check": "table_coverage",
             "status": "skip",
             "message": "No tables detected in structure extraction.",
             "metrics": {"detected_tables": 0, "tagged_tables": tagged_table_count},
+        })
+        checks.append({
+            "check": "table_risk",
+            "status": "skip",
+            "message": "No tables detected in structure extraction.",
+            "metrics": {
+                "complex_tables": 0,
+                "high_risk_tables": 0,
+                "risk_score": 0.0,
+            },
         })
 
     machine_only_alt = 0
@@ -819,6 +1237,61 @@ def assess_fidelity(
         },
     })
 
+    # ── 1A: Link text quality ─────────────────────────────────────────────
+    poor_links = _check_link_text_quality(output_pdf)
+    if poor_links:
+        add_task(
+            "review:link_text_quality",
+            task_type="annotation_description",
+            title="Review non-descriptive link text",
+            detail=(
+                f"{len(poor_links)} link(s) use non-descriptive text such as "
+                f"\"{poor_links[0]['text']}\". Screen reader users rely on "
+                "meaningful link labels to understand where links lead."
+            ),
+            severity="medium",
+            blocking=False,
+            metadata={"poor_links": poor_links[:20]},
+        )
+    checks.append({
+        "check": "link_text_quality",
+        "status": "warning" if poor_links else "pass",
+        "message": (
+            f"{len(poor_links)} link(s) with non-descriptive text detected."
+            if poor_links
+            else "All link text appears descriptive."
+        ),
+        "metrics": {"poor_link_count": len(poor_links)},
+    })
+
+    # ── 1C: Internal link destination validation ──────────────────────────
+    broken_links = _check_internal_link_destinations(output_pdf)
+    if broken_links:
+        add_task(
+            "review:broken_internal_links",
+            task_type="annotation_description",
+            title="Fix broken internal links",
+            detail=(
+                f"{len(broken_links)} internal link(s) point to destinations "
+                "that could not be resolved. These links may not function "
+                "for any user, including those using assistive technology."
+            ),
+            severity="medium",
+            blocking=False,
+            metadata={"broken_links": broken_links[:20]},
+        )
+    checks.append({
+        "check": "internal_link_destinations",
+        "status": "warning" if broken_links else "pass",
+        "message": (
+            f"{len(broken_links)} broken internal link destination(s) detected."
+            if broken_links
+            else "All internal link destinations resolve."
+        ),
+        "metrics": {"broken_link_count": len(broken_links)},
+    })
+
+    # ── Font text fidelity ────────────────────────────────────────────────
     font_remediation = validation_report.get("remediation", {}).get("font_remediation", {})
     unicode_gate = font_remediation.get("unicode_gate", {})
     font_diagnostics = (

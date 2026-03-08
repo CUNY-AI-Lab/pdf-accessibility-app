@@ -1,4 +1,4 @@
-import type { EditableStructureElement } from "../pages/reviewHelpers";
+import type { EditableStructureElement, ReadingOrderTextHint } from "../pages/reviewHelpers";
 import {
   STRUCTURE_TYPE_OPTIONS,
   structureTypeLabel,
@@ -12,7 +12,9 @@ export interface StructureEditorProps {
   taskId: number;
   editablePages: number[];
   editorPage: number | null;
+  editorPagePreviewUrl?: string | null;
   pageElements: Array<{ element: EditableStructureElement; index: number }>;
+  readableTextHints?: ReadingOrderTextHint[];
   hasUnsavedEdits: boolean;
   structureHistoryLength: number;
   structureFutureLength: number;
@@ -37,7 +39,9 @@ export default function StructureEditor({
   taskId,
   editablePages,
   editorPage,
+  editorPagePreviewUrl,
   pageElements,
+  readableTextHints = [],
   hasUnsavedEdits,
   structureHistoryLength,
   structureFutureLength,
@@ -53,15 +57,16 @@ export default function StructureEditor({
   onUpdateHeadingLevel,
   onSave,
 }: StructureEditorProps) {
+  const hintsByReviewId = new Map(readableTextHints.map((hint) => [hint.review_id, hint]));
   return (
     <div className="mt-4 rounded-lg border border-ink/8 bg-white/70 px-3 py-3">
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="text-xs font-semibold text-ink">
-            Reading order editor
+            Reading order review
           </p>
           <p className="text-xs text-ink-muted mt-1">
-            Reorder elements on a page or artifact repeated side material, then rerun tagging and validation.
+            Reorder content on the page or hide repeated side material from assistive technology, then rerun the checks.
           </p>
         </div>
         {editablePages.length > 0 && (
@@ -86,6 +91,24 @@ export default function StructureEditor({
       </div>
       {editorPage && pageElements.length > 0 ? (
         <div className="mt-4 space-y-2">
+          {editorPagePreviewUrl && (
+            <a
+              href={editorPagePreviewUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="block rounded-lg border border-ink/8 bg-paper-warm/60 p-2 no-underline"
+            >
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted mb-2">
+                Page preview
+              </p>
+              <img
+                src={editorPagePreviewUrl}
+                alt={`Preview of page ${editorPage}`}
+                loading="lazy"
+                className="w-full rounded-md border border-ink/6 bg-paper-warm object-cover"
+              />
+            </a>
+          )}
           <div className="flex flex-wrap items-center gap-2 pb-2">
             <button
               type="button"
@@ -129,6 +152,10 @@ export default function StructureEditor({
               key={element.review_id}
               className="rounded-lg border border-ink/8 bg-paper-warm/50 px-3 py-3"
             >
+              {(() => {
+                const textHint = hintsByReviewId.get(element.review_id);
+                return (
+                  <>
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <p className="text-xs text-ink-muted">
@@ -213,16 +240,50 @@ export default function StructureEditor({
                       disabled:opacity-40 disabled:cursor-not-allowed
                     "
                   >
-                    {element.type === "artifact" ? "Restore Type" : "Mark Artifact"}
+                    {element.type === "artifact" ? "Show as Content" : "Hide from Assistive Tech"}
                   </button>
                 </div>
               </div>
+              {textHint && (
+                <div className="mt-3 rounded-lg border border-accent-light bg-white/80 px-3 py-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                      Gemini readable-text hint
+                    </p>
+                    <span
+                      className={`
+                        rounded-full px-2 py-1 text-[11px]
+                        ${
+                          textHint.should_block_accessibility
+                            ? "bg-error-light text-error"
+                            : "bg-accent-glow text-accent"
+                        }
+                      `}
+                    >
+                      {textHint.should_block_accessibility ? "Needs attention" : "Check this"}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-sm text-ink break-words">
+                    {textHint.readable_text_hint}
+                  </p>
+                  <p className="mt-1 text-xs text-ink-muted">
+                    {textHint.confidence ? `${textHint.confidence} confidence` : "Confidence not provided"}
+                    {textHint.issue_type ? ` · ${textHint.issue_type.replaceAll("_", " ")}` : ""}
+                  </p>
+                  {textHint.reason && (
+                    <p className="mt-1 text-xs text-ink-muted">{textHint.reason}</p>
+                  )}
+                </div>
+              )}
+                  </>
+                );
+              })()}
             </div>
           ))}
           <div className="flex items-center justify-between gap-3 pt-2">
             <p className="text-xs text-ink-muted">
               {hasUnsavedEdits
-                ? "Saving reruns tagging, validation, and fidelity on the edited structure."
+                ? "Saving reruns tagging, compliance checks, and fidelity checks on the edited structure."
                 : "No unsaved structure edits yet."}
             </p>
             <button
@@ -236,7 +297,7 @@ export default function StructureEditor({
                 disabled:opacity-50 disabled:cursor-not-allowed
               "
             >
-              {updateStructurePending ? "Reprocessing..." : "Save Structure Edits"}
+              {updateStructurePending ? "Reprocessing..." : "Save Reading Order Changes"}
             </button>
           </div>
           {updateStructureError && (

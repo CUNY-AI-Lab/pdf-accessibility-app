@@ -821,8 +821,9 @@ def _match_regions_to_elements(
 class StructTreeBuilder:
     """Manages MCID allocation, StructElem creation, and ParentTree construction."""
 
-    def __init__(self, pdf: pikepdf.Pdf):
+    def __init__(self, pdf: pikepdf.Pdf, doc_lang: str = "en"):
         self.pdf = pdf
+        self.doc_lang = doc_lang.lower().strip()
         self.struct_tree_root = None
         self.doc_elem = None
         self._page_mcid_counter: dict[int, int] = {}
@@ -831,8 +832,9 @@ class StructTreeBuilder:
         self._object_parent_entries: list[tuple[int, pikepdf.Object]] = []
         self._headings: list[dict] = []
         self._struct_elems_created = 0
-        self._list_cache: dict[str, tuple[pikepdf.Object, list[int]]] = {}
+        self._list_cache: dict[str, tuple[pikepdf.Object, pikepdf.Object | None]] = {}
         self._note_counter = 0
+        self._table_counter = 0
         self._toc_cache: dict[str, pikepdf.Object] = {}
 
     def setup(self):
@@ -895,6 +897,7 @@ class StructTreeBuilder:
         page_ref: pikepdf.Object,
         parent: pikepdf.Object | None = None,
         alt_text: str | None = None,
+        lang: str | None = None,
     ) -> int:
         """Create a StructElem and return its MCID."""
         if parent is None:
@@ -910,6 +913,8 @@ class StructTreeBuilder:
         }
         if alt_text:
             elem_dict["/Alt"] = pikepdf.String(alt_text)
+        if lang and lang.lower().strip() != self.doc_lang:
+            elem_dict["/Lang"] = pikepdf.String(lang)
 
         elem = self.pdf.make_indirect(pikepdf.Dictionary(elem_dict))
         self._register_mcid(page_index, mcid, elem)
@@ -917,20 +922,26 @@ class StructTreeBuilder:
         self._struct_elems_created += 1
         return mcid
 
-    def add_heading(self, level: int, page_index: int, page_ref: pikepdf.Object, text: str) -> int:
+    def add_heading(
+        self, level: int, page_index: int, page_ref: pikepdf.Object,
+        text: str, lang: str | None = None,
+    ) -> int:
         level = max(1, min(6, level))
-        mcid = self._add_struct_elem(f"H{level}", page_index, page_ref)
+        mcid = self._add_struct_elem(f"H{level}", page_index, page_ref, lang=lang)
         self._headings.append({"level": level, "text": text, "page_index": page_index})
         return mcid
 
-    def add_paragraph(self, page_index: int, page_ref: pikepdf.Object) -> int:
-        return self._add_struct_elem("P", page_index, page_ref)
+    def add_paragraph(
+        self, page_index: int, page_ref: pikepdf.Object,
+        lang: str | None = None,
+    ) -> int:
+        return self._add_struct_elem("P", page_index, page_ref, lang=lang)
 
     def add_figure(self, page_index: int, page_ref: pikepdf.Object, alt_text: str | None = None) -> int:
         return self._add_struct_elem("Figure", page_index, page_ref, alt_text=alt_text)
 
-    def add_code(self, page_index: int, page_ref: pikepdf.Object) -> int:
-        return self._add_struct_elem("Code", page_index, page_ref)
+    def add_code(self, page_index: int, page_ref: pikepdf.Object, lang: str | None = None) -> int:
+        return self._add_struct_elem("Code", page_index, page_ref, lang=lang)
 
     def add_formula(
         self,
@@ -1014,7 +1025,10 @@ class StructTreeBuilder:
         return mcid
 
     def add_table(self, page_index: int, page_ref: pikepdf.Object, table_data: dict) -> int:
-        """Add a Table StructElem with rows and cells."""
+        """Add a Table StructElem with rows, cells, /ID on THs, and /Headers on TDs."""
+        self._table_counter += 1
+        table_n = self._table_counter
+
         table_elem = self.pdf.make_indirect(pikepdf.Dictionary({
             "/Type": pikepdf.Name("/StructElem"),
             "/S": pikepdf.Name("/Table"),
@@ -1040,6 +1054,13 @@ class StructTreeBuilder:
                 rows[row_idx] = []
             rows[row_idx].append(cell)
 
+        # Collected during the build pass so we can set /Headers on TDs
+        # after all TH /IDs have been assigned.
+        th_info: list[tuple[int, int, int, int, str]] = []
+        # (row, col, row_span, col_span, cell_id)
+        td_info: list[tuple[int, int, pikepdf.Object]] = []
+        # (row, col, cell_elem)
+
         first_mcid = None
         for row_idx in sorted(rows.keys()):
             row_elem = self.pdf.make_indirect(pikepdf.Dictionary({
@@ -1053,10 +1074,11 @@ class StructTreeBuilder:
 
             for cell in sorted(rows[row_idx], key=lambda c: c.get("col", 0)):
                 cell_type = "TH" if cell.get("is_header", False) else "TD"
+                col_idx = _as_positive_int(cell.get("col", 0), default=0)
                 mcid = self._alloc_mcid(page_index)
                 if first_mcid is None:
                     first_mcid = mcid
-                cell_elem_dict = {
+                cell_elem_dict: dict = {
                     "/Type": pikepdf.Name("/StructElem"),
                     "/S": pikepdf.Name(f"/{cell_type}"),
                     "/P": row_elem,
@@ -1072,15 +1094,21 @@ class StructTreeBuilder:
                 if col_span > 1:
                     attrs["/ColSpan"] = col_span
 
+                scope = ""
                 if cell_type == "TH":
                     scope = "/Column"
                     if bool(cell.get("row_header", False)):
                         scope = "/Row"
                     elif bool(cell.get("column_header", False)):
                         scope = "/Column"
-                    elif _as_positive_int(cell.get("col", 0), default=0) == 0:
+                    elif col_idx == 0:
                         scope = "/Row"
                     attrs["/Scope"] = pikepdf.Name(scope)
+
+                    # Assign a unique /ID so TD cells can reference it.
+                    cell_id = f"t{table_n}-r{row_idx}-c{col_idx}"
+                    cell_elem_dict["/ID"] = pikepdf.String(cell_id)
+                    th_info.append((row_idx, col_idx, row_span, col_span, cell_id))
 
                 if len(attrs) > 1:
                     cell_elem_dict["/A"] = attrs
@@ -1090,6 +1118,29 @@ class StructTreeBuilder:
                 self._register_mcid(page_index, mcid, cell_elem)
                 self._struct_elems_created += 1
 
+                if cell_type == "TD":
+                    td_info.append((row_idx, col_idx, cell_elem))
+
+        # Second pass: set /Headers on each TD pointing to applicable THs.
+        if th_info and td_info:
+            for td_row, td_col, td_elem in td_info:
+                header_ids: list[str] = []
+                for th_row, th_col, th_rspan, th_cspan, th_id in th_info:
+                    # Column header: TH spans TD's column and is above it
+                    if th_col <= td_col < th_col + th_cspan and th_row + th_rspan <= td_row:
+                        header_ids.append(th_id)
+                    # Row header: TH spans TD's row and is to the left
+                    elif th_row <= td_row < th_row + th_rspan and th_col + th_cspan <= td_col:
+                        header_ids.append(th_id)
+                if header_ids:
+                    td_attrs = td_elem.get("/A")
+                    if td_attrs is None:
+                        td_attrs = pikepdf.Dictionary({"/O": pikepdf.Name("/Table")})
+                        td_elem["/A"] = td_attrs
+                    td_attrs["/Headers"] = pikepdf.Array(
+                        [pikepdf.String(h) for h in header_ids],
+                    )
+
         return first_mcid if first_mcid is not None else 0
 
     def add_list_item(
@@ -1097,12 +1148,24 @@ class StructTreeBuilder:
         page_index: int,
         page_ref: pikepdf.Object,
         list_group_ref: str | None,
+        parent_list_group_ref: str | None = None,
     ) -> int:
         """Add a single list item to a list group, creating the list on first use.
 
         List items sharing the same list_group_ref are grouped under a single
         /L StructElem. The list is created lazily on the first item and reused
         for subsequent items in the same group.
+
+        For nested lists, parent_list_group_ref identifies the enclosing list
+        group. The nested /L is attached as a child of the parent list's most
+        recent /LI element, producing the PDF structure::
+
+            /L (outer)
+              /LI
+                /LBody …
+                /L (nested)      ← attached here
+                  /LI
+                    /LBody …
         """
         if list_group_ref and list_group_ref in self._list_cache:
             list_elem, _ = self._list_cache[list_group_ref]
@@ -1110,13 +1173,23 @@ class StructTreeBuilder:
             list_elem = self.pdf.make_indirect(pikepdf.Dictionary({
                 "/Type": pikepdf.Name("/StructElem"),
                 "/S": pikepdf.Name("/L"),
-                "/P": self.doc_elem,
                 "/K": pikepdf.Array([]),
             }))
-            self._append_child(self.doc_elem, list_elem)
+
+            # Determine where to attach this /L element.
+            # If it belongs to a nested list, place it inside the parent
+            # list's most recent /LI; otherwise attach to the document root.
+            attach_parent = self.doc_elem
+            if parent_list_group_ref and parent_list_group_ref in self._list_cache:
+                _, parent_last_li = self._list_cache[parent_list_group_ref]
+                if parent_last_li is not None:
+                    attach_parent = parent_last_li
+
+            list_elem["/P"] = attach_parent
+            self._append_child(attach_parent, list_elem)
             self._struct_elems_created += 1
             if list_group_ref:
-                self._list_cache[list_group_ref] = (list_elem, [])
+                self._list_cache[list_group_ref] = (list_elem, None)
 
         li_elem = self.pdf.make_indirect(pikepdf.Dictionary({
             "/Type": pikepdf.Name("/StructElem"),
@@ -1126,6 +1199,13 @@ class StructTreeBuilder:
         }))
         list_elem["/K"].append(li_elem)
         self._struct_elems_created += 1
+
+        # Track the most recent LI so nested lists can attach to it.
+        if list_group_ref and list_group_ref in self._list_cache:
+            self._list_cache[list_group_ref] = (
+                self._list_cache[list_group_ref][0],
+                li_elem,
+            )
 
         mcid = self._alloc_mcid(page_index)
         lbody_elem = self.pdf.make_indirect(pikepdf.Dictionary({
@@ -1381,6 +1461,7 @@ def _emit_tagged_region(
     if elem_type == "list_item":
         mcid = builder.add_list_item(
             page_index, page_ref, elem.get("list_group_ref"),
+            parent_list_group_ref=elem.get("parent_list_group_ref"),
         )
         new_instructions.append(_make_bdc("LBody", mcid))
         new_instructions.extend(region.instructions)
@@ -1388,9 +1469,11 @@ def _emit_tagged_region(
         return
 
     # All other types: allocate struct elem, wrap with BDC/EMC
+    elem_lang = elem.get("lang")  # per-element language (may be None)
+
     if elem_type == "heading":
         level = elem.get("level", 1)
-        mcid = builder.add_heading(level, page_index, page_ref, elem.get("text", ""))
+        mcid = builder.add_heading(level, page_index, page_ref, elem.get("text", ""), lang=elem_lang)
         tag = f"H{level}"
     elif elem_type == "figure":
         fig_idx = elem.get("figure_index")
@@ -1409,7 +1492,7 @@ def _emit_tagged_region(
         mcid = builder.add_figure(page_index, page_ref, alt_text=alt or None)
         tag = "Figure"
     elif elem_type == "code":
-        mcid = builder.add_code(page_index, page_ref)
+        mcid = builder.add_code(page_index, page_ref, lang=elem_lang)
         tag = "Code"
     elif elem_type == "formula":
         alt = elem.get("text")
@@ -1428,7 +1511,7 @@ def _emit_tagged_region(
         tag = "TOCI"
     else:
         # paragraph or unknown → /P
-        mcid = builder.add_paragraph(page_index, page_ref)
+        mcid = builder.add_paragraph(page_index, page_ref, lang=elem_lang)
         tag = "P"
 
     new_instructions.append(_make_bdc(tag, mcid))
@@ -1526,8 +1609,18 @@ def _should_artifact_nonsemantic_page_content(
         elif subtype == pikepdf.Name("/Form") and str(name).startswith("/OCR-"):
             has_ocr_form = True
 
-    if meaningful_ops and all(op == "Do" for op in meaningful_ops):
+    ink_ratio = None
+    if meaningful_ops and (
+        all(op == "Do" for op in meaningful_ops)
+        or (
+            all(op in OCR_NOISE_ONLY_OPERATORS for op in meaningful_ops)
+            and has_ocr_form
+            and has_image_xobject
+        )
+    ):
         ink_ratio = _render_page_ink_ratio(input_path, page_index + 1)
+
+    if meaningful_ops and all(op == "Do" for op in meaningful_ops):
         if ink_ratio is not None and ink_ratio <= BLANK_PAGE_MAX_INK_RATIO:
             return True
 
@@ -1536,6 +1629,8 @@ def _should_artifact_nonsemantic_page_content(
         and all(op in OCR_NOISE_ONLY_OPERATORS for op in meaningful_ops)
         and has_ocr_form
         and has_image_xobject
+        and ink_ratio is not None
+        and ink_ratio <= BLANK_PAGE_MAX_INK_RATIO
     )
 
 
@@ -2105,6 +2200,79 @@ def _prune_incidental_annotations(page: pikepdf.Page) -> int:
     return removed
 
 
+def _infer_annotation_contents(
+    annotation: pikepdf.Object,
+    subtype: pikepdf.Object | None,
+) -> str:
+    """Generate a meaningful /Contents string based on annotation subtype."""
+    subtype_str = str(subtype) if subtype else ""
+
+    # Markup annotations
+    if subtype_str == "/Highlight":
+        return "Highlighted text"
+    if subtype_str == "/StrikeOut":
+        return "Strikethrough text"
+    if subtype_str == "/Underline":
+        return "Underlined text"
+    if subtype_str == "/Squiggly":
+        return "Squiggly-underlined text"
+
+    # Text note — extract user comment if present
+    if subtype_str in ("/Text", "/Note"):
+        try:
+            contents = str(annotation.get("/Contents", "")).strip()
+            if contents:
+                return contents
+        except Exception:
+            pass
+        return "Text note"
+
+    # Free text annotation
+    if subtype_str == "/FreeText":
+        try:
+            contents = str(annotation.get("/Contents", "")).strip()
+            if contents:
+                return contents
+        except Exception:
+            pass
+        return "Free text annotation"
+
+    # File attachment — extract filename
+    if subtype_str == "/FileAttachment":
+        try:
+            fs = annotation.get("/FS")
+            if fs is not None and hasattr(fs, "get"):
+                filename = str(fs.get("/UF") or fs.get("/F") or "").strip()
+                if filename:
+                    return f"File attachment: {filename}"
+        except Exception:
+            pass
+        return "File attachment"
+
+    # Stamp
+    if subtype_str == "/Stamp":
+        try:
+            name = str(annotation.get("/Name", "")).strip().lstrip("/")
+            if name:
+                return f"Stamp: {name}"
+        except Exception:
+            pass
+        return "Stamp annotation"
+
+    # Caret (insertion point)
+    if subtype_str == "/Caret":
+        return "Insertion mark"
+
+    # Ink (freehand drawing)
+    if subtype_str == "/Ink":
+        return "Freehand drawing"
+
+    # Fallback — use cleaned subtype name
+    if subtype_str.startswith("/"):
+        return f"{subtype_str[1:]} annotation"
+    return "Annotation"
+
+
 def _ensure_annotation_baseline(page: pikepdf.Page):
     """Apply baseline PDF/UA annotation requirements on a page."""
     _prune_incidental_annotations(page)
@@ -2124,7 +2292,9 @@ def _ensure_annotation_baseline(page: pikepdf.Page):
             if subtype == pikepdf.Name("/Link"):
                 annotation["/Contents"] = pikepdf.String(_infer_link_contents(annotation))
             else:
-                annotation["/Contents"] = pikepdf.String("Annotation")
+                annotation["/Contents"] = pikepdf.String(
+                    _infer_annotation_contents(annotation, subtype)
+                )
         except Exception:
             continue
 
@@ -2184,7 +2354,7 @@ async def tag_pdf(
             _normalize_media_clip_data_dicts(pdf)
 
             # 4. Build structure tree
-            builder = StructTreeBuilder(pdf)
+            builder = StructTreeBuilder(pdf, doc_lang=language)
             builder.setup()
             tags_added += 1
 

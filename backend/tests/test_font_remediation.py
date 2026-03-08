@@ -825,8 +825,9 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
     )
     monkeypatch.setattr(
         orchestrator,
-        "select_auto_font_map_override",
+        "select_auto_font_review_resolution",
         lambda **kwargs: {
+            "resolution_type": "font_map",
             "page_number": 2,
             "operator_index": 132,
             "unicode_text": "►",
@@ -894,6 +895,230 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
     assert candidate_validation is improved_validation
     assert candidate_output is not None and candidate_output.exists()
     assert metadata_overrides[("font_text_fidelity", "validation")]["llm_auto_font_map"]["applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_validation_improves(tmp_path, monkeypatch):
+    source_pdf = tmp_path / "source.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\n% test\n")
+
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.model = "google/gemini-3-flash-preview"
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+
+    async def _generate_review_suggestion(**kwargs):
+        return {
+            "task_type": "font_text_fidelity",
+            "confidence": "high",
+            "suggested_action": "artifact_if_decorative",
+            "actualtext_candidates": [],
+            "model": "google/gemini-3-flash-preview",
+        }
+
+    monkeypatch.setattr(
+        orchestrator,
+        "generate_review_suggestion",
+        _generate_review_suggestion,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "select_auto_font_review_resolution",
+        lambda **kwargs: {
+            "resolution_type": "artifact",
+            "font": "ExampleSymbolFont",
+            "font_base_name": "ExampleSymbolFont",
+            "font_code_hex": "01",
+            "unicode_text": "►",
+            "target_count": 2,
+            "targets": [
+                {"page_number": 2, "operator_index": 132, "context_path": "ctx-1"},
+                {"page_number": 2, "operator_index": 194, "context_path": "ctx-2"},
+            ],
+        },
+    )
+
+    def _copy_artifact(*, input_pdf, output_pdf, context_paths):
+        assert context_paths == ["ctx-1", "ctx-2"]
+        output_pdf.write_bytes(Path(input_pdf).read_bytes())
+
+    monkeypatch.setattr(orchestrator, "apply_artifact_batch_to_contexts", _copy_artifact)
+
+    current_validation = SimpleNamespace(
+        compliant=False,
+        violations=[SimpleNamespace(rule_id="ISO 14289-1:2014-7.21.7-1", severity="error", count=3)],
+        raw_report={},
+    )
+    improved_validation = SimpleNamespace(
+        compliant=True,
+        violations=[],
+        raw_report={},
+    )
+
+    async def _validate_pdf(**kwargs):
+        return improved_validation
+
+    monkeypatch.setattr(orchestrator, "validate_pdf", _validate_pdf)
+
+    job = SimpleNamespace(
+        id="job-1",
+        original_filename="sample.pdf",
+        input_path=str(source_pdf),
+        output_path=str(source_pdf),
+        structure_json="{}",
+    )
+    review_tasks = [
+        {
+            "task_type": "font_text_fidelity",
+            "title": "Verify font text fidelity",
+            "detail": "Manual review needed.",
+            "severity": "high",
+            "blocking": True,
+            "source": "validation",
+            "metadata": {
+                "font_review_targets": [
+                    {"page": 2, "operator_index": 132, "context_path": "ctx-1"},
+                    {"page": 2, "operator_index": 194, "context_path": "ctx-2"},
+                ],
+            },
+        }
+    ]
+
+    audit, candidate_validation, candidate_output, metadata_overrides = await _attempt_auto_llm_font_map(
+        job=job,
+        settings=_settings(auto_apply_llm_font_map=True),
+        output_pdf=source_pdf,
+        current_validation=current_validation,
+        review_tasks=review_tasks,
+    )
+
+    assert audit["applied"] is True
+    assert audit["resolution_type"] == "artifact"
+    assert candidate_validation is improved_validation
+    assert candidate_output is not None and candidate_output.exists()
+    assert metadata_overrides[("font_text_fidelity", "validation")]["llm_auto_font_map"]["resolution_type"] == "artifact"
+
+
+@pytest.mark.asyncio
+async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_does_not_improve(tmp_path, monkeypatch):
+    source_pdf = tmp_path / "source.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\n% test\n")
+
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.model = "google/gemini-3-flash-preview"
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+
+    async def _generate_review_suggestion(**kwargs):
+        return {
+            "task_type": "font_text_fidelity",
+            "confidence": "high",
+            "suggested_action": "artifact_if_decorative",
+            "actualtext_candidates": [],
+            "model": "google/gemini-3-flash-preview",
+        }
+
+    monkeypatch.setattr(
+        orchestrator,
+        "generate_review_suggestion",
+        _generate_review_suggestion,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "select_auto_font_review_resolution",
+        lambda **kwargs: {
+            "resolution_type": "artifact",
+            "font": "ExampleSymbolFont",
+            "font_base_name": "ExampleSymbolFont",
+            "font_code_hex": "01",
+            "unicode_text": "►",
+            "target_count": 2,
+            "targets": [
+                {"page_number": 2, "operator_index": 132, "context_path": "ctx-1"},
+                {"page_number": 2, "operator_index": 194, "context_path": "ctx-2"},
+            ],
+        },
+    )
+
+    def _copy_artifact(*, input_pdf, output_pdf, context_paths):
+        output_pdf.write_bytes(Path(input_pdf).read_bytes())
+
+    def _copy_font_map(*, input_pdf, output_pdf, context_path, unicode_text):
+        assert context_path == "ctx-1"
+        assert unicode_text == "►"
+        output_pdf.write_bytes(Path(input_pdf).read_bytes())
+
+    monkeypatch.setattr(orchestrator, "apply_artifact_batch_to_contexts", _copy_artifact)
+    monkeypatch.setattr(orchestrator, "apply_unicode_override_to_context", _copy_font_map)
+
+    current_validation = SimpleNamespace(
+        compliant=False,
+        violations=[SimpleNamespace(rule_id="ISO 14289-1:2014-7.21.7-1", severity="error", count=3)],
+        raw_report={},
+    )
+    unchanged_validation = SimpleNamespace(
+        compliant=False,
+        violations=[SimpleNamespace(rule_id="ISO 14289-1:2014-7.21.7-1", severity="error", count=3)],
+        raw_report={},
+    )
+    improved_validation = SimpleNamespace(
+        compliant=True,
+        violations=[],
+        raw_report={},
+    )
+
+    validations = [unchanged_validation, improved_validation]
+
+    async def _validate_pdf(**kwargs):
+        return validations.pop(0)
+
+    monkeypatch.setattr(orchestrator, "validate_pdf", _validate_pdf)
+
+    job = SimpleNamespace(
+        id="job-1",
+        original_filename="sample.pdf",
+        input_path=str(source_pdf),
+        output_path=str(source_pdf),
+        structure_json="{}",
+    )
+    review_tasks = [
+        {
+            "task_type": "font_text_fidelity",
+            "title": "Verify font text fidelity",
+            "detail": "Manual review needed.",
+            "severity": "high",
+            "blocking": True,
+            "source": "validation",
+            "metadata": {
+                "font_review_targets": [
+                    {"page": 2, "operator_index": 132, "context_path": "ctx-1"},
+                    {"page": 2, "operator_index": 194, "context_path": "ctx-2"},
+                ],
+            },
+        }
+    ]
+
+    audit, candidate_validation, candidate_output, metadata_overrides = await _attempt_auto_llm_font_map(
+        job=job,
+        settings=_settings(auto_apply_llm_font_map=True),
+        output_pdf=source_pdf,
+        current_validation=current_validation,
+        review_tasks=review_tasks,
+    )
+
+    assert audit["applied"] is True
+    assert audit["resolution_type"] == "font_map_fallback"
+    assert candidate_validation is improved_validation
+    assert candidate_output is not None and candidate_output.exists()
+    assert metadata_overrides[("font_text_fidelity", "validation")]["llm_auto_font_map"]["resolution_type"] == "font_map_fallback"
 
 
 def test_embed_lane_skips_local_when_no_supported_candidates():

@@ -26,7 +26,7 @@ def test_generic_annotations_are_tagged_as_annot_struct_elems():
     builder.finalize()
 
     assert tagged == 1
-    assert str(annotation.get("/Contents")) == "Annotation"
+    assert str(annotation.get("/Contents")) == "Square annotation"
     assert annotation.get("/StructParent") == 0
     assert len(builder.doc_elem["/K"]) == 1
     assert builder.doc_elem["/K"][0].get("/S") == pikepdf.Name("/Annot")

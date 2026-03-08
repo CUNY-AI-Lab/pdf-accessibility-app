@@ -26,13 +26,14 @@ from app.pipeline.structure import extract_structure
 from app.pipeline.subprocess_utils import SubprocessTimeout, communicate_with_timeout
 from app.pipeline.tagger import tag_pdf
 from app.pipeline.validator import validate_pdf
+from app.services.font_artifact import apply_artifact_batch_to_contexts
 from app.services.font_unicode_override import apply_unicode_override_to_context
 from app.services.file_storage import create_job_dir, get_output_path
 from app.services.job_manager import JobManager
 from app.services.llm_client import LlmClient
 from app.services.review_suggestions import (
     generate_review_suggestion,
-    select_auto_font_map_override,
+    select_auto_font_review_resolution,
 )
 from app.services.toc_suggestions import enhance_toc_structure_with_llm
 
@@ -485,7 +486,7 @@ async def _attempt_auto_llm_font_map(
     }
     audit["suggestion"] = suggestion_summary
 
-    selected = select_auto_font_map_override(
+    selected = select_auto_font_review_resolution(
         job=job,
         task=pseudo_task,
         suggestion=suggestion,
@@ -503,38 +504,54 @@ async def _attempt_auto_llm_font_map(
         job.id,
         f"accessible_auto_llm_fontmap_{job.original_filename}",
     )
-    task_metadata = task.get("metadata", {})
-    raw_targets = task_metadata.get("font_review_targets") if isinstance(task_metadata, dict) else []
-    context_path = ""
-    if isinstance(raw_targets, list):
-        for target in raw_targets:
-            if not isinstance(target, dict):
-                continue
-            page = target.get("page")
-            operator_index = target.get("operator_index")
-            if not isinstance(page, int) or not isinstance(operator_index, int):
-                continue
-            if page == int(selected["page_number"]) and operator_index == int(selected["operator_index"]):
-                context_path = str(target.get("context_path") or "").strip()
-                break
-    if not context_path:
-        audit["reason"] = "missing_context_path"
-        metadata_overrides[(task_type, task_source)]["llm_auto_font_map"] = {
-            "attempted": True,
-            "applied": False,
-            "reason": audit["reason"],
-        }
-        return audit, None, None, metadata_overrides
+    resolution_type = str(selected.get("resolution_type") or "font_map")
 
     try:
-        apply_unicode_override_to_context(
-            input_pdf=output_pdf,
-            output_pdf=patched_output,
-            context_path=context_path,
-            unicode_text=str(selected["unicode_text"]),
-        )
+        if resolution_type == "artifact":
+            targets = selected.get("targets")
+            if not isinstance(targets, list) or not targets:
+                raise ValueError("artifact resolution missing targets")
+            context_paths = [
+                str(target.get("context_path") or "").strip()
+                for target in targets
+                if isinstance(target, dict)
+            ]
+            if any(not context_path for context_path in context_paths):
+                raise ValueError("artifact resolution missing context path")
+            apply_artifact_batch_to_contexts(
+                input_pdf=output_pdf,
+                output_pdf=patched_output,
+                context_paths=context_paths,
+            )
+        else:
+            task_metadata = task.get("metadata", {})
+            raw_targets = task_metadata.get("font_review_targets") if isinstance(task_metadata, dict) else []
+            context_path = ""
+            if isinstance(raw_targets, list):
+                for target in raw_targets:
+                    if not isinstance(target, dict):
+                        continue
+                    page = target.get("page")
+                    operator_index = target.get("operator_index")
+                    if not isinstance(page, int) or not isinstance(operator_index, int):
+                        continue
+                    if page == int(selected["page_number"]) and operator_index == int(selected["operator_index"]):
+                        context_path = str(target.get("context_path") or "").strip()
+                        break
+            if not context_path:
+                raise ValueError("missing_context_path")
+            apply_unicode_override_to_context(
+                input_pdf=output_pdf,
+                output_pdf=patched_output,
+                context_path=context_path,
+                unicode_text=str(selected["unicode_text"]),
+            )
     except Exception as exc:
-        audit["reason"] = f"apply_failed: {exc}"
+        reason = str(exc)
+        if reason == "missing_context_path":
+            audit["reason"] = "missing_context_path"
+        else:
+            audit["reason"] = f"apply_failed: {exc}"
         metadata_overrides[(task_type, task_source)]["llm_auto_font_map"] = {
             "attempted": True,
             "applied": False,
@@ -548,18 +565,72 @@ async def _attempt_auto_llm_font_map(
         flavour=settings.verapdf_flavour,
         timeout_seconds=settings.subprocess_timeout_validation,
     )
+
     if not _is_better_validation(candidate_validation, current_validation):
-        audit["reason"] = "no_validation_improvement"
-        metadata_overrides[(task_type, task_source)]["llm_auto_font_map"] = {
-            "attempted": True,
-            "applied": False,
-            "reason": audit["reason"],
-        }
-        return audit, None, None, metadata_overrides
+        fallback_unicode_text = str(selected.get("unicode_text") or "").strip()
+        fallback_targets = selected.get("targets") if isinstance(selected.get("targets"), list) else []
+        fallback_context_path = ""
+        if fallback_targets:
+            first_target = fallback_targets[0]
+            if isinstance(first_target, dict):
+                fallback_context_path = str(first_target.get("context_path") or "").strip()
+
+        if (
+            resolution_type == "artifact"
+            and fallback_unicode_text
+            and fallback_context_path
+        ):
+            fallback_output = get_output_path(
+                job.id,
+                f"accessible_auto_llm_fontmap_fallback_{job.original_filename}",
+            )
+            try:
+                apply_unicode_override_to_context(
+                    input_pdf=output_pdf,
+                    output_pdf=fallback_output,
+                    context_path=fallback_context_path,
+                    unicode_text=fallback_unicode_text,
+                )
+                fallback_validation = await validate_pdf(
+                    pdf_path=fallback_output,
+                    verapdf_path=settings.verapdf_path,
+                    flavour=settings.verapdf_flavour,
+                    timeout_seconds=settings.subprocess_timeout_validation,
+                )
+            except Exception as exc:
+                audit["reason"] = f"fallback_apply_failed: {exc}"
+                metadata_overrides[(task_type, task_source)]["llm_auto_font_map"] = {
+                    "attempted": True,
+                    "applied": False,
+                    "reason": audit["reason"],
+                }
+                return audit, None, None, metadata_overrides
+
+            if _is_better_validation(fallback_validation, current_validation):
+                candidate_validation = fallback_validation
+                patched_output = fallback_output
+                resolution_type = "font_map_fallback"
+            else:
+                audit["reason"] = "no_validation_improvement"
+                metadata_overrides[(task_type, task_source)]["llm_auto_font_map"] = {
+                    "attempted": True,
+                    "applied": False,
+                    "reason": audit["reason"],
+                }
+                return audit, None, None, metadata_overrides
+        else:
+            audit["reason"] = "no_validation_improvement"
+            metadata_overrides[(task_type, task_source)]["llm_auto_font_map"] = {
+                "attempted": True,
+                "applied": False,
+                "reason": audit["reason"],
+            }
+            return audit, None, None, metadata_overrides
 
     audit.update({
         "applied": True,
         "reason": "applied",
+        "resolution_type": resolution_type,
         "font": str(selected.get("font") or ""),
         "font_base_name": str(selected.get("font_base_name") or ""),
         "font_code_hex": str(selected.get("font_code_hex") or ""),
@@ -572,6 +643,7 @@ async def _attempt_auto_llm_font_map(
         "attempted": True,
         "applied": True,
         "reason": "applied",
+        "resolution_type": resolution_type,
         "font_code_hex": audit["font_code_hex"],
         "unicode_text": audit["unicode_text"],
         "target_count": audit["target_count"],

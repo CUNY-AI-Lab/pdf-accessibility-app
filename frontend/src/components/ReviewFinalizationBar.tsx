@@ -49,7 +49,7 @@ export default function ReviewFinalizationBar(props: ReviewFinalizationBarProps)
           </p>
           <p className="text-xs text-ink-muted mt-0.5">
             {props.allReviewed
-              ? "Ready to finalize tagging and validation."
+              ? "Ready to finalize the accessibility checks."
               : "Review all figures to continue."}
           </p>
         </div>
@@ -102,17 +102,17 @@ export default function ReviewFinalizationBar(props: ReviewFinalizationBarProps)
       <div>
         <p className="text-sm font-medium text-ink">
           {props.blockingValidationCount > 0
-            ? `${props.blockingValidationCount} validation ${pluralize(props.blockingValidationCount, "task")} still block release`
+            ? `${props.blockingValidationCount} compliance ${pluralize(props.blockingValidationCount, "issue")} still block release`
             : props.pendingBlockingFidelityCount > 0
-              ? `${props.pendingBlockingFidelityCount} blocking review ${pluralize(props.pendingBlockingFidelityCount, "task")} still need review`
-              : "Manual fidelity review can be finalized"}
+              ? `${props.pendingBlockingFidelityCount} required review ${pluralize(props.pendingBlockingFidelityCount, "task")} still need attention`
+              : "Manual accessibility review can be finalized"}
         </p>
         <p className="text-xs text-ink-muted mt-0.5">
           {props.blockingValidationCount > 0
-            ? "The PDF still has unresolved validation errors. Those cannot be cleared in-app."
+            ? "The PDF still has unresolved compliance errors. Those cannot be cleared in this review screen."
             : props.finalizable
-              ? "All blocking fidelity tasks are resolved."
-              : "Resolve the remaining fidelity tasks to complete the manual review."}
+              ? "All required accessibility review tasks are resolved."
+              : "Resolve the remaining accessibility review tasks to complete the manual review."}
         </p>
       </div>
       <button

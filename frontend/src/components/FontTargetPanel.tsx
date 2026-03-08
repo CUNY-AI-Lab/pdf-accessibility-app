@@ -57,7 +57,7 @@ export default function FontTargetPanel({
       {/* Targeted findings */}
       {reviewTargets.length > 0 && (
         <div className="mt-4 rounded-lg border border-ink/8 bg-paper-warm/70 px-3 py-3">
-          <p className="text-xs font-semibold text-ink mb-2">Targeted findings</p>
+          <p className="text-xs font-semibold text-ink mb-2">Flagged text locations</p>
           <div className="space-y-2">
             {reviewTargets.map((target, index) => (
               <div
@@ -131,7 +131,7 @@ export default function FontTargetPanel({
                       {actualtextCandidate && typeof actualtextCandidate.proposed_actualtext === "string" && actualtextCandidate.proposed_actualtext.trim().length > 0 && (
                         <div className="mt-3 rounded-lg border border-accent-light bg-accent-glow/60 px-3 py-2">
                           <p className="text-xs font-semibold text-ink">
-                            Gemini `ActualText` suggestion
+                            Gemini spoken-text suggestion
                           </p>
                           <p className="mt-1 text-sm text-ink break-words">
                             {actualtextCandidate.proposed_actualtext}
@@ -150,7 +150,7 @@ export default function FontTargetPanel({
                                 hover:border-accent-light transition-colors
                               "
                             >
-                              Use suggestion
+                              Use this text
                             </button>
                           </div>
                         </div>
@@ -193,7 +193,7 @@ export default function FontTargetPanel({
                               >
                                 {applyingActualTextKey === actualTextKeyForTarget(task.id, target)
                                   ? "Applying..."
-                                  : "Apply ActualText"}
+                                  : "Set Spoken Text"}
                               </button>
                               <button
                                 type="button"
@@ -212,11 +212,11 @@ export default function FontTargetPanel({
                               >
                                 {applyingFontMapKey === actualTextKeyForTarget(task.id, target)
                                   ? "Applying..."
-                                  : "Apply Font Map"}
+                                  : "Fix Matching Symbols"}
                               </button>
                             </div>
                             <p className="mt-2 text-[11px] text-ink-muted">
-                              `ActualText` changes this one target for assistive output. `Font Map` writes a `ToUnicode` override for this font/code and affects every matching use in the font.
+                              “Set Spoken Text” changes only this one location for screen readers and copy/paste. “Fix Matching Symbols” updates the font mapping for every matching use of this symbol in the document.
                             </p>
                           </>
                         )}
@@ -243,7 +243,7 @@ export default function FontTargetPanel({
       {actualTextAttempts.length > 0 && (
         <div className="mt-4 rounded-lg border border-ink/8 bg-white/70 px-3 py-3">
           <p className="text-xs font-semibold text-ink mb-2">
-            Applied `ActualText` attempts
+            Applied spoken-text fixes
           </p>
           <div className="space-y-2">
             {actualTextAttempts.map((attempt, index) => (
@@ -276,7 +276,7 @@ export default function FontTargetPanel({
       {fontMappingAttempts.length > 0 && (
         <div className="mt-4 rounded-lg border border-ink/8 bg-white/70 px-3 py-3">
           <p className="text-xs font-semibold text-ink mb-2">
-            Applied font-map attempts
+            Applied symbol-mapping fixes
           </p>
           <div className="space-y-2">
             {fontMappingAttempts.map((attempt, index) => (

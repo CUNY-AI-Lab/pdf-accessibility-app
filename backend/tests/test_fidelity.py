@@ -5,8 +5,13 @@ from tests.fixtures import TEST_SAMPLE_PDF
 
 from app.pipeline import fidelity
 from app.pipeline.fidelity import (
+    _canonical_named_destination,
     _collect_structural_fragments,
+    _check_internal_link_destinations,
+    _check_link_text_quality,
     _extract_font_review_targets,
+    _iter_name_tree_entries,
+    _table_semantics_risk,
     _reading_order_metrics,
     assess_fidelity,
 )
@@ -184,6 +189,91 @@ def test_extract_pdf_text_sample_suppresses_pdfminer_fontbbox_warning(monkeypatc
     messages = [record.getMessage() for record in caplog.records]
     assert not any("Could not get FontBBox from font descriptor because" in message for message in messages)
     assert any("Different pdfminer warning that should remain visible" in message for message in messages)
+
+
+def test_link_text_quality_ignores_generated_link_fallbacks(tmp_path):
+    import pikepdf
+
+    pdf_path = tmp_path / "links.pdf"
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    good = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Link"),
+        "/Rect": pikepdf.Array([10, 10, 40, 20]),
+        "/Contents": pikepdf.String("click here"),
+        "/A": pikepdf.Dictionary({"/S": pikepdf.Name("/URI"), "/URI": pikepdf.String("https://example.com/a")}),
+    }))
+    generated = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Link"),
+        "/Rect": pikepdf.Array([50, 10, 80, 20]),
+        "/Contents": pikepdf.String("Link to https://example.com/b"),
+        "/A": pikepdf.Dictionary({"/S": pikepdf.Name("/URI"), "/URI": pikepdf.String("https://example.com/b")}),
+    }))
+    page["/Annots"] = pikepdf.Array([good, generated])
+    pdf.save(str(pdf_path))
+
+    poor = _check_link_text_quality(pdf_path)
+
+    assert len(poor) == 1
+    assert poor[0]["text"] == "click here"
+
+
+def test_internal_link_destinations_support_name_objects_and_nested_name_trees(tmp_path):
+    import pikepdf
+
+    pdf_path = tmp_path / "internal_links.pdf"
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+
+    valid = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Link"),
+        "/Rect": pikepdf.Array([10, 10, 40, 20]),
+        "/Dest": pikepdf.Name("/Section1"),
+    }))
+    broken = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Link"),
+        "/Rect": pikepdf.Array([50, 10, 80, 20]),
+        "/A": pikepdf.Dictionary({
+            "/S": pikepdf.Name("/GoTo"),
+            "/D": pikepdf.Name("/MissingDest"),
+        }),
+    }))
+    page["/Annots"] = pikepdf.Array([valid, broken])
+
+    kid = pdf.make_indirect(pikepdf.Dictionary({
+        "/Names": pikepdf.Array([pikepdf.Name("/Section1"), pikepdf.Array([page.obj, pikepdf.Name("/XYZ"), 0, 0, 0])]),
+    }))
+    pdf.Root["/Names"] = pikepdf.Dictionary({
+        "/Dests": pdf.make_indirect(pikepdf.Dictionary({"/Kids": pikepdf.Array([kid])})),
+    })
+    pdf.save(str(pdf_path))
+
+    broken_links = _check_internal_link_destinations(pdf_path)
+
+    assert broken_links == [
+        {"page": 1, "dest": "MissingDest", "reason": "GoTo destination not found"},
+    ]
+
+
+def test_named_destination_helpers_normalize_and_walk_nested_trees():
+    import pikepdf
+
+    kid = pikepdf.Dictionary({
+        "/Names": pikepdf.Array([pikepdf.Name("/SectionA"), pikepdf.String("dest")]),
+    })
+    root = pikepdf.Dictionary({
+        "/Kids": pikepdf.Array([kid]),
+    })
+
+    assert _canonical_named_destination(pikepdf.Name("/SectionA")) == "SectionA"
+    assert _canonical_named_destination(pikepdf.String("SectionB")) == "SectionB"
+    entries = _iter_name_tree_entries(root)
+    assert len(entries) == 1
+    assert entries[0][0] == "SectionA"
 
 
 def test_collect_structural_fragments_skips_toc_elements():
@@ -596,6 +686,81 @@ def test_fidelity_blocks_truly_scrambled_reading_order(monkeypatch):
 
     assert report["passed"] is False
     assert any(task["task_type"] == "reading_order" and task["blocking"] for task in tasks)
+
+
+def test_table_semantics_risk_ignores_simple_regular_table():
+    risk = _table_semantics_risk(
+        {
+            "elements": [
+                {
+                    "type": "table",
+                    "page": 0,
+                    "num_rows": 3,
+                    "num_cols": 2,
+                    "cells": [
+                        {"row": 0, "col": 0, "text": "Program", "column_header": True},
+                        {"row": 0, "col": 1, "text": "Students", "column_header": True},
+                        {"row": 1, "col": 0, "text": "History", "row_header": True},
+                        {"row": 1, "col": 1, "text": "45"},
+                        {"row": 2, "col": 0, "text": "Math", "row_header": True},
+                        {"row": 2, "col": 1, "text": "50"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert risk["table_count"] == 1
+    assert risk["complex_tables"] == 0
+    assert risk["high_risk_tables"] == 0
+    assert risk["targets"] == []
+
+
+def test_fidelity_flags_high_risk_complex_tables(monkeypatch):
+    monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "program students history 45")
+    monkeypatch.setattr(fidelity, "_sample_visual_ink", lambda path: {
+        "sampled_pages": 1,
+        "pages_with_visible_ink": 1,
+        "mean_ink_ratio": 0.1,
+        "max_ink_ratio": 0.1,
+        "visually_blank": False,
+    })
+
+    structure = {
+        "elements": [
+            {
+                "type": "table",
+                "page": 0,
+                "bbox": {"l": 72, "t": 700, "r": 520, "b": 200},
+                "num_rows": 12,
+                "num_cols": 8,
+                "cells": [
+                    {"row": row, "col": col, "text": ("" if col > 0 else f"r{row}"), "row_span": (2 if row == 0 and col == 0 else 1), "col_span": 1}
+                    for row in range(12)
+                    for col in range(8)
+                ],
+            }
+        ]
+    }
+
+    report, tasks = assess_fidelity(
+        input_pdf=Path("in.pdf"),
+        output_pdf=Path("out.pdf"),
+        structure_json=structure,
+        alt_entries=[],
+        validation_report=_validation_report(compliant=True, violations=[]),
+        tagging_metrics={"tables_tagged": 1},
+        classification="digital",
+    )
+
+    assert report["passed"] is False
+    task = next(task for task in tasks if task["task_type"] == "table_semantics")
+    assert task["blocking"] is True
+    assert task["source"] == "fidelity"
+    assert task["metadata"]["complex_tables"] == 1
+    assert task["metadata"]["high_risk_tables"] == 1
+    assert task["metadata"]["pages_to_check"] == [1]
+    assert task["metadata"]["table_review_targets"][0]["table_review_id"] == "review-0"
 
 
 def test_fidelity_font_task_includes_review_targets():

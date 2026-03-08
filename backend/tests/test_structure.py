@@ -1,4 +1,4 @@
-from app.pipeline.structure import _normalize_docling_elements
+from app.pipeline.structure import _normalize_docling_elements, _normalize_lang_tag
 
 
 def test_normalize_docling_elements_maps_footnotes_to_note_elements():
@@ -30,6 +30,31 @@ def test_normalize_docling_elements_maps_footnotes_to_note_elements():
             "bbox": {"l": 10, "b": 20, "r": 100, "t": 40},
         }
     ]
+
+
+def test_normalize_lang_tag_maps_common_names_and_rejects_invalid_tokens():
+    assert _normalize_lang_tag("English") == "en"
+    assert _normalize_lang_tag("eng") == "en"
+    assert _normalize_lang_tag("fr-ca") == "fr-CA"
+    assert _normalize_lang_tag("not a language") is None
+
+
+def test_normalize_docling_elements_normalizes_metadata_language_tags():
+    doc_dict = {
+        "body": {"children": [{"$ref": "#/texts/0"}]},
+        "texts": [
+            {
+                "label": "paragraph",
+                "text": "Bonjour tout le monde ici present aujourd hui",
+                "language": "French",
+                "prov": [{"page_no": 1, "bbox": {"l": 10, "b": 20, "r": 100, "t": 40}}],
+            }
+        ],
+    }
+
+    elements = _normalize_docling_elements(doc_dict)
+
+    assert elements[0]["lang"] == "fr"
 
 
 def test_normalize_docling_elements_marks_table_of_contents_sequences():
