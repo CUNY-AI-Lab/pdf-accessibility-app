@@ -6,6 +6,8 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.pipeline.subprocess_utils import SubprocessTimeout, communicate_with_timeout
+
 logger = logging.getLogger(__name__)
 
 
@@ -112,10 +114,13 @@ async def validate_pdf(
     pdf_path: Path,
     verapdf_path: str = "verapdf",
     flavour: str = "ua1",
+    timeout_seconds: int | None = None,
 ) -> ValidationResult:
     """Run veraPDF PDF/UA validation and parse results."""
     try:
-        return await _validate_with_verapdf(pdf_path, verapdf_path, flavour)
+        return await _validate_with_verapdf(
+            pdf_path, verapdf_path, flavour, timeout_seconds
+        )
     except FileNotFoundError as exc:
         raise RuntimeError(
             f"veraPDF executable not found at '{verapdf_path}'. "
@@ -127,6 +132,7 @@ async def _validate_with_verapdf(
     pdf_path: Path,
     verapdf_path: str,
     flavour: str,
+    timeout_seconds: int | None = None,
 ) -> ValidationResult:
     """Full validation via veraPDF CLI."""
     proc = await asyncio.create_subprocess_exec(
@@ -141,7 +147,13 @@ async def _validate_with_verapdf(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await communicate_with_timeout(proc, timeout_seconds)
+    except SubprocessTimeout:
+        return ValidationResult(
+            compliant=False,
+            error=f"veraPDF timed out after {timeout_seconds}s",
+        )
 
     if proc.returncode not in (0, 1):
         # 0 = compliant, 1 = violations found, other = error

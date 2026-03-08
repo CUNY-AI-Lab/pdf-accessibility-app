@@ -16,6 +16,7 @@ import mimetypes
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ import numpy as np
 import pikepdf
 from docling_core.types.doc.page import TextCellUnit
 from docling_parse.pdf_parser import DoclingPdfParser
+from PIL import Image
 from rtree import index as rtree_index
 from scipy.optimize import linear_sum_assignment
 
@@ -39,6 +41,11 @@ TEXT_ELEMENT_TYPES = frozenset({
 })
 MATCH_ACCEPT_THRESHOLD = 0.05
 LARGE_COST = 1e6
+BLANK_PAGE_NONWHITE_THRESHOLD = 245
+BLANK_PAGE_MAX_INK_RATIO = 0.001
+OCR_NOISE_ONLY_OPERATORS = frozenset({
+    "Do", "re", "W*", "n", "INLINE IMAGE", "w", "m", "l", "S",
+})
 
 
 @dataclass
@@ -57,6 +64,36 @@ class TaggingResult:
     decorative_figures_artifacted: int = 0
     bookmarks_added: int = 0
     title_set: bool = False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Shared pikepdf helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _obj_key(obj) -> tuple[int, int] | None:
+    """Return the (objgen) identity tuple for a pikepdf indirect object."""
+    try:
+        obj_num, gen_num = obj.objgen
+        if isinstance(obj_num, int) and isinstance(gen_num, int) and obj_num > 0:
+            return obj_num, gen_num
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_dictionary(obj):
+    """Resolve a pikepdf reference to a Dictionary (or dict-like) object."""
+    if obj is None:
+        return None
+    try:
+        if isinstance(obj, pikepdf.Dictionary):
+            return obj
+        if hasattr(obj, "keys") and hasattr(obj, "get"):
+            return obj
+        return obj.get_object()
+    except Exception:
+        return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1420,6 +1457,88 @@ def _make_bmc_artifact() -> pikepdf.ContentStreamInstruction:
     )
 
 
+def _render_page_ink_ratio(pdf_path: Path, page_number: int) -> float | None:
+    from app.services.pdf_preview import render_page_png_bytes
+
+    try:
+        page_png = render_page_png_bytes(pdf_path, page_number, dpi=72, max_width=900)
+    except Exception:
+        return None
+
+    with Image.open(BytesIO(page_png)) as image:
+        grayscale = image.convert("L")
+        histogram = grayscale.histogram()
+
+    total_pixels = sum(histogram)
+    if total_pixels <= 0:
+        return 0.0
+    nonwhite_pixels = sum(histogram[:BLANK_PAGE_NONWHITE_THRESHOLD])
+    return nonwhite_pixels / total_pixels
+
+
+def _should_artifact_nonsemantic_page_content(
+    input_path: Path,
+    page: pikepdf.Page,
+    page_index: int,
+) -> bool:
+    try:
+        instructions = list(pikepdf.parse_content_stream(page))
+    except Exception:
+        return False
+
+    instructions = _strip_existing_markers(instructions)
+    if not instructions:
+        return False
+
+    regions = _extract_content_regions(instructions, page)
+    if any(region.kind == "text" for region in regions):
+        return False
+
+    meaningful_ops: list[str] = []
+    has_ocr_form = False
+    has_image_xobject = False
+    xobjects = {}
+    try:
+        resources = page.get("/Resources", {})
+        xobjects = resources.get("/XObject", {}) or {}
+    except Exception:
+        xobjects = {}
+
+    for instr in instructions:
+        if not hasattr(instr, "operator"):
+            continue
+        op = str(instr.operator)
+        if op in {"q", "Q", "cm"}:
+            continue
+        meaningful_ops.append(op)
+        if op != "Do":
+            continue
+        operands = list(instr.operands) if hasattr(instr, "operands") else []
+        if not operands:
+            continue
+        name = operands[0]
+        xobject = xobjects.get(name) if hasattr(xobjects, "get") else None
+        if xobject is None or not hasattr(xobject, "get"):
+            continue
+        subtype = xobject.get("/Subtype")
+        if subtype == pikepdf.Name("/Image"):
+            has_image_xobject = True
+        elif subtype == pikepdf.Name("/Form") and str(name).startswith("/OCR-"):
+            has_ocr_form = True
+
+    if meaningful_ops and all(op == "Do" for op in meaningful_ops):
+        ink_ratio = _render_page_ink_ratio(input_path, page_index + 1)
+        if ink_ratio is not None and ink_ratio <= BLANK_PAGE_MAX_INK_RATIO:
+            return True
+
+    return (
+        bool(meaningful_ops)
+        and all(op in OCR_NOISE_ONLY_OPERATORS for op in meaningful_ops)
+        and has_ocr_form
+        and has_image_xobject
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Document metadata
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1602,27 +1721,6 @@ def _normalize_type1_font_charsets(pdf: pikepdf.Pdf) -> int:
 
     def _is_mapping_like(obj) -> bool:
         return isinstance(obj, pikepdf.Dictionary) or (hasattr(obj, "keys") and hasattr(obj, "get"))
-
-    def _obj_key(obj) -> tuple[int, int] | None:
-        try:
-            obj_num, gen_num = obj.objgen
-            if isinstance(obj_num, int) and isinstance(gen_num, int) and obj_num > 0:
-                return obj_num, gen_num
-        except Exception:
-            return None
-        return None
-
-    def _resolve_dictionary(obj):
-        if obj is None:
-            return None
-        try:
-            if isinstance(obj, pikepdf.Dictionary):
-                return obj
-            if hasattr(obj, "keys") and hasattr(obj, "get"):
-                return obj
-            return obj.get_object()
-        except Exception:
-            return None
 
     def _has_embedded_font(descriptor) -> bool:
         if not isinstance(descriptor, pikepdf.Dictionary):
@@ -2151,6 +2249,13 @@ async def tag_pdf(
                             tables_tagged += 1
                         elif t == "list_item":
                             lists_tagged += 1
+                elif _should_artifact_nonsemantic_page_content(input_path, page, page_index):
+                    _rewrite_content_stream(
+                        pdf, page, page_index, [],
+                        builder, page.obj, alt_lookup,
+                        decorative_figures=decorative_figures,
+                        docling_page_lines=None,
+                    )
 
                 _ensure_annotation_baseline(page)
                 links_tagged += _tag_link_annotations(page, page.obj, builder)

@@ -1,0 +1,630 @@
+import type { ReviewTask } from "../types";
+import type { FontReviewTarget, LlmSuggestion } from "../pages/reviewHelpers";
+import {
+  LLM_SUGGESTION_TASK_TYPES,
+  applicableActualTextCandidates,
+  evidenceFieldsForTask,
+  existingEvidenceForTask,
+  fontReviewTargets,
+  guidanceForTask,
+  llmSuggestionForTask,
+  metadataEntriesForTask,
+  numberListMetadata,
+  pagePreviewUrl,
+  previewPagesForTask,
+  stringListMetadata,
+  structureElementsForPage,
+  structurePages,
+} from "../pages/reviewHelpers";
+import FontTargetPanel from "./FontTargetPanel";
+import StructureEditor from "./StructureEditor";
+
+// ---------------------------------------------------------------------------
+// Mutation status interfaces
+// ---------------------------------------------------------------------------
+
+export interface MutationStatus {
+  isPending: boolean;
+  error: Error | null;
+  key?: string | number | null;
+}
+
+export interface FontMutationState {
+  actualText: MutationStatus;
+  unicodeMapping: MutationStatus;
+  actualTextBatch: MutationStatus;
+  applyingActualTextKey: string | null;
+  applyingFontMapKey: string | null;
+}
+
+export interface StructureMutationState {
+  update: MutationStatus;
+  historyLength: number;
+  futureLength: number;
+}
+
+export interface TaskMutationState {
+  updateTask: MutationStatus;
+  suggestTask: MutationStatus;
+  savingTask: number | null;
+  suggestingTask: number | null;
+  suggestErrorTask: number | null;
+}
+
+// ---------------------------------------------------------------------------
+// Props
+// ---------------------------------------------------------------------------
+
+export interface ReviewTaskCardProps {
+  jobId: string;
+  task: ReviewTask;
+  resolutionNote: string;
+  missingEvidence: string[];
+  canResolve: boolean;
+
+  // Font target state
+  actualTextDrafts: Record<string, string>;
+  fontMutation: FontMutationState;
+
+  // Structure editor state
+  editingStructure: Record<string, unknown> | null;
+  selectedReadingOrderPage: number | null;
+  structureMutation: StructureMutationState;
+
+  // Task action state
+  taskMutation: TaskMutationState;
+
+  // Callbacks
+  onResolutionNoteChange: (taskId: number, value: string) => void;
+  onEvidenceChange: (taskId: number, existingEvidence: Record<string, string>, key: string, value: string) => void;
+  onActualTextDraftChange: (key: string, value: string) => void;
+  onApplyActualText: (task: ReviewTask, target: FontReviewTarget) => void;
+  onApplyFontMap: (task: ReviewTask, target: FontReviewTarget) => void;
+  onUseSuggestedActualText: (task: ReviewTask, target: FontReviewTarget, proposedText: string) => void;
+  onApplySuggestedBatch: (task: ReviewTask, llmSuggestion: LlmSuggestion | null, targets: FontReviewTarget[]) => void;
+  onUpdateTask: (task: ReviewTask, status: "pending_review" | "resolved") => void;
+  onSuggestTask: (task: ReviewTask) => void;
+  onSelectReadingOrderPage: (page: number) => void;
+  onUndoStructure: () => void;
+  onRedoStructure: () => void;
+  onResetReadingOrderPage: (page: number) => void;
+  onMoveElement: (page: number, reviewId: string, direction: -1 | 1) => void;
+  onToggleArtifact: (reviewId: string) => void;
+  onUpdateElementType: (reviewId: string, nextType: string) => void;
+  onUpdateHeadingLevel: (reviewId: string, level: number) => void;
+  onSaveStructure: () => void;
+
+  /** Called to get the evidence value for a task+field key */
+  evidenceValueForTask: (task: ReviewTask, evidenceKey: string) => string;
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
+export default function ReviewTaskCard({
+  jobId,
+  task,
+  resolutionNote,
+  missingEvidence,
+  canResolve,
+  actualTextDrafts,
+  fontMutation,
+  editingStructure,
+  selectedReadingOrderPage,
+  structureMutation,
+  taskMutation,
+  onResolutionNoteChange,
+  onEvidenceChange,
+  onActualTextDraftChange,
+  onApplyActualText,
+  onApplyFontMap,
+  onUseSuggestedActualText,
+  onApplySuggestedBatch,
+  onUpdateTask,
+  onSuggestTask,
+  onSelectReadingOrderPage,
+  onUndoStructure,
+  onRedoStructure,
+  onResetReadingOrderPage,
+  onMoveElement,
+  onToggleArtifact,
+  onUpdateElementType,
+  onUpdateHeadingLevel,
+  onSaveStructure,
+  evidenceValueForTask,
+}: ReviewTaskCardProps) {
+  // Destructure only the font mutation state used directly in this component
+  const {
+    actualTextBatch: { isPending: applyFontActualTextBatchPending, error: applyFontActualTextBatchError },
+  } = fontMutation;
+  const applyingActualTextBatchTaskId = fontMutation.actualTextBatch.key as number | null;
+  const {
+    update: { isPending: updateStructurePending, error: updateStructureError },
+    historyLength: structureHistoryLength,
+    futureLength: structureFutureLength,
+  } = structureMutation;
+  const {
+    savingTask,
+    suggestingTask,
+    suggestErrorTask,
+    updateTask: { isPending: updateReviewTaskPending, error: updateReviewTaskError },
+    suggestTask: { isPending: suggestReviewTaskPending, error: suggestReviewTaskError },
+  } = taskMutation;
+  const metaEntries = metadataEntriesForTask(task);
+  const evidenceFields = evidenceFieldsForTask(task.task_type);
+  const pagesToCheck = numberListMetadata(task, "pages_to_check");
+  const fontsToCheck = stringListMetadata(task, "fonts_to_check");
+  const fontRuleIds = stringListMetadata(task, "font_rule_ids");
+  const reviewTargets = fontReviewTargets(task);
+  const llmSuggestion = llmSuggestionForTask(task);
+  const suggestedActualTextCandidates = applicableActualTextCandidates(llmSuggestion, reviewTargets);
+  const supportsSuggestion = LLM_SUGGESTION_TASK_TYPES.has(task.task_type);
+  const suggestionGeneratedAt = llmSuggestion?.generated_at
+    ? new Date(llmSuggestion.generated_at).toLocaleString()
+    : null;
+  const previewPages = previewPagesForTask(task, llmSuggestion);
+
+  // Structure editor data
+  const editablePages = structurePages(editingStructure);
+  const editorPage =
+    selectedReadingOrderPage && editablePages.includes(selectedReadingOrderPage)
+      ? selectedReadingOrderPage
+      : previewPages[0] ?? editablePages[0] ?? null;
+  const pageElements =
+    task.task_type === "reading_order" && editorPage
+      ? structureElementsForPage(editingStructure, editorPage)
+      : [];
+  const hasUnsavedStructureEdits = structureHistoryLength > 0;
+
+  return (
+    <div className="rounded-xl border border-ink/6 bg-cream p-5">
+      {/* Header: title, severity, source badges */}
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="font-display text-lg text-ink">{task.title}</h3>
+          <p className="text-sm text-ink-muted mt-1">{task.detail}</p>
+        </div>
+        <div className="flex flex-col items-end gap-2 shrink-0">
+          <span
+            className={`
+              text-[11px] px-2 py-1 rounded-full
+              ${
+                task.blocking
+                  ? "bg-error-light text-error"
+                  : "bg-warning-light text-warning"
+              }
+            `}
+          >
+            {task.blocking ? "Blocking" : "Advisory"}
+          </span>
+          <span className="text-xs text-ink-muted capitalize">
+            {task.severity} severity
+          </span>
+          <span className="text-xs text-ink-muted capitalize">
+            {task.source}
+          </span>
+        </div>
+      </div>
+
+      {/* Review focus: pages, fonts, rules */}
+      {(pagesToCheck.length > 0 || fontsToCheck.length > 0 || fontRuleIds.length > 0) && (
+        <div className="mt-4 rounded-lg border border-ink/8 bg-white/60 px-3 py-3">
+          <p className="text-xs font-semibold text-ink mb-2">Review focus</p>
+          <div className="grid gap-3 md:grid-cols-3">
+            {pagesToCheck.length > 0 && (
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                  Pages
+                </p>
+                <p className="text-sm text-ink mt-1">
+                  {pagesToCheck.join(", ")}
+                </p>
+              </div>
+            )}
+            {fontsToCheck.length > 0 && (
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                  Fonts
+                </p>
+                <p className="text-sm text-ink mt-1">
+                  {fontsToCheck.join(", ")}
+                </p>
+              </div>
+            )}
+            {fontRuleIds.length > 0 && (
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                  Rules
+                </p>
+                <p className="text-sm text-ink mt-1 break-words">
+                  {fontRuleIds.join(", ")}
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Relevant page previews */}
+      {previewPages.length > 0 && (
+        <div className="mt-4">
+          <p className="text-xs font-semibold text-ink mb-2">Relevant pages</p>
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {previewPages.map((pageNumber) => (
+              <a
+                key={`${task.id}-page-${pageNumber}`}
+                href={pagePreviewUrl(jobId, pageNumber)}
+                target="_blank"
+                rel="noreferrer"
+                className="block rounded-lg border border-ink/8 bg-white/70 p-2 no-underline"
+              >
+                <p className="text-xs font-semibold text-ink mb-2">
+                  Page {pageNumber}
+                </p>
+                <img
+                  src={pagePreviewUrl(jobId, pageNumber)}
+                  alt={`Preview of page ${pageNumber}`}
+                  loading="lazy"
+                  className="w-full rounded-md border border-ink/6 bg-paper-warm object-cover"
+                />
+              </a>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Font target panel */}
+      <FontTargetPanel
+        jobId={jobId}
+        task={task}
+        reviewTargets={reviewTargets}
+        llmSuggestion={llmSuggestion}
+        actualTextDrafts={actualTextDrafts}
+        fontMutation={fontMutation}
+        onActualTextDraftChange={onActualTextDraftChange}
+        onApplyActualText={onApplyActualText}
+        onApplyFontMap={onApplyFontMap}
+        onUseSuggestedActualText={onUseSuggestedActualText}
+      />
+
+      {/* Metadata entries */}
+      {metaEntries.length > 0 && (
+        <p className="text-xs text-ink-muted mt-3 font-mono">
+          {metaEntries
+            .map(([key, value]) => `${key}=${value}`)
+            .join(" | ")}
+        </p>
+      )}
+
+      {/* Review checklist / guidance */}
+      <div className="mt-4 rounded-lg bg-paper-warm/60 px-3 py-3">
+        <p className="text-xs font-semibold text-ink mb-2">Review checklist</p>
+        <div className="space-y-1">
+          {guidanceForTask(task.task_type).map((item, index) => (
+            <p key={`${task.id}-guidance-${index}`} className="text-xs text-ink-muted">
+              {index + 1}. {item}
+            </p>
+          ))}
+        </div>
+      </div>
+
+      {/* Structure editor (reading_order tasks only) */}
+      {task.task_type === "reading_order" && (
+        <StructureEditor
+          taskId={task.id}
+          editablePages={editablePages}
+          editorPage={editorPage}
+          pageElements={pageElements}
+          hasUnsavedEdits={hasUnsavedStructureEdits}
+          structureHistoryLength={structureHistoryLength}
+          structureFutureLength={structureFutureLength}
+          updateStructurePending={updateStructurePending}
+          updateStructureError={updateStructureError}
+          onSelectPage={onSelectReadingOrderPage}
+          onUndo={onUndoStructure}
+          onRedo={onRedoStructure}
+          onResetPage={onResetReadingOrderPage}
+          onMoveElement={onMoveElement}
+          onToggleArtifact={onToggleArtifact}
+          onUpdateElementType={onUpdateElementType}
+          onUpdateHeadingLevel={onUpdateHeadingLevel}
+          onSave={onSaveStructure}
+        />
+      )}
+
+      {/* LLM suggestion panel */}
+      {(supportsSuggestion || llmSuggestion) && (
+        <div className="mt-4 rounded-lg border border-accent-light bg-accent-glow/60 px-3 py-3">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-xs font-semibold text-ink">Gemini suggestion</p>
+              <p className="text-xs text-ink-muted mt-1">
+                Proposal only. Review it, then apply remediation or manual verification yourself.
+              </p>
+            </div>
+            {supportsSuggestion && (
+              <button
+                type="button"
+                onClick={() => onSuggestTask(task)}
+                disabled={suggestingTask === task.id || suggestReviewTaskPending}
+                className="
+                  px-3 py-2 rounded-lg text-xs font-medium
+                  bg-accent text-white
+                  hover:bg-accent/90 transition-colors
+                  disabled:opacity-50 disabled:cursor-not-allowed
+                "
+              >
+                {suggestingTask === task.id ? "Analyzing..." : llmSuggestion ? "Refresh Suggestion" : "Suggest Fix"}
+              </button>
+            )}
+          </div>
+          {llmSuggestion ? (
+            <div className="mt-3 space-y-3">
+              <div className="grid gap-3 md:grid-cols-3">
+                <div className="rounded-lg bg-white/70 px-3 py-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                    Action
+                  </p>
+                  <p className="mt-1 text-sm text-ink break-words">
+                    {String(llmSuggestion.suggested_action ?? "manual_only").replaceAll("_", " ")}
+                  </p>
+                </div>
+                <div className="rounded-lg bg-white/70 px-3 py-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                    Confidence
+                  </p>
+                  <p className="mt-1 text-sm text-ink capitalize">
+                    {String(llmSuggestion.confidence ?? "unknown")}
+                  </p>
+                </div>
+                <div className="rounded-lg bg-white/70 px-3 py-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                    Model
+                  </p>
+                  <p className="mt-1 text-sm text-ink break-words">
+                    {llmSuggestion.model ?? "unknown"}
+                  </p>
+                </div>
+              </div>
+              {llmSuggestion.summary && (
+                <p className="text-sm text-ink">{llmSuggestion.summary}</p>
+              )}
+              {llmSuggestion.reason && (
+                <p className="text-xs text-ink-muted">{llmSuggestion.reason}</p>
+              )}
+              {task.task_type === "font_text_fidelity" && suggestedActualTextCandidates.length > 0 && (
+                <div className="rounded-lg border border-accent-light bg-white/70 px-3 py-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-semibold text-ink">
+                        Suggested `ActualText` batch
+                      </p>
+                      <p className="mt-1 text-xs text-ink-muted">
+                        Reviewer-approved batch apply. This rewrites all suggested localized targets and reruns validation once.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onApplySuggestedBatch(task, llmSuggestion, reviewTargets)}
+                      disabled={applyingActualTextBatchTaskId === task.id || applyFontActualTextBatchPending}
+                      className="
+                        px-3 py-2 rounded-lg text-xs font-medium
+                        bg-accent text-white
+                        hover:bg-accent/90 transition-colors
+                        disabled:opacity-50 disabled:cursor-not-allowed
+                      "
+                    >
+                      {applyingActualTextBatchTaskId === task.id ? "Applying..." : "Apply Suggested Batch"}
+                    </button>
+                  </div>
+                  <div className="mt-3 space-y-2">
+                    {suggestedActualTextCandidates.map((candidate, index) => (
+                      <div
+                        key={`${task.id}-batch-candidate-${index}`}
+                        className="rounded-lg bg-paper-warm/70 px-3 py-2"
+                      >
+                        <p className="text-sm text-ink">
+                          Page {candidate.page} · operator {candidate.operator_index}
+                          {candidate.font ? ` · ${candidate.font}` : ""}
+                        </p>
+                        <p className="mt-1 text-sm text-ink break-words">
+                          {candidate.proposed_actualtext}
+                        </p>
+                        <p className="mt-1 text-xs text-ink-muted">
+                          {candidate.confidence ? `${candidate.confidence} confidence` : "Confidence not provided"}
+                          {candidate.reason ? ` · ${candidate.reason}` : ""}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                  {applyFontActualTextBatchError && applyingActualTextBatchTaskId === task.id && (
+                    <p className="mt-3 text-xs text-error">
+                      {applyFontActualTextBatchError.message || "Failed to apply ActualText batch remediation"}
+                    </p>
+                  )}
+                </div>
+              )}
+              {llmSuggestion.review_focus && llmSuggestion.review_focus.length > 0 && (
+                <div>
+                  <p className="text-xs font-semibold text-ink mb-2">
+                    Suggested review focus
+                  </p>
+                  <div className="space-y-2">
+                    {llmSuggestion.review_focus.map((item, index) => (
+                      <div
+                        key={`${task.id}-focus-${index}`}
+                        className="rounded-lg bg-white/70 px-3 py-2"
+                      >
+                        <p className="text-sm text-ink">
+                          {item.page ? `Page ${item.page}` : "Page unknown"}
+                          {item.font ? ` · ${item.font}` : ""}
+                          {item.rule_id ? ` · ${item.rule_id}` : ""}
+                        </p>
+                        {item.visible_text_hypothesis && (
+                          <p className="mt-1 text-xs text-ink-muted">
+                            Visible text hypothesis: {item.visible_text_hypothesis}
+                          </p>
+                        )}
+                        {typeof item.is_likely_decorative === "boolean" && (
+                          <p className="mt-1 text-xs text-ink-muted">
+                            Likely decorative: {item.is_likely_decorative ? "yes" : "no"}
+                          </p>
+                        )}
+                        {item.recommended_reviewer_action && (
+                          <p className="mt-1 text-xs text-ink-muted">
+                            Reviewer action: {item.recommended_reviewer_action}
+                          </p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {llmSuggestion.reviewer_checklist && llmSuggestion.reviewer_checklist.length > 0 && (
+                <div>
+                  <p className="text-xs font-semibold text-ink mb-2">
+                    Suggested checklist
+                  </p>
+                  <div className="space-y-1">
+                    {llmSuggestion.reviewer_checklist.map((item, index) => (
+                      <p key={`${task.id}-llm-check-${index}`} className="text-xs text-ink-muted">
+                        {index + 1}. {item}
+                      </p>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {suggestionGeneratedAt && (
+                <p className="text-[11px] text-ink-muted">
+                  Generated {suggestionGeneratedAt}
+                </p>
+              )}
+            </div>
+          ) : (
+            <p className="mt-3 text-xs text-ink-muted">
+              No suggestion generated yet.
+            </p>
+          )}
+          {suggestReviewTaskError && suggestErrorTask === task.id && (
+            <p className="mt-3 text-xs text-error">
+              {suggestReviewTaskError.message || "Failed to generate suggestion"}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Evidence fields and resolution note (non-validation tasks only) */}
+      {task.source !== "validation" && (
+        <>
+          {evidenceFields.length > 0 && (
+            <div className="mt-4">
+              <p className="text-xs font-semibold text-ink mb-2">
+                Review evidence
+              </p>
+              <div className="grid gap-3 md:grid-cols-2">
+                {evidenceFields.map((field) => (
+                  <label key={`${task.id}-${field.key}`} className="block">
+                    <span className="block text-xs font-semibold text-ink mb-1">
+                      {field.label}
+                    </span>
+                    <input
+                      type="text"
+                      value={evidenceValueForTask(task, field.key)}
+                      onChange={(e) =>
+                        onEvidenceChange(
+                          task.id,
+                          existingEvidenceForTask(task),
+                          field.key,
+                          e.target.value,
+                        )
+                      }
+                      placeholder={field.placeholder}
+                      className="
+                        w-full rounded-lg border border-ink/10 bg-white/70 px-3 py-2
+                        text-sm text-ink placeholder:text-ink-muted/70
+                        focus:outline-none focus:ring-2 focus:ring-accent/20
+                      "
+                    />
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="mt-4">
+            <label className="block text-xs font-semibold text-ink mb-2">
+              Reviewer note
+            </label>
+            <textarea
+              value={resolutionNote}
+              onChange={(e) => onResolutionNoteChange(task.id, e.target.value)}
+              rows={3}
+              placeholder="Record what you checked and how you verified it."
+              className="
+                w-full rounded-lg border border-ink/10 bg-white/70 px-3 py-2
+                text-sm text-ink placeholder:text-ink-muted/70
+                focus:outline-none focus:ring-2 focus:ring-accent/20
+              "
+            />
+          </div>
+          {task.status !== "resolved" && !canResolve && (
+            <p className="mt-3 text-xs text-warning">
+              Required before marking reviewed:
+              {resolutionNote.trim().length === 0 ? " reviewer note" : ""}
+              {resolutionNote.trim().length === 0 && missingEvidence.length > 0
+                ? "; "
+                : " "}
+              {missingEvidence.length > 0
+                ? `${missingEvidence.join(", ")}`
+                : ""}
+            </p>
+          )}
+        </>
+      )}
+
+      {/* Task action buttons */}
+      <div className="mt-4 flex items-center gap-2">
+        {task.source === "validation" ? (
+          <span className="text-xs text-ink-muted bg-paper-warm px-2 py-1 rounded-full">
+            Read-only: requires actual PDF remediation
+          </span>
+        ) : (
+          <button
+            type="button"
+            onClick={() =>
+              onUpdateTask(
+                task,
+                task.status === "resolved" ? "pending_review" : "resolved",
+              )
+            }
+            disabled={
+              savingTask === task.id
+              || updateReviewTaskPending
+              || (task.status !== "resolved" && !canResolve)
+            }
+            className="
+              px-4 py-2 rounded-lg text-sm font-medium
+              bg-accent text-white
+              hover:bg-accent/90 transition-colors
+              disabled:opacity-50 disabled:cursor-not-allowed
+            "
+          >
+            {savingTask === task.id
+              ? "Saving..."
+              : task.status === "resolved"
+                ? "Reopen Task"
+                : "Mark Reviewed"}
+          </button>
+        )}
+        <span className="text-xs text-ink-muted capitalize">
+          status: {task.status.replaceAll("_", " ")}
+        </span>
+        {updateReviewTaskError && savingTask === null && (
+          <span className="text-xs text-error">
+            {updateReviewTaskError.message || "Failed to update task"}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}

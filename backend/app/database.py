@@ -52,3 +52,20 @@ def _ensure_schema(sync_conn, review_tasks_table) -> None:
 
     if "review_tasks" not in table_names:
         review_tasks_table.create(bind=sync_conn, checkfirst=True)
+
+    # Ensure indexes exist for databases created before index definitions were added
+    sync_conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status)"))
+    sync_conn.execute(
+        text("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs (created_at)")
+    )
+    sync_conn.execute(
+        text("CREATE INDEX IF NOT EXISTS idx_job_steps_job_id ON job_steps (job_id)")
+    )
+    sync_conn.execute(
+        text("CREATE INDEX IF NOT EXISTS idx_alt_texts_job_id ON alt_texts (job_id)")
+    )
+    sync_conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_review_tasks_job_id ON review_tasks (job_id)"
+        )
+    )

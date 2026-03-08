@@ -551,7 +551,9 @@ def _extract_title_from_docling(doc_dict: dict, elements: list[dict] | None = No
     return None
 
 
-def _repair_pdf_with_ghostscript(input_path: Path, output_path: Path) -> bool:
+def _repair_pdf_with_ghostscript(
+    input_path: Path, output_path: Path, timeout: int = 120
+) -> bool:
     """Try to rewrite a damaged PDF into a parser-friendly file using Ghostscript."""
     gs = shutil.which("gs")
     if not gs:
@@ -569,7 +571,14 @@ def _repair_pdf_with_ghostscript(input_path: Path, output_path: Path) -> bool:
         str(input_path),
     ]
     try:
-        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        proc = subprocess.run(
+            cmd, check=False, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            f"Ghostscript repair timed out after {timeout}s for {input_path.name}"
+        )
+        return False
     except Exception as exc:
         logger.warning(f"Ghostscript repair execution failed for {input_path.name}: {exc}")
         return False

@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
 import type { AltText, AltTextStatus } from "../types";
+import { CheckIcon } from "./Icons";
 
 interface AltTextEditorProps {
   altText: AltText;
@@ -62,9 +63,7 @@ export default function AltTextEditor({
               </span>
               {isApproved && (
                 <span className="text-xs font-medium text-success bg-success-light px-2 py-0.5 rounded-full flex items-center gap-1">
-                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-                    <polyline points="20 6 9 17 4 12" />
-                  </svg>
+                  <CheckIcon size={10} />
                   Approved
                 </span>
               )}

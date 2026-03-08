@@ -1,16 +1,15 @@
 import json
+import logging
 from io import BytesIO
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.database import get_db
-from app.database import get_session_maker
+from app.database import get_db, get_session_maker
 from app.models import AltTextEntry, Job, ReviewTask
 from app.pipeline.orchestrator import run_tagging_and_validation
 from app.schemas import (
@@ -20,8 +19,11 @@ from app.schemas import (
     StructureUpdateRequest,
     ValidationReportResponse,
 )
-from app.services.pdf_preview import render_page_png_bytes
 from app.services.job_manager import get_job_manager
+from app.services.path_safety import safe_filename, validate_path_within_allowed_roots
+from app.services.pdf_preview import render_page_png_bytes
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/jobs/{job_id}", tags=["documents"])
 ALLOWED_STRUCTURE_TYPES = {
@@ -37,7 +39,7 @@ ALLOWED_STRUCTURE_TYPES = {
 
 
 def _job_pdf_path(job: Job) -> Path:
-    candidate = Path(job.output_path or job.input_path)
+    candidate = validate_path_within_allowed_roots(Path(job.output_path or job.input_path))
     if not candidate.exists():
         raise HTTPException(status_code=404, detail="PDF file not found")
     return candidate
@@ -273,13 +275,16 @@ async def get_page_preview(
         raise HTTPException(status_code=404, detail="Page number exceeds document length")
 
     try:
-        preview_bytes = render_page_png_bytes(_job_pdf_path(job), page_number)
+        preview_bytes = render_page_png_bytes(_job_pdf_path(job), page_number, timeout=get_settings().subprocess_timeout_preview)
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        logger.exception("PDF file not found for page preview")
+        raise HTTPException(status_code=404, detail="PDF file not found") from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.exception("Invalid page preview request")
+        raise HTTPException(status_code=400, detail="Invalid preview request") from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to render preview: {exc}") from exc
+        logger.exception("Failed to render page preview")
+        raise HTTPException(status_code=502, detail="Failed to render preview") from exc
 
     return StreamingResponse(
         BytesIO(preview_bytes),
@@ -300,7 +305,7 @@ async def download_pdf(job_id: str, db: AsyncSession = Depends(get_db)):
     return FileResponse(
         _job_pdf_path(job),
         media_type="application/pdf",
-        filename=f"accessible_{job.original_filename}",
+        filename=f"accessible_{safe_filename(job.original_filename)}",
     )
 
 

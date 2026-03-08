@@ -1,6 +1,8 @@
 import logging
 from pathlib import Path
 
+from tests.fixtures import TEST_SAMPLE_PDF
+
 from app.pipeline import fidelity
 from app.pipeline.fidelity import (
     _collect_structural_fragments,
@@ -364,7 +366,7 @@ def test_extract_font_review_targets_enriches_local_text_context(tmp_path):
             return value
 
     pdf_path = tmp_path / "context.pdf"
-    with pikepdf.open("backend/test_sample.pdf") as pdf:
+    with pikepdf.open(str(TEST_SAMPLE_PDF)) as pdf:
         page = pdf.pages[0]
         page_resources = _resolve_object(page.obj.get("/Resources"))
         fonts = _resolve_object(page_resources.get("/Font"))

@@ -1,19 +1,10 @@
 import type { ValidationChange, ValidationReport as ValidationReportType } from "../types";
+import { pluralize } from "../utils/format";
+import { asBool, asNumber, asString } from "../utils/typeGuards";
+import { CheckIcon, WarningIcon } from "./Icons";
 
 interface ValidationReportProps {
   report: ValidationReportType;
-}
-
-function asNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function asBool(value: unknown): boolean | null {
-  return typeof value === "boolean" ? value : null;
-}
-
-function asString(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
 function statusLabel(status: ValidationChange["remediation_status"]): string {
@@ -101,17 +92,11 @@ export default function ValidationReport({ report }: ValidationReportProps) {
         <div className="flex items-center gap-3">
           {report.compliant ? (
             <div className="w-10 h-10 rounded-xl bg-success text-white flex items-center justify-center">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="20 6 9 17 4 12" />
-              </svg>
+              <CheckIcon size={20} />
             </div>
           ) : (
             <div className="w-10 h-10 rounded-xl bg-warning text-white flex items-center justify-center">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-                <line x1="12" y1="9" x2="12" y2="13" />
-                <line x1="12" y1="17" x2="12.01" y2="17" />
-              </svg>
+              <WarningIcon size={20} />
             </div>
           )}
           <div>
@@ -123,7 +108,7 @@ export default function ValidationReport({ report }: ValidationReportProps) {
             <p className="text-sm text-ink-muted">
               {report.violations.length === 0
                 ? "All validation checks passed."
-                : `${report.violations.length} issue${report.violations.length === 1 ? "" : "s"} require attention.`}
+                : `${report.violations.length} ${pluralize(report.violations.length, "issue")} require attention.`}
             </p>
           </div>
         </div>

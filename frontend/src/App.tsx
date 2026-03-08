@@ -1,4 +1,5 @@
 import { BrowserRouter, Link, Route, Routes } from "react-router-dom";
+import ErrorBoundary from "./components/ErrorBoundary";
 import Layout from "./components/Layout";
 import DashboardPage from "./pages/DashboardPage";
 import JobDetailPage from "./pages/JobDetailPage";
@@ -22,16 +23,18 @@ function NotFound() {
 
 export default function App() {
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route element={<Layout />}>
-          <Route path="/" element={<UploadPage />} />
-          <Route path="/dashboard" element={<DashboardPage />} />
-          <Route path="/jobs/:id" element={<JobDetailPage />} />
-          <Route path="/jobs/:id/review" element={<ReviewPage />} />
-          <Route path="*" element={<NotFound />} />
-        </Route>
-      </Routes>
-    </BrowserRouter>
+    <ErrorBoundary>
+      <BrowserRouter>
+        <Routes>
+          <Route element={<Layout />}>
+            <Route path="/" element={<UploadPage />} />
+            <Route path="/dashboard" element={<DashboardPage />} />
+            <Route path="/jobs/:id" element={<JobDetailPage />} />
+            <Route path="/jobs/:id/review" element={<ReviewPage />} />
+            <Route path="*" element={<NotFound />} />
+          </Route>
+        </Routes>
+      </BrowserRouter>
+    </ErrorBoundary>
   );
 }

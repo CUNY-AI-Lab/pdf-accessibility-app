@@ -32,6 +32,7 @@ def render_page_png_bytes(
     *,
     dpi: int = RENDER_DPI,
     max_width: int = MAX_IMAGE_WIDTH,
+    timeout: int = 30,
 ) -> bytes:
     if page_number < 1:
         raise ValueError("page_number must be 1 or greater")
@@ -53,7 +54,12 @@ def render_page_png_bytes(
             str(pdf_path),
             str(output_prefix),
         ]
-        subprocess.run(cmd, check=True, capture_output=True)
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Page preview timed out after {timeout}s"
+            ) from exc
         image_path = output_prefix.with_suffix(".png")
         with Image.open(image_path) as image:
             rendered = image.convert("RGB")

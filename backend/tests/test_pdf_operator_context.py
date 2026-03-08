@@ -1,5 +1,7 @@
-from pathlib import Path
 from io import BytesIO
+from pathlib import Path
+
+from tests.fixtures import TEST_SAMPLE_PDF
 
 import pikepdf
 from PIL import Image
@@ -80,7 +82,7 @@ def _replace_page_with_single_text_operator(pdf_path: Path, output_path: Path) -
 def test_extract_operator_text_context_returns_surrounding_text(tmp_path):
     pdf_path = tmp_path / "three_text_ops.pdf"
     context_path = _replace_page_with_three_text_operators(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         pdf_path,
     )
 
@@ -99,7 +101,7 @@ def test_extract_operator_text_context_returns_surrounding_text(tmp_path):
 def test_extract_operator_visual_context_returns_bbox(tmp_path):
     pdf_path = tmp_path / "three_text_ops.pdf"
     context_path = _replace_page_with_three_text_operators(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         pdf_path,
     )
 
@@ -118,7 +120,7 @@ def test_extract_operator_visual_context_returns_bbox(tmp_path):
 def test_render_target_preview_png_bytes_returns_png(tmp_path):
     pdf_path = tmp_path / "three_text_ops.pdf"
     context_path = _replace_page_with_three_text_operators(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         pdf_path,
     )
 
@@ -133,7 +135,7 @@ def test_render_target_preview_png_bytes_returns_png(tmp_path):
 def test_render_target_preview_png_bytes_highlights_target_region(tmp_path):
     pdf_path = tmp_path / "three_text_ops.pdf"
     context_path = _replace_page_with_three_text_operators(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         pdf_path,
     )
 
@@ -153,7 +155,7 @@ def test_render_target_preview_png_bytes_highlights_target_region(tmp_path):
 def test_extract_operator_context_handles_actualtext_wrapped_target(tmp_path):
     source_pdf = tmp_path / "three_text_ops.pdf"
     context_path = _replace_page_with_three_text_operators(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         source_pdf,
     )
     wrapped_pdf = tmp_path / "three_text_ops_wrapped.pdf"
@@ -182,7 +184,7 @@ def test_extract_operator_context_handles_actualtext_wrapped_target(tmp_path):
 def test_render_target_preview_png_bytes_handles_actualtext_wrapped_target(tmp_path):
     source_pdf = tmp_path / "three_text_ops.pdf"
     context_path = _replace_page_with_three_text_operators(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         source_pdf,
     )
     wrapped_pdf = tmp_path / "three_text_ops_wrapped.pdf"
@@ -205,7 +207,7 @@ def test_render_target_preview_png_bytes_handles_actualtext_wrapped_target(tmp_p
 def test_extract_operator_context_handles_single_text_object_et_target(tmp_path):
     pdf_path = tmp_path / "single_text_op.pdf"
     context_path = _replace_page_with_single_text_operator(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         pdf_path,
     )
 

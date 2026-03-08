@@ -11,6 +11,8 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
+import pikepdf
+
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +23,7 @@ from app.pipeline.classify import classify_pdf
 from app.pipeline.fidelity import assess_fidelity
 from app.pipeline.ocr import run_ocr
 from app.pipeline.structure import extract_structure
+from app.pipeline.subprocess_utils import SubprocessTimeout, communicate_with_timeout
 from app.pipeline.tagger import tag_pdf
 from app.pipeline.validator import validate_pdf
 from app.services.font_unicode_override import apply_unicode_override_to_context
@@ -119,6 +122,43 @@ GHOSTSCRIPT_TYPE1_DESCRIPTOR_SPECS = {
     "symbol": {"afm": "s050000l.afm", "flags": 4},
     "zapfdingbats": {"afm": "d050000l.afm", "flags": 4},
 }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Shared pikepdf helpers (used across multiple font-repair functions)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _obj_key(obj) -> tuple[int, int] | None:
+    """Return the (objgen) identity tuple for a pikepdf indirect object."""
+    try:
+        obj_num, gen_num = obj.objgen
+        if isinstance(obj_num, int) and isinstance(gen_num, int) and obj_num > 0:
+            return obj_num, gen_num
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_dictionary(obj):
+    """Resolve a pikepdf reference to a Dictionary (or dict-like) object."""
+    if obj is None:
+        return None
+    try:
+        if isinstance(obj, pikepdf.Dictionary):
+            return obj
+        if hasattr(obj, "keys") and hasattr(obj, "get"):
+            return obj
+        return obj.get_object()
+    except Exception:
+        return None
+
+
+def _join_messages(a: str | None, b: str | None) -> str | None:
+    """Join two optional message strings with ' | ', dropping None/empty values."""
+    if a and b:
+        return f"{a} | {b}"
+    return a or b
 
 
 def _aggregate_violations(violations) -> dict[str, dict]:
@@ -423,6 +463,8 @@ async def _attempt_auto_llm_font_map(
         api_key=settings.llm_api_key,
         model=settings.llm_model,
         timeout=settings.llm_timeout,
+        max_retries=settings.llm_max_retries,
+        retry_backoff_base=settings.llm_retry_backoff_base,
     )
     audit["attempted"] = True
     try:
@@ -504,6 +546,7 @@ async def _attempt_auto_llm_font_map(
         pdf_path=patched_output,
         verapdf_path=settings.verapdf_path,
         flavour=settings.verapdf_flavour,
+        timeout_seconds=settings.subprocess_timeout_validation,
     )
     if not _is_better_validation(candidate_validation, current_validation):
         audit["reason"] = "no_validation_improvement"
@@ -566,27 +609,6 @@ def _inspect_pdf_features(pdf_path: Path) -> dict[str, int | bool]:
         seen_resources: set[tuple[int, int]] = set()
         seen_fonts: set[tuple[int, int]] = set()
         seen_appearances: set[tuple[int, int]] = set()
-
-        def _obj_key(obj) -> tuple[int, int] | None:
-            try:
-                obj_num, gen_num = obj.objgen
-                if isinstance(obj_num, int) and isinstance(gen_num, int) and obj_num > 0:
-                    return obj_num, gen_num
-            except Exception:
-                return None
-            return None
-
-        def _resolve_dictionary(obj):
-            if obj is None:
-                return None
-            try:
-                if isinstance(obj, pikepdf.Dictionary):
-                    return obj
-                if hasattr(obj, "keys") and hasattr(obj, "get"):
-                    return obj
-                return obj.get_object()
-            except Exception:
-                return None
 
         def _has_embedded_font(descriptor) -> bool:
             if not isinstance(descriptor, pikepdf.Dictionary):
@@ -685,18 +707,27 @@ def _inspect_pdf_features(pdf_path: Path) -> dict[str, int | bool]:
 
         with pikepdf.open(str(pdf_path)) as pdf:
             features["pages"] = len(pdf.pages)
-            features["has_forms"] = bool(pdf.Root.get("/AcroForm"))
+            acroform = _resolve_dictionary(pdf.Root.get("/AcroForm"))
+            has_form_fields = False
+            if isinstance(acroform, pikepdf.Dictionary):
+                fields = acroform.get("/Fields")
+                has_form_fields = isinstance(fields, pikepdf.Array) and len(fields) > 0
             links = 0
+            widget_annots = 0
             for page in pdf.pages:
                 annots = page.get("/Annots")
                 if isinstance(annots, pikepdf.Array):
                     for annot in annots:
                         try:
-                            if annot.get("/Subtype") == pikepdf.Name("/Link"):
+                            subtype = annot.get("/Subtype")
+                            if subtype == pikepdf.Name("/Link"):
                                 links += 1
+                            elif subtype == pikepdf.Name("/Widget"):
+                                widget_annots += 1
                         except Exception:
                             continue
             features["link_annots"] = links
+            features["has_forms"] = has_form_fields or widget_annots > 0
             _walk_pdf_resource_graph(
                 pdf,
                 resolve_dictionary=_resolve_dictionary,
@@ -1423,6 +1454,121 @@ def _local_font_program(
     return None, None, None, None
 
 
+def _parse_cid_widths_array(widths_obj) -> dict[int, int]:
+    import pikepdf
+
+    widths: dict[int, int] = {}
+    if not isinstance(widths_obj, pikepdf.Array):
+        return widths
+
+    idx = 0
+    while idx < len(widths_obj):
+        try:
+            start_cid = int(widths_obj[idx])
+        except Exception:
+            break
+        idx += 1
+        if idx >= len(widths_obj):
+            break
+
+        entry = widths_obj[idx]
+        idx += 1
+        if isinstance(entry, pikepdf.Array):
+            cid = start_cid
+            for width_value in entry:
+                try:
+                    widths[cid] = int(round(float(width_value)))
+                except Exception:
+                    pass
+                cid += 1
+            continue
+
+        try:
+            end_cid = int(entry)
+        except Exception:
+            break
+        if idx >= len(widths_obj):
+            break
+        try:
+            width = int(round(float(widths_obj[idx])))
+        except Exception:
+            idx += 1
+            continue
+        idx += 1
+        for cid in range(start_cid, end_cid + 1):
+            widths[cid] = width
+
+    return widths
+
+
+def _render_cid_widths_array(widths: dict[int, int]):
+    import pikepdf
+
+    array = pikepdf.Array()
+    if not widths:
+        return array
+
+    sorted_items = sorted(widths.items())
+    run_start, first_width = sorted_items[0]
+    run_widths = [first_width]
+
+    for cid, width in sorted_items[1:]:
+        if cid == run_start + len(run_widths):
+            run_widths.append(width)
+            continue
+        array.append(run_start)
+        array.append(pikepdf.Array(run_widths))
+        run_start = cid
+        run_widths = [width]
+
+    array.append(run_start)
+    array.append(pikepdf.Array(run_widths))
+    return array
+
+
+def _cid_cff_width_key(glyph_name: str | None, fallback_index: int) -> int:
+    raw = str(glyph_name or "").strip()
+    if raw == ".notdef":
+        return 0
+    if raw.startswith("cid") and raw[3:].isdigit():
+        try:
+            return int(raw[3:])
+        except ValueError:
+            pass
+    return fallback_index
+
+
+def _collect_cid_cff_widths(font_bytes: bytes) -> dict[int, int]:
+    from fontTools.cffLib import CFFFontSet
+    from fontTools.pens.basePen import NullPen
+
+    widths: dict[int, int] = {}
+    if not font_bytes:
+        return widths
+
+    font_set = CFFFontSet()
+    font_set.decompile(BytesIO(font_bytes), None)
+    for font_name in font_set.keys():
+        cff_font = font_set[font_name]
+        if not getattr(cff_font, "ROS", None):
+            continue
+        charset = getattr(cff_font, "charset", None)
+        char_strings = getattr(cff_font, "CharStrings", None)
+        if not isinstance(charset, list) or char_strings is None:
+            continue
+        for glyph_index, glyph_name in enumerate(charset):
+            try:
+                char_string = char_strings[glyph_name]
+                char_string.draw(NullPen())
+            except Exception:
+                continue
+            width = getattr(char_string, "width", None)
+            if isinstance(width, (int, float)):
+                cid = _cid_cff_width_key(glyph_name, glyph_index)
+                widths[cid] = int(round(width))
+    return widths
+
+
 def _repair_pdf_font_dicts_sync(
     input_path: Path,
     output_path: Path,
@@ -1438,27 +1584,6 @@ def _repair_pdf_font_dicts_sync(
     seen_fonts: set[tuple[int, int]] = set()
     seen_resources: set[tuple[int, int]] = set()
     seen_appearances: set[tuple[int, int]] = set()
-
-    def _obj_key(obj) -> tuple[int, int] | None:
-        try:
-            obj_num, gen_num = obj.objgen
-            if isinstance(obj_num, int) and isinstance(gen_num, int) and obj_num > 0:
-                return obj_num, gen_num
-        except Exception:
-            return None
-        return None
-
-    def _resolve_dictionary(obj):
-        if obj is None:
-            return None
-        try:
-            if isinstance(obj, pikepdf.Dictionary):
-                return obj
-            if hasattr(obj, "keys") and hasattr(obj, "get"):
-                return obj
-            return obj.get_object()
-        except Exception:
-            return None
 
     def _has_embedded_font(descriptor) -> bool:
         if not isinstance(descriptor, pikepdf.Dictionary):
@@ -1480,13 +1605,18 @@ def _repair_pdf_font_dicts_sync(
             return
 
         changed = False
-        if cid_font.get("/Subtype") != pikepdf.Name("/CIDFontType2"):
+        subtype = cid_font.get("/Subtype")
+        if subtype not in (pikepdf.Name("/CIDFontType2"), pikepdf.Name("/CIDFontType0")):
             if obj_key:
                 seen_fonts.add(obj_key)
             return
 
         descriptor = _resolve_dictionary(cid_font.get("/FontDescriptor"))
-        if _has_embedded_font(descriptor) and pikepdf.Name("/CIDToGIDMap") not in cid_font:
+        if (
+            subtype == pikepdf.Name("/CIDFontType2")
+            and _has_embedded_font(descriptor)
+            and pikepdf.Name("/CIDToGIDMap") not in cid_font
+        ):
             cid_font[pikepdf.Name("/CIDToGIDMap")] = pikepdf.Name("/Identity")
             stats["cidtogid_added"] += 1
             changed = True
@@ -1596,6 +1726,158 @@ async def _repair_pdf_font_dicts(
     output_path: Path,
 ) -> tuple[bool, str, dict[str, int]]:
     return await asyncio.to_thread(_repair_pdf_font_dicts_sync, input_path, output_path)
+
+
+def _sync_pdf_cid_cff_widths_sync(
+    input_path: Path,
+    output_path: Path,
+) -> tuple[bool, str, dict[str, int]]:
+    """Sync CIDFontType0 width arrays to embedded CFF program widths."""
+    import pikepdf
+
+    stats = {
+        "fonts_touched": 0,
+        "widths_synced": 0,
+    }
+    seen_fonts: set[tuple[int, int]] = set()
+    seen_resources: set[tuple[int, int]] = set()
+    seen_appearances: set[tuple[int, int]] = set()
+
+    def _repair_cid_font_widths(cid_font) -> None:
+        if not isinstance(cid_font, pikepdf.Dictionary):
+            return
+        obj_key = _obj_key(cid_font)
+        if obj_key and obj_key in seen_fonts:
+            return
+
+        try:
+            if cid_font.get("/Subtype") != pikepdf.Name("/CIDFontType0"):
+                return
+            widths_obj = cid_font.get("/W")
+            current_widths = _parse_cid_widths_array(widths_obj)
+            if not current_widths:
+                return
+
+            descriptor = _resolve_dictionary(cid_font.get("/FontDescriptor"))
+            if not isinstance(descriptor, pikepdf.Dictionary):
+                return
+            font_stream = _resolve_dictionary(descriptor.get("/FontFile3"))
+            if font_stream is None:
+                return
+            if font_stream.get("/Subtype") != pikepdf.Name("/CIDFontType0C"):
+                return
+            try:
+                font_bytes = bytes(font_stream.read_bytes())
+            except Exception:
+                return
+            program_widths = _collect_cid_cff_widths(font_bytes)
+            if not program_widths:
+                return
+
+            updated_widths = dict(current_widths)
+            font_changed = False
+            for cid, current_width in current_widths.items():
+                program_width = program_widths.get(cid)
+                if program_width is None or program_width == current_width:
+                    continue
+                updated_widths[cid] = program_width
+                stats["widths_synced"] += 1
+                font_changed = True
+
+            if font_changed:
+                cid_font[pikepdf.Name("/W")] = _render_cid_widths_array(updated_widths)
+                stats["fonts_touched"] += 1
+        finally:
+            if obj_key:
+                seen_fonts.add(obj_key)
+
+    def _walk_resources(resources) -> None:
+        if not _is_pdf_mapping(resources):
+            return
+
+        resources_key = _obj_key(resources)
+        if resources_key and resources_key in seen_resources:
+            return
+        if resources_key:
+            seen_resources.add(resources_key)
+
+        fonts = _resolve_dictionary(resources.get("/Font"))
+        if isinstance(fonts, pikepdf.Dictionary):
+            for _, font_obj in fonts.items():
+                font_dict = _resolve_dictionary(font_obj)
+                if not isinstance(font_dict, pikepdf.Dictionary):
+                    continue
+
+                subtype = font_dict.get("/Subtype")
+                if subtype == pikepdf.Name("/Type0"):
+                    descendants = font_dict.get("/DescendantFonts")
+                    if not isinstance(descendants, pikepdf.Array):
+                        continue
+                    for descendant in descendants:
+                        _repair_cid_font_widths(_resolve_dictionary(descendant))
+                elif subtype == pikepdf.Name("/CIDFontType0"):
+                    _repair_cid_font_widths(font_dict)
+
+        xobjects = _resolve_dictionary(resources.get("/XObject"))
+        if not isinstance(xobjects, pikepdf.Dictionary):
+            return
+        for _, xobject in xobjects.items():
+            xobject_dict = _resolve_dictionary(xobject)
+            if not _is_pdf_mapping(xobject_dict):
+                continue
+            try:
+                subtype = xobject_dict.get("/Subtype")
+            except Exception:
+                continue
+            if subtype != pikepdf.Name("/Form"):
+                continue
+            child_resources = _resolve_dictionary(xobject_dict.get("/Resources"))
+            _walk_resources(child_resources)
+
+    def _walk_appearance_object(obj) -> None:
+        appearance_obj = _resolve_dictionary(obj)
+        if not _is_pdf_mapping(appearance_obj):
+            return
+        appearance_key = _obj_key(appearance_obj)
+        if appearance_key and appearance_key in seen_appearances:
+            return
+        if appearance_key:
+            seen_appearances.add(appearance_key)
+
+        _walk_resources(_resolve_dictionary(appearance_obj.get("/Resources")))
+        for key in ("/N", "/R", "/D"):
+            child = appearance_obj.get(key)
+            if child is not None:
+                _walk_appearance_object(child)
+
+    try:
+        with pikepdf.open(str(input_path)) as pdf:
+            _walk_pdf_resource_graph(
+                pdf,
+                resolve_dictionary=_resolve_dictionary,
+                walk_resources=_walk_resources,
+                walk_appearance_object=_walk_appearance_object,
+            )
+            if stats["widths_synced"] <= 0:
+                return False, "No eligible CID CFF width mismatches found", stats
+            pdf.save(str(output_path))
+        return (
+            True,
+            (
+                f"CID CFF width sync completed "
+                f"(fonts={stats['fonts_touched']}, widths synced={stats['widths_synced']})"
+            ),
+            stats,
+        )
+    except Exception as exc:
+        return False, f"CID CFF width sync failed: {exc}", stats
+
+
+async def _sync_pdf_cid_cff_widths(
+    input_path: Path,
+    output_path: Path,
+) -> tuple[bool, str, dict[str, int]]:
+    return await asyncio.to_thread(_sync_pdf_cid_cff_widths_sync, input_path, output_path)
 
 
 def _is_valid_unicode_text(text: str) -> bool:
@@ -1999,27 +2281,6 @@ def _inspect_font_diagnostics(
         used_simple_codes: dict[tuple[int, int], set[int]] = {}
         profiles_by_key: dict[str, dict[str, object]] = {}
         simple_font_candidates: dict[tuple[int, int], dict[str, object]] = {}
-
-        def _obj_key(obj) -> tuple[int, int] | None:
-            try:
-                obj_num, gen_num = obj.objgen
-                if isinstance(obj_num, int) and isinstance(gen_num, int) and obj_num > 0:
-                    return obj_num, gen_num
-            except Exception:
-                return None
-            return None
-
-        def _resolve_dictionary(obj):
-            if obj is None:
-                return None
-            try:
-                if isinstance(obj, pikepdf.Dictionary):
-                    return obj
-                if hasattr(obj, "keys") and hasattr(obj, "get"):
-                    return obj
-                return obj.get_object()
-            except Exception:
-                return None
 
         def _font_stream_bytes(descriptor) -> bytes | None:
             if not isinstance(descriptor, pikepdf.Dictionary):
@@ -2579,32 +2840,11 @@ def _repair_pdf_tounicode_sync(
     seen_content_streams: set[tuple[int, int]] = set()
     seen_collect_appearances: set[tuple[int, int]] = set()
 
-    def _obj_key(obj) -> tuple[int, int] | None:
-        try:
-            obj_num, gen_num = obj.objgen
-            if isinstance(obj_num, int) and isinstance(gen_num, int) and obj_num > 0:
-                return obj_num, gen_num
-        except Exception:
-            return None
-        return None
-
-    def _resolve_object(obj):
-        if obj is None:
-            return None
-        try:
-            if isinstance(obj, pikepdf.Dictionary):
-                return obj
-            if hasattr(obj, "keys") and hasattr(obj, "get"):
-                return obj
-            return obj.get_object()
-        except Exception:
-            return None
-
     def _font_stream_bytes(descriptor) -> bytes | None:
         if not isinstance(descriptor, pikepdf.Dictionary):
             return None
         for key in ("/FontFile", "/FontFile2", "/FontFile3"):
-            stream_obj = _resolve_object(descriptor.get(key))
+            stream_obj = _resolve_dictionary(descriptor.get(key))
             if stream_obj is None:
                 continue
             try:
@@ -2620,7 +2860,7 @@ def _repair_pdf_tounicode_sync(
         if cid_to_gid == pikepdf.Name("/Identity"):
             return None, True
 
-        stream_obj = _resolve_object(cid_to_gid)
+        stream_obj = _resolve_dictionary(cid_to_gid)
         if stream_obj is None:
             return None, True
         try:
@@ -2641,7 +2881,7 @@ def _repair_pdf_tounicode_sync(
     def _collect_used_simple_font_codes(content_obj, resources) -> None:
         if resources is None:
             return
-        resolved_obj = _resolve_object(content_obj)
+        resolved_obj = _resolve_dictionary(content_obj)
         if resolved_obj is None:
             return
         content_key = _obj_key(resolved_obj)
@@ -2650,8 +2890,8 @@ def _repair_pdf_tounicode_sync(
         if content_key:
             seen_content_streams.add(content_key)
 
-        fonts = _resolve_object(resources.get("/Font"))
-        xobjects = _resolve_object(resources.get("/XObject"))
+        fonts = _resolve_dictionary(resources.get("/Font"))
+        xobjects = _resolve_dictionary(resources.get("/XObject"))
         current_font = None
         try:
             instructions = pikepdf.parse_content_stream(resolved_obj)
@@ -2663,7 +2903,7 @@ def _repair_pdf_tounicode_sync(
             operands = list(instr.operands) if hasattr(instr, "operands") else []
             if op == "Tf" and operands and isinstance(fonts, pikepdf.Dictionary):
                 font_ref = fonts.get(operands[0])
-                current_font = _resolve_object(font_ref)
+                current_font = _resolve_dictionary(font_ref)
                 continue
 
             if op in ("Tj", "TJ", "'", '"') and isinstance(current_font, pikepdf.Dictionary):
@@ -2683,16 +2923,16 @@ def _repair_pdf_tounicode_sync(
                 continue
 
             if op == "Do" and operands and isinstance(xobjects, pikepdf.Dictionary):
-                xobject = _resolve_object(xobjects.get(operands[0]))
+                xobject = _resolve_dictionary(xobjects.get(operands[0]))
                 if not isinstance(xobject, pikepdf.Dictionary):
                     continue
                 if xobject.get("/Subtype") != pikepdf.Name("/Form"):
                     continue
-                child_resources = _resolve_object(xobject.get("/Resources")) or resources
+                child_resources = _resolve_dictionary(xobject.get("/Resources")) or resources
                 _collect_used_simple_font_codes(xobject, child_resources)
 
     def _collect_used_simple_font_codes_from_appearance(obj, fallback_resources) -> None:
-        appearance_obj = _resolve_object(obj)
+        appearance_obj = _resolve_dictionary(obj)
         if not _is_pdf_mapping(appearance_obj):
             return
         appearance_key = _obj_key(appearance_obj)
@@ -2701,7 +2941,7 @@ def _repair_pdf_tounicode_sync(
         if appearance_key:
             seen_collect_appearances.add(appearance_key)
 
-        appearance_resources = _resolve_object(appearance_obj.get("/Resources")) or fallback_resources
+        appearance_resources = _resolve_dictionary(appearance_obj.get("/Resources")) or fallback_resources
         if hasattr(appearance_obj, "read_bytes"):
             _collect_used_simple_font_codes(appearance_obj, appearance_resources)
 
@@ -2724,10 +2964,10 @@ def _repair_pdf_tounicode_sync(
         if resources_key:
             candidate_seen_resources.add(resources_key)
 
-        fonts = _resolve_object(resources.get("/Font"))
+        fonts = _resolve_dictionary(resources.get("/Font"))
         if isinstance(fonts, pikepdf.Dictionary):
             for _, font_obj in fonts.items():
-                font_dict = _resolve_object(font_obj)
+                font_dict = _resolve_dictionary(font_obj)
                 if not isinstance(font_dict, pikepdf.Dictionary):
                     continue
                 if font_dict.get("/Subtype") not in (
@@ -2747,9 +2987,9 @@ def _repair_pdf_tounicode_sync(
                 if 0 not in used_codes:
                     continue
 
-                existing_stream = _resolve_object(font_dict.get("/ToUnicode"))
+                existing_stream = _resolve_dictionary(font_dict.get("/ToUnicode"))
                 existing_map, _ = _parse_tounicode_map_details(existing_stream)
-                descriptor = _resolve_object(font_dict.get("/FontDescriptor"))
+                descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
                 font_bytes = _font_stream_bytes(descriptor)
                 generated_map = {}
                 if _simple_font_auto_unicode_policy(font_dict, font_bytes=font_bytes) != "blocked":
@@ -2763,20 +3003,20 @@ def _repair_pdf_tounicode_sync(
                 ):
                     zero_byte_candidate_fonts.add(font_key)
 
-        xobjects = _resolve_object(resources.get("/XObject"))
+        xobjects = _resolve_dictionary(resources.get("/XObject"))
         if not isinstance(xobjects, pikepdf.Dictionary):
             return
         for _, xobject in xobjects.items():
-            xobject_dict = _resolve_object(xobject)
+            xobject_dict = _resolve_dictionary(xobject)
             if not _is_pdf_mapping(xobject_dict):
                 continue
             if xobject_dict.get("/Subtype") != pikepdf.Name("/Form"):
                 continue
-            child_resources = _resolve_object(xobject_dict.get("/Resources")) or resources
+            child_resources = _resolve_dictionary(xobject_dict.get("/Resources")) or resources
             _collect_zero_byte_candidates(child_resources)
 
     def _collect_zero_byte_candidates_from_appearance(obj, fallback_resources) -> None:
-        appearance_obj = _resolve_object(obj)
+        appearance_obj = _resolve_dictionary(obj)
         if not _is_pdf_mapping(appearance_obj):
             return
         appearance_key = _obj_key(appearance_obj)
@@ -2785,7 +3025,7 @@ def _repair_pdf_tounicode_sync(
         if appearance_key:
             candidate_seen_appearances.add(appearance_key)
 
-        appearance_resources = _resolve_object(appearance_obj.get("/Resources")) or fallback_resources
+        appearance_resources = _resolve_dictionary(appearance_obj.get("/Resources")) or fallback_resources
         _collect_zero_byte_candidates(appearance_resources)
 
         for key in ("/N", "/R", "/D"):
@@ -2808,7 +3048,7 @@ def _repair_pdf_tounicode_sync(
         if resources is None or not zero_byte_candidate_fonts:
             return
 
-        resolved_obj = _resolve_object(content_obj)
+        resolved_obj = _resolve_dictionary(content_obj)
         if resolved_obj is None:
             return
         content_key = _obj_key(resolved_obj)
@@ -2817,8 +3057,8 @@ def _repair_pdf_tounicode_sync(
         if content_key:
             rewritten_content_streams.add(content_key)
 
-        fonts = _resolve_object(resources.get("/Font"))
-        xobjects = _resolve_object(resources.get("/XObject"))
+        fonts = _resolve_dictionary(resources.get("/Font"))
+        xobjects = _resolve_dictionary(resources.get("/XObject"))
         parse_target = content_obj if isinstance(content_obj, pikepdf.Page) else resolved_obj
         current_font = None
         changed = False
@@ -2835,7 +3075,7 @@ def _repair_pdf_tounicode_sync(
             current_instruction = instr
 
             if op == "Tf" and operands and isinstance(fonts, pikepdf.Dictionary):
-                current_font = _resolve_object(fonts.get(operands[0]))
+                current_font = _resolve_dictionary(fonts.get(operands[0]))
             elif op in ("Tj", "TJ", "'", '"') and isinstance(current_font, pikepdf.Dictionary):
                 font_key = _obj_key(current_font)
                 if font_key in zero_byte_candidate_fonts:
@@ -2850,9 +3090,9 @@ def _repair_pdf_tounicode_sync(
                         sanitized_font_keys.add(font_key)
                         changed = True
             elif op == "Do" and operands and isinstance(xobjects, pikepdf.Dictionary):
-                xobject = _resolve_object(xobjects.get(operands[0]))
+                xobject = _resolve_dictionary(xobjects.get(operands[0]))
                 if isinstance(xobject, pikepdf.Dictionary) and xobject.get("/Subtype") == pikepdf.Name("/Form"):
-                    child_resources = _resolve_object(xobject.get("/Resources")) or resources
+                    child_resources = _resolve_dictionary(xobject.get("/Resources")) or resources
                     _sanitize_simple_font_zero_bytes(pdf, xobject, child_resources)
 
             new_instructions.append(current_instruction)
@@ -2861,7 +3101,7 @@ def _repair_pdf_tounicode_sync(
             _write_content_stream(pdf, content_obj, resolved_obj, new_instructions)
 
     def _sanitize_simple_font_zero_bytes_from_appearance(pdf, obj, fallback_resources) -> None:
-        appearance_obj = _resolve_object(obj)
+        appearance_obj = _resolve_dictionary(obj)
         if not _is_pdf_mapping(appearance_obj):
             return
         appearance_key = _obj_key(appearance_obj)
@@ -2870,7 +3110,7 @@ def _repair_pdf_tounicode_sync(
         if appearance_key:
             sanitized_appearance_streams.add(appearance_key)
 
-        appearance_resources = _resolve_object(appearance_obj.get("/Resources")) or fallback_resources
+        appearance_resources = _resolve_dictionary(appearance_obj.get("/Resources")) or fallback_resources
         if hasattr(appearance_obj, "read_bytes"):
             _sanitize_simple_font_zero_bytes(pdf, appearance_obj, appearance_resources)
 
@@ -2880,7 +3120,7 @@ def _repair_pdf_tounicode_sync(
                 _sanitize_simple_font_zero_bytes_from_appearance(pdf, child, appearance_resources)
 
     def _rebuild_type0_tounicode(pdf, type0_font, cid_font) -> tuple[bool, int, int, int, int]:
-        descriptor = _resolve_object(cid_font.get("/FontDescriptor"))
+        descriptor = _resolve_dictionary(cid_font.get("/FontDescriptor"))
         font_bytes = _font_stream_bytes(descriptor)
         gid_to_unicode: dict[int, str] = {}
         if font_bytes:
@@ -2903,7 +3143,7 @@ def _repair_pdf_tounicode_sync(
                     if text:
                         generated[cid] = text
 
-        existing_stream = _resolve_object(type0_font.get("/ToUnicode"))
+        existing_stream = _resolve_dictionary(type0_font.get("/ToUnicode"))
         existing_map, invalid_entries = _parse_tounicode_map_details(existing_stream)
         merged_map, overwritten = _merge_tounicode_maps(existing_map, generated)
         if not merged_map:
@@ -2921,7 +3161,7 @@ def _repair_pdf_tounicode_sync(
     def _rebuild_simple_font_tounicode(pdf, font_dict) -> tuple[bool, int, int, int, int, int]:
         font_key = _obj_key(font_dict)
         used_codes = used_simple_codes.get(font_key or (-1, -1), set())
-        existing_stream = _resolve_object(font_dict.get("/ToUnicode"))
+        existing_stream = _resolve_dictionary(font_dict.get("/ToUnicode"))
         existing_map, invalid_entries = _parse_tounicode_map_details(existing_stream)
         if not used_codes:
             return False, len(existing_map), 0, invalid_entries, 0, 0
@@ -2935,7 +3175,7 @@ def _repair_pdf_tounicode_sync(
         if not missing_used_codes and invalid_entries <= 0:
             return False, len(existing_map), 0, 0, 0, 0
 
-        descriptor = _resolve_object(font_dict.get("/FontDescriptor"))
+        descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
         font_bytes = _font_stream_bytes(descriptor)
         if _simple_font_auto_unicode_policy(font_dict, font_bytes=font_bytes) == "blocked":
             return False, 0, 0, invalid_entries, 0, 0
@@ -2979,10 +3219,10 @@ def _repair_pdf_tounicode_sync(
         if resources_key:
             seen_resources.add(resources_key)
 
-        fonts = _resolve_object(resources.get("/Font"))
+        fonts = _resolve_dictionary(resources.get("/Font"))
         if isinstance(fonts, pikepdf.Dictionary):
             for _, font_obj in fonts.items():
-                type0_font = _resolve_object(font_obj)
+                type0_font = _resolve_dictionary(font_obj)
                 if not isinstance(type0_font, pikepdf.Dictionary):
                     continue
                 font_key = _obj_key(type0_font)
@@ -3007,7 +3247,7 @@ def _repair_pdf_tounicode_sync(
                     descendants = type0_font.get("/DescendantFonts")
                     if not isinstance(descendants, pikepdf.Array) or len(descendants) <= 0:
                         continue
-                    cid_font = _resolve_object(descendants[0])
+                    cid_font = _resolve_dictionary(descendants[0])
                     if not isinstance(cid_font, pikepdf.Dictionary):
                         continue
                     if cid_font.get("/Subtype") != pikepdf.Name("/CIDFontType2"):
@@ -3028,11 +3268,11 @@ def _repair_pdf_tounicode_sync(
                 stats["mappings_overridden"] += overwritten
                 stats["stale_entries_removed"] += stale_entries_removed
 
-        xobjects = _resolve_object(resources.get("/XObject"))
+        xobjects = _resolve_dictionary(resources.get("/XObject"))
         if not isinstance(xobjects, pikepdf.Dictionary):
             return
         for _, xobject in xobjects.items():
-            xobject_dict = _resolve_object(xobject)
+            xobject_dict = _resolve_dictionary(xobject)
             if not _is_pdf_mapping(xobject_dict):
                 continue
             try:
@@ -3041,11 +3281,11 @@ def _repair_pdf_tounicode_sync(
                 continue
             if subtype != pikepdf.Name("/Form"):
                 continue
-            child_resources = _resolve_object(xobject_dict.get("/Resources"))
+            child_resources = _resolve_dictionary(xobject_dict.get("/Resources"))
             _walk_resources(pdf, child_resources)
 
     def _walk_appearance_object(pdf, obj) -> None:
-        appearance_obj = _resolve_object(obj)
+        appearance_obj = _resolve_dictionary(obj)
         if not _is_pdf_mapping(appearance_obj):
             return
         appearance_key = _obj_key(appearance_obj)
@@ -3054,7 +3294,7 @@ def _repair_pdf_tounicode_sync(
         if appearance_key:
             seen_appearances.add(appearance_key)
 
-        _walk_resources(pdf, _resolve_object(appearance_obj.get("/Resources")))
+        _walk_resources(pdf, _resolve_dictionary(appearance_obj.get("/Resources")))
         for key in ("/N", "/R", "/D"):
             child = appearance_obj.get(key)
             if child is not None:
@@ -3063,22 +3303,22 @@ def _repair_pdf_tounicode_sync(
     try:
         with pikepdf.open(str(input_path)) as pdf:
             for page in pdf.pages:
-                page_resources = _resolve_object(page.get("/Resources"))
+                page_resources = _resolve_dictionary(page.get("/Resources"))
                 _collect_used_simple_font_codes(page, page_resources)
                 annots = page.get("/Annots")
                 if isinstance(annots, pikepdf.Array):
                     for annot in annots:
                         _collect_used_simple_font_codes_from_appearance(
                             annot.get("/AP"),
-                            _resolve_object(annot.get("/Resources")),
+                            _resolve_dictionary(annot.get("/Resources")),
                         )
 
-            acroform = _resolve_object(pdf.Root.get("/AcroForm"))
+            acroform = _resolve_dictionary(pdf.Root.get("/AcroForm"))
             if _is_pdf_mapping(acroform):
                 seen_fields: set[tuple[int, int]] = set()
 
                 def _walk_field(field_obj) -> None:
-                    field = _resolve_object(field_obj)
+                    field = _resolve_dictionary(field_obj)
                     if not isinstance(field, pikepdf.Dictionary):
                         return
                     field_key = _obj_key(field)
@@ -3087,7 +3327,7 @@ def _repair_pdf_tounicode_sync(
                     if field_key:
                         seen_fields.add(field_key)
 
-                    field_resources = _resolve_object(field.get("/DR"))
+                    field_resources = _resolve_dictionary(field.get("/DR"))
                     _collect_used_simple_font_codes_from_appearance(field.get("/AP"), field_resources)
 
                     kids = field.get("/Kids")
@@ -3101,31 +3341,31 @@ def _repair_pdf_tounicode_sync(
                         _walk_field(field)
 
             for page in pdf.pages:
-                page_resources = _resolve_object(page.get("/Resources"))
+                page_resources = _resolve_dictionary(page.get("/Resources"))
                 _collect_zero_byte_candidates(page_resources)
                 annots = page.get("/Annots")
                 if isinstance(annots, pikepdf.Array):
                     for annot in annots:
                         _collect_zero_byte_candidates_from_appearance(
                             annot.get("/AP"),
-                            _resolve_object(annot.get("/Resources")),
+                            _resolve_dictionary(annot.get("/Resources")),
                         )
             if isinstance(acroform, pikepdf.Dictionary):
-                _collect_zero_byte_candidates(_resolve_object(acroform.get("/DR")))
+                _collect_zero_byte_candidates(_resolve_dictionary(acroform.get("/DR")))
                 fields = acroform.get("/Fields")
                 if isinstance(fields, pikepdf.Array):
                     for field in fields:
-                        field_dict = _resolve_object(field)
+                        field_dict = _resolve_dictionary(field)
                         if _is_pdf_mapping(field_dict):
-                            _collect_zero_byte_candidates(_resolve_object(field_dict.get("/DR")))
+                            _collect_zero_byte_candidates(_resolve_dictionary(field_dict.get("/DR")))
                             _collect_zero_byte_candidates_from_appearance(
                                 field_dict.get("/AP"),
-                                _resolve_object(field_dict.get("/DR")),
+                                _resolve_dictionary(field_dict.get("/DR")),
                             )
 
             if zero_byte_candidate_fonts:
                 for page in pdf.pages:
-                    page_resources = _resolve_object(page.get("/Resources"))
+                    page_resources = _resolve_dictionary(page.get("/Resources"))
                     _sanitize_simple_font_zero_bytes(pdf, page, page_resources)
                     annots = page.get("/Annots")
                     if isinstance(annots, pikepdf.Array):
@@ -3133,38 +3373,38 @@ def _repair_pdf_tounicode_sync(
                             _sanitize_simple_font_zero_bytes_from_appearance(
                                 pdf,
                                 annot.get("/AP"),
-                                _resolve_object(annot.get("/Resources")),
+                                _resolve_dictionary(annot.get("/Resources")),
                             )
 
                 if isinstance(acroform, pikepdf.Dictionary):
                     fields = acroform.get("/Fields")
                     if isinstance(fields, pikepdf.Array):
                         for field in fields:
-                            field_dict = _resolve_object(field)
+                            field_dict = _resolve_dictionary(field)
                             if not isinstance(field_dict, pikepdf.Dictionary):
                                 continue
                             _sanitize_simple_font_zero_bytes_from_appearance(
                                 pdf,
                                 field_dict.get("/AP"),
-                                _resolve_object(field_dict.get("/DR")),
+                                _resolve_dictionary(field_dict.get("/DR")),
                             )
 
                 for font_key in sanitized_font_keys:
                     used_simple_codes.setdefault(font_key, set()).discard(0)
 
             for page in pdf.pages:
-                _walk_resources(pdf, _resolve_object(page.get("/Resources")))
+                _walk_resources(pdf, _resolve_dictionary(page.get("/Resources")))
                 annots = page.get("/Annots")
                 if isinstance(annots, pikepdf.Array):
                     for annot in annots:
                         _walk_appearance_object(pdf, annot.get("/AP"))
 
             if isinstance(acroform, pikepdf.Dictionary):
-                _walk_resources(pdf, _resolve_object(acroform.get("/DR")))
+                _walk_resources(pdf, _resolve_dictionary(acroform.get("/DR")))
                 seen_fields = set()
 
                 def _walk_field_repairs(field_obj) -> None:
-                    field = _resolve_object(field_obj)
+                    field = _resolve_dictionary(field_obj)
                     if not isinstance(field, pikepdf.Dictionary):
                         return
                     field_key = _obj_key(field)
@@ -3173,7 +3413,7 @@ def _repair_pdf_tounicode_sync(
                     if field_key:
                         seen_fields.add(field_key)
 
-                    field_resources = _resolve_object(field.get("/DR"))
+                    field_resources = _resolve_dictionary(field.get("/DR"))
                     _walk_resources(pdf, field_resources)
                     _walk_appearance_object(pdf, field.get("/AP"))
 
@@ -3234,27 +3474,6 @@ def _embed_system_fonts_sync(
     seen_resources: set[tuple[int, int]] = set()
     seen_fonts: set[tuple[int, int]] = set()
     seen_appearances: set[tuple[int, int]] = set()
-
-    def _obj_key(obj) -> tuple[int, int] | None:
-        try:
-            obj_num, gen_num = obj.objgen
-            if isinstance(obj_num, int) and isinstance(gen_num, int) and obj_num > 0:
-                return obj_num, gen_num
-        except Exception:
-            return None
-        return None
-
-    def _resolve_dictionary(obj):
-        if obj is None:
-            return None
-        try:
-            if isinstance(obj, pikepdf.Dictionary):
-                return obj
-            if hasattr(obj, "keys") and hasattr(obj, "get"):
-                return obj
-            return obj.get_object()
-        except Exception:
-            return None
 
     def _has_embedded_font(descriptor) -> bool:
         if not isinstance(descriptor, pikepdf.Dictionary):
@@ -3516,7 +3735,11 @@ def _ghostscript_embed_command(gs: str, input_path: Path, output_path: Path) -> 
     )
 
 
-async def _rewrite_pdf_with_ghostscript_embed(input_path: Path, output_path: Path) -> tuple[bool, str]:
+async def _rewrite_pdf_with_ghostscript_embed(
+    input_path: Path,
+    output_path: Path,
+    timeout_seconds: int = 120,
+) -> tuple[bool, str]:
     """Rewrite PDF through Ghostscript with aggressive font embedding options."""
     gs = shutil.which("gs")
     if not gs:
@@ -3527,7 +3750,11 @@ async def _rewrite_pdf_with_ghostscript_embed(input_path: Path, output_path: Pat
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await communicate_with_timeout(proc, timeout_seconds)
+    except SubprocessTimeout:
+        return False, f"Ghostscript timed out after {timeout_seconds}s"
+
     if proc.returncode != 0:
         output = (stderr or stdout).decode("utf-8", errors="replace").strip()
         return False, output or f"Ghostscript failed (exit {proc.returncode})"
@@ -3604,12 +3831,8 @@ async def _attempt_font_lane(
                 "diagnostics_summary": embed_diagnostics.get("summary", {}),
             }
             rewritten = job_dir / "fontfix_embedded_gs.pdf"
-            ok, message = await _rewrite_pdf_with_ghostscript_embed(working_pdf, rewritten)
-            preprocess_message = (
-                f"{preprocess_message} | {message}"
-                if preprocess_message and message
-                else preprocess_message or message
-            )
+            ok, message = await _rewrite_pdf_with_ghostscript_embed(working_pdf, rewritten, timeout_seconds=settings.subprocess_timeout_ghostscript)
+            preprocess_message = _join_messages(preprocess_message, message)
             if not ok:
                 return {
                     "lane": lane,
@@ -3631,7 +3854,7 @@ async def _attempt_font_lane(
                 requires_retag = False
             else:
                 rewritten = job_dir / "fontfix_embedded_gs.pdf"
-                ok, message = await _rewrite_pdf_with_ghostscript_embed(working_pdf, rewritten)
+                ok, message = await _rewrite_pdf_with_ghostscript_embed(working_pdf, rewritten, timeout_seconds=settings.subprocess_timeout_ghostscript)
                 preprocess_message = message
                 if not ok:
                     return {
@@ -3654,6 +3877,7 @@ async def _attempt_font_lane(
             mode=mode,
             rotate_pages=settings.ocr_rotate_pages,
             deskew=settings.ocr_deskew,
+            timeout_seconds=settings.subprocess_timeout_ocr,
         )
         preprocess_message = ocr_result.message
         preprocess_skipped = ocr_result.skipped
@@ -3729,10 +3953,28 @@ async def _attempt_font_lane(
         tagging_result = current_tagging_result
         validation_target = remediation_input
 
+    if lane in (FONT_LANE_OCR_REDO, FONT_LANE_OCR_FORCE):
+        post_ocr_repaired = job_dir / f"{lane}_post_font_dicts.pdf"
+        ok, post_message, post_stats = await _repair_pdf_font_dicts(validation_target, post_ocr_repaired)
+        if ok:
+            validation_target = post_ocr_repaired
+            remediation_output = post_ocr_repaired
+            preprocess_details["post_ocr_font_dicts"] = post_stats
+            preprocess_message = _join_messages(preprocess_message, post_message)
+
+        post_ocr_widths = job_dir / f"{lane}_post_width_sync.pdf"
+        ok, width_message, width_stats = await _sync_pdf_cid_cff_widths(validation_target, post_ocr_widths)
+        if ok:
+            validation_target = post_ocr_widths
+            remediation_output = post_ocr_widths
+            preprocess_details["post_ocr_width_sync"] = width_stats
+            preprocess_message = _join_messages(preprocess_message, width_message)
+
     validation = await validate_pdf(
         pdf_path=validation_target,
         verapdf_path=settings.verapdf_path,
         flavour=settings.verapdf_flavour,
+        timeout_seconds=settings.subprocess_timeout_validation,
     )
 
     return {
@@ -3840,6 +4082,7 @@ async def run_pipeline(
                     settings.ocr_language,
                     rotate_pages=settings.ocr_rotate_pages,
                     deskew=settings.ocr_deskew,
+                    timeout_seconds=settings.subprocess_timeout_ocr,
                 )
 
                 if ocr_result.success:
@@ -4079,6 +4322,7 @@ async def run_tagging_and_validation(
             pdf_path=working_pdf,
             verapdf_path=settings.verapdf_path,
             flavour=settings.verapdf_flavour,
+            timeout_seconds=settings.subprocess_timeout_validation,
         )
 
         # ── Step 5: Tagging ──
@@ -4137,6 +4381,7 @@ async def run_tagging_and_validation(
             pdf_path=tagging_result.output_path,
             verapdf_path=settings.verapdf_path,
             flavour=settings.verapdf_flavour,
+            timeout_seconds=settings.subprocess_timeout_validation,
         )
 
         selected_tagging_result = tagging_result

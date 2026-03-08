@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useJobs } from "../api/jobs";
 import JobCard from "../components/JobCard";
+import { pluralize } from "../utils/format";
 
 
 const FILTERS: { label: string; value: string | undefined }[] = [
@@ -25,7 +26,7 @@ export default function DashboardPage() {
         <div>
           <h1 className="text-3xl text-ink tracking-tight">Dashboard</h1>
           <p className="text-sm text-ink-muted mt-1">
-            {data?.total ?? 0} document{data?.total !== 1 ? "s" : ""} processed
+            {data?.total ?? 0} {pluralize(data?.total ?? 0, "document")} processed
           </p>
         </div>
         <Link

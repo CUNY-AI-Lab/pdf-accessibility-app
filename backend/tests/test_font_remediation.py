@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import pikepdf
 import pytest
 
+from tests.fixtures import TEST_SAMPLE_PDF
+
 from app.config import Settings
 from app.pipeline import orchestrator
 from app.pipeline.orchestrator import (
@@ -14,8 +16,12 @@ from app.pipeline.orchestrator import (
     _embed_lane_should_skip_local,
     _font_remediation_lanes,
     _ghostscript_embed_command,
+    _inspect_pdf_features,
     _inspect_font_diagnostics,
+    _repair_pdf_font_dicts_sync,
+    _sync_pdf_cid_cff_widths_sync,
     _attempt_auto_llm_font_map,
+    _cid_cff_width_key,
     _local_embed_support_kind,
     _local_font_program,
     _merge_tounicode_maps,
@@ -50,7 +56,7 @@ def _resolve_object(value):
 
 
 def _xobject_font_only_pdf(output_path: Path) -> None:
-    with pikepdf.open("backend/test_sample.pdf") as sample_pdf:
+    with pikepdf.open(str(TEST_SAMPLE_PDF)) as sample_pdf:
         sample_page = sample_pdf.pages[0]
         sample_resources = _resolve_object(sample_page.obj.get("/Resources"))
         sample_fonts = _resolve_object(sample_resources.get("/Font"))
@@ -92,6 +98,84 @@ def _xobject_font_only_pdf(output_path: Path) -> None:
             )
         )
         pdf.save(str(output_path))
+
+
+def _pdf_with_stale_acroform(output_path: Path) -> None:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    link = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Link"),
+        "/Rect": pikepdf.Array([10, 10, 40, 20]),
+        "/A": pikepdf.Dictionary({
+            "/S": pikepdf.Name("/URI"),
+            "/URI": pikepdf.String("https://example.com"),
+        }),
+    }))
+    page["/Annots"] = pikepdf.Array([link])
+    pdf.Root["/AcroForm"] = pikepdf.Dictionary({
+        "/Fields": pikepdf.Array([]),
+        "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
+        "/DR": pikepdf.Dictionary(),
+    })
+    pdf.save(str(output_path))
+
+
+def _pdf_with_real_widget(output_path: Path) -> None:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    widget = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Widget"),
+        "/Rect": pikepdf.Array([10, 10, 40, 20]),
+        "/FT": pikepdf.Name("/Tx"),
+        "/T": pikepdf.String("field1"),
+    }))
+    page["/Annots"] = pikepdf.Array([widget])
+    pdf.Root["/AcroForm"] = pikepdf.Dictionary({
+        "/Fields": pikepdf.Array([widget]),
+        "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
+        "/DR": pikepdf.Dictionary(),
+    })
+    pdf.save(str(output_path))
+
+
+def _pdf_with_cid_type0_widths(output_path: Path) -> None:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+
+    font_file3 = pdf.make_stream(b"dummy")
+    font_file3["/Subtype"] = pikepdf.Name("/CIDFontType0C")
+
+    descriptor = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/FontDescriptor"),
+        "/FontName": pikepdf.Name("/ABCDEE+TestCID"),
+        "/FontFile3": font_file3,
+    }))
+    cid_font = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Font"),
+        "/Subtype": pikepdf.Name("/CIDFontType0"),
+        "/BaseFont": pikepdf.Name("/ABCDEE+TestCID"),
+        "/CIDSystemInfo": pikepdf.Dictionary({
+            "/Registry": pikepdf.String("Adobe"),
+            "/Ordering": pikepdf.String("Identity"),
+            "/Supplement": 0,
+        }),
+        "/FontDescriptor": descriptor,
+        "/W": pikepdf.Array([170, pikepdf.Array([10, 0, 20])]),
+    }))
+    type0_font = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Font"),
+        "/Subtype": pikepdf.Name("/Type0"),
+        "/BaseFont": pikepdf.Name("/ABCDEE+TestCID-Identity-H"),
+        "/Encoding": pikepdf.Name("/Identity-H"),
+        "/DescendantFonts": pikepdf.Array([cid_font]),
+    }))
+
+    page["/Resources"] = pikepdf.Dictionary({
+        "/Font": pikepdf.Dictionary({"/F0": type0_font}),
+    })
+    pdf.save(str(output_path))
 
 
 def test_font_lanes_prioritize_tounicode_when_fonts_are_embedded():
@@ -171,6 +255,54 @@ def test_ocr_lane_still_respects_suspect_page_limit():
 
     assert FONT_LANE_OCR_REDO not in lanes
     assert skipped == ["OCR lanes skipped: page count 250 > limit 200"]
+
+
+def test_inspect_pdf_features_ignores_stale_acroform_without_widgets(tmp_path):
+    pdf_path = tmp_path / "stale_acroform.pdf"
+    _pdf_with_stale_acroform(pdf_path)
+
+    features = _inspect_pdf_features(pdf_path)
+
+    assert features["has_forms"] is False
+    assert features["link_annots"] == 1
+
+
+def test_inspect_pdf_features_marks_real_widgets_as_forms(tmp_path):
+    pdf_path = tmp_path / "widget_form.pdf"
+    _pdf_with_real_widget(pdf_path)
+
+    features = _inspect_pdf_features(pdf_path)
+
+    assert features["has_forms"] is True
+
+
+def test_sync_pdf_cid_cff_widths_syncs_cff_widths(monkeypatch, tmp_path):
+    input_pdf = tmp_path / "cid_widths.pdf"
+    output_pdf = tmp_path / "cid_widths_fixed.pdf"
+    _pdf_with_cid_type0_widths(input_pdf)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_collect_cid_cff_widths",
+        lambda _font_bytes: {170: 10, 171: -4, 172: 20},
+    )
+
+    ok, message, stats = _sync_pdf_cid_cff_widths_sync(input_pdf, output_pdf)
+
+    assert ok is True
+    assert "widths synced=1" in message
+    assert stats["widths_synced"] == 1
+
+    with pikepdf.open(output_pdf) as pdf:
+        cid_font = pdf.pages[0]["/Resources"]["/Font"]["/F0"]["/DescendantFonts"][0]
+        widths = list(cid_font["/W"][1])
+        assert widths == [10, -4, 20]
+
+
+def test_cid_cff_width_key_prefers_cid_glyph_names():
+    assert _cid_cff_width_key("cid00016", 4) == 16
+    assert _cid_cff_width_key(".notdef", 7) == 0
+    assert _cid_cff_width_key("A", 12) == 12
 
 
 def test_unicode_lane_is_skipped_when_gate_has_no_safe_candidates():
@@ -795,7 +927,7 @@ async def test_font_dict_lane_reuses_existing_tags(tmp_path, monkeypatch):
         output_path.write_bytes(b"%PDF-1.7\n")
         return True, "repaired", {"fonts_touched": 1}
 
-    async def fake_validate(pdf_path, verapdf_path, flavour):
+    async def fake_validate(pdf_path, verapdf_path, flavour, **kwargs):
         return SimpleNamespace(
             compliant=True,
             violations=[],
@@ -837,7 +969,7 @@ async def test_embed_lane_skips_local_attempt_when_diagnostics_rule_it_out(tmp_p
     async def fail_local_embed(*args, **kwargs):
         raise AssertionError("_embed_system_fonts should not run when diagnostics skip local embedding")
 
-    async def fake_gs_embed(input_path, output_path):
+    async def fake_gs_embed(input_path, output_path, **kwargs):
         output_path.write_bytes(b"%PDF-1.7\n")
         return True, "ghostscript rewrite"
 
@@ -859,7 +991,7 @@ async def test_embed_lane_skips_local_attempt_when_diagnostics_rule_it_out(tmp_p
             lang_set=False,
         )
 
-    async def fake_validate(pdf_path, verapdf_path, flavour):
+    async def fake_validate(pdf_path, verapdf_path, flavour, **kwargs):
         return SimpleNamespace(
             compliant=False,
             violations=[],
@@ -931,7 +1063,7 @@ async def test_ocr_lane_refreshes_structure_before_retag(tmp_path, monkeypatch):
             lang_set=False,
         )
 
-    async def fake_validate(pdf_path, verapdf_path, flavour):
+    async def fake_validate(pdf_path, verapdf_path, flavour, **kwargs):
         return SimpleNamespace(
             compliant=True,
             violations=[],

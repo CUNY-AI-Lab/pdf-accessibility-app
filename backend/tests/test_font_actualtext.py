@@ -3,6 +3,8 @@ from pathlib import Path
 import pikepdf
 import pytest
 
+from tests.fixtures import TEST_SAMPLE_PDF
+
 from app.services.font_actualtext import (
     apply_actualtext_batch_to_contexts,
     apply_actualtext_to_context,
@@ -208,7 +210,7 @@ def _first_text_showing_operator(pdf_path: Path) -> tuple[int, str]:
 
 
 def test_apply_actualtext_to_page_operator_wraps_target_instruction(tmp_path):
-    source_pdf = Path("backend/test_sample.pdf")
+    source_pdf = TEST_SAMPLE_PDF
     output_pdf = tmp_path / "patched.pdf"
     operator_index, operator_name = _first_text_showing_operator(source_pdf)
 
@@ -231,7 +233,7 @@ def test_apply_actualtext_to_page_operator_wraps_target_instruction(tmp_path):
 
 
 def test_apply_actualtext_rejects_non_text_showing_operator(tmp_path):
-    source_pdf = Path("backend/test_sample.pdf")
+    source_pdf = TEST_SAMPLE_PDF
     output_pdf = tmp_path / "patched.pdf"
 
     with pytest.raises(ValueError) as exc:
@@ -248,7 +250,7 @@ def test_apply_actualtext_rejects_non_text_showing_operator(tmp_path):
 
 def test_apply_actualtext_to_nested_xobject_context(tmp_path):
     nested_pdf = tmp_path / "nested_xobject.pdf"
-    context_path = _append_form_xobject_page(Path("backend/test_sample.pdf"), nested_pdf)
+    context_path = _append_form_xobject_page(TEST_SAMPLE_PDF, nested_pdf)
     output_pdf = tmp_path / "nested_xobject_patched.pdf"
 
     apply_actualtext_to_context(
@@ -271,7 +273,7 @@ def test_apply_actualtext_to_nested_xobject_context(tmp_path):
 
 def test_apply_actualtext_to_annotation_appearance_context(tmp_path):
     annotated_pdf = tmp_path / "annot_appearance.pdf"
-    context_path = _append_annotation_appearance(Path("backend/test_sample.pdf"), annotated_pdf)
+    context_path = _append_annotation_appearance(TEST_SAMPLE_PDF, annotated_pdf)
     output_pdf = tmp_path / "annot_appearance_patched.pdf"
 
     apply_actualtext_to_context(
@@ -295,7 +297,7 @@ def test_apply_actualtext_to_annotation_appearance_context(tmp_path):
 def test_apply_actualtext_to_unnamed_xobject_context_uses_do_operator_target(tmp_path):
     unnamed_pdf = tmp_path / "unnamed_xobject.pdf"
     context_path, used_xobject_name = _append_unnamed_xobject_context(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         unnamed_pdf,
     )
     output_pdf = tmp_path / "unnamed_xobject_patched.pdf"
@@ -327,7 +329,7 @@ def test_apply_actualtext_to_unnamed_xobject_context_uses_do_operator_target(tmp
 def test_apply_actualtext_batch_to_multiple_targets_in_same_stream(tmp_path):
     source_pdf = tmp_path / "two_text_ops.pdf"
     context_first, context_second = _replace_page_with_two_text_operators(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         source_pdf,
     )
     output_pdf = tmp_path / "two_text_ops_patched.pdf"
@@ -358,7 +360,7 @@ def test_apply_actualtext_batch_rejects_duplicate_contexts(tmp_path):
 
     with pytest.raises(ValueError) as exc:
         apply_actualtext_batch_to_contexts(
-            input_pdf=Path("backend/test_sample.pdf"),
+            input_pdf=TEST_SAMPLE_PDF,
             output_pdf=output_pdf,
             patches=[
                 {"context_path": context, "actual_text": "One"},
@@ -372,7 +374,7 @@ def test_apply_actualtext_batch_rejects_duplicate_contexts(tmp_path):
 def test_apply_actualtext_to_context_updates_existing_wrapper_without_nesting(tmp_path):
     source_pdf = tmp_path / "two_text_ops.pdf"
     context_first, _ = _replace_page_with_two_text_operators(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         source_pdf,
     )
     first_output = tmp_path / "wrapped_once.pdf"
@@ -405,7 +407,7 @@ def test_apply_actualtext_to_context_updates_existing_wrapper_without_nesting(tm
 def test_apply_actualtext_to_context_resolves_single_text_object_et_target(tmp_path):
     source_pdf = tmp_path / "single_text_op.pdf"
     context_path = _replace_page_with_single_text_et_context(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         source_pdf,
     )
     output_pdf = tmp_path / "single_text_op_patched.pdf"

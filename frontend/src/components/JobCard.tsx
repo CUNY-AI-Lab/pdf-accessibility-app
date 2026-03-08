@@ -1,6 +1,10 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useDeleteJob } from "../api/jobs";
+import ConfirmDialog from "./ConfirmDialog";
 import type { Job, JobStatus } from "../types";
+import { pluralize } from "../utils/format";
+import { CheckIcon } from "./Icons";
 
 const STATUS_CONFIG: Record<
   JobStatus,
@@ -70,10 +74,19 @@ interface JobCardProps {
 export default function JobCard({ job }: JobCardProps) {
   const config = STATUS_CONFIG[job.status];
   const deleteJob = useDeleteJob();
+  const [showConfirmDialog, setShowConfirmDialog] = useState(false);
   const completedSteps = job.steps.filter(
     (s) => s.status === "complete" || s.status === "skipped",
   ).length;
   const progress = job.steps.length > 0 ? (completedSteps / job.steps.length) * 100 : 0;
+
+  // Outcome summary values (computed once, not in JSX)
+  const valResult = job.steps.find((s) => s.step_name === "validation")?.result;
+  const isCompliant = valResult && typeof valResult.compliant === "boolean" ? valResult.compliant : null;
+  const fidelityResult = job.steps.find((s) => s.step_name === "fidelity")?.result;
+  const blockingTasks = typeof fidelityResult?.blocking_tasks === "number" ? fidelityResult.blocking_tasks : 0;
+  const advisoryTasks = typeof fidelityResult?.advisory_tasks === "number" ? fidelityResult.advisory_tasks : 0;
+  const reviewItemCount = blockingTasks + advisoryTasks;
 
   const linkTo =
     job.status === "awaiting_review"
@@ -83,9 +96,7 @@ export default function JobCard({ job }: JobCardProps) {
   const handleDelete = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    if (window.confirm(`Delete "${job.original_filename}"?`)) {
-      deleteJob.mutate(job.id);
-    }
+    setShowConfirmDialog(true);
   };
 
   return (
@@ -150,6 +161,25 @@ export default function JobCard({ job }: JobCardProps) {
         </div>
       )}
 
+      {/* Outcome summary for finished jobs */}
+      {job.status === "complete" && isCompliant === true && (
+        <p className="text-xs text-success font-medium mb-3 flex items-center gap-1.5">
+          <CheckIcon size={12} />
+          Fully compliant
+        </p>
+      )}
+      {job.status === "complete" && isCompliant === false && (
+        <p className="text-xs text-warning font-medium mb-3">
+          Some issues remain
+        </p>
+      )}
+
+      {job.status === "needs_manual_review" && reviewItemCount > 0 && (
+        <p className="text-xs text-warning font-medium mb-3">
+          {reviewItemCount} {pluralize(reviewItemCount, "item")} {pluralize(reviewItemCount, "needs", "need")} review
+        </p>
+      )}
+
       {/* Error message */}
       {job.error && (
         <p className="text-xs text-error bg-error-light rounded-lg px-3 py-2 mb-3 line-clamp-2">
@@ -182,6 +212,18 @@ export default function JobCard({ job }: JobCardProps) {
           </span>
         </div>
       </div>
+      <ConfirmDialog
+        open={showConfirmDialog}
+        title="Delete Job"
+        message={`Delete "${job.original_filename}"? This action cannot be undone.`}
+        confirmLabel="Delete"
+        cancelLabel="Cancel"
+        onConfirm={() => {
+          setShowConfirmDialog(false);
+          deleteJob.mutate(job.id);
+        }}
+        onCancel={() => setShowConfirmDialog(false)}
+      />
     </Link>
   );
 }

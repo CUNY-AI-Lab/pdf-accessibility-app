@@ -1,4 +1,5 @@
 import type { PipelineStep, StepName } from "../types";
+import { CheckIcon, XIcon } from "./Icons";
 
 const STEP_META: Record<StepName, { label: string; description: string; icon: string }> = {
   classify: {
@@ -71,14 +72,9 @@ export default function PipelineProgress({ steps }: PipelineProgressProps) {
                 `}
               >
                 {step.status === "complete" ? (
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <polyline points="20 6 9 17 4 12" />
-                  </svg>
+                  <CheckIcon size={16} />
                 ) : step.status === "failed" ? (
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
+                  <XIcon size={16} />
                 ) : step.status === "skipped" ? (
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M5 4h4l5 8-5 8H5l5-8z" />

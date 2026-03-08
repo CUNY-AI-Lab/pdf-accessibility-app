@@ -3,6 +3,8 @@ from pathlib import Path
 import pikepdf
 import pytest
 
+from tests.fixtures import TEST_SAMPLE_PDF
+
 from app.pipeline.orchestrator import _parse_tounicode_map
 from app.services.font_unicode_override import apply_unicode_override_to_context
 
@@ -91,7 +93,7 @@ def _font_tounicode_map(pdf_path: Path, base_font_name: str) -> dict[int, str]:
 def test_apply_unicode_override_to_context_creates_tounicode_mapping(tmp_path):
     source_pdf = tmp_path / "single_char.pdf"
     context_path = _replace_page_with_single_text(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         source_pdf,
         "A",
     )
@@ -112,7 +114,7 @@ def test_apply_unicode_override_to_context_creates_tounicode_mapping(tmp_path):
 def test_apply_unicode_override_to_context_rejects_multi_byte_target(tmp_path):
     source_pdf = tmp_path / "multi_char.pdf"
     context_path = _replace_page_with_single_text(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         source_pdf,
         "AB",
     )
@@ -132,7 +134,7 @@ def test_apply_unicode_override_to_context_rejects_multi_byte_target(tmp_path):
 def test_apply_unicode_override_to_nested_xobject_context(tmp_path):
     nested_pdf = tmp_path / "nested_xobject.pdf"
     context_path = _append_form_xobject_page(
-        Path("backend/test_sample.pdf"),
+        TEST_SAMPLE_PDF,
         nested_pdf,
         "A",
     )

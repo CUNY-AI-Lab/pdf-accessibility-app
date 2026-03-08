@@ -21,6 +21,7 @@ dependencies = [
     "fonttools>=4.0.0",
     "scipy>=1.17.0",
     "rtree>=1.4.0",
+    "tenacity>=9.0.0",
 ]
 
 [project.optional-dependencies]

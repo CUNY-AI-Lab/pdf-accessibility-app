@@ -50,6 +50,22 @@ class Settings(BaseSettings):
     font_remediation_ocr_max_pages: int = 40
     font_remediation_ocr_suspect_max_pages: int = 200
 
+    # Subprocess timeouts (seconds)
+    subprocess_timeout_ocr: int = 900  # 15 min — large scanned PDFs
+    subprocess_timeout_ghostscript: int = 120  # 2 min
+    subprocess_timeout_validation: int = 600  # 10 min — veraPDF on large docs
+    subprocess_timeout_preview: int = 30  # single page render
+
+    # Upload limits
+    max_upload_size_bytes: int = 500 * 1024 * 1024  # 500 MB
+
+    # Job lifecycle
+    job_ttl_hours: int = 24
+
+    # LLM retry
+    llm_max_retries: int = 3
+    llm_retry_backoff_base: float = 2.0
+
     # Dev
     debug: bool = False
 

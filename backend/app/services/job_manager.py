@@ -76,6 +76,19 @@ class JobManager:
         task = self._tasks.get(job_id)
         return task is not None and not task.done()
 
+    async def shutdown(self):
+        """Cancel all running tasks for graceful shutdown."""
+        tasks_to_cancel = [
+            task for task in self._tasks.values() if not task.done()
+        ]
+        if not tasks_to_cancel:
+            return
+        logger.info(f"Cancelling {len(tasks_to_cancel)} running job(s)...")
+        for task in tasks_to_cancel:
+            task.cancel()
+        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        logger.info("All job tasks cancelled")
+
 
 _job_manager: JobManager | None = None
 

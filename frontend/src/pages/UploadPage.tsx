@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useCreateJobs } from "../api/jobs";
 import FileDropzone from "../components/FileDropzone";
+import { ArrowRightIcon, XIcon } from "../components/Icons";
 
 export default function UploadPage() {
   const navigate = useNavigate();
@@ -87,10 +88,7 @@ export default function UploadPage() {
                   className="text-ink-muted hover:text-error transition-colors p-1"
                   aria-label={`Remove ${file.name}`}
                 >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
+                  <XIcon size={14} />
                 </button>
               </div>
             ))}
@@ -121,10 +119,7 @@ export default function UploadPage() {
                 ) : (
                   <>
                     Start Processing
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <line x1="5" y1="12" x2="19" y2="12" />
-                      <polyline points="12 5 19 12 12 19" />
-                    </svg>
+                    <ArrowRightIcon size={14} />
                   </>
                 )}
               </button>
@@ -138,8 +133,23 @@ export default function UploadPage() {
           </div>
         )}
 
+        {/* What to expect */}
+        <div className="mt-14 mb-10 text-center">
+          <h2 className="text-lg font-display text-ink mb-2">
+            What to expect
+          </h2>
+          <p className="text-sm text-ink-muted leading-relaxed max-w-md mx-auto">
+            Processing typically takes 1&ndash;3 minutes depending on document
+            length. You'll get an accessible PDF with proper structure tags,
+            alt text for images, and a compliance report.
+          </p>
+        </div>
+
         {/* Pipeline overview */}
-        <div className="mt-16 grid grid-cols-2 md:grid-cols-3 gap-4 stagger">
+        <h3 className="text-sm font-semibold text-ink-muted text-center mb-4 tracking-wide uppercase">
+          Our 6-step process
+        </h3>
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4 stagger">
           {[
             { icon: "M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2", label: "Classify", desc: "Detect document type" },
             { icon: "M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z", label: "OCR", desc: "Extract text from scans" },

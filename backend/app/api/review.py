@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -12,12 +13,12 @@ from app.config import get_settings
 from app.database import get_db, get_session_maker
 from app.models import AltTextEntry, Job, ReviewTask
 from app.pipeline.fidelity import assess_fidelity
-from app.pipeline.orchestrator import run_tagging_and_validation
 from app.pipeline.orchestrator import (
     _build_validation_changes,
     _error_count,
     _update_step,
     _warning_count,
+    run_tagging_and_validation,
 )
 from app.pipeline.validator import ValidationResult, Violation, validate_pdf
 from app.schemas import (
@@ -27,16 +28,19 @@ from app.schemas import (
     ReviewTaskResponse,
     ReviewTaskUpdateRequest,
 )
-from app.services.job_manager import get_job_manager
-from app.services.llm_client import LlmClient
 from app.services.file_storage import get_output_path
 from app.services.font_actualtext import (
     apply_actualtext_batch_to_contexts,
     apply_actualtext_to_context,
 )
 from app.services.font_unicode_override import apply_unicode_override_to_context
+from app.services.job_manager import get_job_manager
+from app.services.llm_client import LlmClient
+from app.services.path_safety import safe_filename, validate_path_within_allowed_roots
 from app.services.pdf_preview import render_target_preview_png_bytes
 from app.services.review_suggestions import generate_review_suggestion
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/jobs/{job_id}", tags=["review"])
 
@@ -128,8 +132,9 @@ def _existing_job_pdf_path(job: Job) -> Path:
     if job.input_path:
         candidates.append(Path(job.input_path))
     for candidate in candidates:
-        if candidate.exists():
-            return candidate
+        resolved = validate_path_within_allowed_roots(candidate)
+        if resolved.exists():
+            return resolved
     raise HTTPException(status_code=404, detail="PDF file not found for review preview")
 
 
@@ -271,6 +276,7 @@ async def _refresh_post_tagging_reports(
         pdf_path=output_pdf,
         verapdf_path=settings.verapdf_path,
         flavour=settings.verapdf_flavour,
+        timeout_seconds=settings.subprocess_timeout_validation,
     )
 
     changes, status_by_rule = _build_validation_changes(
@@ -559,17 +565,21 @@ async def suggest_review_task(
         api_key=settings.llm_api_key,
         model=settings.llm_model,
         timeout=settings.llm_timeout,
+        max_retries=settings.llm_max_retries,
+        retry_backoff_base=settings.llm_retry_backoff_base,
     )
 
     metadata = _parse_json(task.metadata_json)
     try:
         suggestion = await generate_review_suggestion(job=job, task=task, llm_client=llm_client)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.exception("Invalid review suggestion request")
+        raise HTTPException(status_code=400, detail="Invalid suggestion request") from exc
     except Exception as exc:
+        logger.exception("Failed to generate LLM suggestion")
         raise HTTPException(
             status_code=502,
-            detail=f"Failed to generate LLM suggestion: {exc}",
+            detail="Failed to generate suggestion",
         ) from exc
     finally:
         await llm_client.close()
@@ -623,11 +633,14 @@ async def get_font_target_preview(
     try:
         image_bytes = render_target_preview_png_bytes(pdf_path, context_path)
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        logger.exception("PDF file not found for font target preview")
+        raise HTTPException(status_code=404, detail="PDF file not found") from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.exception("Invalid font target preview request")
+        raise HTTPException(status_code=400, detail="Invalid preview request") from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to render font target preview: {exc}") from exc
+        logger.exception("Failed to render font target preview")
+        raise HTTPException(status_code=502, detail="Failed to render preview") from exc
 
     return StreamingResponse(BytesIO(image_bytes), media_type="image/png")
 
@@ -681,7 +694,7 @@ async def apply_font_actualtext(
 
     patched_output = get_output_path(
         job_id,
-        f"accessible_manual_actualtext_{task_id}_{job.original_filename}",
+        f"accessible_manual_actualtext_{task_id}_{safe_filename(job.original_filename)}",
     )
 
     try:
@@ -692,9 +705,11 @@ async def apply_font_actualtext(
             actual_text=request.actual_text,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.exception("Invalid ActualText remediation request")
+        raise HTTPException(status_code=400, detail="Invalid remediation request") from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to apply ActualText remediation: {exc}") from exc
+        logger.exception("Failed to apply ActualText remediation")
+        raise HTTPException(status_code=502, detail="Internal processing error") from exc
 
     job.status = "processing"
     await db.commit()
@@ -725,9 +740,10 @@ async def apply_font_actualtext(
     except Exception as exc:
         job.status = "needs_manual_review"
         await db.commit()
+        logger.exception("Validation refresh failed after ActualText remediation")
         raise HTTPException(
             status_code=502,
-            detail=f"ActualText remediation was applied, but validation refresh failed: {exc}",
+            detail="Remediation applied but validation refresh failed",
         ) from exc
 
     return {
@@ -803,7 +819,7 @@ async def apply_font_actualtext_batch(
 
     patched_output = get_output_path(
         job_id,
-        f"accessible_manual_actualtext_batch_{task_id}_{job.original_filename}",
+        f"accessible_manual_actualtext_batch_{task_id}_{safe_filename(job.original_filename)}",
     )
 
     try:
@@ -813,9 +829,11 @@ async def apply_font_actualtext_batch(
             patches=batch_patches,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.exception("Invalid ActualText batch remediation request")
+        raise HTTPException(status_code=400, detail="Invalid remediation request") from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to apply ActualText batch remediation: {exc}") from exc
+        logger.exception("Failed to apply ActualText batch remediation")
+        raise HTTPException(status_code=502, detail="Internal processing error") from exc
 
     job.status = "processing"
     await db.commit()
@@ -847,9 +865,10 @@ async def apply_font_actualtext_batch(
     except Exception as exc:
         job.status = "needs_manual_review"
         await db.commit()
+        logger.exception("Validation refresh failed after ActualText batch remediation")
         raise HTTPException(
             status_code=502,
-            detail=f"ActualText batch remediation was applied, but validation refresh failed: {exc}",
+            detail="Remediation applied but validation refresh failed",
         ) from exc
 
     return {
@@ -907,7 +926,7 @@ async def apply_font_unicode_override(
 
     patched_output = get_output_path(
         job_id,
-        f"accessible_manual_fontmap_{task_id}_{job.original_filename}",
+        f"accessible_manual_fontmap_{task_id}_{safe_filename(job.original_filename)}",
     )
 
     try:
@@ -918,9 +937,11 @@ async def apply_font_unicode_override(
             unicode_text=request.unicode_text,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.exception("Invalid font-map remediation request")
+        raise HTTPException(status_code=400, detail="Invalid remediation request") from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to apply font-map remediation: {exc}") from exc
+        logger.exception("Failed to apply font-map remediation")
+        raise HTTPException(status_code=502, detail="Internal processing error") from exc
 
     job.status = "processing"
     await db.commit()
@@ -952,9 +973,10 @@ async def apply_font_unicode_override(
     except Exception as exc:
         job.status = "needs_manual_review"
         await db.commit()
+        logger.exception("Validation refresh failed after font-map remediation")
         raise HTTPException(
             status_code=502,
-            detail=f"Font-map remediation was applied, but validation refresh failed: {exc}",
+            detail="Remediation applied but validation refresh failed",
         ) from exc
 
     return {

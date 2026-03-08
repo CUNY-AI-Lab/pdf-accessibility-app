@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -19,6 +19,10 @@ def utcnow() -> datetime:
 
 class Job(Base):
     __tablename__ = "jobs"
+    __table_args__ = (
+        Index("idx_jobs_status", "status"),
+        Index("idx_jobs_created_at", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
     filename: Mapped[str] = mapped_column(String, nullable=False)
@@ -53,6 +57,9 @@ class Job(Base):
 
 class JobStep(Base):
     __tablename__ = "job_steps"
+    __table_args__ = (
+        Index("idx_job_steps_job_id", "job_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_id: Mapped[str] = mapped_column(
@@ -70,6 +77,9 @@ class JobStep(Base):
 
 class AltTextEntry(Base):
     __tablename__ = "alt_texts"
+    __table_args__ = (
+        Index("idx_alt_texts_job_id", "job_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_id: Mapped[str] = mapped_column(
@@ -92,6 +102,9 @@ class AltTextEntry(Base):
 
 class ReviewTask(Base):
     __tablename__ = "review_tasks"
+    __table_args__ = (
+        Index("idx_review_tasks_job_id", "job_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_id: Mapped[str] = mapped_column(

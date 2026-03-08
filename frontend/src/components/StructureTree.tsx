@@ -30,11 +30,19 @@ function TreeNode({ element, depth = 0 }: TreeNodeProps) {
   const icon = TYPE_ICONS[element.type] || element.type.charAt(0).toUpperCase();
   const color = TYPE_COLORS[element.type] || "bg-paper-warm text-ink-muted";
 
+  const nodeLabel = element.text || `${element.type}${element.level ? ` ${element.level}` : ""}`;
+
   return (
-    <div style={{ paddingLeft: depth > 0 ? 20 : 0 }}>
+    <div
+      role="treeitem"
+      aria-expanded={hasChildren ? expanded : undefined}
+      aria-level={depth + 1}
+      style={{ paddingLeft: depth > 0 ? 20 : 0 }}
+    >
       <button
         type="button"
         onClick={() => hasChildren && setExpanded(!expanded)}
+        aria-label={hasChildren ? `${expanded ? "Collapse" : "Expand"} ${nodeLabel}` : undefined}
         className={`
           w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left
           transition-colors duration-150
@@ -42,12 +50,13 @@ function TreeNode({ element, depth = 0 }: TreeNodeProps) {
         `}
       >
         {/* Expand/collapse indicator */}
-        <span className="w-4 text-center text-xs text-ink-muted">
+        <span className="w-4 text-center text-xs text-ink-muted" aria-hidden="true">
           {hasChildren ? (expanded ? "▾" : "▸") : ""}
         </span>
 
         {/* Type badge */}
         <span
+          aria-hidden="true"
           className={`
             w-6 h-6 rounded flex items-center justify-center
             text-[10px] font-bold font-mono shrink-0
@@ -69,7 +78,7 @@ function TreeNode({ element, depth = 0 }: TreeNodeProps) {
       </button>
 
       {expanded && hasChildren && (
-        <div className="border-l border-ink/6 ml-4">
+        <div role="group" className="border-l border-ink/6 ml-4">
           {element.children!.map((child, i) => (
             <TreeNode key={i} element={child} depth={depth + 1} />
           ))}
@@ -93,7 +102,7 @@ export default function StructureTree({ elements }: StructureTreeProps) {
   }
 
   return (
-    <div className="space-y-0.5">
+    <div role="tree" aria-label="Document structure" className="space-y-0.5">
       {elements.map((el, i) => (
         <TreeNode key={i} element={el} />
       ))}

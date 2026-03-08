@@ -6,6 +6,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.pipeline.subprocess_utils import SubprocessTimeout, communicate_with_timeout
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +71,7 @@ async def run_ocr(
     *,
     rotate_pages: bool = True,
     deskew: bool = True,
+    timeout_seconds: int | None = None,
 ) -> OcrResult:
     """Run OCRmyPDF as a subprocess to add text layer to scanned PDFs.
 
@@ -90,7 +93,12 @@ async def run_ocr(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await communicate_with_timeout(proc, timeout_seconds)
+    except SubprocessTimeout:
+        msg = f"OCR timed out after {timeout_seconds}s"
+        logger.error(msg)
+        return OcrResult(success=False, output_path=input_path, message=msg)
 
     stderr_text = stderr.decode("utf-8", errors="replace")
     stdout_text = stdout.decode("utf-8", errors="replace")
