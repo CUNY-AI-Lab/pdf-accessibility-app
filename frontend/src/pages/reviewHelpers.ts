@@ -96,6 +96,27 @@ export type LlmSuggestion = {
     should_block_accessibility?: boolean;
     reason?: string;
   }>;
+  document_overlay?: {
+    provenance?: string;
+    pages?: Array<{
+      page_number?: number;
+      blocks?: Array<{
+        review_id?: string;
+        role?: string;
+        text?: string;
+        level?: number;
+        provenance?: string;
+        confidence?: number;
+      }>;
+      tables?: Array<{
+        table_review_id?: string;
+        header_rows?: number[];
+        row_header_columns?: number[];
+        provenance?: string;
+        confidence?: number;
+      }>;
+    }>;
+  };
 };
 
 export type EditableStructureElement = Record<string, unknown> & {
@@ -136,6 +157,37 @@ export type ReadingOrderTextHint = {
   confidence?: string;
   should_block_accessibility?: boolean;
   reason?: string;
+};
+
+export type DocumentOverlayBlock = {
+  review_id: string;
+  role?: string;
+  text?: string;
+  level?: number;
+  semantic_text_hint?: string;
+  semantic_issue_type?: string;
+  semantic_blocking?: boolean;
+  provenance?: string;
+  confidence?: number;
+};
+
+export type DocumentOverlayTable = {
+  table_review_id: string;
+  header_rows: number[];
+  row_header_columns: number[];
+  provenance?: string;
+  confidence?: number;
+};
+
+export type DocumentOverlayPage = {
+  page_number: number;
+  blocks: DocumentOverlayBlock[];
+  tables: DocumentOverlayTable[];
+};
+
+export type DocumentOverlay = {
+  provenance?: string;
+  pages: DocumentOverlayPage[];
 };
 
 // ---------------------------------------------------------------------------
@@ -480,6 +532,68 @@ export function readingOrderTextHints(llmSuggestion: LlmSuggestion | null): Read
       reason: typeof item.reason === "string" ? item.reason : undefined,
     }))
     .filter((item) => item.review_id.length > 0 && typeof item.readable_text_hint === "string" && item.readable_text_hint.trim().length > 0);
+}
+
+export function documentOverlayForSuggestion(llmSuggestion: LlmSuggestion | null): DocumentOverlay | null {
+  const value = llmSuggestion?.document_overlay;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const rawPages = Array.isArray(value.pages) ? value.pages : [];
+  const pages = rawPages
+    .filter((page): page is Record<string, unknown> => !!page && typeof page === "object" && !Array.isArray(page))
+    .map((page) => {
+      const blocks = Array.isArray(page.blocks)
+        ? page.blocks
+            .filter((block): block is Record<string, unknown> => !!block && typeof block === "object" && !Array.isArray(block))
+            .map((block) => ({
+              review_id: typeof block.review_id === "string" ? block.review_id.trim() : "",
+              role: typeof block.role === "string" ? block.role : undefined,
+              text: typeof block.text === "string" ? block.text : undefined,
+              level: typeof block.level === "number" ? block.level : undefined,
+              semantic_text_hint: typeof block.semantic_text_hint === "string" ? block.semantic_text_hint : undefined,
+              semantic_issue_type: typeof block.semantic_issue_type === "string" ? block.semantic_issue_type : undefined,
+              semantic_blocking: typeof block.semantic_blocking === "boolean" ? block.semantic_blocking : undefined,
+              provenance: typeof block.provenance === "string" ? block.provenance : undefined,
+              confidence: typeof block.confidence === "number" ? block.confidence : undefined,
+            }))
+            .filter((block) => block.review_id.length > 0)
+        : [];
+
+      const tables = Array.isArray(page.tables)
+        ? page.tables
+            .filter((table): table is Record<string, unknown> => !!table && typeof table === "object" && !Array.isArray(table))
+            .map((table) => ({
+              table_review_id: typeof table.table_review_id === "string" ? table.table_review_id.trim() : "",
+              header_rows: Array.isArray(table.header_rows)
+                ? table.header_rows
+                    .map((entry) => (typeof entry === "number" ? entry : Number(entry)))
+                    .filter((entry) => Number.isFinite(entry) && entry >= 0)
+                : [],
+              row_header_columns: Array.isArray(table.row_header_columns)
+                ? table.row_header_columns
+                    .map((entry) => (typeof entry === "number" ? entry : Number(entry)))
+                    .filter((entry) => Number.isFinite(entry) && entry >= 0)
+                : [],
+              provenance: typeof table.provenance === "string" ? table.provenance : undefined,
+              confidence: typeof table.confidence === "number" ? table.confidence : undefined,
+            }))
+            .filter((table) => table.table_review_id.length > 0)
+        : [];
+
+      return {
+        page_number: typeof page.page_number === "number" ? page.page_number : NaN,
+        blocks,
+        tables,
+      };
+    })
+    .filter((page) => Number.isFinite(page.page_number) && page.page_number > 0);
+
+  return {
+    provenance: typeof value.provenance === "string" ? value.provenance : undefined,
+    pages,
+  };
 }
 
 export function pagePreviewUrl(jobId: string, pageNumber: number): string {

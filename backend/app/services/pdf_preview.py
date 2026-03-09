@@ -274,6 +274,7 @@ def render_bbox_preview_png_bytes(
     dpi: int = RENDER_DPI,
     max_width: int = MAX_IMAGE_WIDTH,
     crop_margin_points: float = 24.0,
+    highlight: bool = True,
 ) -> bytes:
     if not isinstance(bbox, dict):
         raise ValueError("bbox must be a mapping")
@@ -316,11 +317,13 @@ def render_bbox_preview_png_bytes(
         y1 = min(image_height, int(round(focus_box[3] + margin_y)))
 
         if x1 <= x0 or y1 <= y0:
-            crop = _draw_target_focus(
-                rendered,
-                exact_box=exact_box,
-                focus_box=focus_box,
-            )
+            crop = rendered
+            if highlight:
+                crop = _draw_target_focus(
+                    rendered,
+                    exact_box=exact_box,
+                    focus_box=focus_box,
+                )
         else:
             exact_crop_box = (
                 exact_box[0] - x0,
@@ -334,11 +337,13 @@ def render_bbox_preview_png_bytes(
                 focus_box[2] - x0,
                 focus_box[3] - y0,
             )
-            crop = _draw_target_focus(
-                rendered.crop((x0, y0, x1, y1)),
-                exact_box=exact_crop_box,
-                focus_box=focus_crop_box,
-            )
+            crop = rendered.crop((x0, y0, x1, y1))
+            if highlight:
+                crop = _draw_target_focus(
+                    crop,
+                    exact_box=exact_crop_box,
+                    focus_box=focus_crop_box,
+                )
 
         output = BytesIO()
         crop.save(output, format="PNG")
@@ -349,8 +354,10 @@ def render_bbox_preview_png_data_url(
     pdf_path: Path,
     page_number: int,
     bbox: dict[str, float],
+    *,
+    highlight: bool = True,
 ) -> str:
     encoded = base64.b64encode(
-        render_bbox_preview_png_bytes(pdf_path, page_number, bbox)
+        render_bbox_preview_png_bytes(pdf_path, page_number, bbox, highlight=highlight)
     ).decode("ascii")
     return f"data:image/png;base64,{encoded}"

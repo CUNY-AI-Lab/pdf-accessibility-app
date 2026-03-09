@@ -147,6 +147,11 @@ def test_reading_order_task_payload_collects_structure_fragments(monkeypatch, tm
         "render_bbox_preview_png_data_url",
         lambda pdf_path, page_number, bbox: f"data:image/png;base64:block-{page_number}",
     )
+    monkeypatch.setattr(
+        review_suggestions,
+        "extract_ocr_text_from_bbox",
+        lambda pdf_path, page_number, bbox: "Data Book",
+    )
 
     prompt_text, content = _reading_order_task_payload(
         _job(
@@ -173,6 +178,7 @@ def test_reading_order_task_payload_collects_structure_fragments(monkeypatch, tm
     assert '"page_blocks": [' in prompt_text
     assert '"suspicious_text_blocks": [' in prompt_text
     assert '"D a t a B o o k"' in prompt_text
+    assert '"ocr_text_candidate": "Data Book"' in prompt_text
     assert '"review_id": "review-0"' in prompt_text
     assert '"current_order": 1' in prompt_text
     assert len(content) == 4
@@ -187,22 +193,26 @@ def test_generate_review_suggestion_supports_reading_order(monkeypatch, tmp_path
         "_render_page_image",
         lambda pdf_path, page_number: f"data:image/png;base64,page-{page_number}",
     )
-
-    fake_llm = _FakeLlmClient(
-        {
-            "task_type": "reading_order",
-            "summary": "Sidebar likely interrupts the main text flow.",
-            "confidence": "medium",
-            "suggested_action": "reorder_review",
-            "reason": "The sampled blocks suggest a sidebar before the body text.",
-            "review_focus": [{"page": 1, "recommended_reviewer_action": "check sidebar order"}],
-            "reviewer_checklist": ["Verify order with NVDA"],
-            "readable_text_hints": [
+    monkeypatch.setattr(
+        review_suggestions,
+        "extract_ocr_text_from_bbox",
+        lambda pdf_path, page_number, bbox: "Data Book",
+    )
+    async def _fake_page_intelligence(**kwargs):
+        return {
+            "task_type": "page_text_intelligence",
+            "summary": "Title extraction spacing is broken but readable.",
+            "confidence": "high",
+            "confidence_score": 0.9,
+            "blocks": [
                 {
                     "page": 1,
                     "review_id": "review-1",
                     "extracted_text": "D a t a  B o o k",
+                    "native_text_candidate": "D a t a  B o o k",
+                    "ocr_text_candidate": "Data Book",
                     "readable_text_hint": "Data Book",
+                    "chosen_source": "ocr",
                     "issue_type": "spacing_only",
                     "confidence": "high",
                     "should_block_accessibility": False,
@@ -210,7 +220,22 @@ def test_generate_review_suggestion_supports_reading_order(monkeypatch, tmp_path
                 }
             ],
         }
-    )
+    monkeypatch.setattr(review_suggestions, "generate_suspicious_text_intelligence", _fake_page_intelligence)
+    async def _fake_reading_order_intelligence(**kwargs):
+        return {
+            "task_type": "reading_order_intelligence",
+            "summary": "Sidebar likely interrupts the main text flow.",
+            "confidence": "medium",
+            "confidence_score": 0.7,
+            "suggested_action": "reorder_review",
+            "reason": "The sampled blocks suggest a sidebar before the body text.",
+            "page": 1,
+            "ordered_review_ids": ["review-0", "review-1"],
+            "element_updates": [],
+        }
+    monkeypatch.setattr(review_suggestions, "generate_reading_order_intelligence", _fake_reading_order_intelligence)
+
+    fake_llm = _FakeLlmClient({})
 
     suggestion = asyncio.run(
         generate_review_suggestion(
@@ -230,10 +255,15 @@ def test_generate_review_suggestion_supports_reading_order(monkeypatch, tmp_path
 
     assert suggestion["task_type"] == "reading_order"
     assert suggestion["suggested_action"] == "reorder_review"
+    assert suggestion["proposed_page_orders"][0]["ordered_review_ids"] == ["review-0", "review-1"]
+    assert suggestion["page_text_intelligence"]["blocks"][0]["readable_text_hint"] == "Data Book"
     assert suggestion["readable_text_hints"][0]["readable_text_hint"] == "Data Book"
+    assert suggestion["readable_text_hints"][0]["ocr_text_candidate"] == "Data Book"
+    assert suggestion["readable_text_hints"][0]["chosen_source"] == "ocr"
+    assert suggestion["document_overlay"]["provenance"] == "gemini_review_suggestion"
+    assert suggestion["document_overlay"]["pages"][0]["page_number"] == 1
     assert suggestion["model"] == "google/gemini-3-flash-preview"
-    assert fake_llm.calls
-    assert fake_llm.calls[0]["kwargs"]["temperature"] == 0
+    assert fake_llm.calls == []
 
 
 def test_generate_review_suggestion_keeps_font_actualtext_candidates(monkeypatch, tmp_path):
@@ -411,37 +441,36 @@ def test_generate_review_suggestion_supports_table_semantics(monkeypatch, tmp_pa
         "render_bbox_preview_png_data_url",
         lambda pdf_path, page_number, bbox: f"data:image/png;base64:table-{page_number}",
     )
-
-    fake_llm = _FakeLlmClient(
-        [
-            {
-                "task_type": "table_semantics",
+    async def _fake_table_intelligence(**kwargs):
+        target = kwargs["target"]
+        if target["table_review_id"] == "review-0":
+            return {
+                "task_type": "table_intelligence",
                 "summary": "The first row and first column look like headers.",
                 "confidence": "high",
+                "confidence_score": 0.9,
                 "suggested_action": "set_table_headers",
-                "reason": "The crop shows a regular matrix with a header row and row labels.",
-                "proposed_table_updates": [
-                    {
-                        "page": 1,
-                        "table_review_id": "review-0",
-                        "header_rows": [0],
-                        "row_header_columns": [0],
-                        "reason": "Top row contains column labels and first column contains row labels.",
-                    }
-                ],
-                "reviewer_checklist": ["Verify headers with a screen reader."],
-            },
-            {
-                "task_type": "table_semantics",
-                "summary": "The second table needs manual interpretation.",
-                "confidence": "medium",
-                "suggested_action": "manual_only",
-                "reason": "Merged headers make simple row and column flags insufficient.",
-                "proposed_table_updates": [],
-                "reviewer_checklist": ["Check merged header groupings manually."],
-            },
-        ]
-    )
+                "reason": "The table is regular and the labels are visually clear.",
+                "table_review_id": "review-0",
+                "page": 1,
+                "header_rows": [0],
+                "row_header_columns": [0],
+            }
+        return {
+            "task_type": "table_intelligence",
+            "summary": "The second table needs manual interpretation.",
+            "confidence": "medium",
+            "confidence_score": 0.7,
+            "suggested_action": "manual_only",
+            "reason": "Merged headers make simple row and column flags insufficient.",
+            "table_review_id": "review-1",
+            "page": 1,
+            "header_rows": [],
+            "row_header_columns": [],
+        }
+    monkeypatch.setattr(review_suggestions, "generate_table_intelligence", _fake_table_intelligence)
+
+    fake_llm = _FakeLlmClient({"summary": "unused"})
 
     suggestion = asyncio.run(
         generate_review_suggestion(
@@ -500,10 +529,11 @@ def test_generate_review_suggestion_supports_table_semantics(monkeypatch, tmp_pa
     assert suggestion["suggested_action"] == "set_table_headers"
     assert suggestion["confidence"] == "medium"
     assert len(suggestion["proposed_table_updates"]) == 1
+    assert len(suggestion["table_intelligence"]) == 2
+    assert suggestion["document_overlay"]["provenance"] == "gemini_review_suggestion"
+    assert suggestion["document_overlay"]["pages"][0]["page_number"] == 1
     assert "manual review" in suggestion["summary"].lower()
-    assert fake_llm.calls
-    assert len(fake_llm.calls) == 2
-    assert fake_llm.calls[0]["kwargs"]["temperature"] == 0
+    assert fake_llm.calls == []
 
 
 def test_generate_review_suggestion_rejects_unsupported_task(tmp_path):

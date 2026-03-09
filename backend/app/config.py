@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     llm_strict_validation: bool = True
     auto_approve_generated_alt_text: bool = True
     auto_apply_llm_font_map: bool = True
+    auto_apply_grounded_text: bool = True
+    auto_apply_table_intelligence: bool = True
     assist_toc_with_llm: bool = True
 
     # veraPDF

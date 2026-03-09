@@ -5,6 +5,16 @@ from pathlib import Path
 from typing import Any
 
 from app.models import Job, ReviewTask
+from app.services.document_intelligence import (
+    build_document_model,
+    collect_structure_fragments,
+)
+from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
+from app.services.intelligence_gemini_reading_order import generate_reading_order_intelligence
+from app.services.intelligence_gemini_tables import generate_table_intelligence
+from app.services.intelligence_merge import document_overlay_for_suggestion
+from app.services.intelligence_merge import apply_suspicious_text_intelligence
+from app.services.intelligence_merge import apply_table_intelligence
 from app.services.llm_client import LlmClient
 from app.services.font_unicode_override import inspect_context_font_target
 from app.services.page_intelligence import suspicious_text_signals
@@ -13,6 +23,7 @@ from app.services.pdf_preview import (
     render_page_png_data_url,
     render_target_preview_png_data_url,
 )
+from app.services.text_grounding import extract_ocr_text_from_bbox
 
 SUPPORTED_SUGGESTION_TASK_TYPES = {"font_text_fidelity", "reading_order", "table_semantics"}
 MAX_REVIEW_PAGES = 2
@@ -271,16 +282,6 @@ def _unicode_from_visible_text_hypothesis(value: Any) -> str | None:
     return VISIBLE_GLYPH_HINT_TO_UNICODE.get(normalized)
 
 
-def _parse_job_structure(job: Job) -> dict[str, Any]:
-    if not job.structure_json:
-        return {}
-    try:
-        parsed = json.loads(job.structure_json)
-    except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
 def _render_page_image(pdf_path: Path, page_number: int) -> str:
     return render_page_png_data_url(pdf_path, page_number)
 
@@ -300,36 +301,12 @@ def _job_pdf_path(job: Job) -> Path:
     raise RuntimeError(f"PDF file not found for review suggestion: {preferred}")
 
 
-def _collect_structure_fragments(job: Job) -> list[dict[str, Any]]:
-    structure_json = _parse_job_structure(job)
-    elements = structure_json.get("elements")
-    if not isinstance(elements, list):
-        return []
+def _document_model(job: Job):
+    return build_document_model(job=job)
 
-    fragments: list[dict[str, Any]] = []
-    seen: set[tuple[int, str, str]] = set()
-    for element in elements:
-        if not isinstance(element, dict):
-            continue
-        text = _normalize_text(element.get("text"))
-        if len(text) < 16:
-            continue
-        page_raw = element.get("page")
-        page = int(page_raw) + 1 if isinstance(page_raw, int) and page_raw >= 0 else None
-        element_type = str(element.get("type") or "").strip()
-        key = (page or 0, element_type, text[:120])
-        if key in seen:
-            continue
-        seen.add(key)
-        fragments.append({
-            "page": page,
-            "type": element_type,
-            "text": text[:240],
-            "bbox": element.get("bbox") if isinstance(element.get("bbox"), dict) else None,
-        })
-        if len(fragments) >= MAX_STRUCTURE_FRAGMENTS:
-            break
-    return fragments
+
+def _collect_structure_fragments(job: Job) -> list[dict[str, Any]]:
+    return collect_structure_fragments(_document_model(job), max_fragments=MAX_STRUCTURE_FRAGMENTS)
 
 
 def _page_structure_fragments(job: Job, page_numbers: list[int]) -> list[dict[str, Any]]:
@@ -346,34 +323,33 @@ def _page_structure_fragments(job: Job, page_numbers: list[int]) -> list[dict[st
 
 
 def _page_blocks_for_review(job: Job, page_numbers: list[int]) -> list[dict[str, Any]]:
-    structure_json = _parse_job_structure(job)
-    elements = structure_json.get("elements")
-    if not isinstance(elements, list):
-        return []
-
     allowed_pages = {page for page in page_numbers if isinstance(page, int) and page > 0}
     if not allowed_pages:
         return []
 
+    document = _document_model(job)
     blocks_by_page: dict[int, list[dict[str, Any]]] = {}
-    for index, raw_element in enumerate(elements):
-        if not isinstance(raw_element, dict):
+    for page in document.pages:
+        if page.page_number not in allowed_pages:
             continue
-        page_raw = raw_element.get("page")
-        page = int(page_raw) + 1 if isinstance(page_raw, int) and page_raw >= 0 else None
-        if page is None or page not in allowed_pages:
-            continue
-        review_id = str(raw_element.get("review_id") or f"review-{index}")
-        block = {
-            "review_id": review_id,
-            "page": page,
-            "current_order": len(blocks_by_page.get(page, [])) + 1,
-            "type": str(raw_element.get("type") or "paragraph"),
-            "level": int(raw_element.get("level")) if isinstance(raw_element.get("level"), int) else None,
-            "text": _normalize_text(raw_element.get("text"))[:240],
-            "bbox": raw_element.get("bbox") if isinstance(raw_element.get("bbox"), dict) else None,
-        }
-        blocks_by_page.setdefault(page, []).append(block)
+        for block in page.blocks:
+            blocks_by_page.setdefault(page.page_number, []).append(
+                {
+                    "review_id": block.review_id,
+                    "page": page.page_number,
+                    "current_order": len(blocks_by_page.get(page.page_number, [])) + 1,
+                    "type": block.role,
+                    "level": block.level,
+                    "text": block.text[:240],
+                    "native_text_candidate": block.native_text_candidate[:240],
+                    "ocr_text_candidate": block.ocr_text_candidate,
+                    "resolved_text": block.resolved_text,
+                    "resolution_source": block.resolution_source,
+                    "bbox": block.bbox.to_dict() if block.bbox else None,
+                    "provenance": block.provenance,
+                    "confidence": block.confidence,
+                }
+            )
 
     page_blocks: list[dict[str, Any]] = []
     for page in sorted(blocks_by_page):
@@ -388,23 +364,62 @@ def _page_blocks_for_review(job: Job, page_numbers: list[int]) -> list[dict[str,
 
 def _suspicious_reading_blocks(job: Job, page_numbers: list[int]) -> list[dict[str, Any]]:
     suspicious_blocks: list[dict[str, Any]] = []
-    for page_block in _page_blocks_for_review(job, page_numbers):
+    pdf_path = _job_pdf_path(job)
+    page_blocks = _page_blocks_for_review(job, page_numbers)
+    for page_block in page_blocks:
+        page_entries = [
+            block for block in page_block.get("blocks", [])
+            if isinstance(block, dict)
+        ]
+        blocks_by_id = {
+            str(block.get("review_id") or "").strip(): block
+            for block in page_entries
+            if str(block.get("review_id") or "").strip()
+        }
         for block in page_block.get("blocks", []):
             if not isinstance(block, dict):
                 continue
-            text = _normalize_text(block.get("text"))
+            text = _normalize_text(block.get("native_text_candidate") or block.get("text"))
             if len(text) < 6:
                 continue
             signals = suspicious_text_signals(text)
             if not signals:
                 continue
+            bbox = block.get("bbox") if isinstance(block.get("bbox"), dict) else None
+            page = block.get("page")
+            ocr_text = ""
+            if isinstance(page, int) and isinstance(bbox, dict):
+                ocr_text = _normalize_text(
+                    extract_ocr_text_from_bbox(
+                        pdf_path,
+                        page_number=page,
+                        bbox=bbox,
+                    )
+                )
+            review_id = str(block.get("review_id") or "").strip()
+            current_order = int(block.get("current_order") or 0)
+            previous_text = ""
+            next_text = ""
+            if review_id and current_order > 0:
+                previous_block = blocks_by_id.get(
+                    str(page_entries[current_order - 2].get("review_id") or "").strip()
+                ) if current_order > 1 and current_order - 2 < len(page_entries) else None
+                next_block = page_entries[current_order] if current_order < len(page_entries) else None
+                if isinstance(previous_block, dict):
+                    previous_text = _normalize_text(previous_block.get("native_text_candidate") or previous_block.get("text"))
+                if isinstance(next_block, dict):
+                    next_text = _normalize_text(next_block.get("native_text_candidate") or next_block.get("text"))
             suspicious_blocks.append({
-                "page": block.get("page"),
-                "review_id": block.get("review_id"),
+                "page": page,
+                "review_id": review_id,
                 "type": block.get("type"),
                 "level": block.get("level"),
                 "text": text,
-                "bbox": block.get("bbox") if isinstance(block.get("bbox"), dict) else None,
+                "native_text_candidate": text,
+                "ocr_text_candidate": ocr_text,
+                "previous_text": previous_text[:240],
+                "next_text": next_text[:240],
+                "bbox": bbox,
                 "signals": signals,
             })
             if len(suspicious_blocks) >= MAX_SUSPICIOUS_READING_BLOCKS:
@@ -413,11 +428,6 @@ def _suspicious_reading_blocks(job: Job, page_numbers: list[int]) -> list[dict[s
 
 
 def _table_targets_for_review(job: Job, metadata: dict[str, Any]) -> list[dict[str, Any]]:
-    structure_json = _parse_job_structure(job)
-    elements = structure_json.get("elements")
-    if not isinstance(elements, list):
-        return []
-
     requested_pages = {
         page for page in metadata.get("pages_to_check", [])
         if isinstance(page, int) and page > 0
@@ -430,67 +440,30 @@ def _table_targets_for_review(job: Job, metadata: dict[str, Any]) -> list[dict[s
     ] if isinstance(raw_targets, list) else []
     requested_ids = set(requested_order)
 
+    document = _document_model(job)
     targets_by_id: dict[str, dict[str, Any]] = {}
-    for index, raw_element in enumerate(elements):
-        if not isinstance(raw_element, dict):
-            continue
-        if raw_element.get("type") != "table":
-            continue
-        page_raw = raw_element.get("page")
-        page = int(page_raw) + 1 if isinstance(page_raw, int) and page_raw >= 0 else None
-        if page is None:
-            continue
-        review_id = str(raw_element.get("review_id") or f"review-{index}")
-        if requested_ids and review_id not in requested_ids:
-            continue
-        if requested_pages and page not in requested_pages:
-            continue
-
-        cells = raw_element.get("cells")
-        if not isinstance(cells, list) or not cells:
-            continue
-
-        normalized_cells: list[dict[str, Any]] = []
-        header_rows: set[int] = set()
-        row_header_columns: set[int] = set()
-        for cell in cells:
-            if not isinstance(cell, dict):
+    for page in document.pages:
+        for table in page.tables:
+            review_id = table.table_review_id
+            if requested_ids and review_id not in requested_ids:
                 continue
-            row = int(cell.get("row", 0)) if isinstance(cell.get("row"), int) else 0
-            col = int(cell.get("col", 0)) if isinstance(cell.get("col"), int) else 0
-            row_span = int(cell.get("row_span", 1)) if isinstance(cell.get("row_span"), int) else 1
-            col_span = int(cell.get("col_span", 1)) if isinstance(cell.get("col_span"), int) else 1
-            column_header = bool(cell.get("column_header", False))
-            row_header = bool(cell.get("row_header", False))
-            if column_header:
-                header_rows.add(row)
-            if row_header:
-                row_header_columns.add(col)
-            normalized_cells.append({
-                "row": row,
-                "col": col,
-                "row_span": row_span,
-                "col_span": col_span,
-                "text": _normalize_text(cell.get("text"))[:120],
-                "column_header": column_header,
-                "row_header": row_header,
-                "is_header": bool(cell.get("is_header", False) or column_header or row_header),
-            })
-
-        if not normalized_cells:
-            continue
-
-        targets_by_id[review_id] = {
-            "table_review_id": review_id,
-            "page": page,
-            "bbox": raw_element.get("bbox") if isinstance(raw_element.get("bbox"), dict) else None,
-            "num_rows": raw_element.get("num_rows", 0),
-            "num_cols": raw_element.get("num_cols", 0),
-            "header_rows": sorted(header_rows),
-            "row_header_columns": sorted(row_header_columns),
-            "cells": normalized_cells,
-            "text_excerpt": _normalize_text(raw_element.get("text"))[:240],
-        }
+            if requested_pages and page.page_number not in requested_pages:
+                continue
+            if not table.cells:
+                continue
+            targets_by_id[review_id] = {
+                "table_review_id": review_id,
+                "page": page.page_number,
+                "bbox": table.bbox.to_dict() if table.bbox else None,
+                "num_rows": table.num_rows,
+                "num_cols": table.num_cols,
+                "header_rows": list(table.header_rows),
+                "row_header_columns": list(table.row_header_columns),
+                "cells": [cell.to_dict() for cell in table.cells],
+                "text_excerpt": table.text_excerpt[:240],
+                "provenance": table.provenance,
+                "confidence": table.confidence,
+            }
 
     if requested_order:
         ordered_targets = [
@@ -671,23 +644,16 @@ def _font_task_payload(job: Job, task: ReviewTask) -> tuple[str, list[dict[str, 
     return prompt_text, content
 
 
-def _reading_order_task_payload(job: Job, task: ReviewTask) -> tuple[str, list[dict[str, Any]]]:
+def _reading_order_task_payload(
+    job: Job,
+    task: ReviewTask,
+    *,
+    page_intelligence: dict[str, Any] | None = None,
+    suspicious_blocks: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     metadata = _parse_metadata(task)
     structure_fragments = _collect_structure_fragments(job)
-    page_numbers = [
-        page
-        for page in metadata.get("pages_to_check", [])
-        if isinstance(page, int) and page > 0
-    ][:MAX_REVIEW_PAGES]
-    if not page_numbers:
-        for fragment in structure_fragments:
-            page = fragment.get("page")
-            if isinstance(page, int) and page > 0 and page not in page_numbers:
-                page_numbers.append(page)
-            if len(page_numbers) >= MAX_REVIEW_PAGES:
-                break
-    if not page_numbers:
-        page_numbers = [1]
+    page_numbers = _reading_order_pages(metadata, structure_fragments)
 
     pdf_path = _job_pdf_path(job)
     images = []
@@ -697,7 +663,7 @@ def _reading_order_task_payload(job: Job, task: ReviewTask) -> tuple[str, list[d
             "image_url": {"url": _render_page_image(pdf_path, page_number)},
         })
 
-    suspicious_blocks = _suspicious_reading_blocks(job, page_numbers)
+    suspicious_blocks = suspicious_blocks if isinstance(suspicious_blocks, list) else _suspicious_reading_blocks(job, page_numbers)
     suspicious_block_previews: list[dict[str, Any]] = []
     for block in suspicious_blocks:
         bbox = block.get("bbox")
@@ -737,6 +703,7 @@ def _reading_order_task_payload(job: Job, task: ReviewTask) -> tuple[str, list[d
         "page_structure_fragments": _page_structure_fragments(job, page_numbers),
         "suspicious_text_blocks": suspicious_blocks,
         "suspicious_block_previews": suspicious_block_previews,
+        "page_text_intelligence": page_intelligence if isinstance(page_intelligence, dict) else None,
     }
     prompt_text = (
         f"{READING_ORDER_PROMPT}\n\n"
@@ -746,6 +713,24 @@ def _reading_order_task_payload(job: Job, task: ReviewTask) -> tuple[str, list[d
     )
     content = [{"type": "text", "text": prompt_text}, *images]
     return prompt_text, content
+
+
+def _reading_order_pages(metadata: dict[str, Any], structure_fragments: list[dict[str, Any]]) -> list[int]:
+    page_numbers = [
+        page
+        for page in metadata.get("pages_to_check", [])
+        if isinstance(page, int) and page > 0
+    ][:MAX_REVIEW_PAGES]
+    if not page_numbers:
+        for fragment in structure_fragments:
+            page = fragment.get("page")
+            if isinstance(page, int) and page > 0 and page not in page_numbers:
+                page_numbers.append(page)
+            if len(page_numbers) >= MAX_REVIEW_PAGES:
+                break
+    if not page_numbers:
+        page_numbers = [1]
+    return page_numbers
 
 
 def _table_target_payload(
@@ -990,6 +975,191 @@ def _aggregate_table_suggestions(
     }
 
 
+def _aggregate_table_intelligence(
+    intelligence_items: list[dict[str, Any]],
+    *,
+    total_targets: int,
+) -> dict[str, Any]:
+    suggestions: list[dict[str, Any]] = []
+    for item in intelligence_items:
+        if not isinstance(item, dict):
+            continue
+        suggestions.append(
+            {
+                "summary": item.get("summary"),
+                "confidence": item.get("confidence"),
+                "suggested_action": item.get("suggested_action"),
+                "reason": item.get("reason"),
+                "proposed_table_updates": (
+                    [
+                        {
+                            "page": item.get("page"),
+                            "table_review_id": item.get("table_review_id"),
+                            "header_rows": item.get("header_rows", []),
+                            "row_header_columns": item.get("row_header_columns", []),
+                            "reason": item.get("reason"),
+                        }
+                    ]
+                    if str(item.get("suggested_action") or "").strip() == "set_table_headers"
+                    else []
+                ),
+                "reviewer_checklist": [],
+            }
+        )
+    aggregated = _aggregate_table_suggestions(suggestions, total_targets=total_targets)
+    aggregated["table_intelligence"] = intelligence_items
+    return aggregated
+
+
+def _aggregate_reading_order_intelligence(
+    intelligence_items: list[dict[str, Any]],
+    *,
+    page_intelligence: dict[str, Any],
+) -> dict[str, Any]:
+    proposed_page_orders: list[dict[str, Any]] = []
+    proposed_element_updates: list[dict[str, Any]] = []
+    review_focus: list[dict[str, Any]] = []
+    reviewer_checklist: list[str] = [
+        "Listen to the affected page in reading order and confirm the sequence matches the visible layout.",
+        "Hide only repeated running heads, page numbers, or decorative side material.",
+    ]
+    reasons: list[str] = []
+    summary_parts: list[str] = []
+    confidence_rank = 2
+    suggested_actions: set[str] = set()
+
+    for item in intelligence_items:
+        if not isinstance(item, dict):
+            continue
+        confidence_rank = min(confidence_rank, _confidence_rank(item.get("confidence")))
+        action = _normalize_text(item.get("suggested_action"))
+        if action:
+            suggested_actions.add(action)
+        reason = _normalize_text(item.get("reason"))
+        if reason:
+            reasons.append(reason)
+        summary = _normalize_text(item.get("summary"))
+        if summary:
+            summary_parts.append(summary)
+
+        page = item.get("page")
+        if isinstance(page, int) and page > 0:
+            recommended_action = reason or "Check the page order and block roles against the visible layout."
+            review_focus.append(
+                {
+                    "page": page,
+                    "font": "",
+                    "rule_id": "",
+                    "visible_text_hypothesis": summary or f"Review page {page} reading order",
+                    "is_likely_decorative": False,
+                    "recommended_reviewer_action": recommended_action,
+                }
+            )
+
+        ordered_review_ids = item.get("ordered_review_ids")
+        if isinstance(page, int) and page > 0 and isinstance(ordered_review_ids, list) and ordered_review_ids:
+            proposed_page_orders.append(
+                {
+                    "page": page,
+                    "ordered_review_ids": [
+                        str(review_id).strip()
+                        for review_id in ordered_review_ids
+                        if str(review_id).strip()
+                    ],
+                    "reason": reason,
+                }
+            )
+
+        raw_updates = item.get("element_updates")
+        if isinstance(raw_updates, list):
+            for raw_update in raw_updates:
+                if not isinstance(raw_update, dict) or not isinstance(page, int) or page < 1:
+                    continue
+                review_id = _normalize_text(raw_update.get("review_id"))
+                new_type = _normalize_text(raw_update.get("new_type"))
+                if not review_id or not new_type:
+                    continue
+                normalized_update = {
+                    "page": page,
+                    "review_id": review_id,
+                    "new_type": new_type,
+                    "reason": _normalize_text(raw_update.get("reason")),
+                }
+                if isinstance(raw_update.get("new_level"), int):
+                    normalized_update["new_level"] = int(raw_update["new_level"])
+                proposed_element_updates.append(normalized_update)
+
+    if "reorder_review" in suggested_actions:
+        suggested_action = "reorder_review"
+    elif "artifact_headers_footers" in suggested_actions:
+        suggested_action = "artifact_headers_footers"
+    elif "manual_only" in suggested_actions:
+        suggested_action = "manual_only"
+    else:
+        suggested_action = "confirm_current_order"
+
+    summaries = _dedupe_preserving_order(summary_parts)
+    if summaries:
+        summary = " ".join(summaries)[:1000]
+    elif suggested_action == "confirm_current_order":
+        summary = "Current reading order looks acceptable on the reviewed pages."
+    elif suggested_action == "manual_only":
+        summary = "Reading order still needs manual review."
+    else:
+        summary = "Review the proposed reading order changes."
+
+    return {
+        "task_type": "reading_order",
+        "summary": summary,
+        "confidence": _confidence_label(confidence_rank),
+        "suggested_action": suggested_action,
+        "reason": " ".join(_dedupe_preserving_order(reasons))[:1000],
+        "proposed_page_orders": proposed_page_orders,
+        "proposed_element_updates": proposed_element_updates,
+        "review_focus": review_focus,
+        "reviewer_checklist": _dedupe_preserving_order(reviewer_checklist),
+        "readable_text_hints": list(page_intelligence.get("blocks", [])),
+        "page_text_intelligence": page_intelligence,
+        "reading_order_intelligence": intelligence_items,
+    }
+
+
+def _ground_readable_text_hints(
+    hints: list[dict[str, Any]] | Any,
+    page_intelligence: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not isinstance(hints, list):
+        return list(page_intelligence.get("blocks", []))
+
+    evidence_by_key: dict[tuple[int, str], dict[str, Any]] = {}
+    for item in page_intelligence.get("blocks", []):
+        if not isinstance(item, dict):
+            continue
+        page = item.get("page")
+        review_id = str(item.get("review_id") or "").strip()
+        if isinstance(page, int) and page > 0 and review_id:
+            evidence_by_key[(page, review_id)] = item
+
+    grounded: list[dict[str, Any]] = []
+    for raw_hint in hints:
+        if not isinstance(raw_hint, dict):
+            continue
+        page = raw_hint.get("page")
+        review_id = str(raw_hint.get("review_id") or "").strip()
+        evidence = evidence_by_key.get((page, review_id), {})
+        grounded.append(
+            {
+                **evidence,
+                **raw_hint,
+                "extracted_text": str(raw_hint.get("extracted_text") or evidence.get("extracted_text") or "").strip(),
+                "native_text_candidate": str(raw_hint.get("native_text_candidate") or evidence.get("native_text_candidate") or "").strip(),
+                "ocr_text_candidate": str(raw_hint.get("ocr_text_candidate") or evidence.get("ocr_text_candidate") or "").strip(),
+                "chosen_source": str(raw_hint.get("chosen_source") or evidence.get("chosen_source") or "").strip(),
+            }
+        )
+    return grounded
+
+
 async def generate_review_suggestion(
     *,
     job: Job,
@@ -999,12 +1169,50 @@ async def generate_review_suggestion(
     if task.task_type not in SUPPORTED_SUGGESTION_TASK_TYPES:
         raise ValueError(f"Suggestions are not supported for task type '{task.task_type}'")
 
+    document = _document_model(job)
     if task.task_type == "font_text_fidelity":
         _prompt_text, content = _font_task_payload(job, task)
         suggestion = await _request_llm_json(llm_client=llm_client, content=content)
     elif task.task_type == "reading_order":
-        _prompt_text, content = _reading_order_task_payload(job, task)
-        suggestion = await _request_llm_json(llm_client=llm_client, content=content)
+        metadata = _parse_metadata(task)
+        structure_fragments = _collect_structure_fragments(job)
+        page_numbers = _reading_order_pages(metadata, structure_fragments)
+        suspicious_blocks = _suspicious_reading_blocks(job, page_numbers)
+        page_intelligence = await generate_suspicious_text_intelligence(
+            job=job,
+            page_numbers=page_numbers,
+            suspicious_blocks=suspicious_blocks,
+            llm_client=llm_client,
+        )
+        _prompt_text, content = _reading_order_task_payload(
+            job,
+            task,
+            page_intelligence=page_intelligence,
+            suspicious_blocks=suspicious_blocks,
+        )
+        reading_order_intelligence = []
+        for page_blocks in _page_blocks_for_review(job, page_numbers):
+            page = page_blocks.get("page")
+            if not isinstance(page, int) or page < 1:
+                continue
+            reading_order_intelligence.append(
+                await generate_reading_order_intelligence(
+                    job=job,
+                    page_number=page,
+                    page_blocks=page_blocks,
+                    page_structure_fragments=_page_structure_fragments(job, [page]),
+                    page_text_intelligence_blocks=[
+                        item
+                        for item in page_intelligence.get("blocks", [])
+                        if isinstance(item, dict) and item.get("page") == page
+                    ],
+                    llm_client=llm_client,
+                )
+            )
+        suggestion = _aggregate_reading_order_intelligence(
+            reading_order_intelligence,
+            page_intelligence=page_intelligence,
+        )
     elif task.task_type == "table_semantics":
         metadata = _parse_metadata(task)
         table_targets = _table_targets_for_review(job, metadata)
@@ -1012,19 +1220,31 @@ async def generate_review_suggestion(
             _prompt_text, content = _table_task_payload(job, task)
             suggestion = await _request_llm_json(llm_client=llm_client, content=content)
         else:
-            per_table_suggestions: list[dict[str, Any]] = []
+            per_table_intelligence: list[dict[str, Any]] = []
             for target in table_targets:
-                _prompt_text, content = _table_target_payload(job, task, target)
-                per_table_suggestions.append(
-                    await _request_llm_json(llm_client=llm_client, content=content)
+                per_table_intelligence.append(
+                    await generate_table_intelligence(
+                        job=job,
+                        target=target,
+                        page_structure_fragments=_page_structure_fragments(
+                            job,
+                            [int(target["page"])] if isinstance(target.get("page"), int) else [1],
+                        ),
+                        llm_client=llm_client,
+                    )
                 )
-            suggestion = _aggregate_table_suggestions(
-                per_table_suggestions,
+            suggestion = _aggregate_table_intelligence(
+                per_table_intelligence,
                 total_targets=len(table_targets),
             )
     else:
         raise ValueError(f"Suggestions are not supported for task type '{task.task_type}'")
     suggestion.setdefault("task_type", task.task_type)
+    if task.task_type == "reading_order" and isinstance(suggestion.get("page_text_intelligence"), dict):
+        document, _ = apply_suspicious_text_intelligence(document, suggestion["page_text_intelligence"])
+    if task.task_type == "table_semantics" and isinstance(suggestion.get("table_intelligence"), list):
+        document, _ = apply_table_intelligence(document, suggestion["table_intelligence"])
+    suggestion["document_overlay"] = document_overlay_for_suggestion(document, suggestion)
     suggestion["generated_at"] = datetime.now(UTC).isoformat()
     suggestion["model"] = llm_client.model
     return suggestion

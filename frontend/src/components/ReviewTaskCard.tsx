@@ -3,6 +3,7 @@ import type { FontReviewTarget, LlmSuggestion } from "../pages/reviewHelpers";
 import {
   canApplySingleTableSuggestion,
   canApplyTableSuggestion,
+  documentOverlayForSuggestion,
   LLM_SUGGESTION_TASK_TYPES,
   canApplyReadingOrderSuggestion,
   applicableActualTextCandidates,
@@ -23,6 +24,7 @@ import {
   tableHeaderUpdates,
   tableTargetPreviewUrl,
   tableReviewTargets,
+  structureTypeLabel,
   structureElementsForPage,
   structurePages,
 } from "../pages/reviewHelpers";
@@ -176,6 +178,7 @@ export default function ReviewTaskCard({
   const suggestedElementUpdates = readingOrderElementUpdates(llmSuggestion);
   const suggestedTextHints = readingOrderTextHints(llmSuggestion);
   const suggestedTableUpdates = tableHeaderUpdates(llmSuggestion);
+  const documentOverlay = documentOverlayForSuggestion(llmSuggestion);
   const tableTargets = tableReviewTargets(task);
   const canApplyReadingOrder =
     task.task_type === "reading_order"
@@ -420,6 +423,112 @@ export default function ReviewTaskCard({
               )}
               {llmSuggestion.reason && (
                 <p className="text-xs text-ink-muted">{llmSuggestion.reason}</p>
+              )}
+              {documentOverlay && documentOverlay.pages.length > 0 && (
+                <div className="rounded-lg border border-accent-light bg-white/70 px-3 py-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-semibold text-ink">
+                        Gemini page model
+                      </p>
+                      <p className="mt-1 text-xs text-ink-muted">
+                        This is the merged page interpretation the app derived from Gemini&apos;s structured proposal.
+                      </p>
+                    </div>
+                    <span className="rounded-full bg-accent-glow px-2 py-1 text-[11px] text-accent">
+                      {documentOverlay.provenance ?? "gemini"}
+                    </span>
+                  </div>
+                  <div className="mt-3 space-y-3">
+                    {documentOverlay.pages.map((page) => (
+                      <div
+                        key={`${task.id}-overlay-page-${page.page_number}`}
+                        className="rounded-lg bg-paper-warm/70 px-3 py-3"
+                      >
+                        <p className="text-sm font-medium text-ink">
+                          Page {page.page_number}
+                        </p>
+                        {page.blocks.length > 0 && (
+                          <div className="mt-3">
+                            <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                              Block order
+                            </p>
+                            <div className="mt-2 space-y-2">
+                              {page.blocks.map((block, index) => (
+                                <div
+                                  key={`${task.id}-overlay-block-${page.page_number}-${block.review_id}`}
+                                  className="rounded-lg bg-white/70 px-3 py-2"
+                                >
+                                  <p className="text-xs font-medium text-ink">
+                                    {index + 1}. {structureTypeLabel(block.role ?? "paragraph")}
+                                    {typeof block.level === "number" ? ` (H${block.level})` : ""}
+                                    {" · "}
+                                    {block.review_id}
+                                  </p>
+                                  {block.text && (
+                                    <p className="mt-1 text-xs text-ink break-words">{block.text}</p>
+                                  )}
+                                  {block.semantic_text_hint && (
+                                    <div className="mt-2 rounded-lg border border-accent-light bg-accent-glow/40 px-2 py-2">
+                                      <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                                        Gemini readable text
+                                      </p>
+                                      <p className="mt-1 text-xs text-ink break-words">
+                                        {block.semantic_text_hint}
+                                      </p>
+                                      <p className="mt-1 text-[11px] text-ink-muted">
+                                        {block.semantic_issue_type
+                                          ? block.semantic_issue_type.replaceAll("_", " ")
+                                          : "semantic hint"}
+                                        {block.semantic_blocking ? " · blocking" : ""}
+                                      </p>
+                                    </div>
+                                  )}
+                                  <p className="mt-1 text-[11px] text-ink-muted">
+                                    {block.provenance ?? "unknown"}
+                                    {typeof block.confidence === "number"
+                                      ? ` · ${Math.round(block.confidence * 100)}% confidence`
+                                      : ""}
+                                  </p>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {page.tables.length > 0 && (
+                          <div className="mt-3">
+                            <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                              Table semantics
+                            </p>
+                            <div className="mt-2 space-y-2">
+                              {page.tables.map((table) => (
+                                <div
+                                  key={`${task.id}-overlay-table-${page.page_number}-${table.table_review_id}`}
+                                  className="rounded-lg bg-white/70 px-3 py-2"
+                                >
+                                  <p className="text-xs font-medium text-ink">
+                                    {table.table_review_id}
+                                  </p>
+                                  <p className="mt-1 text-xs text-ink-muted">
+                                    Header rows: {table.header_rows.length > 0 ? table.header_rows.join(", ") : "none"}
+                                    {" · "}
+                                    Row-header columns: {table.row_header_columns.length > 0 ? table.row_header_columns.join(", ") : "none"}
+                                  </p>
+                                  <p className="mt-1 text-[11px] text-ink-muted">
+                                    {table.provenance ?? "unknown"}
+                                    {typeof table.confidence === "number"
+                                      ? ` · ${Math.round(table.confidence * 100)}% confidence`
+                                      : ""}
+                                  </p>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
               )}
               {task.task_type === "font_text_fidelity" && suggestedActualTextCandidates.length > 0 && (
                 <div className="rounded-lg border border-accent-light bg-white/70 px-3 py-3">

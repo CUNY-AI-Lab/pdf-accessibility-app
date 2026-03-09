@@ -192,7 +192,10 @@ def test_garbled_text_followup_spec_only_uses_blocking_hints():
                     "page": 1,
                     "review_id": "review-2",
                     "extracted_text": "D a t a  B o o k",
+                    "native_text_candidate": "D a t a  B o o k",
+                    "ocr_text_candidate": "Data Book",
                     "readable_text_hint": "Data Book",
+                    "chosen_source": "ocr",
                     "issue_type": "spacing_only",
                     "confidence": "high",
                     "should_block_accessibility": True,
@@ -218,7 +221,10 @@ def test_garbled_text_followup_spec_only_uses_blocking_hints():
             "page": 1,
             "review_id": "review-2",
             "extracted_text": "D a t a  B o o k",
+            "native_text_candidate": "D a t a  B o o k",
+            "ocr_text_candidate": "Data Book",
             "readable_text_hint": "Data Book",
+            "chosen_source": "ocr",
             "issue_type": "spacing_only",
             "confidence": "high",
             "reason": "The visible title is tightly kerned, but extraction is split.",
@@ -269,7 +275,10 @@ async def test_sync_llm_followup_tasks_creates_and_removes_garbled_text_task():
                         "page": 1,
                         "review_id": "review-2",
                         "extracted_text": "D a t a  B o o k",
+                        "native_text_candidate": "D a t a  B o o k",
+                        "ocr_text_candidate": "Data Book",
                         "readable_text_hint": "Data Book",
+                        "chosen_source": "ocr",
                         "issue_type": "spacing_only",
                         "confidence": "high",
                         "should_block_accessibility": True,
@@ -292,6 +301,7 @@ async def test_sync_llm_followup_tasks_creates_and_removes_garbled_text_task():
         assert metadata["llm_followup_kind"] == "garbled_text_hint"
         assert metadata["parent_task_id"] == parent_task.id
         assert metadata["flagged_blocks"][0]["readable_text_hint"] == "Data Book"
+        assert metadata["flagged_blocks"][0]["chosen_source"] == "ocr"
 
         await _sync_llm_followup_tasks(
             db=db,

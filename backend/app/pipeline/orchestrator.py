@@ -1,6 +1,7 @@
 """Pipeline orchestrator: runs all steps in sequence with progress events."""
 
 import asyncio
+import copy
 import json
 import logging
 import re
@@ -20,17 +21,25 @@ from app.config import Settings
 from app.models import AltTextEntry, Job, JobStep, ReviewTask
 from app.pipeline.alt_text import generate_alt_text
 from app.pipeline.classify import classify_pdf
-from app.pipeline.fidelity import assess_fidelity
+from app.pipeline.fidelity import _table_semantics_risk, assess_fidelity
 from app.pipeline.ocr import run_ocr
 from app.pipeline.structure import extract_structure
 from app.pipeline.subprocess_utils import SubprocessTimeout, communicate_with_timeout
 from app.pipeline.tagger import tag_pdf
 from app.pipeline.validator import validate_pdf
 from app.services.font_artifact import apply_artifact_batch_to_contexts
+from app.services.document_intelligence import build_document_model, collect_structure_fragments
+from app.services.intelligence_gemini_tables import generate_table_intelligence
 from app.services.font_unicode_override import apply_unicode_override_to_context
 from app.services.file_storage import create_job_dir, get_output_path
 from app.services.job_manager import JobManager
+from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
 from app.services.llm_client import LlmClient
+from app.services.page_intelligence import (
+    collect_grounded_text_candidates,
+    repair_text_candidate,
+    text_similarity_score,
+)
 from app.services.review_suggestions import (
     generate_review_suggestion,
     select_auto_font_review_resolution,
@@ -123,6 +132,36 @@ GHOSTSCRIPT_TYPE1_DESCRIPTOR_SPECS = {
     "symbol": {"afm": "s050000l.afm", "flags": 4},
     "zapfdingbats": {"afm": "d050000l.afm", "flags": 4},
 }
+PRETAG_GROUNDED_TEXT_TARGET_LIMIT = 12
+PRETAG_GROUNDED_TEXT_MAX_CHARS = 64
+PRETAG_GROUNDED_TEXT_ENCODING_MAX_CHARS = 128
+PRETAG_GROUNDED_TEXT_ENCODING_MIN_SIMILARITY = 0.94
+PRETAG_GROUNDED_TEXT_ALLOWED_ROLES = frozenset({
+    "heading",
+    "paragraph",
+    "note",
+    "toc_caption",
+    "toc_item",
+})
+PRETAG_GROUNDED_TEXT_ARTIFACT_MAX_CHARS = 96
+PRETAG_GROUNDED_TEXT_ALLOWED_ARTIFACT_ROLES = frozenset({
+    "heading",
+    "paragraph",
+    "note",
+    "toc_caption",
+    "toc_item",
+})
+PRETAG_GROUNDED_TEXT_ALLOWED_DUPLICATE_ROLES = frozenset({
+    "heading",
+    "paragraph",
+    "note",
+    "toc_caption",
+    "toc_item",
+})
+PRETAG_GROUNDED_CODE_MAX_CHARS = 2000
+PRETAG_GROUNDED_CODE_MAX_LINES = 40
+PRETAG_GROUNDED_CODE_MIN_SUPPORT = 0.55
+PRETAG_TABLE_ALLOWED_ACTIONS = frozenset({"confirm_current_headers", "set_table_headers"})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -386,6 +425,925 @@ def _merge_review_task_metadata(
             task["metadata"] = {**current, **metadata}
             break
     return review_tasks
+
+
+def _recalculate_fidelity_summary(
+    fidelity_report: dict[str, object],
+    review_tasks: list[dict[str, object]],
+) -> dict[str, object]:
+    blocking_tasks = _blocking_task_count(review_tasks)
+    advisory_tasks = max(len(review_tasks) - blocking_tasks, 0)
+    fidelity_report["passed"] = blocking_tasks == 0
+    fidelity_report["summary"] = {
+        "blocking_tasks": blocking_tasks,
+        "advisory_tasks": advisory_tasks,
+        "total_tasks": len(review_tasks),
+    }
+    return fidelity_report
+
+
+def _update_grounded_text_check(
+    fidelity_report: dict[str, object],
+    *,
+    status: str,
+    message: str,
+    candidate_count: int,
+    confirmed_count: int,
+) -> dict[str, object]:
+    checks = fidelity_report.get("checks")
+    if not isinstance(checks, list):
+        checks = []
+        fidelity_report["checks"] = checks
+    for check in checks:
+        if isinstance(check, dict) and str(check.get("check") or "") == "grounded_text_fidelity":
+            check["status"] = status
+            check["message"] = message
+            check["metrics"] = {
+                "candidate_blocks": candidate_count,
+                "confirmed_blocks": confirmed_count,
+            }
+            return fidelity_report
+    checks.append(
+        {
+            "check": "grounded_text_fidelity",
+            "status": status,
+            "message": message,
+            "metrics": {
+                "candidate_blocks": candidate_count,
+                "confirmed_blocks": confirmed_count,
+            },
+        }
+    )
+    return fidelity_report
+
+
+def _apply_grounded_text_adjudication(
+    review_tasks: list[dict[str, object]],
+    fidelity_report: dict[str, object],
+    adjudication: dict[str, object] | None,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    task_index = next(
+        (
+            index
+            for index, task in enumerate(review_tasks)
+            if str(task.get("task_type") or "") == "content_fidelity"
+            and str(task.get("source") or "fidelity") == "fidelity"
+            and isinstance(task.get("metadata"), dict)
+            and bool(task["metadata"].get("grounded_text_candidate"))
+        ),
+        None,
+    )
+    if task_index is None:
+        return review_tasks, fidelity_report
+
+    task = review_tasks[task_index]
+    metadata = task.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    candidate_blocks = metadata.get("flagged_blocks")
+    if not isinstance(candidate_blocks, list):
+        candidate_blocks = []
+
+    confirmed_blocks: list[dict[str, object]] = []
+    if isinstance(adjudication, dict):
+        for block in adjudication.get("blocks", []) if isinstance(adjudication.get("blocks"), list) else []:
+            if isinstance(block, dict) and bool(block.get("should_block_accessibility", False)):
+                confirmed_blocks.append(block)
+
+    if not confirmed_blocks:
+        review_tasks = [
+            existing
+            for index, existing in enumerate(review_tasks)
+            if index != task_index
+        ]
+        fidelity_report = _update_grounded_text_check(
+            fidelity_report,
+            status="pass",
+            message="Grounded semantic review did not confirm any accessibility-significant text mismatch.",
+            candidate_count=len(candidate_blocks),
+            confirmed_count=0,
+        )
+        return review_tasks, _recalculate_fidelity_summary(fidelity_report, review_tasks)
+
+    issue_types = sorted(
+        {
+            str(block.get("issue_type") or "").strip()
+            for block in confirmed_blocks
+            if str(block.get("issue_type") or "").strip()
+        }
+    )
+    pages_to_check = sorted(
+        {
+            int(block["page"])
+            for block in confirmed_blocks
+            if isinstance(block.get("page"), int)
+        }
+    )
+    task["title"] = "Verify readable text on flagged blocks"
+    task["detail"] = (
+        "Grounded Gemini review confirmed text blocks where the extracted accessible text "
+        "likely does not match what appears on the page."
+    )
+    task["severity"] = "high"
+    task["blocking"] = True
+    task["metadata"] = {
+        **metadata,
+        "grounded_text_candidate": True,
+        "grounded_text_llm_adjudicated": True,
+        "pages_to_check": pages_to_check,
+        "flagged_blocks": confirmed_blocks,
+        "issue_types": issue_types,
+        "grounded_target_count": len(confirmed_blocks),
+        "encoding_problem_count": len(
+            [block for block in confirmed_blocks if str(block.get("issue_type") or "") == "encoding_problem"]
+        ),
+        "llm_summary": str(adjudication.get("summary") or "").strip() if isinstance(adjudication, dict) else "",
+        "llm_confidence": str(adjudication.get("confidence") or "").strip() if isinstance(adjudication, dict) else "",
+    }
+    fidelity_report = _update_grounded_text_check(
+        fidelity_report,
+        status="fail",
+        message="Grounded semantic review confirmed accessibility-significant extracted-text mismatches.",
+        candidate_count=len(candidate_blocks),
+        confirmed_count=len(confirmed_blocks),
+    )
+    return review_tasks, _recalculate_fidelity_summary(fidelity_report, review_tasks)
+
+
+def _should_auto_apply_grounded_text_block(block: dict[str, object]) -> bool:
+    readable_text = str(block.get("readable_text_hint") or "").strip()
+    if not readable_text:
+        return False
+    if str(block.get("confidence") or "").strip() != "high":
+        return False
+    if not bool(block.get("should_block_accessibility", False)):
+        return False
+    if str(block.get("issue_type") or "").strip() != "spacing_only":
+        return False
+    role = str(block.get("role") or "").strip()
+    if role not in PRETAG_GROUNDED_TEXT_ALLOWED_ROLES:
+        return False
+    if len(readable_text) > PRETAG_GROUNDED_TEXT_MAX_CHARS:
+        return False
+    original_text = str(
+        block.get("original_text_candidate")
+        or block.get("native_text_candidate")
+        or block.get("extracted_text")
+        or ""
+    ).strip()
+    if not original_text:
+        return False
+    dense_original = re.sub(r"\s+", "", original_text).lower()
+    dense_readable = re.sub(r"\s+", "", readable_text).lower()
+    if not dense_original or dense_original != dense_readable:
+        return False
+    chosen_source = str(block.get("chosen_source") or "").strip()
+    return chosen_source in {"ocr", "llm_inferred"}
+
+
+def _should_auto_apply_grounded_encoding_block(block: dict[str, object]) -> bool:
+    readable_text = str(block.get("readable_text_hint") or "").strip()
+    if not readable_text or "\n" in readable_text:
+        return False
+    if str(block.get("confidence") or "").strip() != "high":
+        return False
+    if not bool(block.get("should_block_accessibility", False)):
+        return False
+    if str(block.get("issue_type") or "").strip() != "encoding_problem":
+        return False
+    role = str(block.get("role") or "").strip()
+    if role not in PRETAG_GROUNDED_TEXT_ALLOWED_ROLES:
+        return False
+    if len(readable_text) > PRETAG_GROUNDED_TEXT_ENCODING_MAX_CHARS:
+        return False
+    original_text = str(
+        block.get("original_text_candidate")
+        or block.get("native_text_candidate")
+        or block.get("extracted_text")
+        or ""
+    ).strip()
+    if not original_text or "\n" in original_text:
+        return False
+    similarity = text_similarity_score(original_text, readable_text)
+    if similarity < PRETAG_GROUNDED_TEXT_ENCODING_MIN_SIMILARITY:
+        return False
+    signals = block.get("signals")
+    has_compact_signal = isinstance(signals, list) and any(
+        str(signal).strip() == "very short token pattern"
+        for signal in signals
+    )
+    if not has_compact_signal and len(readable_text.split()) > 10:
+        return False
+    chosen_source = str(block.get("chosen_source") or "").strip()
+    return chosen_source in {"native", "ocr", "llm_inferred"}
+
+
+def _normalized_dense_grounded_text(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", repair_text_candidate(value).lower())
+
+
+def _strip_code_line_numbers(value: object) -> str:
+    lines = []
+    for raw_line in str(value or "").splitlines():
+        line = re.sub(r"^\s*\d+[\]\|:\.]?\s*", "", raw_line).rstrip()
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _looks_like_code_resolution(value: object) -> bool:
+    stripped = _strip_code_line_numbers(value)
+    if not stripped or len(stripped) > PRETAG_GROUNDED_CODE_MAX_CHARS:
+        return False
+    lines = [line for line in stripped.splitlines() if line.strip()]
+    if len(lines) < 2 or len(lines) > PRETAG_GROUNDED_CODE_MAX_LINES:
+        return False
+    marker_lines = 0
+    for line in lines:
+        if re.search(r"(?:\bdef\b|\bfor\b|\bif\b|\breturn\b|\bclass\b|\bwith\b|\bimport\b|#|[=\[\]\(\)\{\}:])", line):
+            marker_lines += 1
+    return marker_lines >= min(2, len(lines))
+
+
+def _code_resolution_support_score(block: dict[str, object], readable_text: str) -> float:
+    stripped_readable = _strip_code_line_numbers(readable_text)
+    if not stripped_readable:
+        return 0.0
+    native_candidate = _strip_code_line_numbers(
+        block.get("native_text_candidate")
+        or block.get("original_text_candidate")
+        or block.get("extracted_text")
+        or ""
+    )
+    ocr_candidate = _strip_code_line_numbers(block.get("ocr_text_candidate") or "")
+    return max(
+        text_similarity_score(stripped_readable, native_candidate),
+        text_similarity_score(stripped_readable, ocr_candidate),
+    )
+
+
+def _should_auto_apply_grounded_code_block(block: dict[str, object]) -> bool:
+    readable_text = str(block.get("readable_text_hint") or "").strip()
+    if not readable_text:
+        return False
+    if str(block.get("role") or "").strip() != "code":
+        return False
+    if str(block.get("confidence") or "").strip() != "high":
+        return False
+    if not bool(block.get("should_block_accessibility", False)):
+        return False
+    if str(block.get("issue_type") or "").strip() != "encoding_problem":
+        return False
+    chosen_source = str(block.get("chosen_source") or "").strip()
+    if chosen_source not in {"ocr", "llm_inferred"}:
+        return False
+    if not _looks_like_code_resolution(readable_text):
+        return False
+    return _code_resolution_support_score(block, readable_text) >= PRETAG_GROUNDED_CODE_MIN_SUPPORT
+
+
+def _neighbor_matches_grounded_hint(block: dict[str, object], readable_text: str) -> bool:
+    readable_dense = _normalized_dense_grounded_text(readable_text)
+    if not readable_dense:
+        return False
+    neighbors = (
+        (
+            str(block.get("previous_text") or "").strip(),
+            str(block.get("previous_role") or "").strip(),
+        ),
+        (
+            str(block.get("next_text") or "").strip(),
+            str(block.get("next_role") or "").strip(),
+        ),
+    )
+    for neighbor_text, neighbor_role in neighbors:
+        if neighbor_role not in PRETAG_GROUNDED_TEXT_ALLOWED_DUPLICATE_ROLES:
+            continue
+        if not neighbor_text:
+            continue
+        if text_similarity_score(neighbor_text, readable_text) >= 0.97:
+            return True
+        if _normalized_dense_grounded_text(neighbor_text) == readable_dense:
+            return True
+    return False
+
+
+def _should_auto_artifact_grounded_text_block(block: dict[str, object]) -> bool:
+    readable_text = str(block.get("readable_text_hint") or "").strip()
+    if not readable_text:
+        return False
+    if str(block.get("confidence") or "").strip() != "high":
+        return False
+    if not bool(block.get("should_block_accessibility", False)):
+        return False
+    if str(block.get("issue_type") or "").strip() != "encoding_problem":
+        return False
+    role = str(block.get("role") or "").strip()
+    if role not in PRETAG_GROUNDED_TEXT_ALLOWED_ARTIFACT_ROLES:
+        return False
+    if "\n" in readable_text or len(readable_text) > PRETAG_GROUNDED_TEXT_ARTIFACT_MAX_CHARS:
+        return False
+    if len(readable_text.split()) > 14:
+        return False
+    chosen_source = str(block.get("chosen_source") or "").strip()
+    if chosen_source not in {"ocr", "llm_inferred"}:
+        return False
+    original_text = str(
+        block.get("original_text_candidate")
+        or block.get("native_text_candidate")
+        or block.get("extracted_text")
+        or ""
+    ).strip()
+    if not original_text:
+        return False
+    if text_similarity_score(original_text, readable_text) >= 0.6:
+        return False
+    return _neighbor_matches_grounded_hint(block, readable_text)
+
+
+def _table_page_structure_fragments(
+    structure_json: dict[str, object],
+    *,
+    page_numbers: list[int],
+    max_fragments: int = 10,
+) -> list[dict[str, object]]:
+    document = build_document_model(structure_json=structure_json)
+    requested_pages = {page for page in page_numbers if isinstance(page, int) and page > 0}
+    fragments: list[dict[str, object]] = []
+    for fragment in collect_structure_fragments(document, max_fragments=max_fragments * 2):
+        page = fragment.get("page")
+        if isinstance(page, int) and page in requested_pages:
+            fragments.append(fragment)
+        if len(fragments) >= max_fragments:
+            break
+    return fragments
+
+
+def _table_targets_with_cells(
+    structure_json: dict[str, object],
+    requested_ids: set[str],
+) -> dict[str, dict[str, object]]:
+    document = build_document_model(structure_json=structure_json)
+    targets: dict[str, dict[str, object]] = {}
+    for page in document.pages:
+        for table in page.tables:
+            review_id = str(table.table_review_id or "").strip()
+            if not review_id or (requested_ids and review_id not in requested_ids):
+                continue
+            targets[review_id] = {
+                "table_review_id": review_id,
+                "page": page.page_number,
+                "bbox": table.bbox.to_dict() if table.bbox else None,
+                "num_rows": table.num_rows,
+                "num_cols": table.num_cols,
+                "header_rows": list(table.header_rows),
+                "row_header_columns": list(table.row_header_columns),
+                "cells": [cell.to_dict() for cell in table.cells],
+                "text_excerpt": table.text_excerpt[:240],
+                "provenance": table.provenance,
+                "confidence": table.confidence,
+            }
+    return targets
+
+
+def _should_auto_apply_table_intelligence(item: dict[str, object]) -> bool:
+    if str(item.get("confidence") or "").strip() != "high":
+        return False
+    action = str(item.get("suggested_action") or "").strip()
+    if action not in PRETAG_TABLE_ALLOWED_ACTIONS:
+        return False
+    return True
+
+
+def _apply_table_intelligence_to_element(
+    element: dict[str, object],
+    *,
+    action: str,
+    header_rows: list[int],
+    row_header_columns: list[int],
+) -> bool:
+    cells = element.get("cells")
+    if not isinstance(cells, list) or not cells:
+        return False
+
+    header_row_set = {int(value) for value in header_rows if isinstance(value, int) and value >= 0}
+    row_header_col_set = {int(value) for value in row_header_columns if isinstance(value, int) and value >= 0}
+
+    updated = False
+    if action == "set_table_headers":
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+            row = cell.get("row")
+            col = cell.get("col")
+            column_header = isinstance(row, int) and row in header_row_set
+            row_header = isinstance(col, int) and col in row_header_col_set
+            if cell.get("column_header") != column_header:
+                cell["column_header"] = column_header
+                updated = True
+            if cell.get("row_header") != row_header:
+                cell["row_header"] = row_header
+                updated = True
+            is_header = column_header or row_header
+            if cell.get("is_header") != is_header:
+                cell["is_header"] = is_header
+                updated = True
+    return updated or action == "confirm_current_headers"
+
+
+def _should_retry_table_intelligence_aggressively(
+    target: dict[str, object],
+    item: dict[str, object],
+) -> bool:
+    if not isinstance(target, dict) or not isinstance(item, dict):
+        return False
+    if str(item.get("suggested_action") or "").strip() in PRETAG_TABLE_ALLOWED_ACTIONS:
+        return False
+    reasons = {
+        str(reason).strip()
+        for reason in target.get("risk_reasons", [])
+        if str(reason).strip()
+    } if isinstance(target.get("risk_reasons"), list) else set()
+    if not reasons:
+        return False
+    allowed = {
+        "merged cells or spans present",
+        "large table matrix",
+        "very dense table",
+        "multi-level header pattern",
+    }
+    return reasons.issubset(allowed)
+
+
+def _should_retry_table_intelligence_confirm_existing(
+    target: dict[str, object],
+    item: dict[str, object],
+) -> bool:
+    if not isinstance(target, dict) or not isinstance(item, dict):
+        return False
+    if str(item.get("suggested_action") or "").strip() in PRETAG_TABLE_ALLOWED_ACTIONS:
+        return False
+    header_rows = target.get("header_rows")
+    row_header_columns = target.get("row_header_columns")
+    has_existing_headers = bool(
+        (isinstance(header_rows, list) and header_rows)
+        or (isinstance(row_header_columns, list) and row_header_columns)
+    )
+    if not has_existing_headers:
+        return False
+    reasons = {
+        str(reason).strip()
+        for reason in target.get("risk_reasons", [])
+        if str(reason).strip()
+    } if isinstance(target.get("risk_reasons"), list) else set()
+    if not reasons:
+        return False
+    allowed = {
+        "merged cells or spans present",
+        "large table matrix",
+        "very dense table",
+        "multi-level header pattern",
+    }
+    return reasons.issubset(allowed)
+
+
+async def _apply_pretag_grounded_text_resolutions(
+    *,
+    job: Job,
+    settings: Settings,
+    working_pdf: Path,
+    structure_json: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    audit: dict[str, object] = {
+        "enabled": bool(settings.auto_apply_grounded_text),
+        "attempted": False,
+        "applied": False,
+        "reason": "",
+        "candidate_count": 0,
+        "applied_count": 0,
+        "applied_actual_text_count": 0,
+        "applied_code_text_count": 0,
+        "applied_artifact_count": 0,
+        "pages": [],
+        "review_ids": [],
+    }
+    if not settings.auto_apply_grounded_text:
+        audit["reason"] = "disabled"
+        return structure_json, audit
+    if not isinstance(structure_json, dict):
+        audit["reason"] = "missing_structure"
+        return structure_json, audit
+
+    grounded = collect_grounded_text_candidates(
+        working_pdf,
+        structure_json,
+        target_limit=PRETAG_GROUNDED_TEXT_TARGET_LIMIT,
+    )
+    suspicious_blocks = grounded.get("targets")
+    if not isinstance(suspicious_blocks, list) or not suspicious_blocks:
+        audit["reason"] = "no_candidates"
+        return structure_json, audit
+    pages_to_check = sorted(
+        {
+            int(block["page"])
+            for block in suspicious_blocks
+            if isinstance(block, dict) and isinstance(block.get("page"), int)
+        }
+    )
+    if not pages_to_check:
+        audit["reason"] = "no_candidate_pages"
+        return structure_json, audit
+
+    audit["attempted"] = True
+    audit["candidate_count"] = len(suspicious_blocks)
+
+    llm_client = LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+        timeout=settings.llm_timeout,
+        max_retries=settings.llm_max_retries,
+        retry_backoff_base=settings.llm_retry_backoff_base,
+    )
+    try:
+        adjudication = await generate_suspicious_text_intelligence(
+            job=job,
+            page_numbers=pages_to_check,
+            suspicious_blocks=suspicious_blocks,
+            llm_client=llm_client,
+        )
+    except Exception as exc:
+        audit["reason"] = f"llm_failed: {exc}"
+        return structure_json, audit
+    finally:
+        await llm_client.close()
+
+    approved_by_key: dict[tuple[int, str], tuple[str, dict[str, object]]] = {}
+    for block in adjudication.get("blocks", []) if isinstance(adjudication, dict) else []:
+        if not isinstance(block, dict):
+            continue
+        page = block.get("page")
+        review_id = str(block.get("review_id") or "").strip()
+        if not isinstance(page, int) or page < 1 or not review_id:
+            continue
+        if _should_auto_apply_grounded_text_block(block):
+            approved_by_key[(page, review_id)] = ("actual_text", block)
+            continue
+        if _should_auto_apply_grounded_encoding_block(block):
+            approved_by_key[(page, review_id)] = ("actual_text", block)
+            continue
+        if _should_auto_apply_grounded_code_block(block):
+            approved_by_key[(page, review_id)] = ("code_actual_text", block)
+            continue
+        if _should_auto_artifact_grounded_text_block(block):
+            approved_by_key[(page, review_id)] = ("artifact", block)
+
+    if not approved_by_key:
+        audit["reason"] = "no_safe_resolutions"
+        return structure_json, audit
+
+    updated_structure = copy.deepcopy(structure_json)
+    elements = updated_structure.get("elements")
+    if not isinstance(elements, list):
+        audit["reason"] = "missing_elements"
+        return structure_json, audit
+
+    applied_pages: set[int] = set()
+    applied_review_ids: list[str] = []
+    applied_count = 0
+    applied_actual_text_count = 0
+    applied_code_text_count = 0
+    applied_artifact_count = 0
+    for index, element in enumerate(elements):
+        if not isinstance(element, dict):
+            continue
+        page_number = element.get("page")
+        review_id = str(element.get("review_id") or f"review-{index}").strip()
+        if not isinstance(page_number, int) or page_number < 0 or not review_id:
+            continue
+        approved_entry = approved_by_key.get((page_number + 1, review_id))
+        if not approved_entry:
+            continue
+        resolution_type, approved = approved_entry
+        resolved_text = str(approved.get("readable_text_hint") or "").strip()
+        if resolution_type in {"actual_text", "code_actual_text"} and not resolved_text:
+            continue
+        element["review_id"] = review_id
+        element["semantic_issue_type"] = str(approved.get("issue_type") or "").strip() or "spacing_only"
+        element["semantic_blocking"] = False
+        element["resolution_reason"] = str(approved.get("reason") or "").strip()
+        chosen_source = str(approved.get("chosen_source") or "llm").strip() or "llm"
+        if resolution_type == "artifact":
+            element["type"] = "artifact"
+            element.pop("actual_text", None)
+            element.pop("resolved_text", None)
+            element.pop("semantic_text_hint", None)
+            element["resolution_source"] = f"pretag_artifact_{chosen_source}"
+            applied_artifact_count += 1
+        else:
+            element["actual_text"] = resolved_text
+            element["resolved_text"] = resolved_text
+            element["semantic_text_hint"] = resolved_text
+            if resolution_type == "code_actual_text":
+                element["resolution_source"] = f"pretag_code_{chosen_source}"
+                applied_code_text_count += 1
+            else:
+                element["resolution_source"] = f"pretag_{chosen_source}"
+                applied_actual_text_count += 1
+        applied_pages.add(int(approved["page"]))
+        applied_review_ids.append(review_id)
+        applied_count += 1
+
+    if applied_count <= 0:
+        audit["reason"] = "no_matching_structure_elements"
+        return structure_json, audit
+
+    audit["applied"] = True
+    audit["applied_count"] = applied_count
+    audit["applied_actual_text_count"] = applied_actual_text_count
+    audit["applied_code_text_count"] = applied_code_text_count
+    audit["applied_artifact_count"] = applied_artifact_count
+    audit["pages"] = sorted(applied_pages)
+    audit["review_ids"] = applied_review_ids
+    audit["reason"] = "applied"
+    return updated_structure, audit
+
+
+async def _apply_pretag_table_intelligence(
+    *,
+    job: Job,
+    settings: Settings,
+    structure_json: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    audit: dict[str, object] = {
+        "enabled": bool(settings.auto_apply_table_intelligence),
+        "attempted": False,
+        "applied": False,
+        "reason": "",
+        "candidate_count": 0,
+        "applied_count": 0,
+        "pages": [],
+        "review_ids": [],
+        "confirmed_count": 0,
+        "set_headers_count": 0,
+        "aggressive_retry_count": 0,
+        "confirm_existing_retry_count": 0,
+    }
+    if not settings.auto_apply_table_intelligence:
+        audit["reason"] = "disabled"
+        return structure_json, audit
+    if not isinstance(structure_json, dict):
+        audit["reason"] = "missing_structure"
+        return structure_json, audit
+
+    table_risk = _table_semantics_risk(structure_json)
+    targets = table_risk.get("targets")
+    if not isinstance(targets, list) or not targets:
+        audit["reason"] = "no_candidates"
+        return structure_json, audit
+    detailed_targets = _table_targets_with_cells(
+        structure_json,
+        {
+            str(target.get("table_review_id") or "").strip()
+            for target in targets
+            if isinstance(target, dict)
+        },
+    )
+    audit["attempted"] = True
+    audit["candidate_count"] = len(targets)
+
+    llm_client = LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+        timeout=settings.llm_timeout,
+        max_retries=settings.llm_max_retries,
+        retry_backoff_base=settings.llm_retry_backoff_base,
+    )
+    try:
+        intelligence_items: list[dict[str, object]] = []
+        targets_by_review_id = {
+            str(target.get("table_review_id") or "").strip(): target
+            for target in targets
+            if isinstance(target, dict) and str(target.get("table_review_id") or "").strip()
+        }
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            review_id = str(target.get("table_review_id") or "").strip()
+            page = target.get("page")
+            page_fragments = _table_page_structure_fragments(
+                structure_json,
+                page_numbers=[int(page)] if isinstance(page, int) else [],
+            )
+            detailed_target = dict(detailed_targets.get(review_id) or target)
+            if isinstance(target.get("risk_reasons"), list):
+                detailed_target["risk_reasons"] = list(target.get("risk_reasons") or [])
+            if isinstance(target.get("risk_score"), (int, float)):
+                detailed_target["risk_score"] = float(target.get("risk_score"))
+            intelligence = await generate_table_intelligence(
+                job=job,
+                target=detailed_target,
+                page_structure_fragments=page_fragments,
+                llm_client=llm_client,
+            )
+            intelligence_items.append(intelligence)
+        retried = 0
+        for idx, item in enumerate(list(intelligence_items)):
+            if not isinstance(item, dict):
+                continue
+            review_id = str(item.get("table_review_id") or "").strip()
+            target = targets_by_review_id.get(review_id)
+            if not _should_retry_table_intelligence_aggressively(target or {}, item):
+                continue
+            if not target:
+                continue
+            detailed_target = dict(detailed_targets.get(review_id) or target)
+            if isinstance(target.get("risk_reasons"), list):
+                detailed_target["risk_reasons"] = list(target.get("risk_reasons") or [])
+            if isinstance(target.get("risk_score"), (int, float)):
+                detailed_target["risk_score"] = float(target.get("risk_score"))
+            page = detailed_target.get("page")
+            page_fragments = _table_page_structure_fragments(
+                structure_json,
+                page_numbers=[int(page)] if isinstance(page, int) else [],
+            )
+            retried_item = await generate_table_intelligence(
+                job=job,
+                target=detailed_target,
+                page_structure_fragments=page_fragments,
+                llm_client=llm_client,
+                aggressive=True,
+            )
+            intelligence_items[idx] = retried_item
+            retried += 1
+        audit["aggressive_retry_count"] = retried
+        confirm_existing_retried = 0
+        for idx, item in enumerate(list(intelligence_items)):
+            if not isinstance(item, dict):
+                continue
+            review_id = str(item.get("table_review_id") or "").strip()
+            target = targets_by_review_id.get(review_id)
+            if not _should_retry_table_intelligence_confirm_existing(target or {}, item):
+                continue
+            if not target:
+                continue
+            detailed_target = dict(detailed_targets.get(review_id) or target)
+            if isinstance(target.get("risk_reasons"), list):
+                detailed_target["risk_reasons"] = list(target.get("risk_reasons") or [])
+            if isinstance(target.get("risk_score"), (int, float)):
+                detailed_target["risk_score"] = float(target.get("risk_score"))
+            page = detailed_target.get("page")
+            page_fragments = _table_page_structure_fragments(
+                structure_json,
+                page_numbers=[int(page)] if isinstance(page, int) else [],
+            )
+            retried_item = await generate_table_intelligence(
+                job=job,
+                target=detailed_target,
+                page_structure_fragments=page_fragments,
+                llm_client=llm_client,
+                aggressive=True,
+                confirm_existing=True,
+            )
+            intelligence_items[idx] = retried_item
+            confirm_existing_retried += 1
+        audit["confirm_existing_retry_count"] = confirm_existing_retried
+    except Exception as exc:
+        audit["reason"] = f"llm_failed: {exc}"
+        return structure_json, audit
+    finally:
+        await llm_client.close()
+
+    approved_by_id: dict[str, dict[str, object]] = {}
+    for item in intelligence_items:
+        if not isinstance(item, dict) or not _should_auto_apply_table_intelligence(item):
+            continue
+        table_review_id = str(item.get("table_review_id") or "").strip()
+        if table_review_id:
+            approved_by_id[table_review_id] = item
+    if not approved_by_id:
+        audit["reason"] = "no_safe_resolutions"
+        return structure_json, audit
+
+    updated_structure = copy.deepcopy(structure_json)
+    elements = updated_structure.get("elements")
+    if not isinstance(elements, list):
+        audit["reason"] = "missing_elements"
+        return structure_json, audit
+
+    applied_pages: set[int] = set()
+    applied_review_ids: list[str] = []
+    applied_count = 0
+    confirmed_count = 0
+    set_headers_count = 0
+    for index, element in enumerate(elements):
+        if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        review_id = str(element.get("review_id") or f"review-{index}").strip()
+        approved = approved_by_id.get(review_id)
+        if not approved:
+            continue
+        action = str(approved.get("suggested_action") or "").strip()
+        if not _apply_table_intelligence_to_element(
+            element,
+            action=action,
+            header_rows=list(approved.get("header_rows") or []),
+            row_header_columns=list(approved.get("row_header_columns") or []),
+        ):
+            continue
+        element["review_id"] = review_id
+        element["table_llm_confirmed"] = True
+        element["table_llm_confidence"] = str(approved.get("confidence") or "").strip() or "high"
+        element["table_llm_action"] = action
+        element["table_llm_reason"] = str(approved.get("reason") or "").strip()
+        element["table_llm_summary"] = str(approved.get("summary") or "").strip()
+        page_number = element.get("page")
+        if isinstance(page_number, int) and page_number >= 0:
+            applied_pages.add(page_number + 1)
+        applied_review_ids.append(review_id)
+        applied_count += 1
+        if action == "confirm_current_headers":
+            confirmed_count += 1
+        elif action == "set_table_headers":
+            set_headers_count += 1
+
+    if applied_count <= 0:
+        audit["reason"] = "no_matching_structure_elements"
+        return structure_json, audit
+
+    audit["applied"] = True
+    audit["applied_count"] = applied_count
+    audit["confirmed_count"] = confirmed_count
+    audit["set_headers_count"] = set_headers_count
+    audit["pages"] = sorted(applied_pages)
+    audit["review_ids"] = applied_review_ids
+    audit["reason"] = "applied"
+    return updated_structure, audit
+
+
+async def _adjudicate_grounded_text_candidates(
+    *,
+    job: Job,
+    settings: Settings,
+    review_tasks: list[dict[str, object]],
+    fidelity_report: dict[str, object],
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    candidate_task = next(
+        (
+            task
+            for task in review_tasks
+            if str(task.get("task_type") or "") == "content_fidelity"
+            and str(task.get("source") or "fidelity") == "fidelity"
+            and isinstance(task.get("metadata"), dict)
+            and bool(task["metadata"].get("grounded_text_candidate"))
+        ),
+        None,
+    )
+    if not isinstance(candidate_task, dict):
+        return review_tasks, fidelity_report
+
+    metadata = candidate_task.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    pages_to_check = metadata.get("pages_to_check")
+    suspicious_blocks = metadata.get("flagged_blocks")
+    if not isinstance(pages_to_check, list) or not isinstance(suspicious_blocks, list) or not suspicious_blocks:
+        return review_tasks, fidelity_report
+
+    llm_client = LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+        timeout=settings.llm_timeout,
+        max_retries=settings.llm_max_retries,
+        retry_backoff_base=settings.llm_retry_backoff_base,
+    )
+    try:
+        adjudication = await generate_suspicious_text_intelligence(
+            job=job,
+            page_numbers=[int(page) for page in pages_to_check if isinstance(page, int) and page >= 1],
+            suspicious_blocks=suspicious_blocks,
+            llm_client=llm_client,
+        )
+    except Exception as exc:
+        candidate_task["metadata"] = {
+            **metadata,
+            "grounded_text_candidate": True,
+            "grounded_text_llm_adjudicated": False,
+            "grounded_text_llm_error": str(exc),
+        }
+        fidelity_report = _update_grounded_text_check(
+            fidelity_report,
+            status="warning",
+            message="Grounded semantic adjudication failed; suspicious text remains advisory only.",
+            candidate_count=len(suspicious_blocks),
+            confirmed_count=0,
+        )
+        return review_tasks, _recalculate_fidelity_summary(fidelity_report, review_tasks)
+    finally:
+        await llm_client.close()
+
+    return _apply_grounded_text_adjudication(review_tasks, fidelity_report, adjudication)
 
 
 def _summarize_llm_font_map_suggestion(suggestion: dict[str, object]) -> dict[str, object]:
@@ -4421,6 +5379,19 @@ async def run_tagging_and_validation(
             for a in reviewed_alt_entries
         ]
 
+        structure_json, pretag_grounded_text = await _apply_pretag_grounded_text_resolutions(
+            job=job,
+            settings=settings,
+            working_pdf=working_pdf,
+            structure_json=structure_json,
+        )
+        structure_json, pretag_table_intelligence = await _apply_pretag_table_intelligence(
+            job=job,
+            settings=settings,
+            structure_json=structure_json,
+        )
+        job.structure_json = json.dumps(structure_json)
+
         tagging_result = await tag_pdf(
             input_path=working_pdf,
             output_path=output_path,
@@ -4442,6 +5413,13 @@ async def run_tagging_and_validation(
             "links_tagged": tagging_result.links_tagged,
             "bookmarks_added": tagging_result.bookmarks_added,
             "title_set": tagging_result.title_set,
+            "grounded_text_auto_applied": bool(pretag_grounded_text.get("applied")),
+            "grounded_text_auto_applied_count": int(pretag_grounded_text.get("applied_count", 0) or 0),
+            "grounded_text_code_auto_applied_count": int(pretag_grounded_text.get("applied_code_text_count", 0) or 0),
+            "table_intelligence_auto_applied": bool(pretag_table_intelligence.get("applied")),
+            "table_intelligence_auto_applied_count": int(pretag_table_intelligence.get("applied_count", 0) or 0),
+            "table_intelligence_confirmed_count": int(pretag_table_intelligence.get("confirmed_count", 0) or 0),
+            "table_intelligence_set_headers_count": int(pretag_table_intelligence.get("set_headers_count", 0) or 0),
         })
         job_manager.emit_progress(job_id, step="tagging", status="complete")
 
@@ -4687,6 +5665,12 @@ async def run_tagging_and_validation(
             raw_validation_report=selected_validation.raw_report,
             tagging_metrics=validation_payload["tagging"],
             classification=job.classification,
+        )
+        review_tasks, fidelity_report = await _adjudicate_grounded_text_candidates(
+            job=job,
+            settings=settings,
+            review_tasks=review_tasks,
+            fidelity_report=fidelity_report,
         )
 
         review_task_metadata_overrides: dict[tuple[str, str], dict[str, object]] = {}

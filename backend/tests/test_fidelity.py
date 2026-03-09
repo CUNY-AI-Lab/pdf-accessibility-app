@@ -10,6 +10,7 @@ from app.pipeline.fidelity import (
     _check_internal_link_destinations,
     _check_link_text_quality,
     _extract_font_review_targets,
+    _grounded_text_risk,
     _iter_name_tree_entries,
     _table_semantics_risk,
     _reading_order_metrics,
@@ -577,6 +578,196 @@ def test_fidelity_flags_large_text_drift(monkeypatch):
     assert any(task["task_type"] == "content_fidelity" and task["blocking"] for task in tasks)
 
 
+def test_grounded_text_risk_flags_spacing_issue(monkeypatch):
+    monkeypatch.setattr("app.services.text_grounding.extract_ocr_text_from_bbox", lambda output_pdf, page_number, bbox: "Data Book")
+
+    risk = _grounded_text_risk(
+        Path("out.pdf"),
+        {
+            "elements": [
+                {
+                    "review_id": "review-1",
+                    "type": "paragraph",
+                    "page": 0,
+                    "text": "D a t a  B o o k",
+                    "bbox": {"l": 72, "t": 700, "r": 240, "b": 660},
+                }
+            ]
+        },
+    )
+
+    assert risk["target_count"] == 1
+    assert risk["encoding_problem_count"] == 0
+    assert risk["targets"][0]["issue_type"] == "spacing_only"
+    assert risk["targets"][0]["ocr_text_candidate"] == "Data Book"
+
+
+def test_fidelity_warns_on_single_grounded_spacing_issue(monkeypatch):
+    monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
+    monkeypatch.setattr("app.services.text_grounding.extract_ocr_text_from_bbox", lambda output_pdf, page_number, bbox: "Data Book")
+
+    report, tasks = assess_fidelity(
+        input_pdf=Path("in.pdf"),
+        output_pdf=Path("out.pdf"),
+        structure_json={
+            "elements": [
+                {
+                    "review_id": "review-1",
+                    "type": "heading",
+                    "page": 0,
+                    "text": "D a t a  B o o k",
+                    "bbox": {"l": 72, "t": 700, "r": 240, "b": 660},
+                }
+            ]
+        },
+        alt_entries=[],
+        validation_report=_validation_report(compliant=True, violations=[]),
+        tagging_metrics={"tables_tagged": 0},
+        classification="digital",
+    )
+
+    grounded = next(check for check in report["checks"] if check["check"] == "grounded_text_fidelity")
+    assert grounded["status"] == "warning"
+    task = next(
+        task for task in tasks
+        if task["task_type"] == "content_fidelity"
+        and task["metadata"].get("grounded_target_count") == 1
+    )
+    assert task["blocking"] is False
+
+
+def test_grounded_text_risk_skips_leaky_ocr_candidate(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.text_grounding.extract_ocr_text_from_bbox",
+        lambda output_pdf, page_number, bbox: (
+            "Heading text paragraph continues with neighboring content that should not belong to this block"
+        ),
+    )
+
+    risk = _grounded_text_risk(
+        Path("out.pdf"),
+        {
+            "elements": [
+                {
+                    "review_id": "review-1",
+                    "type": "heading",
+                    "page": 0,
+                    "text": "H e a d i n g t e x t",
+                    "bbox": {"l": 72, "t": 700, "r": 240, "b": 660},
+                },
+                {
+                    "review_id": "review-2",
+                    "type": "paragraph",
+                    "page": 0,
+                    "text": "paragraph continues with neighboring content that should not belong to this block",
+                    "bbox": {"l": 72, "t": 620, "r": 420, "b": 580},
+                },
+            ]
+        },
+    )
+
+    assert risk["target_count"] == 0
+
+
+def test_grounded_text_risk_skips_ocr_that_contains_native_plus_extra_text(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.text_grounding.extract_ocr_text_from_bbox",
+        lambda output_pdf, page_number, bbox: "Internal Revenue Service data book 2024 additional surrounding text",
+    )
+
+    risk = _grounded_text_risk(
+        Path("out.pdf"),
+        {
+            "elements": [
+                {
+                    "review_id": "review-1",
+                    "type": "heading",
+                    "page": 0,
+                    "text": "I n t e r n a l R e v e n u e S e r v i c e",
+                    "bbox": {"l": 72, "t": 700, "r": 240, "b": 660},
+                }
+            ]
+        },
+    )
+
+    assert risk["target_count"] == 0
+
+
+def test_grounded_text_risk_skips_high_similarity_cleanup(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.text_grounding.extract_ocr_text_from_bbox",
+        lambda output_pdf, page_number, bbox: "Français résumé",
+    )
+
+    risk = _grounded_text_risk(
+        Path("out.pdf"),
+        {
+            "elements": [
+                {
+                    "review_id": "review-1",
+                    "type": "paragraph",
+                    "page": 0,
+                    "text": "FranÃ§ais résumé",
+                    "bbox": {"l": 72, "t": 700, "r": 240, "b": 660},
+                }
+            ]
+        },
+    )
+
+    assert risk["target_count"] == 0
+
+
+def test_fidelity_blocks_multiple_grounded_text_disagreements(monkeypatch):
+    monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
+
+    def _fake_ocr(output_pdf, page_number, bbox):
+        if int(bbox["t"]) == 700:
+            return "INTERNAL REVENUE SERVICE"
+        return "October 1, 2023 to September 30, 2024"
+
+    monkeypatch.setattr("app.services.text_grounding.extract_ocr_text_from_bbox", _fake_ocr)
+
+    structure = {
+        "elements": [
+            {
+                "review_id": "review-1",
+                "type": "heading",
+                "page": 0,
+                "text": "I N T E R N A L R E V E N U E S E R V I C E",
+                "bbox": {"l": 72, "t": 700, "r": 420, "b": 660},
+            },
+            {
+                "review_id": "review-2",
+                "type": "paragraph",
+                "page": 0,
+                "text": "O c t o b e r  1,  2023  to  S e p t e m b e r  30,  2024",
+                "bbox": {"l": 72, "t": 620, "r": 420, "b": 580},
+            },
+        ]
+    }
+
+    report, tasks = assess_fidelity(
+        input_pdf=Path("in.pdf"),
+        output_pdf=Path("out.pdf"),
+        structure_json=structure,
+        alt_entries=[],
+        validation_report=_validation_report(compliant=True, violations=[]),
+        tagging_metrics={"tables_tagged": 0},
+        classification="digital",
+    )
+
+    grounded = next(check for check in report["checks"] if check["check"] == "grounded_text_fidelity")
+    assert grounded["status"] == "warning"
+    task = next(
+        task for task in tasks
+        if task["task_type"] == "content_fidelity"
+        and task["metadata"].get("grounded_target_count") == 2
+    )
+    assert task["blocking"] is False
+    assert task["metadata"]["flagged_blocks"][0]["ocr_text_candidate"] == "INTERNAL REVENUE SERVICE"
+    assert task["metadata"]["grounded_text_candidate"] is True
+
+
 def test_reading_order_metrics_tolerate_single_outlier():
     fragments = [
         "alpha section heading long enough",
@@ -714,6 +905,68 @@ def test_table_semantics_risk_ignores_simple_regular_table():
     assert risk["complex_tables"] == 0
     assert risk["high_risk_tables"] == 0
     assert risk["targets"] == []
+
+
+def test_table_semantics_risk_downgrades_llm_confirmed_header_patterns():
+    risk = _table_semantics_risk(
+        {
+            "elements": [
+                {
+                    "type": "table",
+                    "page": 0,
+                    "review_id": "review-1",
+                    "num_rows": 10,
+                    "num_cols": 8,
+                    "table_llm_confirmed": True,
+                    "table_llm_confidence": "high",
+                    "table_llm_action": "set_table_headers",
+                    "cells": [
+                        {"row": 0, "col": 0, "text": "Hdr", "column_header": True, "row_header": True},
+                        {"row": 0, "col": 1, "text": "Col1", "column_header": True},
+                        {"row": 1, "col": 0, "text": "Row1", "row_header": True},
+                        {"row": 1, "col": 1, "text": "Val"},
+                        {"row": 0, "col": 2, "text": "Col2", "column_header": True, "col_span": 2},
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert risk["complex_tables"] == 0
+    assert risk["high_risk_tables"] == 0
+    assert risk["targets"] == []
+    assert risk["risk_score"] == 0.0
+    assert risk["table_count"] == 1
+
+
+def test_table_semantics_risk_keeps_sparse_text_risk_even_when_llm_confirmed():
+    risk = _table_semantics_risk(
+        {
+            "elements": [
+                {
+                    "type": "table",
+                    "page": 0,
+                    "review_id": "review-2",
+                    "num_rows": 10,
+                    "num_cols": 8,
+                    "table_llm_confirmed": True,
+                    "table_llm_confidence": "high",
+                    "table_llm_action": "confirm_current_headers",
+                    "cells": [
+                        {"row": 0, "col": 0, "text": "Hdr", "column_header": True, "row_header": True},
+                        {"row": 0, "col": 1, "text": "", "column_header": True},
+                        {"row": 1, "col": 0, "text": "", "row_header": True},
+                        {"row": 1, "col": 1, "text": ""},
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert risk["complex_tables"] == 1
+    assert risk["high_risk_tables"] == 0
+    assert risk["targets"][0]["risk_reasons"] == ["sparse cell text"]
+    assert risk["targets"][0]["llm_confirmed"] is True
 
 
 def test_fidelity_flags_high_risk_complex_tables(monkeypatch):

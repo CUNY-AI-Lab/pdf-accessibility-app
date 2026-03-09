@@ -15,6 +15,10 @@ import pikepdf
 from PIL import Image
 from pdfminer.high_level import extract_text
 
+from app.services.document_intelligence import build_document_model
+from app.services.page_intelligence import (
+    collect_grounded_text_candidates,
+)
 from app.services.pdf_operator_context import extract_operator_text_context
 from app.services.pdf_context import parse_verapdf_context_path
 from app.services.pdf_preview import render_page_png_bytes
@@ -49,7 +53,7 @@ TABLE_KEYWORDS = ("table", "thead", "tbody", "tfoot", "tr", "th", "td")
 FONT_SUBSET_RE = re.compile(r"^[A-Z]{6}\+")
 USED_GLYPH_FONT_RE = re.compile(r"usedGlyphs\[\d+\]\(([^ )]+)")
 PDFMINER_FONTBBOX_WARNING = "Could not get FontBBox from font descriptor because"
-TABLE_REVIEW_TARGET_LIMIT = 6
+GROUNDED_TEXT_TARGET_LIMIT = 6
 
 
 class _PdfMinerFontBBoxFilter(logging.Filter):
@@ -271,22 +275,28 @@ def _table_semantics_risk(structure_json: dict[str, Any]) -> dict[str, Any]:
         )
         multi_level_headers = len(header_rows) > 1 or len(row_header_columns) > 1
         sparse_text = nonempty_cells < max(4, len(cells) * 0.35)
+        llm_confirmed = bool(element.get("table_llm_confirmed", False)) and (
+            str(element.get("table_llm_confidence") or "").strip() == "high"
+        ) and (
+            str(element.get("table_llm_action") or "").strip()
+            in {"confirm_current_headers", "set_table_headers"}
+        )
 
         risk_score = 0.0
         reasons: list[str] = []
-        if spans_present:
+        if spans_present and not llm_confirmed:
             risk_score += 1.0
             reasons.append("merged cells or spans present")
-        if dense_matrix:
+        if dense_matrix and not llm_confirmed:
             risk_score += 1.0
             reasons.append("large table matrix")
-        if very_dense_matrix:
+        if very_dense_matrix and not llm_confirmed:
             risk_score += 1.0
             reasons.append("very dense table")
-        if weak_header_signal:
+        if weak_header_signal and not llm_confirmed:
             risk_score += 1.5
             reasons.append("weak header signal")
-        if multi_level_headers:
+        if multi_level_headers and not llm_confirmed:
             risk_score += 1.0
             reasons.append("multi-level header pattern")
         if sparse_text:
@@ -301,19 +311,19 @@ def _table_semantics_risk(structure_json: dict[str, Any]) -> dict[str, Any]:
             high_risk_tables += 1
 
         total_risk_score += risk_score
-        if len(targets) < TABLE_REVIEW_TARGET_LIMIT:
-            targets.append({
-                "table_review_id": str(element.get("review_id") or f"review-{index}"),
-                "page": page,
-                "bbox": element.get("bbox") if isinstance(element.get("bbox"), dict) else None,
-                "num_rows": num_rows,
-                "num_cols": num_cols,
-                "risk_score": round(risk_score, 2),
-                "risk_reasons": reasons,
-                "header_rows": sorted(header_rows),
-                "row_header_columns": sorted(row_header_columns),
-                "text_excerpt": _normalize_text(element.get("text"))[:240],
-            })
+        targets.append({
+            "table_review_id": str(element.get("review_id") or f"review-{index}"),
+            "page": page,
+            "bbox": element.get("bbox") if isinstance(element.get("bbox"), dict) else None,
+            "num_rows": num_rows,
+            "num_cols": num_cols,
+            "risk_score": round(risk_score, 2),
+            "risk_reasons": reasons,
+            "header_rows": sorted(header_rows),
+            "row_header_columns": sorted(row_header_columns),
+            "llm_confirmed": llm_confirmed,
+            "text_excerpt": _normalize_text(element.get("text"))[:240],
+        })
 
     targets.sort(
         key=lambda item: (
@@ -396,6 +406,14 @@ def _reading_order_metrics(fragments: list[str], output_text: str) -> dict[str, 
         "order_rate": round(order_rate, 4),
         "match_mode": match_mode,
     }
+
+
+def _grounded_text_risk(output_pdf: Path, structure_json: dict[str, Any]) -> dict[str, Any]:
+    return collect_grounded_text_candidates(
+        output_pdf,
+        structure_json,
+        target_limit=GROUNDED_TEXT_TARGET_LIMIT,
+    )
 
 
 def _is_poor_link_text(text: str) -> bool:
@@ -1006,6 +1024,51 @@ def assess_fidelity(
                 "source_chars": len(source_text),
                 "output_chars": len(output_text),
                 "classification": classification or "unknown",
+            },
+        })
+
+    grounded_text = _grounded_text_risk(output_pdf, structure_json)
+    if grounded_text["target_count"] > 0:
+        add_task(
+            "review:content_fidelity:grounded_text",
+            task_type="content_fidelity",
+            title="Review suspicious extracted text",
+            detail=(
+                "Suspicious text blocks were found, and OCR on the same crop disagrees with the "
+                "extracted accessible text. A grounded semantic review is needed before treating this "
+                "as a release blocker."
+            ),
+            severity="medium",
+            blocking=False,
+            metadata={
+                "grounded_text_candidate": True,
+                "pages_to_check": sorted({
+                    int(target["page"])
+                    for target in grounded_text["targets"]
+                    if isinstance(target.get("page"), int)
+                }),
+                "flagged_blocks": grounded_text["targets"],
+                "encoding_problem_count": grounded_text["encoding_problem_count"],
+                "grounded_target_count": grounded_text["target_count"],
+            },
+        )
+        checks.append({
+            "check": "grounded_text_fidelity",
+            "status": "warning",
+            "message": "Found suspicious extracted blocks with contradictory OCR evidence; awaiting semantic adjudication.",
+            "metrics": {
+                "candidate_blocks": grounded_text["target_count"],
+                "encoding_problem_candidates": grounded_text["encoding_problem_count"],
+            },
+        })
+    else:
+        checks.append({
+            "check": "grounded_text_fidelity",
+            "status": "pass",
+            "message": "No suspicious text blocks with contradictory OCR evidence were detected.",
+            "metrics": {
+                "candidate_blocks": 0,
+                "encoding_problem_candidates": 0,
             },
         })
 

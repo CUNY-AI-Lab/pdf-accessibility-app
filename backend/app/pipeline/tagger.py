@@ -1441,6 +1441,8 @@ def _emit_tagged_region(
 ):
     """Emit a tagged content region based on the matched element type."""
     elem_type = elem.get("type", "")
+    actual_text = _element_actual_text(elem)
+    accessible_text = _element_accessible_text(elem)
 
     # Types that wrap content as artifact (no struct elem needed)
     if elem_type == "artifact":
@@ -1463,7 +1465,7 @@ def _emit_tagged_region(
             page_index, page_ref, elem.get("list_group_ref"),
             parent_list_group_ref=elem.get("parent_list_group_ref"),
         )
-        new_instructions.append(_make_bdc("LBody", mcid))
+        new_instructions.append(_make_bdc("LBody", mcid, actual_text=actual_text))
         new_instructions.extend(region.instructions)
         new_instructions.append(_make_emc())
         return
@@ -1473,7 +1475,7 @@ def _emit_tagged_region(
 
     if elem_type == "heading":
         level = elem.get("level", 1)
-        mcid = builder.add_heading(level, page_index, page_ref, elem.get("text", ""), lang=elem_lang)
+        mcid = builder.add_heading(level, page_index, page_ref, accessible_text, lang=elem_lang)
         tag = f"H{level}"
     elif elem_type == "figure":
         fig_idx = elem.get("figure_index")
@@ -1495,7 +1497,7 @@ def _emit_tagged_region(
         mcid = builder.add_code(page_index, page_ref, lang=elem_lang)
         tag = "Code"
     elif elem_type == "formula":
-        alt = elem.get("text")
+        alt = accessible_text
         if isinstance(alt, str):
             alt = alt.strip()
         mcid = builder.add_formula(page_index, page_ref, alt_text=alt or None)
@@ -1514,7 +1516,7 @@ def _emit_tagged_region(
         mcid = builder.add_paragraph(page_index, page_ref, lang=elem_lang)
         tag = "P"
 
-    new_instructions.append(_make_bdc(tag, mcid))
+    new_instructions.append(_make_bdc(tag, mcid, actual_text=actual_text))
     new_instructions.extend(region.instructions)
     new_instructions.append(_make_emc())
 
@@ -1523,9 +1525,33 @@ def _emit_tagged_region(
 # BDC/EMC instruction constructors
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _make_bdc(struct_type: str, mcid: int) -> pikepdf.ContentStreamInstruction:
+def _element_accessible_text(elem: dict) -> str:
+    return str(
+        elem.get("actual_text")
+        or elem.get("resolved_text")
+        or elem.get("semantic_text_hint")
+        or elem.get("text")
+        or ""
+    ).strip()
+
+
+def _element_actual_text(elem: dict) -> str | None:
+    actual_text = _element_accessible_text(elem)
+    return actual_text or None
+
+
+def _make_bdc(
+    struct_type: str,
+    mcid: int,
+    *,
+    actual_text: str | None = None,
+) -> pikepdf.ContentStreamInstruction:
+    attributes = pikepdf.Dictionary({"/MCID": mcid})
+    normalized_actual_text = str(actual_text or "").strip()
+    if normalized_actual_text:
+        attributes["/ActualText"] = pikepdf.String(normalized_actual_text)
     return pikepdf.ContentStreamInstruction(
-        [pikepdf.Name(f"/{struct_type}"), pikepdf.Dictionary({"/MCID": mcid})],
+        [pikepdf.Name(f"/{struct_type}"), attributes],
         pikepdf.Operator("BDC"),
     )
 

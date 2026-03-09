@@ -13,6 +13,11 @@ from app.pipeline.orchestrator import (
     FONT_LANE_OCR_REDO,
     FONT_LANE_REPAIR_DICTS,
     FONT_LANE_REPAIR_TOUNICODE,
+    _apply_pretag_grounded_text_resolutions,
+    _apply_pretag_table_intelligence,
+    _apply_grounded_text_adjudication,
+    _should_auto_apply_grounded_encoding_block,
+    _should_auto_apply_grounded_code_block,
     _embed_lane_should_skip_local,
     _font_remediation_lanes,
     _ghostscript_embed_command,
@@ -334,6 +339,670 @@ def test_generated_tounicode_mappings_override_existing_entries():
 
     assert merged == {1: "A", 2: "C", 3: "D"}
     assert overwritten == 1
+
+
+@pytest.mark.asyncio
+async def test_pretag_grounded_text_resolutions_apply_safe_spacing_fix(monkeypatch, tmp_path):
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_grounded_text_candidates",
+        lambda *_args, **_kwargs: {
+            "target_count": 1,
+            "encoding_problem_count": 0,
+            "targets": [
+                    {
+                        "page": 1,
+                        "review_id": "review-0",
+                        "role": "heading",
+                        "original_text_candidate": "A B S T R A C T",
+                        "native_text_candidate": "A B S T R A C T",
+                    "ocr_text_candidate": "ABSTRACT",
+                    "bbox": {"l": 10, "t": 20, "r": 100, "b": 40},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+
+    async def _fake_generate(**kwargs):
+        return {
+            "blocks": [
+                    {
+                        "page": 1,
+                        "review_id": "review-0",
+                        "role": "heading",
+                        "readable_text_hint": "ABSTRACT",
+                    "chosen_source": "ocr",
+                    "issue_type": "spacing_only",
+                    "confidence": "high",
+                    "should_block_accessibility": True,
+                    "reason": "Visible heading is clean once spacing is normalized.",
+                    "original_text_candidate": "A B S T R A C T",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(orchestrator, "generate_suspicious_text_intelligence", _fake_generate)
+
+    updated, audit = await _apply_pretag_grounded_text_resolutions(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_grounded_text=True),
+        working_pdf=tmp_path / "sample.pdf",
+        structure_json={
+            "elements": [
+                {
+                    "type": "heading",
+                    "page": 0,
+                    "text": "A B S T R A C T",
+                }
+            ]
+        },
+    )
+
+    element = updated["elements"][0]
+    assert audit["applied"] is True
+    assert audit["applied_count"] == 1
+    assert element["review_id"] == "review-0"
+    assert element["actual_text"] == "ABSTRACT"
+    assert element["resolved_text"] == "ABSTRACT"
+    assert element["resolution_source"] == "pretag_ocr"
+
+
+@pytest.mark.asyncio
+async def test_pretag_grounded_text_resolutions_artifact_duplicate_noise_block(monkeypatch, tmp_path):
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_grounded_text_candidates",
+        lambda *_args, **_kwargs: {
+            "target_count": 1,
+            "encoding_problem_count": 1,
+            "targets": [
+                {
+                    "page": 1,
+                    "review_id": "review-1",
+                    "role": "paragraph",
+                    "original_text_candidate": "2c 2d 3a 3b 3c 4a",
+                    "native_text_candidate": "2c 2d 3a 3b 3c 4a",
+                    "previous_text": "Incomplete questions",
+                    "previous_role": "paragraph",
+                    "next_text": "Entering and saving information within FDS Question Form Fields",
+                    "next_role": "heading",
+                    "ocr_text_candidate": "Entering and saving information within FDS Question Form Fields",
+                    "bbox": {"l": 10, "t": 20, "r": 100, "b": 40},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+
+    async def _fake_generate(**kwargs):
+        return {
+            "blocks": [
+                {
+                    "page": 1,
+                    "review_id": "review-1",
+                    "role": "paragraph",
+                    "readable_text_hint": "Entering and saving information within FDS Question Form Fields",
+                    "chosen_source": "llm_inferred",
+                    "issue_type": "encoding_problem",
+                    "confidence": "high",
+                    "should_block_accessibility": True,
+                    "reason": "The garbled paragraph duplicates the adjacent heading and should be hidden.",
+                    "original_text_candidate": "2c 2d 3a 3b 3c 4a",
+                    "previous_text": "Incomplete questions",
+                    "previous_role": "paragraph",
+                    "next_text": "Entering and saving information within FDS Question Form Fields",
+                    "next_role": "heading",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(orchestrator, "generate_suspicious_text_intelligence", _fake_generate)
+
+    updated, audit = await _apply_pretag_grounded_text_resolutions(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_grounded_text=True),
+        working_pdf=tmp_path / "sample.pdf",
+        structure_json={
+            "elements": [
+                {
+                    "review_id": "review-0",
+                    "type": "paragraph",
+                    "page": 0,
+                    "text": "Incomplete questions",
+                },
+                {
+                    "review_id": "review-1",
+                    "type": "paragraph",
+                    "page": 0,
+                    "text": "2c 2d 3a 3b 3c 4a",
+                },
+                {
+                    "review_id": "review-2",
+                    "type": "heading",
+                    "page": 0,
+                    "text": "Entering and saving information within FDS Question Form Fields",
+                },
+            ]
+        },
+    )
+
+    element = updated["elements"][1]
+    assert audit["applied"] is True
+    assert audit["applied_count"] == 1
+    assert audit["applied_artifact_count"] == 1
+    assert audit["applied_actual_text_count"] == 0
+    assert element["type"] == "artifact"
+    assert "actual_text" not in element
+    assert element["resolution_source"] == "pretag_artifact_llm_inferred"
+
+
+def test_should_auto_apply_grounded_code_block_accepts_grounded_multiline_code():
+    block = {
+        "role": "code",
+        "readable_text_hint": (
+            "1 def fetch_url(entry):\n"
+            "2     uri = entry['download_url']\n"
+            "3     return uri"
+        ),
+        "chosen_source": "llm_inferred",
+        "issue_type": "encoding_problem",
+        "confidence": "high",
+        "should_block_accessibility": True,
+        "native_text_candidate": "1 2 3 def fetch_url(entry): uri = entry['download_url'] return uri",
+        "ocr_text_candidate": "1 def fetch_url(entry): 2 uri = entry['download_url'] 3 return uri",
+    }
+
+    assert _should_auto_apply_grounded_code_block(block) is True
+
+
+def test_should_auto_apply_grounded_encoding_block_accepts_localized_high_similarity_fix():
+    block = {
+        "role": "paragraph",
+        "readable_text_hint": "2c 2d 3a 3b 3c 4a 4b 5a 5b 6 7 8a 8b 8ba 8bb 8bc 8c 8d 9 11 12a 12b 13 14 15 16 17",
+        "chosen_source": "native",
+        "issue_type": "encoding_problem",
+        "confidence": "high",
+        "should_block_accessibility": True,
+        "original_text_candidate": "2c 2d 3a 3b 3c 4a 4b 5a 5b 6 7 8a 8b 8ba 8bb 8bc 8c 8d 9 11 12a 12b 13 14 15 16 1€",
+        "signals": ["very short token pattern"],
+    }
+
+    assert _should_auto_apply_grounded_encoding_block(block) is True
+
+
+@pytest.mark.asyncio
+async def test_pretag_grounded_text_resolutions_apply_grounded_code_fix(monkeypatch, tmp_path):
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_grounded_text_candidates",
+        lambda *_args, **_kwargs: {
+            "target_count": 1,
+            "encoding_problem_count": 1,
+            "targets": [
+                {
+                    "page": 1,
+                    "review_id": "review-7",
+                    "role": "code",
+                    "original_text_candidate": "1 2 3 def fetch_url(entry): uri = entry['download_url'] return uri",
+                    "native_text_candidate": "1 2 3 def fetch_url(entry): uri = entry['download_url'] return uri",
+                    "ocr_text_candidate": "1 def fetch_url(entry): 2 uri = entry['download_url'] 3 return uri",
+                    "bbox": {"l": 10, "t": 20, "r": 100, "b": 40},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+
+    async def _fake_generate(**kwargs):
+        return {
+            "blocks": [
+                {
+                    "page": 1,
+                    "review_id": "review-7",
+                    "role": "code",
+                    "readable_text_hint": (
+                        "1 def fetch_url(entry):\n"
+                        "2     uri = entry['download_url']\n"
+                        "3     return uri"
+                    ),
+                    "chosen_source": "llm_inferred",
+                    "issue_type": "encoding_problem",
+                    "confidence": "high",
+                    "should_block_accessibility": True,
+                    "reason": "Visible code structure is clear once line breaks are restored.",
+                    "native_text_candidate": "1 2 3 def fetch_url(entry): uri = entry['download_url'] return uri",
+                    "ocr_text_candidate": "1 def fetch_url(entry): 2 uri = entry['download_url'] 3 return uri",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(orchestrator, "generate_suspicious_text_intelligence", _fake_generate)
+
+    updated, audit = await _apply_pretag_grounded_text_resolutions(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_grounded_text=True),
+        working_pdf=tmp_path / "sample.pdf",
+        structure_json={
+            "elements": [
+                {
+                    "review_id": "review-7",
+                    "type": "code",
+                    "page": 0,
+                    "text": "1 2 3 def fetch_url(entry): uri = entry['download_url'] return uri",
+                }
+            ]
+        },
+    )
+
+    element = updated["elements"][0]
+    assert audit["applied"] is True
+    assert audit["applied_count"] == 1
+    assert audit["applied_code_text_count"] == 1
+    assert audit["applied_actual_text_count"] == 0
+    assert element["actual_text"].splitlines()[1] == "2     uri = entry['download_url']"
+    assert element["resolution_source"] == "pretag_code_llm_inferred"
+
+
+@pytest.mark.asyncio
+async def test_pretag_grounded_text_resolutions_apply_localized_encoding_fix(monkeypatch, tmp_path):
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_grounded_text_candidates",
+        lambda *_args, **_kwargs: {
+            "target_count": 1,
+            "encoding_problem_count": 1,
+            "targets": [
+                {
+                    "page": 12,
+                    "review_id": "review-485",
+                    "role": "paragraph",
+                    "original_text_candidate": "2c 2d 3a 3b 3c 4a 4b 5a 5b 6 7 8a 8b 8ba 8bb 8bc 8c 8d 9 11 12a 12b 13 14 15 16 1€",
+                    "native_text_candidate": "2c 2d 3a 3b 3c 4a 4b 5a 5b 6 7 8a 8b 8ba 8bb 8bc 8c 8d 9 11 12a 12b 13 14 15 16 1€",
+                    "ocr_text_candidate": "nteringe and saving information within EDS Question Form Fie",
+                    "previous_text": "Incomplete questions",
+                    "previous_role": "paragraph",
+                    "next_text": "Entering and saving information within FDS Question Form Fields",
+                    "next_role": "heading",
+                    "bbox": {"l": 10, "t": 20, "r": 100, "b": 40},
+                    "signals": ["very short token pattern"],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+
+    async def _fake_generate(**kwargs):
+        return {
+            "blocks": [
+                {
+                    "page": 12,
+                    "review_id": "review-485",
+                    "role": "paragraph",
+                    "readable_text_hint": "2c 2d 3a 3b 3c 4a 4b 5a 5b 6 7 8a 8b 8ba 8bb 8bc 8c 8d 9 11 12a 12b 13 14 15 16 17",
+                    "chosen_source": "native",
+                    "issue_type": "encoding_problem",
+                    "confidence": "high",
+                    "should_block_accessibility": True,
+                    "reason": "The native text is nearly correct but the last token should read 17, not 1€.",
+                    "original_text_candidate": "2c 2d 3a 3b 3c 4a 4b 5a 5b 6 7 8a 8b 8ba 8bb 8bc 8c 8d 9 11 12a 12b 13 14 15 16 1€",
+                    "signals": ["very short token pattern"],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(orchestrator, "generate_suspicious_text_intelligence", _fake_generate)
+
+    updated, audit = await _apply_pretag_grounded_text_resolutions(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_grounded_text=True),
+        working_pdf=tmp_path / "sample.pdf",
+        structure_json={
+            "elements": [
+                {
+                    "review_id": "review-485",
+                    "type": "paragraph",
+                    "page": 11,
+                    "text": "2c 2d 3a 3b 3c 4a 4b 5a 5b 6 7 8a 8b 8ba 8bb 8bc 8c 8d 9 11 12a 12b 13 14 15 16 1€",
+                }
+            ]
+        },
+    )
+
+    element = updated["elements"][0]
+    assert audit["applied"] is True
+    assert audit["applied_count"] == 1
+    assert audit["applied_actual_text_count"] == 1
+    assert element["actual_text"].endswith("17")
+    assert element["resolution_source"] == "pretag_native"
+
+
+@pytest.mark.asyncio
+async def test_pretag_table_intelligence_applies_high_confidence_header_fix(monkeypatch, tmp_path):
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+    monkeypatch.setattr(
+        orchestrator,
+        "_table_semantics_risk",
+        lambda *_args, **_kwargs: {
+            "targets": [
+                {
+                    "table_review_id": "review-7",
+                    "page": 3,
+                    "bbox": {"l": 10, "t": 20, "r": 100, "b": 60},
+                    "num_rows": 4,
+                    "num_cols": 3,
+                    "risk_score": 2.5,
+                    "risk_reasons": ["weak header signal"],
+                    "header_rows": [],
+                    "row_header_columns": [],
+                }
+            ]
+        },
+    )
+
+    async def _fake_generate(**kwargs):
+        target = kwargs["target"]
+        assert target["table_review_id"] == "review-7"
+        assert target["header_rows"] == []
+        assert target["row_header_columns"] == []
+        assert target["cells"][0]["text"] == "A"
+        return {
+            "table_review_id": "review-7",
+            "page": 3,
+            "confidence": "high",
+            "confidence_score": 1.0,
+            "suggested_action": "set_table_headers",
+            "reason": "First row and first column act as headers.",
+            "header_rows": [0],
+            "row_header_columns": [0],
+            "summary": "Add simple row and column headers.",
+        }
+
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence", _fake_generate)
+
+    updated, audit = await _apply_pretag_table_intelligence(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_table_intelligence=True),
+        structure_json={
+            "elements": [
+                {
+                    "review_id": "review-7",
+                    "type": "table",
+                    "page": 2,
+                    "num_rows": 4,
+                    "num_cols": 3,
+                    "cells": [
+                        {"row": 0, "col": 0, "text": "A"},
+                        {"row": 0, "col": 1, "text": "B"},
+                        {"row": 1, "col": 0, "text": "C"},
+                        {"row": 1, "col": 1, "text": "D"},
+                    ],
+                }
+            ]
+        },
+    )
+
+    table = updated["elements"][0]
+    assert audit["applied"] is True
+    assert audit["applied_count"] == 1
+    assert audit["set_headers_count"] == 1
+    assert table["table_llm_confirmed"] is True
+    assert table["table_llm_action"] == "set_table_headers"
+    assert table["cells"][0]["column_header"] is True
+    assert table["cells"][0]["row_header"] is True
+    assert table["cells"][1]["column_header"] is True
+    assert table["cells"][2]["row_header"] is True
+
+
+@pytest.mark.asyncio
+async def test_pretag_table_intelligence_retries_manual_only_aggressively(monkeypatch, tmp_path):
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+    monkeypatch.setattr(
+        orchestrator,
+        "_table_semantics_risk",
+        lambda *_args, **_kwargs: {
+            "targets": [
+                {
+                    "table_review_id": "review-9",
+                    "page": 3,
+                    "bbox": {"l": 10, "t": 20, "r": 100, "b": 60},
+                    "num_rows": 8,
+                    "num_cols": 6,
+                    "risk_score": 3.0,
+                    "risk_reasons": ["merged cells or spans present", "multi-level header pattern"],
+                    "header_rows": [0, 1],
+                    "row_header_columns": [0],
+                }
+            ]
+        },
+    )
+
+    calls = []
+
+    async def _fake_generate(**kwargs):
+        calls.append(kwargs.get("aggressive", False))
+        if kwargs.get("aggressive"):
+            return {
+                "table_review_id": "review-9",
+                "page": 3,
+                "confidence": "high",
+                "confidence_score": 1.0,
+                "suggested_action": "set_table_headers",
+                "reason": "Simple header rows and row headers are enough.",
+                "header_rows": [0, 1],
+                "row_header_columns": [0],
+                "summary": "Use rows 0-1 and column 0 as headers.",
+            }
+        return {
+            "table_review_id": "review-9",
+            "page": 3,
+            "confidence": "medium",
+            "confidence_score": 0.6,
+            "suggested_action": "manual_only",
+            "reason": "Initial pass was conservative.",
+            "header_rows": [],
+            "row_header_columns": [],
+            "summary": "Manual review may be needed.",
+        }
+
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence", _fake_generate)
+
+    updated, audit = await _apply_pretag_table_intelligence(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_table_intelligence=True),
+        structure_json={
+            "elements": [
+                {
+                    "review_id": "review-9",
+                    "type": "table",
+                    "page": 2,
+                    "num_rows": 8,
+                    "num_cols": 6,
+                    "cells": [
+                        {"row": 0, "col": 0, "text": "Group", "column_header": True, "row_header": True},
+                        {"row": 0, "col": 1, "text": "A", "column_header": True},
+                        {"row": 1, "col": 0, "text": "Row", "row_header": True},
+                        {"row": 1, "col": 1, "text": "Value"},
+                    ],
+                }
+            ]
+        },
+    )
+
+    table = updated["elements"][0]
+    assert calls == [False, True]
+    assert audit["applied"] is True
+    assert audit["aggressive_retry_count"] == 1
+    assert table["table_llm_confirmed"] is True
+    assert table["table_llm_action"] == "set_table_headers"
+
+
+@pytest.mark.asyncio
+async def test_pretag_table_intelligence_retries_to_confirm_existing_headers(monkeypatch, tmp_path):
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+    monkeypatch.setattr(
+        orchestrator,
+        "_table_semantics_risk",
+        lambda *_args, **_kwargs: {
+            "targets": [
+                {
+                    "table_review_id": "review-11",
+                    "page": 4,
+                    "bbox": {"l": 10, "t": 20, "r": 100, "b": 60},
+                    "num_rows": 8,
+                    "num_cols": 6,
+                    "risk_score": 3.0,
+                    "risk_reasons": ["merged cells or spans present", "multi-level header pattern"],
+                    "header_rows": [0, 1],
+                    "row_header_columns": [0],
+                }
+            ]
+        },
+    )
+
+    calls = []
+
+    async def _fake_generate(**kwargs):
+        calls.append((kwargs.get("aggressive", False), kwargs.get("confirm_existing", False)))
+        if kwargs.get("confirm_existing"):
+            return {
+                "table_review_id": "review-11",
+                "page": 4,
+                "confidence": "high",
+                "confidence_score": 1.0,
+                "suggested_action": "confirm_current_headers",
+                "reason": "Current visible header bands are already sufficient.",
+                "header_rows": [0, 1],
+                "row_header_columns": [0],
+                "summary": "Keep the existing header interpretation.",
+            }
+        return {
+            "table_review_id": "review-11",
+            "page": 4,
+            "confidence": "medium",
+            "confidence_score": 0.6,
+            "suggested_action": "manual_only",
+            "reason": "Initial passes were conservative.",
+            "header_rows": [],
+            "row_header_columns": [],
+            "summary": "Manual review may be needed.",
+        }
+
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence", _fake_generate)
+
+    updated, audit = await _apply_pretag_table_intelligence(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_table_intelligence=True),
+        structure_json={
+            "elements": [
+                {
+                    "review_id": "review-11",
+                    "type": "table",
+                    "page": 3,
+                    "num_rows": 8,
+                    "num_cols": 6,
+                    "cells": [
+                        {"row": 0, "col": 0, "text": "Group", "column_header": True, "row_header": True},
+                        {"row": 0, "col": 1, "text": "A", "column_header": True},
+                        {"row": 1, "col": 0, "text": "Row", "row_header": True},
+                        {"row": 1, "col": 1, "text": "Value"},
+                    ],
+                }
+            ]
+        },
+    )
+
+    table = updated["elements"][0]
+    assert calls == [(False, False), (True, False), (True, True)]
+    assert audit["applied"] is True
+    assert audit["confirm_existing_retry_count"] == 1
+    assert audit["confirmed_count"] == 1
+    assert table["table_llm_confirmed"] is True
+    assert table["table_llm_action"] == "confirm_current_headers"
 
 
 def test_font_name_normalization_strips_subset_prefix_and_punctuation():
@@ -794,6 +1463,129 @@ def test_ghostscript_embed_command_forces_standard_font_embedding():
     assert "/Helvetica" in distiller_params
     assert "/ZapfDingbats" in distiller_params
     assert cmd[-2:] == ("-f", "/tmp/input.pdf")
+
+
+def test_grounded_text_candidates_do_not_block_until_llm_confirms():
+    review_tasks = [
+        {
+            "task_type": "content_fidelity",
+            "source": "fidelity",
+            "title": "Review suspicious extracted text",
+            "detail": "candidate task",
+            "severity": "medium",
+            "blocking": False,
+            "metadata": {
+                "grounded_text_candidate": True,
+                "flagged_blocks": [
+                    {
+                        "page": 1,
+                        "review_id": "review-1",
+                        "native_text_candidate": "A R T I C L E",
+                    }
+                ],
+            },
+        }
+    ]
+    fidelity_report = {
+        "passed": True,
+        "summary": {"blocking_tasks": 0, "advisory_tasks": 1, "total_tasks": 1},
+        "checks": [
+            {
+                "check": "grounded_text_fidelity",
+                "status": "warning",
+                "message": "candidate",
+                "metrics": {"candidate_blocks": 1, "confirmed_blocks": 0},
+            }
+        ],
+    }
+
+    updated_tasks, updated_report = _apply_grounded_text_adjudication(
+        review_tasks,
+        fidelity_report,
+        {
+            "summary": "Looks fine",
+            "confidence": "high",
+            "blocks": [
+                {
+                    "page": 1,
+                    "review_id": "review-1",
+                    "readable_text_hint": "ARTICLE",
+                    "should_block_accessibility": False,
+                    "issue_type": "spacing_only",
+                }
+            ],
+        },
+    )
+
+    assert updated_tasks == []
+    assert updated_report["passed"] is True
+    grounded = next(check for check in updated_report["checks"] if check["check"] == "grounded_text_fidelity")
+    assert grounded["status"] == "pass"
+    assert grounded["metrics"]["candidate_blocks"] == 1
+    assert grounded["metrics"]["confirmed_blocks"] == 0
+
+
+def test_grounded_text_candidates_block_when_llm_confirms():
+    review_tasks = [
+        {
+            "task_type": "content_fidelity",
+            "source": "fidelity",
+            "title": "Review suspicious extracted text",
+            "detail": "candidate task",
+            "severity": "medium",
+            "blocking": False,
+            "metadata": {
+                "grounded_text_candidate": True,
+                "flagged_blocks": [
+                    {
+                        "page": 1,
+                        "review_id": "review-1",
+                        "native_text_candidate": "A R T I C L E",
+                    }
+                ],
+            },
+        }
+    ]
+    fidelity_report = {
+        "passed": True,
+        "summary": {"blocking_tasks": 0, "advisory_tasks": 1, "total_tasks": 1},
+        "checks": [
+            {
+                "check": "grounded_text_fidelity",
+                "status": "warning",
+                "message": "candidate",
+                "metrics": {"candidate_blocks": 1, "confirmed_blocks": 0},
+            }
+        ],
+    }
+
+    updated_tasks, updated_report = _apply_grounded_text_adjudication(
+        review_tasks,
+        fidelity_report,
+        {
+            "summary": "Visible text differs materially",
+            "confidence": "high",
+            "blocks": [
+                {
+                    "page": 1,
+                    "review_id": "review-1",
+                    "readable_text_hint": "ARTICLE",
+                    "should_block_accessibility": True,
+                    "issue_type": "encoding_problem",
+                    "reason": "Visible text does not match extracted text.",
+                }
+            ],
+        },
+    )
+
+    assert len(updated_tasks) == 1
+    assert updated_tasks[0]["blocking"] is True
+    assert updated_tasks[0]["metadata"]["grounded_text_llm_adjudicated"] is True
+    assert updated_tasks[0]["metadata"]["grounded_target_count"] == 1
+    assert updated_report["passed"] is False
+    grounded = next(check for check in updated_report["checks"] if check["check"] == "grounded_text_fidelity")
+    assert grounded["status"] == "fail"
+    assert grounded["metrics"]["confirmed_blocks"] == 1
 
 
 @pytest.mark.asyncio
