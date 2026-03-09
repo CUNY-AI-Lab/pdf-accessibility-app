@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     auto_apply_llm_font_map: bool = True
     auto_apply_grounded_text: bool = True
     auto_apply_table_intelligence: bool = True
+    auto_apply_form_intelligence: bool = True
     assist_toc_with_llm: bool = True
 
     # veraPDF
@@ -67,6 +68,8 @@ class Settings(BaseSettings):
     # LLM retry
     llm_max_retries: int = 3
     llm_retry_backoff_base: float = 2.0
+    llm_retry_max_backoff_seconds: float = 60.0
+    llm_max_concurrency: int = 4
 
     # Dev
     debug: bool = False

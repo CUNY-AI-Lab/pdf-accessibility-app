@@ -6,12 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 from app.services import review_suggestions
+from app.services.intelligence_llm_utils import extract_json_object, job_pdf_path
 from app.services.review_suggestions import (
-    _extract_json_object,
     _font_task_payload,
-    _reading_order_task_payload,
-    _table_target_payload,
-    _table_task_payload,
+    _page_blocks_for_review,
+    _suspicious_reading_blocks,
+    _table_targets_for_review,
     generate_review_suggestion,
     select_auto_font_review_resolution,
     select_auto_font_map_override,
@@ -66,7 +66,7 @@ class _FakeLlmClient:
 
 
 def test_extract_json_object_accepts_fenced_json():
-    parsed = _extract_json_object(
+    parsed = extract_json_object(
         """```json
         {"summary":"ok","confidence":"high"}
         ```"""
@@ -75,12 +75,18 @@ def test_extract_json_object_accepts_fenced_json():
     assert parsed == {"summary": "ok", "confidence": "high"}
 
 
+def test_extract_json_object_accepts_trailing_text_after_first_json_object():
+    parsed = extract_json_object('{"summary":"ok"}\n{"ignored":true}')
+
+    assert parsed == {"summary": "ok"}
+
+
 def test_job_pdf_path_falls_back_to_input_when_output_missing(tmp_path):
     job = _job(tmp_path)
     missing_output = tmp_path / "missing-output.pdf"
     job.output_path = str(missing_output)
 
-    pdf_path = review_suggestions._job_pdf_path(job)
+    pdf_path = job_pdf_path(job)
 
     assert pdf_path == Path(job.input_path)
 
@@ -88,7 +94,7 @@ def test_job_pdf_path_falls_back_to_input_when_output_missing(tmp_path):
 def test_font_task_payload_uses_review_targets_and_page_structure_context(monkeypatch, tmp_path):
     monkeypatch.setattr(
         review_suggestions,
-        "_render_page_image",
+        "render_page_png_data_url",
         lambda pdf_path, page_number: f"data:image/png;base64,page-{page_number}",
     )
     monkeypatch.setattr(
@@ -135,25 +141,8 @@ def test_font_task_payload_uses_review_targets_and_page_structure_context(monkey
     assert content[2]["image_url"]["url"] == "data:image/png;base64,page-5"
     assert content[3]["image_url"]["url"].startswith("data:image/png;base64,target-")
 
-
-def test_reading_order_task_payload_collects_structure_fragments(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        review_suggestions,
-        "_render_page_image",
-        lambda pdf_path, page_number: f"data:image/png;base64,page-{page_number}",
-    )
-    monkeypatch.setattr(
-        review_suggestions,
-        "render_bbox_preview_png_data_url",
-        lambda pdf_path, page_number, bbox: f"data:image/png;base64:block-{page_number}",
-    )
-    monkeypatch.setattr(
-        review_suggestions,
-        "extract_ocr_text_from_bbox",
-        lambda pdf_path, page_number, bbox: "Data Book",
-    )
-
-    prompt_text, content = _reading_order_task_payload(
+def test_page_blocks_for_review_collects_structure_fragments(tmp_path):
+    page_blocks = _page_blocks_for_review(
         _job(
             tmp_path,
             structure={
@@ -169,30 +158,52 @@ def test_reading_order_task_payload_collects_structure_fragments(monkeypatch, tm
                 ]
             },
         ),
-        _task("reading_order", metadata={"hit_rate": 0.52, "order_rate": 0.61}),
+        [1, 2],
     )
 
-    assert '"pages_to_check": [\n    1,\n    2\n  ]' in prompt_text
-    assert "Library AI Discovery Guide" in prompt_text
-    assert "A sidebar note appears before the main content." in prompt_text
-    assert '"page_blocks": [' in prompt_text
-    assert '"suspicious_text_blocks": [' in prompt_text
-    assert '"D a t a B o o k"' in prompt_text
-    assert '"ocr_text_candidate": "Data Book"' in prompt_text
-    assert '"review_id": "review-0"' in prompt_text
-    assert '"current_order": 1' in prompt_text
-    assert len(content) == 4
-    assert content[1]["image_url"]["url"] == "data:image/png;base64,page-1"
-    assert content[2]["image_url"]["url"] == "data:image/png;base64,page-2"
-    assert content[3]["image_url"]["url"] == "data:image/png;base64:block-1"
+    assert [item["page"] for item in page_blocks] == [1, 2]
+    assert page_blocks[0]["blocks"][0]["review_id"] == "review-0"
+    assert page_blocks[0]["blocks"][0]["current_order"] == 1
+    assert page_blocks[0]["blocks"][0]["text"] == "Library AI Discovery Guide"
+    assert page_blocks[1]["blocks"][0]["text"] == "A sidebar note appears before the main content."
+
+
+def test_suspicious_reading_blocks_collects_grounding(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        review_suggestions,
+        "extract_ocr_text_from_bbox",
+        lambda pdf_path, page_number, bbox: "Data Book",
+    )
+
+    suspicious_blocks = _suspicious_reading_blocks(
+        _job(
+            tmp_path,
+            structure={
+                "elements": [
+                    {"type": "heading", "page": 0, "text": "Library AI Discovery Guide"},
+                    {
+                        "type": "paragraph",
+                        "page": 0,
+                        "text": "D a t a  B o o k",
+                        "bbox": {"l": 72, "t": 700, "r": 250, "b": 660},
+                    },
+                    {"type": "paragraph", "page": 1, "text": "A sidebar note appears before the main content."},
+                ]
+            },
+        ),
+        [1, 2],
+    )
+
+    assert len(suspicious_blocks) == 1
+    assert suspicious_blocks[0]["page"] == 1
+    assert suspicious_blocks[0]["review_id"] == "review-1"
+    assert suspicious_blocks[0]["native_text_candidate"] == "D a t a B o o k"
+    assert suspicious_blocks[0]["ocr_text_candidate"] == "Data Book"
+    assert suspicious_blocks[0]["previous_text"] == "Library AI Discovery Guide"
+    assert suspicious_blocks[0]["next_text"] == ""
 
 
 def test_generate_review_suggestion_supports_reading_order(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        review_suggestions,
-        "_render_page_image",
-        lambda pdf_path, page_number: f"data:image/png;base64,page-{page_number}",
-    )
     monkeypatch.setattr(
         review_suggestions,
         "extract_ocr_text_from_bbox",
@@ -269,7 +280,7 @@ def test_generate_review_suggestion_supports_reading_order(monkeypatch, tmp_path
 def test_generate_review_suggestion_keeps_font_actualtext_candidates(monkeypatch, tmp_path):
     monkeypatch.setattr(
         review_suggestions,
-        "_render_page_image",
+        "render_page_png_data_url",
         lambda pdf_path, page_number: f"data:image/png;base64,page-{page_number}",
     )
 
@@ -326,69 +337,7 @@ def test_generate_review_suggestion_keeps_font_actualtext_candidates(monkeypatch
     assert candidates[0]["proposed_actualtext"] == "bullet"
     assert fake_llm.calls[0]["kwargs"]["temperature"] == 0
 
-
-def test_table_task_payload_collects_table_targets(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        review_suggestions,
-        "_render_page_image",
-        lambda pdf_path, page_number: f"data:image/png;base64,page-{page_number}",
-    )
-    monkeypatch.setattr(
-        review_suggestions,
-        "render_bbox_preview_png_data_url",
-        lambda pdf_path, page_number, bbox: f"data:image/png;base64:table-{page_number}",
-    )
-
-    prompt_text, content = _table_task_payload(
-        _job(
-            tmp_path,
-            structure={
-                "elements": [
-                    {
-                        "type": "table",
-                        "page": 0,
-                        "text": "Enrollment by program and semester",
-                        "bbox": {"l": 72, "t": 700, "r": 400, "b": 500},
-                        "num_rows": 3,
-                        "num_cols": 2,
-                        "cells": [
-                            {"row": 0, "col": 0, "text": "Program", "column_header": True, "row_header": False},
-                            {"row": 0, "col": 1, "text": "Students", "column_header": True, "row_header": False},
-                            {"row": 1, "col": 0, "text": "History", "column_header": False, "row_header": True},
-                            {"row": 1, "col": 1, "text": "45", "column_header": False, "row_header": False},
-                        ],
-                    }
-                ]
-            },
-        ),
-        _task(
-            "table_semantics",
-            metadata={"detected_tables": 2, "tagged_tables": 1},
-        ),
-    )
-
-    assert '"table_review_targets": [' in prompt_text
-    assert '"table_review_id": "review-0"' in prompt_text
-    assert '"header_rows": [' in prompt_text
-    assert '"row_header_columns": [' in prompt_text
-    assert "Enrollment by program and semester" in prompt_text
-    assert len(content) == 3
-    assert content[1]["image_url"]["url"] == "data:image/png;base64,page-1"
-    assert content[2]["image_url"]["url"] == "data:image/png;base64:table-1"
-
-
-def test_table_target_payload_focuses_one_table_with_accessibility_goal(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        review_suggestions,
-        "_render_page_image",
-        lambda pdf_path, page_number: f"data:image/png;base64,page-{page_number}",
-    )
-    monkeypatch.setattr(
-        review_suggestions,
-        "render_bbox_preview_png_data_url",
-        lambda pdf_path, page_number, bbox: f"data:image/png;base64:table-{page_number}",
-    )
-
+def test_table_targets_for_review_collects_table_targets(tmp_path):
     job = _job(
         tmp_path,
         structure={
@@ -410,37 +359,21 @@ def test_table_target_payload_focuses_one_table_with_accessibility_goal(monkeypa
             ]
         },
     )
-    target = review_suggestions._table_targets_for_review(
+    targets = _table_targets_for_review(
         job,
         {"table_review_targets": [{"table_review_id": "review-0", "page": 1}]},
-    )[0]
-
-    prompt_text, content = _table_target_payload(
-        job,
-        _task("table_semantics", metadata={"detected_tables": 1, "tagged_tables": 1}),
-        target,
     )
 
-    assert '"accessibility_goal": "Identify header rows and row-header columns only when they improve how screen readers and other assistive technologies understand this table."' in prompt_text
-    assert '"table_review_target": {' in prompt_text
-    assert '"table_review_id": "review-0"' in prompt_text
-    assert "Preserve the visible meaning and relationships in the source table." in prompt_text
-    assert len(content) == 3
-    assert content[1]["image_url"]["url"] == "data:image/png;base64,page-1"
-    assert content[2]["image_url"]["url"] == "data:image/png;base64:table-1"
+    assert len(targets) == 1
+    target = targets[0]
+    assert target["table_review_id"] == "review-0"
+    assert target["page"] == 1
+    assert target["header_rows"] == [0]
+    assert target["row_header_columns"] == [0]
+    assert target["text_excerpt"] == "Enrollment by program and semester"
 
 
 def test_generate_review_suggestion_supports_table_semantics(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        review_suggestions,
-        "_render_page_image",
-        lambda pdf_path, page_number: f"data:image/png;base64,page-{page_number}",
-    )
-    monkeypatch.setattr(
-        review_suggestions,
-        "render_bbox_preview_png_data_url",
-        lambda pdf_path, page_number, bbox: f"data:image/png;base64:table-{page_number}",
-    )
     async def _fake_table_intelligence(**kwargs):
         target = kwargs["target"]
         if target["table_review_id"] == "review-0":

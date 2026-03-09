@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from app.models import Job
@@ -8,10 +9,12 @@ from app.services.document_intelligence_models import (
     BBoxModel,
     BlockModel,
     DocumentModel,
+    FieldModel,
     PageModel,
     TableCellModel,
     TableModel,
 )
+from app.services.form_fields import extract_widget_fields
 
 LEGACY_PROVENANCE = "legacy_structure"
 
@@ -52,7 +55,26 @@ def _structure_dict(job: Job | None = None, structure_json: dict[str, Any] | Non
     return parsed if isinstance(parsed, dict) else {}
 
 
-def build_document_model(*, job: Job | None = None, structure_json: dict[str, Any] | None = None) -> DocumentModel:
+def _existing_pdf_path(job: Job | None = None, pdf_path: Path | None = None) -> Path | None:
+    if isinstance(pdf_path, Path) and pdf_path.exists():
+        return pdf_path
+    if job is None:
+        return None
+    for candidate in (getattr(job, "output_path", None), getattr(job, "input_path", None)):
+        if not candidate:
+            continue
+        resolved = Path(str(candidate))
+        if resolved.exists():
+            return resolved
+    return None
+
+
+def build_document_model(
+    *,
+    job: Job | None = None,
+    structure_json: dict[str, Any] | None = None,
+    pdf_path: Path | None = None,
+) -> DocumentModel:
     parsed = _structure_dict(job=job, structure_json=structure_json)
     title = _normalize_text(parsed.get("title"))
     elements = parsed.get("elements")
@@ -162,10 +184,43 @@ def build_document_model(*, job: Job | None = None, structure_json: dict[str, An
             )
         )
 
+    existing_pdf = _existing_pdf_path(job=job, pdf_path=pdf_path)
+    if existing_pdf is not None:
+        try:
+            for raw_field in extract_widget_fields(existing_pdf):
+                page_number = int(raw_field["page"])
+                page = pages_by_number.setdefault(page_number, PageModel(page_number=page_number))
+                page.fields.append(
+                    FieldModel(
+                        field_review_id=str(raw_field["field_review_id"]),
+                        page=page_number,
+                        order=int(raw_field["order"]),
+                        field_type=str(raw_field["field_type"]),
+                        field_name=_normalize_text(raw_field.get("field_name"))[:240],
+                        accessible_name=_normalize_text(raw_field.get("accessible_name"))[:240],
+                        value_text=_normalize_text(raw_field.get("value_text"))[:240],
+                        bbox=_coerce_bbox(raw_field.get("bbox")),
+                        provenance="pdf_widgets",
+                        confidence=0.6,
+                        label_quality=str(raw_field.get("label_quality") or "missing"),
+                        source_ids=[
+                            value
+                            for value in (
+                                str(raw_field.get("widget_objgen") or "").strip(),
+                                str(raw_field.get("field_objgen") or "").strip(),
+                            )
+                            if value
+                        ],
+                    )
+                )
+        except Exception:
+            pass
+
     pages = [pages_by_number[page_number] for page_number in sorted(pages_by_number)]
     for page in pages:
         page.blocks.sort(key=lambda block: (block.order, block.review_id))
         page.tables.sort(key=lambda table: (table.order, table.table_review_id))
+        page.fields.sort(key=lambda field: (field.order, field.field_review_id))
 
     return DocumentModel(
         title=title,
@@ -199,3 +254,52 @@ def collect_structure_fragments(document: DocumentModel, *, max_fragments: int) 
             if len(fragments) >= max_fragments:
                 return fragments
     return fragments
+
+
+def collect_nearby_blocks(
+    document: DocumentModel,
+    *,
+    page_number: int,
+    bbox: dict[str, Any] | None,
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    page = document.page(page_number)
+    if page is None:
+        return []
+    if not isinstance(bbox, dict):
+        return [
+            {
+                "review_id": block.review_id,
+                "type": block.role,
+                "text": block.text[:240],
+                "bbox": block.bbox.to_dict() if block.bbox else None,
+            }
+            for block in page.blocks[:limit]
+            if block.text
+        ]
+
+    try:
+        center_x = (float(bbox["l"]) + float(bbox["r"])) / 2.0
+        center_y = (float(bbox["t"]) + float(bbox["b"])) / 2.0
+    except Exception:
+        center_x = center_y = 0.0
+
+    ranked: list[tuple[float, BlockModel]] = []
+    for block in page.blocks:
+        if not block.text or block.bbox is None:
+            continue
+        block_center_x = (block.bbox.l + block.bbox.r) / 2.0
+        block_center_y = (block.bbox.t + block.bbox.b) / 2.0
+        distance = abs(center_x - block_center_x) + abs(center_y - block_center_y)
+        ranked.append((distance, block))
+
+    ranked.sort(key=lambda item: (item[0], item[1].order, item[1].review_id))
+    return [
+        {
+            "review_id": block.review_id,
+            "type": block.role,
+            "text": block.text[:240],
+            "bbox": block.bbox.to_dict() if block.bbox else None,
+        }
+        for _, block in ranked[:limit]
+    ]

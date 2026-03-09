@@ -88,16 +88,43 @@ class TableModel:
 
 
 @dataclass(slots=True)
+class FieldModel:
+    field_review_id: str
+    page: int
+    order: int
+    field_type: str
+    field_name: str = ""
+    accessible_name: str = ""
+    value_text: str = ""
+    resolved_accessible_name: str | None = None
+    resolution_source: str | None = None
+    resolution_reason: str | None = None
+    bbox: BBoxModel | None = None
+    provenance: str = "pdf_widgets"
+    confidence: float = 0.5
+    label_quality: str = "missing"
+    source_ids: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        if self.bbox is not None:
+            data["bbox"] = self.bbox.to_dict()
+        return data
+
+
+@dataclass(slots=True)
 class PageModel:
     page_number: int
     blocks: list[BlockModel] = field(default_factory=list)
     tables: list[TableModel] = field(default_factory=list)
+    fields: list[FieldModel] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "page_number": self.page_number,
             "blocks": [block.to_dict() for block in self.blocks],
             "tables": [table.to_dict() for table in self.tables],
+            "fields": [field.to_dict() for field in self.fields],
         }
 
 

@@ -1,4 +1,6 @@
-from app.pipeline.structure import _normalize_docling_elements, _normalize_lang_tag
+from types import SimpleNamespace
+
+from app.pipeline.structure import _extract_bbox, _normalize_docling_elements, _normalize_lang_tag
 
 
 def test_normalize_docling_elements_maps_footnotes_to_note_elements():
@@ -30,6 +32,16 @@ def test_normalize_docling_elements_maps_footnotes_to_note_elements():
             "bbox": {"l": 10, "b": 20, "r": 100, "t": 40},
         }
     ]
+
+
+def test_extract_bbox_accepts_docling_provenance_objects():
+    prov = [
+        SimpleNamespace(
+            bbox=SimpleNamespace(l=10, b=20, r=100, t=40),
+        )
+    ]
+
+    assert _extract_bbox(prov) == {"l": 10, "b": 20, "r": 100, "t": 40}
 
 
 def test_normalize_lang_tag_maps_common_names_and_rejects_invalid_tokens():

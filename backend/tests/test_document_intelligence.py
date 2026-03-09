@@ -1,7 +1,11 @@
+from pathlib import Path
 from types import SimpleNamespace
+
+import pikepdf
 
 from app.services.document_intelligence import (
     build_document_model,
+    collect_nearby_blocks,
     collect_structure_fragments,
 )
 
@@ -120,3 +124,53 @@ def test_build_document_model_carries_resolved_text_metadata():
     assert block.resolution_source == "pretag_ocr"
     assert block.resolution_reason == "OCR resolves the heading cleanly."
     assert block.semantic_issue_type == "spacing_only"
+
+
+def _pdf_with_widget(path: Path) -> None:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    widget = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Widget"),
+                "/Rect": pikepdf.Array([10, 10, 80, 28]),
+                "/FT": pikepdf.Name("/Tx"),
+                "/T": pikepdf.String("f1_01[0]"),
+            }
+        )
+    )
+    page["/Annots"] = pikepdf.Array([widget])
+    pdf.Root["/AcroForm"] = pikepdf.Dictionary({"/Fields": pikepdf.Array([widget])})
+    pdf.save(path)
+
+
+def test_build_document_model_includes_widget_fields(tmp_path):
+    pdf_path = tmp_path / "widget.pdf"
+    _pdf_with_widget(pdf_path)
+
+    document = build_document_model(
+        structure_json={
+            "elements": [
+                {
+                    "review_id": "review-1",
+                    "type": "paragraph",
+                    "page": 0,
+                    "text": "First name and middle initial",
+                    "bbox": {"l": 10, "t": 50, "r": 140, "b": 70},
+                }
+            ]
+        },
+        pdf_path=pdf_path,
+    )
+
+    assert len(document.pages) == 1
+    page = document.pages[0]
+    assert len(page.fields) == 1
+    field = page.fields[0]
+    assert field.field_type == "text"
+    assert field.field_name == "f1_01[0]"
+    assert field.label_quality == "missing"
+
+    nearby = collect_nearby_blocks(document, page_number=1, bbox=field.bbox.to_dict(), limit=3)
+    assert nearby[0]["review_id"] == "review-1"

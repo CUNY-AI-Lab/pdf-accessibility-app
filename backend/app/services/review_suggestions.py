@@ -12,6 +12,7 @@ from app.services.document_intelligence import (
 from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
 from app.services.intelligence_gemini_reading_order import generate_reading_order_intelligence
 from app.services.intelligence_gemini_tables import generate_table_intelligence
+from app.services.intelligence_llm_utils import job_pdf_path, request_llm_json
 from app.services.intelligence_merge import document_overlay_for_suggestion
 from app.services.intelligence_merge import apply_suspicious_text_intelligence
 from app.services.intelligence_merge import apply_table_intelligence
@@ -107,133 +108,6 @@ Rules:
 - Do not include markdown fences or commentary outside the JSON object.
 """
 
-READING_ORDER_PROMPT = """You are assisting manual PDF accessibility remediation for a PDF/UA workflow.
-
-You will receive:
-- one or more full-page images from the PDF
-- cropped previews of suspicious text blocks when available
-- sampled structural elements in the order our pipeline extracted them
-- reading-order metrics from the fidelity gate
-
-Your job is NOT to rewrite the PDF. You must help a human reviewer decide whether the order looks acceptable or needs manual correction, and help interpret any suspicious extracted text so that assistive technology would announce the right content.
-
-Respond with strict JSON only using this schema:
-{
-  "task_type": "reading_order",
-  "summary": "short summary",
-  "confidence": "high" | "medium" | "low",
-  "suggested_action": "confirm_current_order" | "reorder_review" | "artifact_headers_footers" | "manual_only",
-  "reason": "short explanation",
-  "proposed_page_orders": [
-    {
-      "page": 1,
-      "ordered_review_ids": ["review-3", "review-4", "review-5"],
-      "reason": "short explanation"
-    }
-  ],
-  "proposed_element_updates": [
-    {
-      "page": 1,
-      "review_id": "review-5",
-      "new_type": "artifact" | "heading" | "paragraph" | "list_item" | "code" | "formula",
-      "new_level": 1,
-      "reason": "short explanation"
-    }
-  ],
-  "review_focus": [
-    {
-      "page": 1,
-      "font": "",
-      "rule_id": "",
-      "visible_text_hypothesis": "sidebar appears before main paragraph",
-      "is_likely_decorative": false,
-      "recommended_reviewer_action": "check whether the sidebar should be artifacted or moved after the body text"
-    }
-  ],
-  "reviewer_checklist": [
-    "bullet one",
-    "bullet two"
-  ],
-  "readable_text_hints": [
-    {
-      "page": 1,
-      "review_id": "review-5",
-      "extracted_text": "D a t a  B o o k",
-      "readable_text_hint": "Data Book",
-      "issue_type": "spacing_only" | "encoding_problem" | "uncertain",
-      "confidence": "high" | "medium" | "low",
-      "should_block_accessibility": true,
-      "reason": "short explanation"
-    }
-  ]
-}
-
-Rules:
-- Use "confirm_current_order" only when the current order looks acceptable from the page images and sampled structure.
-- Use "artifact_headers_footers" only for repeated running heads, page numbers, or purely decorative side material.
-- Use "reorder_review" when the issue appears to be structural ordering, not missing text.
-- Use "manual_only" when the visual evidence is ambiguous.
-- Only use review_id values that appear in the provided page_blocks data.
-- Only use readable_text_hints for blocks listed in suspicious_text_blocks.
-- The readable_text_hint should state what a screen reader user should probably hear, not what the PDF currently extracts.
-- If the visible text is unclear, set issue_type to "uncertain" and keep confidence low.
-- For proposed_page_orders, include a page only if ordered_review_ids contains every block on that page exactly once.
-- Prefer minimal edits. If only one element is decorative, use proposed_element_updates instead of rewriting the whole page order.
-- If you propose a heading, set new_level to 1-6. Otherwise omit new_level.
-- Do not invent blocks, pages, or tags that are not present in the provided context.
-- Keep summaries concise and factual.
-- Do not include markdown fences or commentary outside the JSON object.
-"""
-
-TABLE_REVIEW_PROMPT = """You are assisting manual PDF accessibility remediation for a PDF/UA workflow.
-
-You will receive:
-- a full-page image from the PDF
-- a cropped preview of one specific detected table
-- structured table metadata including cells, spans, and current header flags
-- nearby page structure fragments for context
-
-Your job is NOT to rewrite the PDF. You must help a human reviewer decide whether the current table headers are acceptable or need correction so that assistive technology can understand the table correctly.
-
-Respond with strict JSON only using this schema:
-{
-  "task_type": "table_semantics",
-  "summary": "short summary",
-  "confidence": "high" | "medium" | "low",
-  "suggested_action": "confirm_current_headers" | "set_table_headers" | "manual_only",
-  "reason": "short explanation",
-  "proposed_table_updates": [
-    {
-      "page": 1,
-      "table_review_id": "review-7",
-      "header_rows": [0],
-      "row_header_columns": [0],
-      "reason": "short explanation"
-    }
-  ],
-  "reviewer_checklist": [
-    "bullet one",
-    "bullet two"
-  ]
-}
-
-Rules:
-- The goal is accessibility and faithful meaning preservation, not merely clearing a validator rule.
-- Recommend header rows and row-header columns only when they will help screen readers announce the table correctly.
-- Preserve the visible meaning and relationships in the source table. Do not simplify away meaningful structure.
-- If merged cells, multi-level headers, grouped sections, or layout ambiguity mean that simple header_rows/row_header_columns are not enough, use "manual_only".
-- Only use the table_review_id value that appears in the provided table_review_target.
-- header_rows and row_header_columns are zero-based indices.
-- Use "confirm_current_headers" only when the current header flags already look correct.
-- Use "set_table_headers" only when the table appears regular enough that header rows/columns can be identified confidently from the crop and cell text.
-- Use "manual_only" when the table is highly irregular, ambiguous, or depends on semantics you cannot infer confidently.
-- Prefer minimal changes and keep arrays short.
-- Do not invent tables, rows, columns, cells, totals, or relationships that are not present in the provided context.
-- Keep summaries concise and factual.
-- Do not include markdown fences or commentary outside the JSON object.
-"""
-
-
 def _parse_metadata(task: ReviewTask) -> dict[str, Any]:
     if not task.metadata_json:
         return {}
@@ -242,27 +116,6 @@ def _parse_metadata(task: ReviewTask) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return data if isinstance(data, dict) else {}
-
-
-def _extract_json_object(raw_text: str) -> dict[str, Any]:
-    text = (raw_text or "").strip()
-    if not text:
-        raise ValueError("Empty LLM response")
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].startswith("```"):
-            text = "\n".join(lines[1:-1]).strip()
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError("LLM response did not contain a JSON object")
-
-    parsed = json.loads(text[start:end + 1])
-    if not isinstance(parsed, dict):
-        raise ValueError("LLM response JSON was not an object")
-    return parsed
-
 
 def _normalize_text(value: Any) -> str:
     return " ".join(str(value or "").split())
@@ -280,26 +133,6 @@ def _unicode_from_visible_text_hypothesis(value: Any) -> str | None:
     if not normalized:
         return None
     return VISIBLE_GLYPH_HINT_TO_UNICODE.get(normalized)
-
-
-def _render_page_image(pdf_path: Path, page_number: int) -> str:
-    return render_page_png_data_url(pdf_path, page_number)
-
-
-def _job_pdf_path(job: Job) -> Path:
-    candidates = []
-    if getattr(job, "output_path", None):
-        candidates.append(Path(str(job.output_path)))
-    if getattr(job, "input_path", None):
-        candidates.append(Path(str(job.input_path)))
-
-    for pdf_path in candidates:
-        if pdf_path.exists():
-            return pdf_path
-
-    preferred = candidates[0] if candidates else None
-    raise RuntimeError(f"PDF file not found for review suggestion: {preferred}")
-
 
 def _document_model(job: Job):
     return build_document_model(job=job)
@@ -364,7 +197,7 @@ def _page_blocks_for_review(job: Job, page_numbers: list[int]) -> list[dict[str,
 
 def _suspicious_reading_blocks(job: Job, page_numbers: list[int]) -> list[dict[str, Any]]:
     suspicious_blocks: list[dict[str, Any]] = []
-    pdf_path = _job_pdf_path(job)
+    pdf_path = job_pdf_path(job)
     page_blocks = _page_blocks_for_review(job, page_numbers)
     for page_block in page_blocks:
         page_entries = [
@@ -577,7 +410,7 @@ def _font_task_payload(job: Job, task: ReviewTask) -> tuple[str, list[dict[str, 
     if not page_numbers:
         page_numbers = [1]
 
-    pdf_path = _job_pdf_path(job)
+    pdf_path = job_pdf_path(job)
     raw_targets = metadata.get("font_review_targets")
     enriched_targets = _enrich_font_review_targets(
         pdf_path,
@@ -587,7 +420,7 @@ def _font_task_payload(job: Job, task: ReviewTask) -> tuple[str, list[dict[str, 
     for page_number in page_numbers:
         images.append({
             "type": "image_url",
-            "image_url": {"url": _render_page_image(pdf_path, page_number)},
+            "image_url": {"url": render_page_png_data_url(pdf_path, page_number)},
         })
 
     target_previews = []
@@ -644,77 +477,6 @@ def _font_task_payload(job: Job, task: ReviewTask) -> tuple[str, list[dict[str, 
     return prompt_text, content
 
 
-def _reading_order_task_payload(
-    job: Job,
-    task: ReviewTask,
-    *,
-    page_intelligence: dict[str, Any] | None = None,
-    suspicious_blocks: list[dict[str, Any]] | None = None,
-) -> tuple[str, list[dict[str, Any]]]:
-    metadata = _parse_metadata(task)
-    structure_fragments = _collect_structure_fragments(job)
-    page_numbers = _reading_order_pages(metadata, structure_fragments)
-
-    pdf_path = _job_pdf_path(job)
-    images = []
-    for page_number in page_numbers:
-        images.append({
-            "type": "image_url",
-            "image_url": {"url": _render_page_image(pdf_path, page_number)},
-        })
-
-    suspicious_blocks = suspicious_blocks if isinstance(suspicious_blocks, list) else _suspicious_reading_blocks(job, page_numbers)
-    suspicious_block_previews: list[dict[str, Any]] = []
-    for block in suspicious_blocks:
-        bbox = block.get("bbox")
-        page = block.get("page")
-        if not isinstance(page, int) or not isinstance(bbox, dict):
-            continue
-        try:
-            preview_url = render_bbox_preview_png_data_url(pdf_path, page, bbox)
-        except Exception:
-            continue
-        suspicious_block_previews.append({
-            "page": page,
-            "review_id": block.get("review_id"),
-        })
-        images.append({
-            "type": "image_url",
-            "image_url": {"url": preview_url},
-        })
-
-    payload = {
-        "job_filename": job.original_filename,
-        "review_task": {
-            "task_type": task.task_type,
-            "title": task.title,
-            "detail": task.detail,
-            "severity": task.severity,
-            "source": task.source,
-        },
-        "accessibility_goal": (
-            "Use the page image and nearby structure to infer what a screen reader user "
-            "should hear when extracted text looks garbled or oddly spaced."
-        ),
-        "reading_order_metrics": metadata,
-        "pages_to_check": page_numbers,
-        "structure_fragments": structure_fragments,
-        "page_blocks": _page_blocks_for_review(job, page_numbers),
-        "page_structure_fragments": _page_structure_fragments(job, page_numbers),
-        "suspicious_text_blocks": suspicious_blocks,
-        "suspicious_block_previews": suspicious_block_previews,
-        "page_text_intelligence": page_intelligence if isinstance(page_intelligence, dict) else None,
-    }
-    prompt_text = (
-        f"{READING_ORDER_PROMPT}\n\n"
-        "Image order: full-page previews first, then suspicious text block previews in the same order as suspicious_block_previews.\n\n"
-        "Context JSON:\n"
-        f"{json.dumps(payload, indent=2, ensure_ascii=True)}"
-    )
-    content = [{"type": "text", "text": prompt_text}, *images]
-    return prompt_text, content
-
-
 def _reading_order_pages(metadata: dict[str, Any], structure_fragments: list[dict[str, Any]]) -> list[int]:
     page_numbers = [
         page
@@ -731,164 +493,6 @@ def _reading_order_pages(metadata: dict[str, Any], structure_fragments: list[dic
     if not page_numbers:
         page_numbers = [1]
     return page_numbers
-
-
-def _table_target_payload(
-    job: Job,
-    task: ReviewTask,
-    target: dict[str, Any],
-) -> tuple[str, list[dict[str, Any]]]:
-    metadata = _parse_metadata(task)
-    page = target.get("page")
-    page_numbers = [int(page)] if isinstance(page, int) and page > 0 else [1]
-
-    pdf_path = _job_pdf_path(job)
-    images: list[dict[str, Any]] = []
-    images.append({
-        "type": "image_url",
-        "image_url": {"url": _render_page_image(pdf_path, page_numbers[0])},
-    })
-
-    bbox = target.get("bbox")
-    target_preview: dict[str, Any] | None = None
-    if isinstance(page, int) and isinstance(bbox, dict):
-        try:
-            preview_url = render_bbox_preview_png_data_url(pdf_path, page, bbox)
-        except Exception:
-            preview_url = None
-        if preview_url:
-            target_preview = {
-                "table_review_id": target.get("table_review_id"),
-                "page": page,
-                "risk_reasons": target.get("risk_reasons", []),
-            }
-            images.append({
-                "type": "image_url",
-                "image_url": {"url": preview_url},
-            })
-
-    payload = {
-        "job_filename": job.original_filename,
-        "review_task": {
-            "task_type": task.task_type,
-            "title": task.title,
-            "detail": task.detail,
-            "severity": task.severity,
-            "source": task.source,
-        },
-        "accessibility_goal": (
-            "Identify header rows and row-header columns only when they improve how "
-            "screen readers and other assistive technologies understand this table."
-        ),
-        "page_to_check": page_numbers[0],
-        "table_review_target": target,
-        "target_preview": target_preview,
-        "page_structure_fragments": _page_structure_fragments(job, page_numbers),
-        "table_metrics": metadata,
-    }
-    prompt_text = (
-        f"{TABLE_REVIEW_PROMPT}\n\n"
-        "Image order: full-page preview first, then the crop preview for this one table if available.\n\n"
-        "Context JSON:\n"
-        f"{json.dumps(payload, indent=2, ensure_ascii=True)}"
-    )
-    content = [{"type": "text", "text": prompt_text}, *images]
-    return prompt_text, content
-
-
-def _table_task_payload(job: Job, task: ReviewTask) -> tuple[str, list[dict[str, Any]]]:
-    metadata = _parse_metadata(task)
-    table_targets = _table_targets_for_review(job, metadata)
-    page_numbers = sorted({
-        int(target["page"])
-        for target in table_targets
-        if isinstance(target.get("page"), int) and int(target["page"]) > 0
-    })[:MAX_REVIEW_PAGES]
-    if not page_numbers:
-        page_numbers = [
-            page
-            for page in metadata.get("pages_to_check", [])
-            if isinstance(page, int) and page > 0
-        ][:MAX_REVIEW_PAGES]
-    if not page_numbers:
-        page_numbers = [1]
-
-    pdf_path = _job_pdf_path(job)
-    images: list[dict[str, Any]] = []
-    for page_number in page_numbers:
-        images.append({
-            "type": "image_url",
-            "image_url": {"url": _render_page_image(pdf_path, page_number)},
-        })
-
-    target_previews: list[dict[str, Any]] = []
-    for target in table_targets:
-        bbox = target.get("bbox")
-        page = target.get("page")
-        if not isinstance(page, int) or not isinstance(bbox, dict):
-            continue
-        try:
-            preview_url = render_bbox_preview_png_data_url(pdf_path, page, bbox)
-        except Exception:
-            continue
-        target_previews.append({
-            "table_review_id": target.get("table_review_id"),
-            "page": page,
-            "risk_reasons": target.get("risk_reasons", []),
-        })
-        images.append({
-            "type": "image_url",
-            "image_url": {"url": preview_url},
-        })
-
-    payload = {
-        "job_filename": job.original_filename,
-        "review_task": {
-            "task_type": task.task_type,
-            "title": task.title,
-            "detail": task.detail,
-            "severity": task.severity,
-            "source": task.source,
-        },
-        "pages_to_check": page_numbers,
-        "table_review_targets": table_targets,
-        "target_previews": target_previews,
-        "page_structure_fragments": _page_structure_fragments(job, page_numbers),
-        "table_metrics": metadata,
-    }
-    prompt_text = (
-        f"{TABLE_REVIEW_PROMPT}\n\n"
-        "Image order: full-page previews first, then table crop previews in the same order as target_previews.\n\n"
-        "Context JSON:\n"
-        f"{json.dumps(payload, indent=2, ensure_ascii=True)}"
-    )
-    content = [{"type": "text", "text": prompt_text}, *images]
-    return prompt_text, content
-
-
-async def _request_llm_json(
-    *,
-    llm_client: LlmClient,
-    content: list[dict[str, Any]],
-) -> dict[str, Any]:
-    try:
-        response = await llm_client.chat_completion(
-            messages=[{"role": "user", "content": content}],
-            response_format={"type": "json_object"},
-            temperature=0,
-        )
-    except Exception:
-        response = await llm_client.chat_completion(
-            messages=[{"role": "user", "content": content}],
-            temperature=0,
-        )
-
-    try:
-        message_content = response["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError(f"Unexpected LLM response format: {exc}") from exc
-    return _extract_json_object(str(message_content))
-
 
 def _aggregate_table_suggestions(
     suggestions: list[dict[str, Any]],
@@ -1172,7 +776,7 @@ async def generate_review_suggestion(
     document = _document_model(job)
     if task.task_type == "font_text_fidelity":
         _prompt_text, content = _font_task_payload(job, task)
-        suggestion = await _request_llm_json(llm_client=llm_client, content=content)
+        suggestion = await request_llm_json(llm_client=llm_client, content=content)
     elif task.task_type == "reading_order":
         metadata = _parse_metadata(task)
         structure_fragments = _collect_structure_fragments(job)
@@ -1183,12 +787,6 @@ async def generate_review_suggestion(
             page_numbers=page_numbers,
             suspicious_blocks=suspicious_blocks,
             llm_client=llm_client,
-        )
-        _prompt_text, content = _reading_order_task_payload(
-            job,
-            task,
-            page_intelligence=page_intelligence,
-            suspicious_blocks=suspicious_blocks,
         )
         reading_order_intelligence = []
         for page_blocks in _page_blocks_for_review(job, page_numbers):
@@ -1217,8 +815,16 @@ async def generate_review_suggestion(
         metadata = _parse_metadata(task)
         table_targets = _table_targets_for_review(job, metadata)
         if not table_targets:
-            _prompt_text, content = _table_task_payload(job, task)
-            suggestion = await _request_llm_json(llm_client=llm_client, content=content)
+            suggestion = {
+                "task_type": "table_semantics",
+                "summary": "No concrete table targets are available for Gemini review on this task.",
+                "confidence": "low",
+                "suggested_action": "manual_only",
+                "reason": "Table review targets were missing from task metadata.",
+                "proposed_table_updates": [],
+                "reviewer_checklist": [],
+                "table_intelligence": [],
+            }
         else:
             per_table_intelligence: list[dict[str, Any]] = []
             for target in table_targets:
@@ -1282,7 +888,7 @@ def select_auto_font_review_resolution(
     raw_candidates = suggestion.get("actualtext_candidates")
     candidates = raw_candidates if isinstance(raw_candidates, list) else []
 
-    pdf_path = _job_pdf_path(job)
+    pdf_path = job_pdf_path(job)
     enriched_targets = _enrich_font_review_targets(pdf_path, raw_targets)
     if len(enriched_targets) != len(raw_targets):
         return None

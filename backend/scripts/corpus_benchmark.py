@@ -31,6 +31,7 @@ from app.pipeline.tagger import tag_pdf
 from app.pipeline.validator import validate_pdf
 from app.services.file_storage import cleanup_job_files
 from app.services.job_manager import JobManager
+from app.services.llm_client import track_llm_usage
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -85,6 +86,11 @@ class DocMetrics:
     tagging_secs: float
     validation_secs: float
     total_secs: float
+    llm_requests: int
+    llm_prompt_tokens: int
+    llm_completion_tokens: int
+    llm_total_tokens: int
+    llm_cost_usd: float
     structure_ok: bool
     tag_ok: bool
     validation_ok: bool
@@ -165,6 +171,10 @@ def discover_pdfs(
     for root in roots:
         if not root.exists():
             continue
+        if root.is_file():
+            if root.suffix.lower() == ".pdf" and not _should_skip(root):
+                found[str(root.resolve())] = root
+            continue
         for path in root.rglob("*.pdf"):
             if _should_skip(path):
                 continue
@@ -172,7 +182,7 @@ def discover_pdfs(
             found[key] = path
 
     wac = ROOT_DIR / "test_wac.pdf"
-    if wac.exists() and not exclude_wac:
+    if scan_roots is None and wac.exists() and not exclude_wac:
         found[str(wac.resolve())] = wac
 
     # most-recent first
@@ -1170,6 +1180,11 @@ async def benchmark_one_workflow(
     toc_llm_assist_applied = False
     toc_llm_groups_considered = 0
     toc_llm_groups_applied = 0
+    llm_requests = 0
+    llm_prompt_tokens = 0
+    llm_completion_tokens = 0
+    llm_total_tokens = 0
+    llm_cost_usd = 0.0
 
     job_id = str(uuid.uuid4())
 
@@ -1188,8 +1203,14 @@ async def benchmark_one_workflow(
                 db.add(JobStep(job_id=job_id, step_name=step_name))
             await db.commit()
 
-        await run_pipeline(job_id, session_maker, settings, job_manager)
-        await _finalize_review_if_needed(job_id, session_maker, settings, job_manager)
+        with track_llm_usage() as llm_usage:
+            await run_pipeline(job_id, session_maker, settings, job_manager)
+            await _finalize_review_if_needed(job_id, session_maker, settings, job_manager)
+        llm_requests = llm_usage.request_count
+        llm_prompt_tokens = llm_usage.prompt_tokens
+        llm_completion_tokens = llm_usage.completion_tokens
+        llm_total_tokens = llm_usage.total_tokens
+        llm_cost_usd = llm_usage.cost_usd
 
         async with session_maker() as db:
             job = await db.get(Job, job_id)
@@ -1347,6 +1368,11 @@ async def benchmark_one_workflow(
         tagging_secs=round(tagging_secs, 3),
         validation_secs=round(validation_secs, 3),
         total_secs=round(total_secs, 3),
+        llm_requests=llm_requests,
+        llm_prompt_tokens=llm_prompt_tokens,
+        llm_completion_tokens=llm_completion_tokens,
+        llm_total_tokens=llm_total_tokens,
+        llm_cost_usd=round(llm_cost_usd, 6),
         structure_ok=structure_ok,
         tag_ok=tag_ok,
         validation_ok=validation_ok,
@@ -1758,6 +1784,11 @@ def write_outputs(output_dir: Path, rows: list[DocMetrics], mode: str) -> None:
         baseline_warnings = sum(r.baseline_validation_warnings for r in completed)
         remediated_errors = sum(r.validation_errors for r in completed)
         remediated_warnings = sum(r.validation_warnings for r in completed)
+        total_llm_requests = sum(r.llm_requests for r in completed)
+        total_llm_prompt_tokens = sum(r.llm_prompt_tokens for r in completed)
+        total_llm_completion_tokens = sum(r.llm_completion_tokens for r in completed)
+        total_llm_tokens = sum(r.llm_total_tokens for r in completed)
+        total_llm_cost = sum(r.llm_cost_usd for r in completed)
         error_delta = baseline_errors - remediated_errors
         warning_delta = baseline_warnings - remediated_warnings
         f.write(f"- PDFs processed: {total}\n")
@@ -1783,6 +1814,15 @@ def write_outputs(output_dir: Path, rows: list[DocMetrics], mode: str) -> None:
         f.write(
             f"- TOC LLM assist attempted/applied: {len(toc_assist_attempted)} / {len(toc_assist_applied)}\n"
         )
+        f.write(
+            f"- LLM requests / tokens / cost: {total_llm_requests} / {total_llm_tokens} "
+            f"(prompt {total_llm_prompt_tokens}, completion {total_llm_completion_tokens}) / "
+            f"${total_llm_cost:.6f}\n"
+        )
+        if completed:
+            f.write(
+                f"- Average LLM cost per successful PDF: ${total_llm_cost / len(completed):.6f}\n"
+            )
         f.write("\n## Top Link Coverage Gaps\n\n")
         if link_gaps:
             for row in link_gaps[:10]:

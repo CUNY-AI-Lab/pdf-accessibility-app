@@ -1,26 +1,13 @@
 """Step 4: Generate alt text for figures using a vision LLM."""
 
-import base64
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 from app.pipeline.structure import FigureInfo
+from app.services.intelligence_gemini_figures import generate_figure_intelligence
 from app.services.llm_client import LlmClient
 
 logger = logging.getLogger(__name__)
-
-ALT_TEXT_PROMPT = """You are generating alt text for a PDF accessibility remediation workflow.
-
-Generate concise but complete alt text for this image following WCAG guidelines:
-- For charts/graphs: describe the data being shown, key trends, and units
-- For diagrams: describe the relationships and key components
-- For decorative images: respond with exactly "decorative"
-- For photos: describe the essential content relevant to the document
-- Maximum 125 words; prioritize information over visual description
-- Do not begin with "Image of" or "Picture of"
-
-Respond with ONLY the alt text, nothing else."""
 
 
 def _caption_fallback(caption: str | None) -> str:
@@ -34,6 +21,7 @@ class AltTextResult:
     figure_index: int
     generated_text: str
     status: str = "pending_review"
+    resolved_kind: str | None = None
 
 
 async def generate_alt_text(
@@ -55,49 +43,32 @@ async def generate_alt_text(
                 ))
                 continue
 
-            suffix = fig.path.suffix.lower()
-            if suffix in {".jpg", ".jpeg"}:
-                mime_type = "image/jpeg"
-            elif suffix == ".webp":
-                mime_type = "image/webp"
-            else:
-                mime_type = "image/png"
-            image_b64 = base64.b64encode(fig.path.read_bytes()).decode("ascii")
-            prompt = ALT_TEXT_PROMPT
-            caption = _caption_fallback(fig.caption)
-            if caption:
-                prompt += (
-                    "\n\nDocument caption/context:\n"
-                    f"{caption}\n\n"
-                    "Use the caption as supporting context when it matches the image."
-                )
-            response = await llm_client.chat_completion(
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{mime_type};base64,{image_b64}",
-                                },
-                            },
-                        ],
-                    }
-                ],
+            adjudication = await generate_figure_intelligence(
+                figure=fig,
+                llm_client=llm_client,
             )
-
-            try:
-                text = response["choices"][0]["message"]["content"].strip()
-            except (KeyError, IndexError, TypeError) as parse_err:
-                logger.error(f"Unexpected LLM response format for figure {fig.index}: {parse_err}")
-                text = "[Could not parse LLM response]"
+            suggested_action = str(adjudication.get("suggested_action") or "").strip()
+            resolved_kind = str(adjudication.get("resolved_kind") or "").strip() or None
+            if suggested_action == "reclassify_region" and resolved_kind:
+                results.append(AltTextResult(
+                    figure_index=fig.index,
+                    generated_text="",
+                    status="reclassified",
+                    resolved_kind=resolved_kind,
+                ))
+                continue
+            if suggested_action == "mark_decorative" or adjudication.get("is_decorative"):
+                text = "decorative"
+            else:
+                text = str(adjudication.get("alt_text") or "").strip()
+            if not text:
+                text = _caption_fallback(fig.caption) or "[Could not determine figure semantics]"
             logger.info(f"Generated alt text for figure {fig.index}: {text[:80]}...")
 
             results.append(AltTextResult(
                 figure_index=fig.index,
                 generated_text=text,
+                resolved_kind=resolved_kind,
             ))
 
         except Exception as e:
@@ -107,6 +78,7 @@ async def generate_alt_text(
                 figure_index=fig.index,
                 generated_text=fallback or f"[Generation failed: {e}]",
                 status="pending_review",
+                resolved_kind=None,
             ))
 
     return results

@@ -231,6 +231,18 @@ export const TASK_EVIDENCE_FIELDS: Record<string, EvidenceField[]> = {
       placeholder: "Screen-reader table navigation and tags inspection",
     },
   ],
+  form_semantics: [
+    {
+      key: "fields_checked",
+      label: "Fields checked",
+      placeholder: "Name, address, filing status, and signature fields",
+    },
+    {
+      key: "verification_method",
+      label: "Verification method",
+      placeholder: "Tab order and screen-reader field label check",
+    },
+  ],
   content_fidelity: [
     {
       key: "comparison_method",
@@ -1048,6 +1060,12 @@ export function guidanceForTask(taskType: string): string[] {
     return [
       "Check for missing text, duplicated text, or OCR drift.",
       "Compare the first pages and any pages with formulas or figures.",
+    ];
+  }
+  if (taskType === "form_semantics") {
+    return [
+      "Check that each form field has the right spoken label and role.",
+      "Tab through the fields and confirm the label matches the visible form text.",
     ];
   }
   if (taskType === "alt_text") {

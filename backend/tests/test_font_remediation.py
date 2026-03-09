@@ -13,11 +13,14 @@ from app.pipeline.orchestrator import (
     FONT_LANE_OCR_REDO,
     FONT_LANE_REPAIR_DICTS,
     FONT_LANE_REPAIR_TOUNICODE,
+    _apply_figure_reclassification,
     _apply_pretag_grounded_text_resolutions,
+    _apply_pretag_form_intelligence,
     _apply_pretag_table_intelligence,
     _apply_grounded_text_adjudication,
     _should_auto_apply_grounded_encoding_block,
     _should_auto_apply_grounded_code_block,
+    _should_auto_apply_form_intelligence,
     _embed_lane_should_skip_local,
     _font_remediation_lanes,
     _ghostscript_embed_command,
@@ -815,6 +818,65 @@ async def test_pretag_table_intelligence_applies_high_confidence_header_fix(monk
 
 
 @pytest.mark.asyncio
+async def test_pretag_form_intelligence_sets_accessible_label(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "form.pdf"
+    _pdf_with_real_widget(pdf_path)
+
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    async def _fake_generate(**kwargs):
+        target = kwargs["target"]
+        assert target["field_name"] == "field1"
+        assert kwargs["nearby_blocks"][0]["text"] == "First name and middle initial"
+        return {
+            "field_review_id": target["field_review_id"],
+            "page": target["page"],
+            "confidence": "high",
+            "confidence_score": 1.0,
+            "suggested_action": "set_field_label",
+            "reason": "Visible label is immediately above the field.",
+            "accessible_label": "First name and middle initial",
+        }
+
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+    monkeypatch.setattr(orchestrator, "generate_form_intelligence", _fake_generate)
+
+    updated_pdf, audit = await _apply_pretag_form_intelligence(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="form.pdf",
+            input_path=str(pdf_path),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_form_intelligence=True),
+        working_pdf=pdf_path,
+        structure_json={
+            "elements": [
+                {
+                    "review_id": "review-1",
+                    "type": "paragraph",
+                    "page": 0,
+                    "text": "First name and middle initial",
+                    "bbox": {"l": 10, "t": 50, "r": 140, "b": 70},
+                }
+            ]
+        },
+    )
+
+    assert audit["applied"] is True
+    assert audit["applied_count"] == 1
+    assert updated_pdf != pdf_path
+    with pikepdf.Pdf.open(updated_pdf) as pdf:
+        widget = pdf.pages[0]["/Annots"][0]
+        assert str(widget["/TU"]) == "First name and middle initial"
+
+
+@pytest.mark.asyncio
 async def test_pretag_table_intelligence_retries_manual_only_aggressively(monkeypatch, tmp_path):
     class _FakeLlmClient:
         def __init__(self, *args, **kwargs):
@@ -1586,6 +1648,143 @@ def test_grounded_text_candidates_block_when_llm_confirms():
     grounded = next(check for check in updated_report["checks"] if check["check"] == "grounded_text_fidelity")
     assert grounded["status"] == "fail"
     assert grounded["metrics"]["confirmed_blocks"] == 1
+
+
+def test_apply_figure_reclassification_removes_matching_figure_elements():
+    structure_json = {
+        "elements": [
+            {"type": "heading", "page": 0, "text": "Title"},
+            {"type": "figure", "page": 0, "figure_index": 1, "text": "Wrongly detected figure"},
+            {"type": "table", "page": 0, "review_id": "review-1"},
+            {"type": "figure", "page": 1, "figure_index": 2, "text": "Real figure"},
+        ]
+    }
+
+    alt_texts = [
+        SimpleNamespace(figure_index=1, status="reclassified", resolved_kind="table"),
+        SimpleNamespace(figure_index=2, status="pending_review", resolved_kind=None),
+    ]
+
+    updated, audit = _apply_figure_reclassification(structure_json, alt_texts)
+
+    assert updated is not structure_json
+    assert [element.get("type") for element in updated["elements"]] == ["heading", "table", "figure"]
+    assert audit["applied"] is True
+    assert audit["candidate_count"] == 1
+    assert audit["removed_count"] == 1
+    assert audit["removed_indexes"] == [1]
+    assert audit["removed_kinds"] == {"table": 1}
+    assert audit["pages"] == [1]
+
+
+def test_auto_apply_form_intelligence_rejects_technical_or_unchanged_labels():
+    assert _should_auto_apply_form_intelligence(
+        {
+            "confidence": "high",
+            "suggested_action": "set_field_label",
+            "accessible_label": "f1_01[0]",
+            "current_field_name": "f1_01[0]",
+            "current_accessible_name": "",
+        }
+    ) is False
+
+    assert _should_auto_apply_form_intelligence(
+        {
+            "confidence": "high",
+            "suggested_action": "set_field_label",
+            "accessible_label": "First name",
+            "current_field_name": "f1_01[0]",
+            "current_accessible_name": "First name",
+        }
+    ) is False
+
+    assert _should_auto_apply_form_intelligence(
+        {
+            "confidence": "high",
+            "suggested_action": "set_field_label",
+            "accessible_label": "First name and middle initial",
+            "current_field_name": "f1_01[0]",
+            "current_accessible_name": "f1_01[0]",
+        }
+    ) is True
+
+    assert _should_auto_apply_form_intelligence(
+        {
+            "confidence": "high",
+            "suggested_action": "set_field_label",
+            "accessible_label": (
+                "If treating a nonresident alien or dual-status alien spouse as a U.S. "
+                "resident for the entire tax year, check the box and enter their name"
+            ),
+            "current_field_name": "c1_9[0]",
+            "current_accessible_name": "",
+        }
+    ) is True
+
+
+def test_form_targets_for_intelligence_prefers_local_nearby_fields(monkeypatch, tmp_path):
+    field = SimpleNamespace(
+        field_review_id="field-1",
+        page_number=1,
+        order=10,
+        field_type="checkbox",
+        field_name="c1_01[0]",
+        accessible_name="",
+        label_quality="missing",
+        value_text="/Off",
+        bbox=SimpleNamespace(to_dict=lambda: {"l": 100.0, "t": 100.0, "r": 108.0, "b": 92.0}),
+    )
+    close_same_type = SimpleNamespace(
+        field_review_id="field-2",
+        page_number=1,
+        order=11,
+        field_type="checkbox",
+        field_name="c1_02[0]",
+        accessible_name="Nearby option",
+        label_quality="good",
+        value_text="",
+        bbox=SimpleNamespace(to_dict=lambda: {"l": 120.0, "t": 100.0, "r": 128.0, "b": 92.0}),
+    )
+    close_other_type = SimpleNamespace(
+        field_review_id="field-3",
+        page_number=1,
+        order=12,
+        field_type="text",
+        field_name="f1_01[0]",
+        accessible_name="Nearby text field",
+        label_quality="good",
+        value_text="",
+        bbox=SimpleNamespace(to_dict=lambda: {"l": 100.0, "t": 84.0, "r": 180.0, "b": 72.0}),
+    )
+    far_same_type = SimpleNamespace(
+        field_review_id="field-4",
+        page_number=1,
+        order=90,
+        field_type="checkbox",
+        field_name="c1_99[0]",
+        accessible_name="Far checkbox",
+        label_quality="good",
+        value_text="",
+        bbox=SimpleNamespace(to_dict=lambda: {"l": 500.0, "t": 700.0, "r": 508.0, "b": 692.0}),
+    )
+    page = SimpleNamespace(page_number=1, fields=[field, far_same_type, close_other_type, close_same_type])
+    document = SimpleNamespace(pages=[page])
+
+    monkeypatch.setattr(orchestrator, "build_document_model", lambda **kwargs: document)
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_nearby_blocks",
+        lambda *args, **kwargs: [{"review_id": "review-1", "type": "paragraph", "text": "Nearby label"}],
+    )
+
+    targets = orchestrator._form_targets_for_intelligence(
+        working_pdf=tmp_path / "dummy.pdf",
+        structure_json={"elements": []},
+    )
+
+    assert len(targets) == 1
+    nearby_ids = [item["field_review_id"] for item in targets[0]["nearby_fields"]]
+    assert nearby_ids == ["field-2", "field-3"]
 
 
 @pytest.mark.asyncio

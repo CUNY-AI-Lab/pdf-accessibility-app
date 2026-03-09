@@ -16,6 +16,7 @@ from PIL import Image
 from pdfminer.high_level import extract_text
 
 from app.services.document_intelligence import build_document_model
+from app.services.form_fields import extract_widget_fields
 from app.services.page_intelligence import (
     collect_grounded_text_candidates,
 )
@@ -343,6 +344,55 @@ def _table_semantics_risk(structure_json: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _form_semantics_risk(output_pdf: Path) -> dict[str, Any]:
+    try:
+        fields = extract_widget_fields(output_pdf)
+    except Exception:
+        return {
+            "field_count": 0,
+            "missing_labels": 0,
+            "weak_labels": 0,
+            "targets": [],
+        }
+
+    targets: list[dict[str, Any]] = []
+    missing_labels = 0
+    weak_labels = 0
+    for field in fields:
+        quality = str(field.get("label_quality") or "missing")
+        if quality == "missing":
+            missing_labels += 1
+        elif quality == "weak":
+            weak_labels += 1
+        else:
+            continue
+        targets.append(
+            {
+                "field_review_id": str(field.get("field_review_id") or "").strip(),
+                "page": int(field.get("page")) if isinstance(field.get("page"), int) else 1,
+                "bbox": field.get("bbox") if isinstance(field.get("bbox"), dict) else None,
+                "field_type": str(field.get("field_type") or "").strip(),
+                "field_name": _normalize_text(field.get("field_name"))[:240],
+                "accessible_name": _normalize_text(field.get("accessible_name"))[:240],
+                "label_quality": quality,
+            }
+        )
+
+    targets.sort(
+        key=lambda item: (
+            0 if str(item.get("label_quality")) == "missing" else 1,
+            int(item.get("page", 0)),
+            str(item.get("field_review_id", "")),
+        )
+    )
+    return {
+        "field_count": len(fields),
+        "missing_labels": missing_labels,
+        "weak_labels": weak_labels,
+        "targets": targets,
+    }
+
+
 def _longest_nondecreasing_subsequence_len(values: list[int]) -> int:
     tails: list[int] = []
     for value in values:
@@ -595,23 +645,40 @@ def _task_for_violation(violation: dict[str, Any]) -> tuple[str, str, str]:
     rule_id = str(violation.get("rule_id") or "")
     description = str(violation.get("description") or "").lower()
 
+    if (
+        rule_id == "ISO 14289-1:2014-7.18.1-3"
+        or "form field" in description
+        or "widget annotation" in description
+        or "widget annotations" in description
+    ):
+        return (
+            "form_semantics",
+            "Verify form field labels",
+            "Some form fields still need manual review for accessible labeling.",
+        )
     if category == "fonts" or FONT_RULE_FRAGMENT in rule_id:
         return (
             "font_text_fidelity",
             "Verify font-to-text mapping",
             "Remaining font and Unicode errors can change what assistive technology reads.",
         )
+    if (
+        category == "figures"
+        or rule_id.startswith("ISO 14289-1:2014-7.3-")
+        or "figure tag" in description
+        or "replacement text" in description
+        or "alternate text" in description
+    ):
+        return (
+            "alt_text",
+            "Verify figure descriptions",
+            "Some figure descriptions still require manual review for accuracy.",
+        )
     if category in {"annotations", "links"}:
         return (
             "annotation_description",
             "Verify annotations and link descriptions",
             "Annotations or links still need manual review for accessible naming and structure.",
-        )
-    if category == "figures" or "alternate text" in description or " alt " in f" {description} ":
-        return (
-            "alt_text",
-            "Verify figure descriptions",
-            "Some figure descriptions still require manual review for accuracy.",
         )
     if category == "tables" or any(keyword in description for keyword in TABLE_KEYWORDS):
         return (
@@ -845,6 +912,12 @@ def assess_fidelity(
             "message": "No remaining validation errors.",
             "metrics": {"remaining_rules": 0, "remaining_errors": 0},
         })
+
+    remaining_form_validation_errors = sum(
+        int(violation.get("count", 1) or 1)
+        for violation in unresolved_errors
+        if _task_for_violation(violation)[0] == "form_semantics"
+    )
 
     comparison_pdf = comparison_source_pdf or input_pdf
     using_alternate_source = comparison_pdf != input_pdf
@@ -1254,6 +1327,62 @@ def assess_fidelity(
             },
         })
 
+    form_risk = _form_semantics_risk(output_pdf)
+    if form_risk["field_count"] > 0:
+        if (
+            form_risk["missing_labels"] > 0
+            or form_risk["weak_labels"] > 0
+            or remaining_form_validation_errors > 0
+        ):
+            add_task(
+                "review:form_semantics",
+                task_type="form_semantics",
+                title="Verify form field labels",
+                detail=(
+                    "Some form fields are still missing accessible labels, have weak technical names, "
+                    "or are still failing validator checks. Review the affected fields before release."
+                ),
+                severity="high" if form_risk["missing_labels"] > 0 else "medium",
+                blocking=True,
+                metadata={
+                    "field_count": form_risk["field_count"],
+                    "missing_labels": form_risk["missing_labels"],
+                    "weak_labels": form_risk["weak_labels"],
+                    "remaining_validation_errors": remaining_form_validation_errors,
+                    "pages_to_check": sorted({
+                        int(target["page"])
+                        for target in form_risk["targets"]
+                        if isinstance(target.get("page"), int)
+                    }),
+                    "field_review_targets": form_risk["targets"][:12],
+                },
+            )
+            form_status = "fail"
+        else:
+            form_status = "pass"
+        checks.append({
+            "check": "form_semantics",
+            "status": form_status,
+            "message": "Checked whether widget annotations have accessible field labels.",
+            "metrics": {
+                "field_count": form_risk["field_count"],
+                "missing_labels": form_risk["missing_labels"],
+                "weak_labels": form_risk["weak_labels"],
+                "remaining_validation_errors": remaining_form_validation_errors,
+            },
+        })
+    else:
+        checks.append({
+            "check": "form_semantics",
+            "status": "skip",
+            "message": "No form fields detected in the output PDF.",
+            "metrics": {
+                "field_count": 0,
+                "missing_labels": 0,
+                "weak_labels": 0,
+            },
+        })
+
     machine_only_alt = 0
     caption_backed_alt = 0
     for entry in alt_entries:
@@ -1406,9 +1535,8 @@ def assess_fidelity(
         set(font_rule_ids),
         output_pdf=output_pdf,
     )
-    if remaining_font_errors > 0 or (
-        isinstance(unicode_gate, dict) and not unicode_gate.get("allow_automatic", True)
-    ):
+    has_concrete_font_review = bool(font_review_targets or pages_to_check or fonts_to_check)
+    if remaining_font_errors > 0 or has_concrete_font_review:
         add_task(
             "review:font_text_fidelity",
             task_type="font_text_fidelity",
@@ -1433,7 +1561,7 @@ def assess_fidelity(
         checks.append({
             "check": "font_text_fidelity",
             "status": "fail",
-            "message": "Font-related compliance or Unicode-gate risk requires manual review.",
+            "message": "Font-related compliance or visible-text risk requires manual review.",
             "metrics": {
                 "remaining_font_errors": remaining_font_errors,
                 "review_pages": len(pages_to_check),
@@ -1448,7 +1576,12 @@ def assess_fidelity(
             "check": "font_text_fidelity",
             "status": "pass",
             "message": "No residual font-text fidelity risk was detected.",
-            "metrics": {"remaining_font_errors": 0},
+            "metrics": {
+                "remaining_font_errors": 0,
+                "automatic_unicode_allowed": bool(unicode_gate.get("allow_automatic", True))
+                if isinstance(unicode_gate, dict)
+                else True,
+            },
         })
 
     tasks = sorted(

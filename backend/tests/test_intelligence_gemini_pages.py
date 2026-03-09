@@ -1,27 +1,8 @@
 import asyncio
-import json
 from types import SimpleNamespace
 
-from app.services import intelligence_gemini_pages
 from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
-
-
-class _FakeLlmClient:
-    def __init__(self, payload: dict):
-        self.payload = payload
-        self.calls: list[dict] = []
-
-    async def chat_completion(self, messages, **kwargs):
-        self.calls.append({"messages": messages, "kwargs": kwargs})
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps(self.payload),
-                    }
-                }
-            ]
-        }
+from app.services.semantic_units import SemanticDecision
 
 
 def _job(tmp_path):
@@ -35,35 +16,29 @@ def _job(tmp_path):
 
 
 def test_generate_suspicious_text_intelligence_returns_normalized_blocks(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        intelligence_gemini_pages,
-        "render_page_png_data_url",
-        lambda pdf_path, page_number: f"data:image/png;base64,page-{page_number}",
-    )
-    monkeypatch.setattr(
-        intelligence_gemini_pages,
-        "render_bbox_preview_png_data_url",
-        lambda pdf_path, page_number, bbox: f"data:image/png;base64:block-{page_number}",
-    )
+    captured = {}
 
-    fake_llm = _FakeLlmClient(
-        {
-            "task_type": "page_text_intelligence",
-            "summary": "Page title is readable despite broken extraction.",
-            "confidence": "high",
-            "blocks": [
-                {
-                    "page": 1,
-                    "review_id": "review-1",
-                    "readable_text_hint": "Data Book",
-                    "chosen_source": "ocr",
-                    "issue_type": "spacing_only",
-                    "confidence": "high",
-                    "should_block_accessibility": True,
-                    "reason": "Visible title is clear, but extracted text is split by spacing.",
-                }
-            ],
-        }
+    async def _fake_adjudicate(*, job, units, llm_client):
+        captured["units"] = units
+        return [
+            SemanticDecision(
+                unit_id="review-1",
+                unit_type="text_block",
+                summary="Page title is readable despite broken extraction.",
+                confidence="high",
+                confidence_score=0.9,
+                suggested_action="set_resolved_text",
+                reason="Visible title is clear, but extracted text is split by spacing.",
+                chosen_source="ocr",
+                resolved_text="Data Book",
+                issue_type="spacing_only",
+                should_block_accessibility=True,
+            )
+        ]
+
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_pages.adjudicate_semantic_units",
+        _fake_adjudicate,
     )
 
     result = asyncio.run(
@@ -84,7 +59,7 @@ def test_generate_suspicious_text_intelligence_returns_normalized_blocks(monkeyp
                     "signals": ["letters separated by spaces"],
                 }
             ],
-            llm_client=fake_llm,
+            llm_client=object(),
         )
     )
 
@@ -106,7 +81,10 @@ def test_generate_suspicious_text_intelligence_returns_normalized_blocks(monkeyp
     assert block["original_text_candidate"] == "D a t a  B o o k"
     assert block["extracted_text"] == "D a t a  B o o k"
     assert block["ocr_text_candidate"] == "Data Book"
-    assert fake_llm.calls
-    prompt = fake_llm.calls[0]["messages"][0]["content"][0]["text"]
-    assert '"native_text_candidate": "D a t a  B o o k"' in prompt
-    assert '"ocr_text_candidate": "Data Book"' in prompt
+
+    unit = captured["units"][0]
+    assert unit.unit_type == "text_block"
+    assert unit.unit_id == "review-1"
+    assert unit.native_text_candidate == "D a t a  B o o k"
+    assert unit.ocr_text_candidate == "Data Book"
+    assert unit.metadata["signals"] == ["letters separated by spaces"]

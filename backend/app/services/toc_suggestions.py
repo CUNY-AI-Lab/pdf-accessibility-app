@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from app.pipeline.structure import _expand_toc_item_tables
+from app.services.intelligence_gemini_toc import generate_toc_group_intelligence
 from app.services.llm_client import LlmClient
 from app.services.pdf_preview import render_page_png_data_url
 
@@ -16,40 +17,6 @@ MAX_TOC_PAGES = 3
 MAX_TOC_ELEMENTS = 18
 TOC_AUTO_CONFIDENCE = {"high", "medium"}
 TOC_ALLOWED_ENTRY_TYPES = {"paragraph", "list_item", "heading", "table", "toc_item", "toc_item_table"}
-
-TOC_REVIEW_PROMPT = """You are assisting PDF accessibility remediation for a PDF/UA workflow.
-
-You will receive:
-- full-page previews of candidate table-of-contents pages
-- a JSON payload describing extracted structural elements near headings like "Contents" or "Table of Contents"
-
-Respond with strict JSON only using this schema:
-{
-  "groups": [
-    {
-      "caption_index": 4,
-      "is_toc": true,
-      "confidence": "high" | "medium" | "low",
-      "reason": "short explanation",
-      "entry_indexes": [5, 6, 7],
-      "entry_types": {
-        "5": "toc_item",
-        "6": "toc_item_table"
-      }
-    }
-  ]
-}
-
-Rules:
-- Only return groups for caption_index values present in candidate_groups.
-- Use is_toc=false and leave entry_indexes empty when the page is not actually a table of contents.
-- entry_indexes must only refer to indices listed in that group's candidate_elements.
-- Use toc_item_table only for candidate elements whose source type is table.
-- Use toc_item for heading, paragraph, or list-style entries.
-- Prefer precision over recall. If unsure, omit the group or set confidence to low.
-- Do not invent entries that are not represented in candidate_elements.
-- Do not include markdown fences or commentary outside the JSON object.
-"""
 
 
 def _normalize_text(value: Any) -> str:
@@ -146,54 +113,6 @@ def collect_toc_candidates(structure_json: dict[str, Any]) -> list[dict[str, Any
     return candidates[:MAX_TOC_GROUPS]
 
 
-def _extract_json_object(raw_text: str) -> dict[str, Any]:
-    text = (raw_text or "").strip()
-    if not text:
-        raise ValueError("Empty LLM response")
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].startswith("```"):
-            text = "\n".join(lines[1:-1]).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError("LLM response did not contain a JSON object")
-    parsed = json.loads(text[start:end + 1])
-    if not isinstance(parsed, dict):
-        raise ValueError("LLM response JSON was not an object")
-    return parsed
-
-
-def build_toc_llm_payload(
-    *,
-    pdf_path: Path,
-    structure_json: dict[str, Any],
-    original_filename: str,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    candidate_groups = collect_toc_candidates(structure_json)
-    page_numbers: list[int] = []
-    for group in candidate_groups:
-        for page_number in group.get("pages", []):
-            if isinstance(page_number, int) and page_number > 0 and page_number not in page_numbers:
-                page_numbers.append(page_number)
-    images: list[dict[str, Any]] = []
-    for page_number in page_numbers[:MAX_TOC_PAGES]:
-        try:
-            image_url = render_page_png_data_url(pdf_path, page_number)
-        except Exception:
-            continue
-        images.append({
-            "type": "image_url",
-            "image_url": {"url": image_url},
-        })
-    payload = {
-        "job_filename": original_filename,
-        "candidate_groups": candidate_groups,
-        "page_numbers": page_numbers[:MAX_TOC_PAGES],
-    }
-    return payload, images
-
-
 def apply_toc_llm_suggestion(
     structure_json: dict[str, Any],
     suggestion: dict[str, Any],
@@ -280,12 +199,7 @@ async def enhance_toc_structure_with_llm(
     original_filename: str,
     llm_client: LlmClient,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    payload, images = build_toc_llm_payload(
-        pdf_path=pdf_path,
-        structure_json=structure_json,
-        original_filename=original_filename,
-    )
-    candidate_groups = payload.get("candidate_groups", [])
+    candidate_groups = collect_toc_candidates(structure_json)
     if not candidate_groups:
         return structure_json, {
             "attempted": False,
@@ -295,33 +209,22 @@ async def enhance_toc_structure_with_llm(
             "groups_applied": 0,
         }
 
-    prompt_text = (
-        f"{TOC_REVIEW_PROMPT}\n\n"
-        "Context JSON:\n"
-        f"{json.dumps(payload, indent=2, ensure_ascii=True)}"
-    )
-    content = [{"type": "text", "text": prompt_text}, *images]
-
-    try:
-        response = await llm_client.chat_completion(
-            messages=[{"role": "user", "content": content}],
-            response_format={"type": "json_object"},
-            temperature=0,
-        )
-    except Exception:
-        response = await llm_client.chat_completion(
-            messages=[{"role": "user", "content": content}],
-            temperature=0,
+    groups: list[dict[str, Any]] = []
+    for group in candidate_groups:
+        groups.append(
+            await generate_toc_group_intelligence(
+                pdf_path=pdf_path,
+                original_filename=original_filename,
+                candidate_group=group,
+                llm_client=llm_client,
+            )
         )
 
-    try:
-        message_content = response["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError(f"Unexpected LLM response format: {exc}") from exc
-
-    suggestion = _extract_json_object(str(message_content))
-    suggestion["generated_at"] = datetime.now(UTC).isoformat()
-    suggestion["model"] = llm_client.model
+    suggestion = {
+        "groups": groups,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "model": llm_client.model,
+    }
     audit = apply_toc_llm_suggestion(structure_json, suggestion)
     audit["groups_considered"] = len(candidate_groups)
     audit["suggestion"] = suggestion

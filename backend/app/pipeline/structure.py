@@ -118,6 +118,7 @@ class FigureInfo:
     path: Path
     caption: str | None = None
     page: int | None = None
+    bbox: dict | None = None
 
 
 @dataclass
@@ -190,14 +191,29 @@ def _extract_bbox(prov: list[dict]) -> dict | None:
     """
     if not prov:
         return None
-    bbox = prov[0].get("bbox")
+    first = prov[0]
+    if isinstance(first, dict):
+        bbox = first.get("bbox")
+    else:
+        bbox = getattr(first, "bbox", None)
     if not bbox:
         return None
+
+    if isinstance(bbox, dict):
+        left = bbox.get("l", 0)
+        bottom = bbox.get("b", 0)
+        right = bbox.get("r", 0)
+        top = bbox.get("t", 0)
+    else:
+        left = getattr(bbox, "l", 0)
+        bottom = getattr(bbox, "b", 0)
+        right = getattr(bbox, "r", 0)
+        top = getattr(bbox, "t", 0)
     return {
-        "l": bbox.get("l", 0),
-        "b": bbox.get("b", 0),
-        "r": bbox.get("r", 0),
-        "t": bbox.get("t", 0),
+        "l": left,
+        "b": bottom,
+        "r": right,
+        "t": top,
     }
 
 
@@ -793,6 +809,7 @@ async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
                         path=fig_path,
                         caption=caption,
                         page=(element.prov[0].page_no - 1) if element.prov else None,
+                        bbox=_extract_bbox(element.prov) if getattr(element, "prov", None) else None,
                     ))
             except Exception as e:
                 logger.warning(f"Failed to extract figure {i}: {e}")

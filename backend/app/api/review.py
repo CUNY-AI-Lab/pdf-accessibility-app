@@ -60,6 +60,10 @@ TASK_EVIDENCE_REQUIREMENTS: dict[str, tuple[tuple[str, str], ...]] = {
         ("tables_checked", "tables checked"),
         ("verification_method", "verification method"),
     ),
+    "form_semantics": (
+        ("fields_checked", "fields checked"),
+        ("verification_method", "verification method"),
+    ),
     "content_fidelity": (
         ("comparison_method", "comparison method"),
         ("pages_checked", "pages checked"),
@@ -714,6 +718,8 @@ async def suggest_review_task(
         timeout=settings.llm_timeout,
         max_retries=settings.llm_max_retries,
         retry_backoff_base=settings.llm_retry_backoff_base,
+        max_backoff_seconds=settings.llm_retry_max_backoff_seconds,
+        max_concurrency=settings.llm_max_concurrency,
     )
 
     metadata = _parse_json(task.metadata_json)

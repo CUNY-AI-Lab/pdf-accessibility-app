@@ -10,6 +10,7 @@ from app.pipeline.fidelity import (
     _check_internal_link_destinations,
     _check_link_text_quality,
     _extract_font_review_targets,
+    _form_semantics_risk,
     _grounded_text_risk,
     _iter_name_tree_entries,
     _table_semantics_risk,
@@ -57,6 +58,143 @@ def test_fidelity_creates_blocking_font_task_when_unicode_gate_blocks():
 
     assert report["passed"] is False
     assert any(task["task_type"] == "font_text_fidelity" and task["blocking"] for task in tasks)
+
+
+def test_fidelity_does_not_block_font_task_on_gate_only_without_residual_font_risk():
+    report, tasks = assess_fidelity(
+        input_pdf=Path("in.pdf"),
+        output_pdf=Path("out.pdf"),
+        structure_json={"elements": []},
+        alt_entries=[],
+        validation_report={
+            "compliant": True,
+            "violations": [],
+            "summary": {"errors": 0, "warnings": 0},
+            "remediation": {
+                "font_remediation": {
+                    "unicode_gate": {"allow_automatic": False, "reason": "ambiguous simple fonts"},
+                    "postflight_diagnostics": {
+                        "summary": {
+                            "fonts_with_unresolved_used_codes": 0,
+                            "fonts_with_missing_used_codes": 0,
+                        }
+                    },
+                }
+            },
+            "raw_report": {"report": {"jobs": []}},
+            "tagging": {"tables_tagged": 0},
+        },
+        tagging_metrics={"tables_tagged": 0},
+        classification="digital",
+    )
+
+    font_check = next(check for check in report["checks"] if check["check"] == "font_text_fidelity")
+    assert font_check["status"] == "pass"
+    assert not any(task["task_type"] == "font_text_fidelity" for task in tasks)
+
+
+def test_fidelity_routes_widget_alt_rule_to_form_semantics():
+    report, tasks = assess_fidelity(
+        input_pdf=Path("in.pdf"),
+        output_pdf=Path("out.pdf"),
+        structure_json={"elements": []},
+        alt_entries=[],
+        validation_report=_validation_report(
+            compliant=False,
+            violations=[
+                {
+                    "rule_id": "ISO 14289-1:2014-7.18.1-3",
+                    "severity": "error",
+                    "category": None,
+                    "description": (
+                        "A form field shall have a TU key present or all its Widget annotations shall "
+                        "have alternative descriptions (in the form of an Alt entry in the enclosing structure elements)"
+                    ),
+                    "count": 1,
+                }
+            ],
+        ),
+        tagging_metrics={"tables_tagged": 0},
+        classification="digital",
+    )
+
+    assert report["passed"] is False
+    assert any(task["task_type"] == "form_semantics" and task["blocking"] for task in tasks)
+    assert not any(task["task_type"] == "alt_text" for task in tasks)
+
+
+def test_fidelity_form_semantics_fails_when_validator_still_has_form_errors(monkeypatch):
+    monkeypatch.setattr(
+        fidelity,
+        "_form_semantics_risk",
+        lambda output_pdf: {
+            "field_count": 10,
+            "missing_labels": 0,
+            "weak_labels": 0,
+            "targets": [],
+        },
+    )
+
+    report, tasks = assess_fidelity(
+        input_pdf=Path("in.pdf"),
+        output_pdf=Path("out.pdf"),
+        structure_json={"elements": []},
+        alt_entries=[],
+        validation_report=_validation_report(
+            compliant=False,
+            violations=[
+                {
+                    "rule_id": "ISO 14289-1:2014-7.18.1-3",
+                    "severity": "error",
+                    "category": None,
+                    "description": (
+                        "A form field shall have a TU key present or all its Widget annotations shall "
+                        "have alternative descriptions (in the form of an Alt entry in the enclosing structure elements)"
+                    ),
+                    "count": 3,
+                }
+            ],
+        ),
+        tagging_metrics={"tables_tagged": 0},
+        classification="digital",
+    )
+
+    form_check = next(check for check in report["checks"] if check["check"] == "form_semantics")
+    assert form_check["status"] == "fail"
+    assert form_check["metrics"]["remaining_validation_errors"] == 3
+    form_task = next(task for task in tasks if task["task_type"] == "form_semantics")
+    assert form_task["blocking"] is True
+    assert form_task["metadata"]["remaining_validation_errors"] == 3
+
+
+def test_fidelity_routes_figure_alt_rule_to_alt_text_not_table_semantics():
+    report, tasks = assess_fidelity(
+        input_pdf=Path("in.pdf"),
+        output_pdf=Path("out.pdf"),
+        structure_json={"elements": []},
+        alt_entries=[],
+        validation_report=_validation_report(
+            compliant=False,
+            violations=[
+                {
+                    "rule_id": "ISO 14289-1:2014-7.3-1",
+                    "severity": "error",
+                    "category": None,
+                    "description": (
+                        "Figure tags shall include an alternative representation or replacement text that "
+                        "represents the contents marked with the Figure tag as noted in ISO 32000-1:2008, 14.7.2, Table 323"
+                    ),
+                    "count": 3,
+                }
+            ],
+        ),
+        tagging_metrics={"tables_tagged": 0},
+        classification="digital",
+    )
+
+    assert report["passed"] is False
+    assert any(task["task_type"] == "alt_text" and task["blocking"] for task in tasks)
+    assert not any(task["task_type"] == "table_semantics" for task in tasks)
 
 
 def test_extract_font_review_targets_from_verapdf_contexts():
@@ -258,6 +396,35 @@ def test_internal_link_destinations_support_name_objects_and_nested_name_trees(t
     assert broken_links == [
         {"page": 1, "dest": "MissingDest", "reason": "GoTo destination not found"},
     ]
+
+
+def test_form_semantics_risk_flags_missing_accessible_labels(tmp_path):
+    import pikepdf
+
+    pdf_path = tmp_path / "form.pdf"
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    widget = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Widget"),
+                "/Rect": pikepdf.Array([10, 10, 80, 28]),
+                "/FT": pikepdf.Name("/Tx"),
+                "/T": pikepdf.String("f1_01[0]"),
+            }
+        )
+    )
+    page["/Annots"] = pikepdf.Array([widget])
+    pdf.Root["/AcroForm"] = pikepdf.Dictionary({"/Fields": pikepdf.Array([widget])})
+    pdf.save(pdf_path)
+
+    risk = _form_semantics_risk(pdf_path)
+
+    assert risk["field_count"] == 1
+    assert risk["missing_labels"] == 1
+    assert risk["weak_labels"] == 0
+    assert risk["targets"][0]["field_type"] == "text"
 
 
 def test_named_destination_helpers_normalize_and_walk_nested_trees():

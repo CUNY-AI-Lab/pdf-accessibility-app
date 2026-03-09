@@ -28,7 +28,16 @@ from app.pipeline.subprocess_utils import SubprocessTimeout, communicate_with_ti
 from app.pipeline.tagger import tag_pdf
 from app.pipeline.validator import validate_pdf
 from app.services.font_artifact import apply_artifact_batch_to_contexts
-from app.services.document_intelligence import build_document_model, collect_structure_fragments
+from app.services.document_intelligence import (
+    build_document_model,
+    collect_nearby_blocks,
+    collect_structure_fragments,
+)
+from app.services.form_fields import apply_field_accessible_names, field_label_quality
+from app.services.intelligence_gemini_forms import (
+    generate_form_intelligence,
+    generate_form_intelligence_for_page,
+)
 from app.services.intelligence_gemini_tables import generate_table_intelligence
 from app.services.font_unicode_override import apply_unicode_override_to_context
 from app.services.file_storage import create_job_dir, get_output_path
@@ -58,6 +67,7 @@ FONT_LANE_OCR_FORCE = "ocr_force"
 FONT_EMBED_RULE_MARKERS = ("-7.21.3.2-", "-7.21.4.")
 FONT_UNICODE_RULE_MARKERS = ("-7.21.7-", "-7.21.8-")
 FONT_DICT_REPAIR_RULE_MARKERS = ("-7.21.3.2-", "-7.21.4.2-")
+FIGURE_RECLASSIFY_KINDS = {"table", "form_region", "artifact"}
 FONT_SUBSET_RE = re.compile(r"^[A-Z]{6}\+.+")
 FONT_NAME_RE = re.compile(r"[^A-Za-z0-9]+")
 HEX_STR_RE = re.compile(r"<([0-9A-Fa-f]+)>")
@@ -162,6 +172,15 @@ PRETAG_GROUNDED_CODE_MAX_CHARS = 2000
 PRETAG_GROUNDED_CODE_MAX_LINES = 40
 PRETAG_GROUNDED_CODE_MIN_SUPPORT = 0.55
 PRETAG_TABLE_ALLOWED_ACTIONS = frozenset({"confirm_current_headers", "set_table_headers"})
+PRETAG_FORM_ALLOWED_ACTIONS = frozenset({"confirm_current_label", "set_field_label"})
+PRETAG_FORM_ALLOWED_TYPES = frozenset({
+    "text",
+    "checkbox",
+    "radio_button",
+    "push_button",
+    "combo_box",
+    "list_box",
+})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -570,6 +589,82 @@ def _apply_grounded_text_adjudication(
     return review_tasks, _recalculate_fidelity_summary(fidelity_report, review_tasks)
 
 
+def _apply_figure_reclassification(
+    structure_json: dict[str, object],
+    alt_texts: list[object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    audit: dict[str, object] = {
+        "attempted": False,
+        "applied": False,
+        "reason": "",
+        "candidate_count": 0,
+        "removed_count": 0,
+        "removed_indexes": [],
+        "removed_kinds": {},
+        "pages": [],
+    }
+    if not isinstance(structure_json, dict):
+        audit["reason"] = "missing_structure"
+        return structure_json, audit
+
+    reclassified: dict[int, str] = {}
+    for item in alt_texts:
+        figure_index = getattr(item, "figure_index", None)
+        status = str(getattr(item, "status", "") or "").strip()
+        resolved_kind = str(getattr(item, "resolved_kind", "") or "").strip()
+        if (
+            isinstance(figure_index, int)
+            and status == "reclassified"
+            and resolved_kind in FIGURE_RECLASSIFY_KINDS
+        ):
+            reclassified[figure_index] = resolved_kind
+
+    if not reclassified:
+        audit["reason"] = "no_candidates"
+        return structure_json, audit
+
+    elements = structure_json.get("elements")
+    if not isinstance(elements, list):
+        audit["reason"] = "missing_elements"
+        return structure_json, audit
+
+    audit["attempted"] = True
+    audit["candidate_count"] = len(reclassified)
+    updated = copy.deepcopy(structure_json)
+    updated_elements: list[object] = []
+    removed_indexes: list[int] = []
+    removed_pages: set[int] = set()
+    removed_kinds: dict[str, int] = {}
+    for element in elements:
+        if not isinstance(element, dict):
+            updated_elements.append(element)
+            continue
+        if element.get("type") == "figure" and isinstance(element.get("figure_index"), int):
+            figure_index = int(element["figure_index"])
+            resolved_kind = reclassified.get(figure_index)
+            if resolved_kind:
+                removed_indexes.append(figure_index)
+                page = element.get("page")
+                if isinstance(page, int) and page >= 0:
+                    removed_pages.add(page + 1)
+                removed_kinds[resolved_kind] = removed_kinds.get(resolved_kind, 0) + 1
+                continue
+        updated_elements.append(element)
+
+    if not removed_indexes:
+        audit["reason"] = "no_matching_structure_elements"
+        return structure_json, audit
+
+    updated["elements"] = updated_elements
+    audit["applied"] = True
+    audit["reason"] = "applied"
+    audit["removed_count"] = len(removed_indexes)
+    audit["removed_indexes"] = sorted(removed_indexes)
+    audit["removed_kinds"] = removed_kinds
+    audit["pages"] = sorted(removed_pages)
+    return updated, audit
+
+
 def _should_auto_apply_grounded_text_block(block: dict[str, object]) -> bool:
     readable_text = str(block.get("readable_text_hint") or "").strip()
     if not readable_text:
@@ -906,6 +1001,127 @@ def _should_retry_table_intelligence_confirm_existing(
     return reasons.issubset(allowed)
 
 
+def _form_targets_for_intelligence(
+    *,
+    working_pdf: Path,
+    structure_json: dict[str, object],
+) -> list[dict[str, object]]:
+    def _bbox_distance(a: dict[str, object] | None, b: dict[str, object] | None) -> float:
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            return float("inf")
+        try:
+            ax = (float(a["l"]) + float(a["r"])) / 2.0
+            ay = (float(a["t"]) + float(a["b"])) / 2.0
+            bx = (float(b["l"]) + float(b["r"])) / 2.0
+            by = (float(b["t"]) + float(b["b"])) / 2.0
+        except Exception:
+            return float("inf")
+        return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+
+    document = build_document_model(structure_json=structure_json, pdf_path=working_pdf)
+    targets: list[dict[str, object]] = []
+    for page in document.pages:
+        for field in page.fields:
+            if field.field_type not in PRETAG_FORM_ALLOWED_TYPES:
+                continue
+            if field.label_quality not in {"missing", "weak"}:
+                continue
+            field_bbox = field.bbox.to_dict() if field.bbox else None
+            nearby_fields: list[dict[str, object]] = []
+            for other in page.fields:
+                if other.field_review_id == field.field_review_id:
+                    continue
+                other_bbox = other.bbox.to_dict() if other.bbox else None
+                close = abs(other.order - field.order) <= 3
+                if field_bbox and other_bbox:
+                    overlaps_vertically = not (
+                        float(other_bbox["t"]) < float(field_bbox["b"]) or float(other_bbox["b"]) > float(field_bbox["t"])
+                    )
+                    overlaps_horizontally = not (
+                        float(other_bbox["r"]) < float(field_bbox["l"]) or float(other_bbox["l"]) > float(field_bbox["r"])
+                    )
+                    vertical_gap = min(
+                        abs(float(field_bbox["t"]) - float(other_bbox["b"])),
+                        abs(float(other_bbox["t"]) - float(field_bbox["b"])),
+                    )
+                    horizontal_gap = min(
+                        abs(float(field_bbox["l"]) - float(other_bbox["r"])),
+                        abs(float(other_bbox["l"]) - float(field_bbox["r"])),
+                    )
+                    close = (
+                        close
+                        or overlaps_vertically
+                        or overlaps_horizontally
+                        or vertical_gap <= 24.0
+                        or horizontal_gap <= 48.0
+                    )
+                if not close:
+                    continue
+                nearby_fields.append(
+                    {
+                        "field_review_id": other.field_review_id,
+                        "field_type": other.field_type,
+                        "field_name": other.field_name,
+                        "accessible_name": other.accessible_name,
+                        "label_quality": other.label_quality,
+                        "bbox": other_bbox,
+                        "_distance": _bbox_distance(field_bbox, other_bbox),
+                        "_order_gap": abs(other.order - field.order),
+                    }
+                )
+            nearby_fields.sort(
+                key=lambda item: (
+                    float(item.get("_distance", float("inf"))),
+                    int(item.get("_order_gap", 9999)),
+                    str(item.get("field_review_id", "")),
+                )
+            )
+            targets.append(
+                {
+                    "field_review_id": field.field_review_id,
+                    "page": page.page_number,
+                    "field_type": field.field_type,
+                    "field_name": field.field_name,
+                    "accessible_name": field.accessible_name,
+                    "label_quality": field.label_quality,
+                    "bbox": field_bbox,
+                    "value_text": field.value_text[:120],
+                    "nearby_blocks": collect_nearby_blocks(
+                        document,
+                        page_number=page.page_number,
+                        bbox=field_bbox,
+                        limit=6,
+                    ),
+                    "nearby_fields": [
+                        {
+                            key: value
+                            for key, value in nearby_field.items()
+                            if not str(key).startswith("_")
+                        }
+                        for nearby_field in nearby_fields[:6]
+                    ],
+                }
+            )
+    return targets
+
+
+def _should_auto_apply_form_intelligence(item: dict[str, object]) -> bool:
+    if str(item.get("confidence") or "").strip() != "high":
+        return False
+    if str(item.get("suggested_action") or "").strip() != "set_field_label":
+        return False
+    label = str(item.get("accessible_label") or "").strip()
+    if not label or len(label) > 400:
+        return False
+    current_label = str(item.get("current_accessible_name") or "").strip()
+    current_field_name = str(item.get("current_field_name") or "").strip()
+    if field_label_quality(accessible_name=label, field_name=current_field_name) != "good":
+        return False
+    if current_label and label == current_label:
+        return False
+    return True
+
+
 async def _apply_pretag_grounded_text_resolutions(
     *,
     job: Job,
@@ -963,6 +1179,8 @@ async def _apply_pretag_grounded_text_resolutions(
         timeout=settings.llm_timeout,
         max_retries=settings.llm_max_retries,
         retry_backoff_base=settings.llm_retry_backoff_base,
+        max_backoff_seconds=settings.llm_retry_max_backoff_seconds,
+        max_concurrency=settings.llm_max_concurrency,
     )
     try:
         adjudication = await generate_suspicious_text_intelligence(
@@ -1118,6 +1336,8 @@ async def _apply_pretag_table_intelligence(
         timeout=settings.llm_timeout,
         max_retries=settings.llm_max_retries,
         retry_backoff_base=settings.llm_retry_backoff_base,
+        max_backoff_seconds=settings.llm_retry_max_backoff_seconds,
+        max_concurrency=settings.llm_max_concurrency,
     )
     try:
         intelligence_items: list[dict[str, object]] = []
@@ -1281,6 +1501,179 @@ async def _apply_pretag_table_intelligence(
     return updated_structure, audit
 
 
+async def _apply_pretag_form_intelligence(
+    *,
+    job: Job,
+    settings: Settings,
+    working_pdf: Path,
+    structure_json: dict[str, object],
+) -> tuple[Path, dict[str, object]]:
+    audit: dict[str, object] = {
+        "enabled": bool(settings.auto_apply_form_intelligence),
+        "attempted": False,
+        "applied": False,
+        "reason": "",
+        "candidate_count": 0,
+        "applied_count": 0,
+        "page_batch_count": 0,
+        "page_batch_resolved_count": 0,
+        "page_batch_failed_count": 0,
+        "individual_fallback_count": 0,
+        "pages": [],
+        "review_ids": [],
+    }
+    if not settings.auto_apply_form_intelligence:
+        audit["reason"] = "disabled"
+        return working_pdf, audit
+    if not working_pdf.exists():
+        audit["reason"] = "missing_pdf"
+        return working_pdf, audit
+    if not isinstance(structure_json, dict):
+        audit["reason"] = "missing_structure"
+        return working_pdf, audit
+
+    targets = _form_targets_for_intelligence(
+        working_pdf=working_pdf,
+        structure_json=structure_json,
+    )
+    if not targets:
+        audit["reason"] = "no_candidates"
+        return working_pdf, audit
+
+    audit["attempted"] = True
+    audit["candidate_count"] = len(targets)
+    llm_client = LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+        timeout=settings.llm_timeout,
+        max_retries=settings.llm_max_retries,
+        retry_backoff_base=settings.llm_retry_backoff_base,
+        max_backoff_seconds=settings.llm_retry_max_backoff_seconds,
+        max_concurrency=settings.llm_max_concurrency,
+    )
+    try:
+        semaphore = asyncio.Semaphore(max(1, settings.llm_max_concurrency))
+
+        targets_by_review_id = {
+            str(target.get("field_review_id") or "").strip(): target
+            for target in targets
+            if str(target.get("field_review_id") or "").strip()
+        }
+        targets_by_page: dict[int, list[dict[str, object]]] = {}
+        for target in targets:
+            page = target.get("page")
+            if not isinstance(page, int) or page <= 0:
+                continue
+            targets_by_page.setdefault(page, []).append(target)
+        audit["page_batch_count"] = len(targets_by_page)
+
+        async def _generate(target: dict[str, object]) -> dict[str, object]:
+            async with semaphore:
+                return await generate_form_intelligence(
+                    job=job,
+                    target={key: value for key, value in target.items() if key != "nearby_blocks"},
+                    nearby_blocks=list(target.get("nearby_blocks") or []),
+                    llm_client=llm_client,
+                )
+
+        async def _generate_page(page_number: int, page_targets: list[dict[str, object]]) -> list[dict[str, object]]:
+            async with semaphore:
+                return await generate_form_intelligence_for_page(
+                    job=job,
+                    page_number=page_number,
+                    targets=page_targets,
+                    llm_client=llm_client,
+                )
+
+        intelligence_items: list[dict[str, object]] = []
+        page_items_by_id: dict[str, dict[str, object]] = {}
+        for page_number, page_targets in sorted(targets_by_page.items()):
+            try:
+                page_items = await _generate_page(page_number, page_targets)
+            except Exception:
+                audit["page_batch_failed_count"] = int(audit.get("page_batch_failed_count", 0)) + 1
+                continue
+            for item in page_items:
+                if not isinstance(item, dict):
+                    continue
+                review_id = str(item.get("field_review_id") or "").strip()
+                if review_id:
+                    page_items_by_id[review_id] = item
+                intelligence_items.append(item)
+        safe_page_results = sum(
+            1
+            for item in page_items_by_id.values()
+            if _should_auto_apply_form_intelligence(item)
+        )
+        audit["page_batch_resolved_count"] = safe_page_results
+
+        unresolved_targets = [
+            target
+            for review_id, target in targets_by_review_id.items()
+            if not _should_auto_apply_form_intelligence(page_items_by_id.get(review_id, {}))
+        ]
+        audit["individual_fallback_count"] = len(unresolved_targets)
+        if unresolved_targets:
+            fallback_items = await asyncio.gather(
+                *[_generate(target) for target in unresolved_targets]
+            )
+            for item in fallback_items:
+                if not isinstance(item, dict):
+                    continue
+                review_id = str(item.get("field_review_id") or "").strip()
+                if review_id:
+                    page_items_by_id[review_id] = item
+            intelligence_items = list(page_items_by_id.values())
+    except Exception as exc:
+        audit["reason"] = f"llm_failed: {exc}"
+        return working_pdf, audit
+    finally:
+        await llm_client.close()
+
+    approved_labels: dict[str, str] = {}
+    approved_pages: set[int] = set()
+    for item in intelligence_items:
+        if not isinstance(item, dict) or not _should_auto_apply_form_intelligence(item):
+            continue
+        review_id = str(item.get("field_review_id") or "").strip()
+        label = str(item.get("accessible_label") or "").strip()
+        if not review_id or not label:
+            continue
+        approved_labels[review_id] = label
+        page = item.get("page")
+        if isinstance(page, int) and page > 0:
+            approved_pages.add(page)
+
+    if not approved_labels:
+        audit["reason"] = "no_safe_resolutions"
+        return working_pdf, audit
+
+    patched_pdf = get_output_path(
+        job.id,
+        f"pretag_form_intelligence_{job.original_filename}",
+    )
+    try:
+        applied_review_ids = apply_field_accessible_names(
+            input_pdf=working_pdf,
+            output_pdf=patched_pdf,
+            labels_by_review_id=approved_labels,
+        )
+    except Exception as exc:
+        audit["reason"] = f"apply_failed: {exc}"
+        return working_pdf, audit
+    if not applied_review_ids:
+        audit["reason"] = "no_matching_fields"
+        return working_pdf, audit
+
+    audit["applied"] = True
+    audit["applied_count"] = len(applied_review_ids)
+    audit["pages"] = sorted(approved_pages)
+    audit["review_ids"] = applied_review_ids
+    audit["reason"] = "applied"
+    return patched_pdf, audit
+
+
 async def _adjudicate_grounded_text_candidates(
     *,
     job: Job,
@@ -1317,6 +1710,8 @@ async def _adjudicate_grounded_text_candidates(
         timeout=settings.llm_timeout,
         max_retries=settings.llm_max_retries,
         retry_backoff_base=settings.llm_retry_backoff_base,
+        max_backoff_seconds=settings.llm_retry_max_backoff_seconds,
+        max_concurrency=settings.llm_max_concurrency,
     )
     try:
         adjudication = await generate_suspicious_text_intelligence(
@@ -1424,6 +1819,8 @@ async def _attempt_auto_llm_font_map(
         timeout=settings.llm_timeout,
         max_retries=settings.llm_max_retries,
         retry_backoff_base=settings.llm_retry_backoff_base,
+        max_backoff_seconds=settings.llm_retry_max_backoff_seconds,
+        max_concurrency=settings.llm_max_concurrency,
     )
     audit["attempted"] = True
     try:
@@ -5156,6 +5553,10 @@ async def run_pipeline(
                     api_key=settings.llm_api_key,
                     model=settings.llm_model,
                     timeout=settings.llm_timeout,
+                    max_retries=settings.llm_max_retries,
+                    retry_backoff_base=settings.llm_retry_backoff_base,
+                    max_backoff_seconds=settings.llm_retry_max_backoff_seconds,
+                    max_concurrency=settings.llm_max_concurrency,
                 )
                 try:
                     structure.document_json, toc_llm_assist = await enhance_toc_structure_with_llm(
@@ -5213,6 +5614,10 @@ async def run_pipeline(
                     api_key=settings.llm_api_key,
                     model=settings.llm_model,
                     timeout=settings.llm_timeout,
+                    max_retries=settings.llm_max_retries,
+                    retry_backoff_base=settings.llm_retry_backoff_base,
+                    max_backoff_seconds=settings.llm_retry_max_backoff_seconds,
+                    max_concurrency=settings.llm_max_concurrency,
                 )
 
                 try:
@@ -5220,12 +5625,24 @@ async def run_pipeline(
                 finally:
                     await llm_client.close()
 
+                structure.document_json, figure_reclassification = _apply_figure_reclassification(
+                    structure.document_json,
+                    alt_texts,
+                )
+                if figure_reclassification.get("applied"):
+                    job.structure_json = json.dumps(structure.document_json)
+                    await db.commit()
+
                 # Save alt text entries to database
                 approved_count = 0
                 rejected_count = 0
                 pending_count = 0
+                reclassified_count = 0
                 for alt in alt_texts:
                     if alt.figure_index < 0 or alt.figure_index >= len(structure.figures):
+                        continue
+                    if alt.status == "reclassified":
+                        reclassified_count += 1
                         continue
                     fig = structure.figures[alt.figure_index]
                     generated_text = (alt.generated_text or "").strip()
@@ -5266,6 +5683,8 @@ async def run_pipeline(
                     "approved": approved_count,
                     "rejected": rejected_count,
                     "pending_review": pending_count,
+                    "reclassified": reclassified_count,
+                    "figure_reclassification": figure_reclassification,
                     "auto_approve_enabled": settings.auto_approve_generated_alt_text,
                 })
                 job_manager.emit_progress(
@@ -5275,6 +5694,7 @@ async def run_pipeline(
                         "approved": approved_count,
                         "rejected": rejected_count,
                         "pending_review": pending_count,
+                        "reclassified": reclassified_count,
                         "auto_approve_enabled": settings.auto_approve_generated_alt_text,
                     },
                 )
@@ -5390,6 +5810,12 @@ async def run_tagging_and_validation(
             settings=settings,
             structure_json=structure_json,
         )
+        working_pdf, pretag_form_intelligence = await _apply_pretag_form_intelligence(
+            job=job,
+            settings=settings,
+            working_pdf=working_pdf,
+            structure_json=structure_json,
+        )
         job.structure_json = json.dumps(structure_json)
 
         tagging_result = await tag_pdf(
@@ -5420,6 +5846,8 @@ async def run_tagging_and_validation(
             "table_intelligence_auto_applied_count": int(pretag_table_intelligence.get("applied_count", 0) or 0),
             "table_intelligence_confirmed_count": int(pretag_table_intelligence.get("confirmed_count", 0) or 0),
             "table_intelligence_set_headers_count": int(pretag_table_intelligence.get("set_headers_count", 0) or 0),
+            "form_intelligence_auto_applied": bool(pretag_form_intelligence.get("applied")),
+            "form_intelligence_auto_applied_count": int(pretag_form_intelligence.get("applied_count", 0) or 0),
         })
         job_manager.emit_progress(job_id, step="tagging", status="complete")
 
