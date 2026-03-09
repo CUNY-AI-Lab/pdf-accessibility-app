@@ -88,3 +88,55 @@ def test_generate_suspicious_text_intelligence_returns_normalized_blocks(monkeyp
     assert unit.native_text_candidate == "D a t a  B o o k"
     assert unit.ocr_text_candidate == "Data Book"
     assert unit.metadata["signals"] == ["letters separated by spaces"]
+
+
+def test_generate_suspicious_text_intelligence_keeps_mark_decorative_blocks(monkeypatch, tmp_path):
+    async def _fake_adjudicate(*, job, units, llm_client):
+        return [
+            SemanticDecision(
+                unit_id="review-9",
+                unit_type="text_block",
+                summary="Screenshot token list should be hidden.",
+                confidence="high",
+                confidence_score=0.9,
+                suggested_action="mark_decorative",
+                reason="This is redundant screenshot UI text, not narrative content.",
+                chosen_source="llm_inferred",
+                resolved_text=None,
+                issue_type="uncertain",
+                should_block_accessibility=True,
+            )
+        ]
+
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_pages.adjudicate_semantic_units",
+        _fake_adjudicate,
+    )
+
+    result = asyncio.run(
+        generate_suspicious_text_intelligence(
+            job=_job(tmp_path),
+            page_numbers=[12],
+            suspicious_blocks=[
+                {
+                    "page": 12,
+                    "review_id": "review-9",
+                    "role": "paragraph",
+                    "text": "2c 2d 3a 3b 3c 4a",
+                    "extracted_text": "2c 2d 3a 3b 3c 4a",
+                    "original_text_candidate": "2c 2d 3a 3b 3c 4a",
+                    "native_text_candidate": "2c 2d 3a 3b 3c 4a",
+                    "ocr_text_candidate": "Entering and saving information",
+                    "bbox": {"l": 10, "t": 20, "r": 100, "b": 40},
+                    "signals": ["very short token pattern"],
+                }
+            ],
+            llm_client=object(),
+        )
+    )
+
+    assert len(result["blocks"]) == 1
+    block = result["blocks"][0]
+    assert block["suggested_action"] == "mark_decorative"
+    assert block["readable_text_hint"] == ""
+    assert block["should_block_accessibility"] is True

@@ -115,6 +115,7 @@ async def generate_suspicious_text_intelligence(
             "page": unit.page,
             "review_id": decision.unit_id,
             "readable_text_hint": decision.resolved_text or "",
+            "suggested_action": decision.suggested_action,
             "chosen_source": decision.chosen_source or "llm_inferred",
             "issue_type": decision.issue_type or "uncertain",
             "confidence": decision.confidence,
@@ -122,7 +123,7 @@ async def generate_suspicious_text_intelligence(
             "reason": decision.reason,
         }
         for unit, decision in zip(units, decisions, strict=False)
-        if decision.resolved_text
+        if decision.resolved_text or decision.suggested_action == "mark_decorative"
     ]
     enriched_blocks = _attach_grounding_evidence(normalized_blocks, suspicious_blocks)
     summary = decisions[0].summary if len(decisions) == 1 else f"Reviewed {len(decisions)} suspicious text blocks."

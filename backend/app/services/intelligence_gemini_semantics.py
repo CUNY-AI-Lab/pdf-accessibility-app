@@ -42,6 +42,7 @@ Definitions:
 Text-block rules:
 - Use confirm_current_text when the native/current semantic text is already acceptable for assistive technology.
 - Use set_resolved_text when a corrected local reading is clearly supported.
+- Use mark_decorative when the extracted block is really redundant screenshot/UI text, repeated page furniture, or other non-narrative content that should be hidden from assistive technology instead of being read aloud.
 - Use manual_only when the local text is too ambiguous.
 - Set should_block_accessibility=true only when the current extracted text would likely mislead assistive technology.
 - Use spacing_only when the meaning is clear but spacing is broken.

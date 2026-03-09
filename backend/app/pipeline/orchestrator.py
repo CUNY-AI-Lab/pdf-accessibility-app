@@ -589,6 +589,124 @@ def _apply_grounded_text_adjudication(
     return review_tasks, _recalculate_fidelity_summary(fidelity_report, review_tasks)
 
 
+def _collect_safe_grounded_text_resolutions(
+    adjudication: dict[str, object] | None,
+) -> dict[tuple[int, str], tuple[str, dict[str, object]]]:
+    approved_by_key: dict[tuple[int, str], tuple[str, dict[str, object]]] = {}
+    if not isinstance(adjudication, dict):
+        return approved_by_key
+    blocks = adjudication.get("blocks")
+    if not isinstance(blocks, list):
+        return approved_by_key
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        page = block.get("page")
+        review_id = str(block.get("review_id") or "").strip()
+        if not isinstance(page, int) or page < 1 or not review_id:
+            continue
+        if _should_auto_apply_grounded_text_block(block):
+            approved_by_key[(page, review_id)] = ("actual_text", block)
+            continue
+        if _should_auto_apply_grounded_encoding_block(block):
+            approved_by_key[(page, review_id)] = ("actual_text", block)
+            continue
+        if _should_auto_apply_grounded_code_block(block):
+            approved_by_key[(page, review_id)] = ("code_actual_text", block)
+            continue
+        if _should_auto_artifact_grounded_text_block(block):
+            approved_by_key[(page, review_id)] = ("artifact", block)
+    return approved_by_key
+
+
+def _apply_grounded_text_resolutions_to_structure(
+    structure_json: dict[str, object],
+    approved_by_key: dict[tuple[int, str], tuple[str, dict[str, object]]],
+) -> tuple[dict[str, object], dict[str, object]]:
+    audit: dict[str, object] = {
+        "applied": False,
+        "reason": "",
+        "applied_count": 0,
+        "applied_actual_text_count": 0,
+        "applied_code_text_count": 0,
+        "applied_artifact_count": 0,
+        "pages": [],
+        "review_ids": [],
+    }
+    if not approved_by_key:
+        audit["reason"] = "no_safe_resolutions"
+        return structure_json, audit
+    updated_structure = copy.deepcopy(structure_json)
+    elements = updated_structure.get("elements")
+    if not isinstance(elements, list):
+        audit["reason"] = "missing_elements"
+        return structure_json, audit
+
+    applied_pages: set[int] = set()
+    applied_review_ids: list[str] = []
+    applied_count = 0
+    applied_actual_text_count = 0
+    applied_code_text_count = 0
+    applied_artifact_count = 0
+    for index, element in enumerate(elements):
+        if not isinstance(element, dict):
+            continue
+        page_number = element.get("page")
+        review_id = str(element.get("review_id") or f"review-{index}").strip()
+        if not isinstance(page_number, int) or page_number < 0 or not review_id:
+            continue
+        approved_entry = approved_by_key.get((page_number + 1, review_id))
+        if not approved_entry:
+            continue
+        resolution_type, approved = approved_entry
+        resolved_text = str(approved.get("readable_text_hint") or "").strip()
+        if resolution_type in {"actual_text", "code_actual_text"} and not resolved_text:
+            continue
+        element["review_id"] = review_id
+        element["semantic_issue_type"] = str(approved.get("issue_type") or "").strip() or "spacing_only"
+        element["semantic_blocking"] = False
+        element["resolution_reason"] = str(approved.get("reason") or "").strip()
+        chosen_source = str(approved.get("chosen_source") or "llm").strip() or "llm"
+        if resolution_type == "artifact":
+            element["type"] = "artifact"
+            element.pop("actual_text", None)
+            element.pop("resolved_text", None)
+            element.pop("semantic_text_hint", None)
+            element["resolution_source"] = f"pretag_artifact_{chosen_source}"
+            applied_artifact_count += 1
+        else:
+            element["actual_text"] = resolved_text
+            element["resolved_text"] = resolved_text
+            element["semantic_text_hint"] = resolved_text
+            if resolution_type == "code_actual_text":
+                element["resolution_source"] = f"pretag_code_{chosen_source}"
+                applied_code_text_count += 1
+            else:
+                element["resolution_source"] = f"pretag_{chosen_source}"
+                applied_actual_text_count += 1
+        applied_pages.add(int(approved["page"]))
+        applied_review_ids.append(review_id)
+        applied_count += 1
+
+    if applied_count <= 0:
+        audit["reason"] = "no_matching_structure_elements"
+        return structure_json, audit
+
+    audit["applied"] = True
+    audit["applied_count"] = applied_count
+    audit["applied_actual_text_count"] = applied_actual_text_count
+    audit["applied_code_text_count"] = applied_code_text_count
+    audit["applied_artifact_count"] = applied_artifact_count
+    audit["pages"] = sorted(applied_pages)
+    audit["review_ids"] = applied_review_ids
+    audit["reason"] = "applied"
+    return updated_structure, audit
+
+
+def _blocking_review_task_count(review_tasks: list[dict[str, object]]) -> int:
+    return sum(1 for task in review_tasks if isinstance(task, dict) and bool(task.get("blocking")))
+
+
 def _apply_figure_reclassification(
     structure_json: dict[str, object],
     alt_texts: list[object],
@@ -823,24 +941,35 @@ def _neighbor_matches_grounded_hint(block: dict[str, object], readable_text: str
 
 
 def _should_auto_artifact_grounded_text_block(block: dict[str, object]) -> bool:
+    suggested_action = str(block.get("suggested_action") or "").strip()
     readable_text = str(block.get("readable_text_hint") or "").strip()
-    if not readable_text:
-        return False
     if str(block.get("confidence") or "").strip() != "high":
         return False
     if not bool(block.get("should_block_accessibility", False)):
         return False
-    if str(block.get("issue_type") or "").strip() != "encoding_problem":
-        return False
     role = str(block.get("role") or "").strip()
     if role not in PRETAG_GROUNDED_TEXT_ALLOWED_ARTIFACT_ROLES:
+        return False
+    chosen_source = str(block.get("chosen_source") or "").strip()
+    if chosen_source not in {"ocr", "llm_inferred"}:
+        return False
+    if suggested_action == "mark_decorative":
+        original_text = str(
+            block.get("original_text_candidate")
+            or block.get("native_text_candidate")
+            or block.get("extracted_text")
+            or ""
+        ).strip()
+        if not original_text or "\n" in original_text:
+            return False
+        return len(original_text) <= PRETAG_GROUNDED_TEXT_ARTIFACT_MAX_CHARS
+    if not readable_text:
+        return False
+    if str(block.get("issue_type") or "").strip() != "encoding_problem":
         return False
     if "\n" in readable_text or len(readable_text) > PRETAG_GROUNDED_TEXT_ARTIFACT_MAX_CHARS:
         return False
     if len(readable_text.split()) > 14:
-        return False
-    chosen_source = str(block.get("chosen_source") or "").strip()
-    if chosen_source not in {"ocr", "llm_inferred"}:
         return False
     original_text = str(
         block.get("original_text_candidate")
@@ -1195,94 +1324,12 @@ async def _apply_pretag_grounded_text_resolutions(
     finally:
         await llm_client.close()
 
-    approved_by_key: dict[tuple[int, str], tuple[str, dict[str, object]]] = {}
-    for block in adjudication.get("blocks", []) if isinstance(adjudication, dict) else []:
-        if not isinstance(block, dict):
-            continue
-        page = block.get("page")
-        review_id = str(block.get("review_id") or "").strip()
-        if not isinstance(page, int) or page < 1 or not review_id:
-            continue
-        if _should_auto_apply_grounded_text_block(block):
-            approved_by_key[(page, review_id)] = ("actual_text", block)
-            continue
-        if _should_auto_apply_grounded_encoding_block(block):
-            approved_by_key[(page, review_id)] = ("actual_text", block)
-            continue
-        if _should_auto_apply_grounded_code_block(block):
-            approved_by_key[(page, review_id)] = ("code_actual_text", block)
-            continue
-        if _should_auto_artifact_grounded_text_block(block):
-            approved_by_key[(page, review_id)] = ("artifact", block)
-
-    if not approved_by_key:
-        audit["reason"] = "no_safe_resolutions"
-        return structure_json, audit
-
-    updated_structure = copy.deepcopy(structure_json)
-    elements = updated_structure.get("elements")
-    if not isinstance(elements, list):
-        audit["reason"] = "missing_elements"
-        return structure_json, audit
-
-    applied_pages: set[int] = set()
-    applied_review_ids: list[str] = []
-    applied_count = 0
-    applied_actual_text_count = 0
-    applied_code_text_count = 0
-    applied_artifact_count = 0
-    for index, element in enumerate(elements):
-        if not isinstance(element, dict):
-            continue
-        page_number = element.get("page")
-        review_id = str(element.get("review_id") or f"review-{index}").strip()
-        if not isinstance(page_number, int) or page_number < 0 or not review_id:
-            continue
-        approved_entry = approved_by_key.get((page_number + 1, review_id))
-        if not approved_entry:
-            continue
-        resolution_type, approved = approved_entry
-        resolved_text = str(approved.get("readable_text_hint") or "").strip()
-        if resolution_type in {"actual_text", "code_actual_text"} and not resolved_text:
-            continue
-        element["review_id"] = review_id
-        element["semantic_issue_type"] = str(approved.get("issue_type") or "").strip() or "spacing_only"
-        element["semantic_blocking"] = False
-        element["resolution_reason"] = str(approved.get("reason") or "").strip()
-        chosen_source = str(approved.get("chosen_source") or "llm").strip() or "llm"
-        if resolution_type == "artifact":
-            element["type"] = "artifact"
-            element.pop("actual_text", None)
-            element.pop("resolved_text", None)
-            element.pop("semantic_text_hint", None)
-            element["resolution_source"] = f"pretag_artifact_{chosen_source}"
-            applied_artifact_count += 1
-        else:
-            element["actual_text"] = resolved_text
-            element["resolved_text"] = resolved_text
-            element["semantic_text_hint"] = resolved_text
-            if resolution_type == "code_actual_text":
-                element["resolution_source"] = f"pretag_code_{chosen_source}"
-                applied_code_text_count += 1
-            else:
-                element["resolution_source"] = f"pretag_{chosen_source}"
-                applied_actual_text_count += 1
-        applied_pages.add(int(approved["page"]))
-        applied_review_ids.append(review_id)
-        applied_count += 1
-
-    if applied_count <= 0:
-        audit["reason"] = "no_matching_structure_elements"
-        return structure_json, audit
-
-    audit["applied"] = True
-    audit["applied_count"] = applied_count
-    audit["applied_actual_text_count"] = applied_actual_text_count
-    audit["applied_code_text_count"] = applied_code_text_count
-    audit["applied_artifact_count"] = applied_artifact_count
-    audit["pages"] = sorted(applied_pages)
-    audit["review_ids"] = applied_review_ids
-    audit["reason"] = "applied"
+    approved_by_key = _collect_safe_grounded_text_resolutions(adjudication)
+    updated_structure, apply_audit = _apply_grounded_text_resolutions_to_structure(
+        structure_json,
+        approved_by_key,
+    )
+    audit.update(apply_audit)
     return updated_structure, audit
 
 
@@ -1680,7 +1727,7 @@ async def _adjudicate_grounded_text_candidates(
     settings: Settings,
     review_tasks: list[dict[str, object]],
     fidelity_report: dict[str, object],
-) -> tuple[list[dict[str, object]], dict[str, object]]:
+) -> tuple[list[dict[str, object]], dict[str, object], dict[str, object] | None]:
     candidate_task = next(
         (
             task
@@ -1693,7 +1740,7 @@ async def _adjudicate_grounded_text_candidates(
         None,
     )
     if not isinstance(candidate_task, dict):
-        return review_tasks, fidelity_report
+        return review_tasks, fidelity_report, None
 
     metadata = candidate_task.get("metadata", {})
     if not isinstance(metadata, dict):
@@ -1701,7 +1748,7 @@ async def _adjudicate_grounded_text_candidates(
     pages_to_check = metadata.get("pages_to_check")
     suspicious_blocks = metadata.get("flagged_blocks")
     if not isinstance(pages_to_check, list) or not isinstance(suspicious_blocks, list) or not suspicious_blocks:
-        return review_tasks, fidelity_report
+        return review_tasks, fidelity_report, None
 
     llm_client = LlmClient(
         base_url=settings.llm_base_url,
@@ -1734,11 +1781,12 @@ async def _adjudicate_grounded_text_candidates(
             candidate_count=len(suspicious_blocks),
             confirmed_count=0,
         )
-        return review_tasks, _recalculate_fidelity_summary(fidelity_report, review_tasks)
+        return review_tasks, _recalculate_fidelity_summary(fidelity_report, review_tasks), None
     finally:
         await llm_client.close()
 
-    return _apply_grounded_text_adjudication(review_tasks, fidelity_report, adjudication)
+    updated_tasks, updated_report = _apply_grounded_text_adjudication(review_tasks, fidelity_report, adjudication)
+    return updated_tasks, updated_report, adjudication
 
 
 def _summarize_llm_font_map_suggestion(suggestion: dict[str, object]) -> dict[str, object]:
@@ -5621,7 +5669,12 @@ async def run_pipeline(
                 )
 
                 try:
-                    alt_texts = await generate_alt_text(structure.figures, llm_client)
+                    alt_texts = await generate_alt_text(
+                        structure.figures,
+                        llm_client,
+                        job=job,
+                        original_filename=job.original_filename,
+                    )
                 finally:
                     await llm_client.close()
 
@@ -6094,12 +6147,75 @@ async def run_tagging_and_validation(
             tagging_metrics=validation_payload["tagging"],
             classification=job.classification,
         )
-        review_tasks, fidelity_report = await _adjudicate_grounded_text_candidates(
+        review_tasks, fidelity_report, grounded_text_adjudication = await _adjudicate_grounded_text_candidates(
             job=job,
             settings=settings,
             review_tasks=review_tasks,
             fidelity_report=fidelity_report,
         )
+        safe_grounded_resolutions = _collect_safe_grounded_text_resolutions(grounded_text_adjudication)
+        if safe_grounded_resolutions and _blocking_review_task_count(review_tasks) > 0:
+            retry_structure_json, retry_audit = _apply_grounded_text_resolutions_to_structure(
+                structure_json or {},
+                safe_grounded_resolutions,
+            )
+            if bool(retry_audit.get("applied")):
+                retry_output_path = get_output_path(job_id, f"accessible_grounded_retry_{job.original_filename}")
+                retry_tagging_result = await tag_pdf(
+                    input_path=working_pdf,
+                    output_path=retry_output_path,
+                    structure_json=retry_structure_json,
+                    alt_texts=reviewed_alts,
+                    original_filename=job.original_filename or "",
+                )
+                retry_validation = await validate_pdf(
+                    pdf_path=retry_tagging_result.output_path,
+                    verapdf_path=settings.verapdf_path,
+                    flavour=settings.verapdf_flavour,
+                    timeout_seconds=settings.subprocess_timeout_validation,
+                )
+                retry_validation_payload = _build_validation_payload(
+                    baseline_validation=baseline_validation,
+                    selected_validation=retry_validation,
+                    settings=settings,
+                    font_remediation=font_remediation,
+                    tagging_result=retry_tagging_result,
+                    llm_font_map_auto=llm_font_map_auto,
+                )
+                retry_fidelity_report, retry_review_tasks = assess_fidelity(
+                    input_pdf=Path(job.input_path),
+                    output_pdf=retry_tagging_result.output_path,
+                    comparison_source_pdf=fidelity_source_pdf,
+                    structure_json=retry_structure_json,
+                    alt_entries=[
+                        {
+                            "figure_index": entry.figure_index,
+                            "generated_text": entry.generated_text,
+                            "edited_text": entry.edited_text,
+                            "status": entry.status,
+                        }
+                        for entry in reviewed_alt_entries
+                    ],
+                    validation_report=retry_validation_payload,
+                    raw_validation_report=retry_validation.raw_report,
+                    tagging_metrics=retry_validation_payload["tagging"],
+                    classification=job.classification,
+                )
+                retry_review_tasks, retry_fidelity_report, _ = await _adjudicate_grounded_text_candidates(
+                    job=job,
+                    settings=settings,
+                    review_tasks=retry_review_tasks,
+                    fidelity_report=retry_fidelity_report,
+                )
+                if retry_validation.compliant and _blocking_review_task_count(retry_review_tasks) < _blocking_review_task_count(review_tasks):
+                    structure_json = retry_structure_json
+                    job.structure_json = json.dumps(retry_structure_json)
+                    job.output_path = str(retry_tagging_result.output_path)
+                    selected_tagging_result = retry_tagging_result
+                    selected_validation = retry_validation
+                    validation_payload = retry_validation_payload
+                    review_tasks = retry_review_tasks
+                    fidelity_report = retry_fidelity_report
 
         review_task_metadata_overrides: dict[tuple[str, str], dict[str, object]] = {}
         auto_audit, candidate_validation, candidate_output_pdf, metadata_overrides = await _attempt_auto_llm_font_map(

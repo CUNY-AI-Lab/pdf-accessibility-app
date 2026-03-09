@@ -524,6 +524,107 @@ async def test_pretag_grounded_text_resolutions_artifact_duplicate_noise_block(m
     assert element["resolution_source"] == "pretag_artifact_llm_inferred"
 
 
+@pytest.mark.asyncio
+async def test_pretag_grounded_text_resolutions_artifact_mark_decorative_block(monkeypatch, tmp_path):
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_grounded_text_candidates",
+        lambda *_args, **_kwargs: {
+            "target_count": 1,
+            "encoding_problem_count": 0,
+            "targets": [
+                {
+                    "page": 12,
+                    "review_id": "review-483",
+                    "role": "paragraph",
+                    "original_text_candidate": "2c 2d 3a 3b 3c 4a 4b 5a",
+                    "native_text_candidate": "2c 2d 3a 3b 3c 4a 4b 5a",
+                    "previous_text": "Incomplete questions",
+                    "previous_role": "paragraph",
+                    "next_text": "Entering and saving information within FDS Question Form Fields",
+                    "next_role": "heading",
+                    "ocr_text_candidate": "Entering and saving information within FDS Question Form Fields",
+                    "bbox": {"l": 10, "t": 20, "r": 100, "b": 40},
+                    "signals": ["very short token pattern"],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+
+    async def _fake_generate(**kwargs):
+        return {
+            "blocks": [
+                {
+                    "page": 12,
+                    "review_id": "review-483",
+                    "role": "paragraph",
+                    "readable_text_hint": "",
+                    "suggested_action": "mark_decorative",
+                    "chosen_source": "llm_inferred",
+                    "issue_type": "uncertain",
+                    "confidence": "high",
+                    "should_block_accessibility": True,
+                    "reason": "This is a screenshot token list and should be hidden from assistive technology.",
+                    "original_text_candidate": "2c 2d 3a 3b 3c 4a 4b 5a",
+                    "previous_text": "Incomplete questions",
+                    "previous_role": "paragraph",
+                    "next_text": "Entering and saving information within FDS Question Form Fields",
+                    "next_role": "heading",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(orchestrator, "generate_suspicious_text_intelligence", _fake_generate)
+
+    updated, audit = await _apply_pretag_grounded_text_resolutions(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_grounded_text=True),
+        working_pdf=tmp_path / "sample.pdf",
+        structure_json={
+            "elements": [
+                {
+                    "review_id": "review-482",
+                    "type": "paragraph",
+                    "page": 11,
+                    "text": "Incomplete questions",
+                },
+                {
+                    "review_id": "review-483",
+                    "type": "paragraph",
+                    "page": 11,
+                    "text": "2c 2d 3a 3b 3c 4a 4b 5a",
+                },
+                {
+                    "review_id": "review-484",
+                    "type": "heading",
+                    "page": 11,
+                    "text": "Entering and saving information within FDS Question Form Fields",
+                },
+            ]
+        },
+    )
+
+    element = updated["elements"][1]
+    assert audit["applied"] is True
+    assert audit["applied_count"] == 1
+    assert audit["applied_artifact_count"] == 1
+    assert element["type"] == "artifact"
+    assert element["resolution_source"] == "pretag_artifact_llm_inferred"
+
+
 def test_should_auto_apply_grounded_code_block_accepts_grounded_multiline_code():
     block = {
         "role": "code",
