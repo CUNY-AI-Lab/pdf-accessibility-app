@@ -21,7 +21,7 @@ from app.services.font_unicode_override import inspect_context_font_target
 from app.services.page_intelligence import suspicious_text_signals
 from app.services.pdf_preview import (
     render_bbox_preview_png_data_url,
-    render_page_png_data_url,
+    render_page_jpeg_data_url,
     render_target_preview_png_data_url,
 )
 from app.services.text_grounding import extract_ocr_text_from_bbox
@@ -420,7 +420,7 @@ def _font_task_payload(job: Job, task: ReviewTask) -> tuple[str, list[dict[str, 
     for page_number in page_numbers:
         images.append({
             "type": "image_url",
-            "image_url": {"url": render_page_png_data_url(pdf_path, page_number)},
+            "image_url": {"url": render_page_jpeg_data_url(pdf_path, page_number)},
         })
 
     target_previews = []

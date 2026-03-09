@@ -21,6 +21,7 @@ from app.pipeline.orchestrator import (
     _should_auto_apply_grounded_encoding_block,
     _should_auto_apply_grounded_code_block,
     _should_auto_apply_form_intelligence,
+    _has_grounded_text_candidate_task,
     _embed_lane_should_skip_local,
     _font_remediation_lanes,
     _ghostscript_embed_command,
@@ -1749,6 +1750,23 @@ def test_grounded_text_candidates_block_when_llm_confirms():
     grounded = next(check for check in updated_report["checks"] if check["check"] == "grounded_text_fidelity")
     assert grounded["status"] == "fail"
     assert grounded["metrics"]["confirmed_blocks"] == 1
+
+
+def test_has_grounded_text_candidate_task_detects_only_grounded_candidate():
+    review_tasks = [
+        {
+            "task_type": "content_fidelity",
+            "blocking": True,
+            "metadata": {"grounded_text_candidate": True},
+        },
+        {
+            "task_type": "content_fidelity",
+            "blocking": True,
+            "metadata": {},
+        },
+    ]
+    assert _has_grounded_text_candidate_task(review_tasks) is True
+    assert _has_grounded_text_candidate_task(review_tasks[1:]) is False
 
 
 def test_apply_figure_reclassification_removes_matching_figure_elements():

@@ -7,7 +7,7 @@ from app.models import Job
 from app.services.intelligence_gemini import confidence_score
 from app.services.intelligence_llm_utils import job_pdf_path, request_llm_json
 from app.services.llm_client import LlmClient
-from app.services.pdf_preview import render_page_png_data_url
+from app.services.pdf_preview import render_page_jpeg_data_url
 
 READING_ORDER_INTELLIGENCE_PROMPT = """You are a PDF accessibility reading-order assistant.
 
@@ -123,7 +123,7 @@ async def generate_reading_order_intelligence(
         },
         {
             "type": "image_url",
-            "image_url": {"url": render_page_png_data_url(pdf_path, page_number)},
+            "image_url": {"url": render_page_jpeg_data_url(pdf_path, page_number)},
         },
     ]
 

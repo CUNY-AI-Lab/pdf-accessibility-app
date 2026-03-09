@@ -707,6 +707,18 @@ def _blocking_review_task_count(review_tasks: list[dict[str, object]]) -> int:
     return sum(1 for task in review_tasks if isinstance(task, dict) and bool(task.get("blocking")))
 
 
+def _has_grounded_text_candidate_task(review_tasks: list[dict[str, object]]) -> bool:
+    for task in review_tasks:
+        if not isinstance(task, dict):
+            continue
+        if str(task.get("task_type") or "") != "content_fidelity":
+            continue
+        metadata = task.get("metadata")
+        if isinstance(metadata, dict) and bool(metadata.get("grounded_text_candidate")):
+            return True
+    return False
+
+
 def _apply_figure_reclassification(
     structure_json: dict[str, object],
     alt_texts: list[object],
@@ -6201,13 +6213,12 @@ async def run_tagging_and_validation(
                     tagging_metrics=retry_validation_payload["tagging"],
                     classification=job.classification,
                 )
-                retry_review_tasks, retry_fidelity_report, _ = await _adjudicate_grounded_text_candidates(
-                    job=job,
-                    settings=settings,
-                    review_tasks=retry_review_tasks,
-                    fidelity_report=retry_fidelity_report,
-                )
-                if retry_validation.compliant and _blocking_review_task_count(retry_review_tasks) < _blocking_review_task_count(review_tasks):
+                retry_blocking_count = _blocking_review_task_count(retry_review_tasks)
+                if (
+                    retry_validation.compliant
+                    and retry_blocking_count < _blocking_review_task_count(review_tasks)
+                    and not _has_grounded_text_candidate_task(retry_review_tasks)
+                ):
                     structure_json = retry_structure_json
                     job.structure_json = json.dumps(retry_structure_json)
                     job.output_path = str(retry_tagging_result.output_path)
@@ -6216,6 +6227,22 @@ async def run_tagging_and_validation(
                     validation_payload = retry_validation_payload
                     review_tasks = retry_review_tasks
                     fidelity_report = retry_fidelity_report
+                else:
+                    retry_review_tasks, retry_fidelity_report, _ = await _adjudicate_grounded_text_candidates(
+                        job=job,
+                        settings=settings,
+                        review_tasks=retry_review_tasks,
+                        fidelity_report=retry_fidelity_report,
+                    )
+                    if retry_validation.compliant and _blocking_review_task_count(retry_review_tasks) < _blocking_review_task_count(review_tasks):
+                        structure_json = retry_structure_json
+                        job.structure_json = json.dumps(retry_structure_json)
+                        job.output_path = str(retry_tagging_result.output_path)
+                        selected_tagging_result = retry_tagging_result
+                        selected_validation = retry_validation
+                        validation_payload = retry_validation_payload
+                        review_tasks = retry_review_tasks
+                        fidelity_report = retry_fidelity_report
 
         review_task_metadata_overrides: dict[tuple[str, str], dict[str, object]] = {}
         auto_audit, candidate_validation, candidate_output_pdf, metadata_overrides = await _attempt_auto_llm_font_map(

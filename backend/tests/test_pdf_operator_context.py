@@ -10,7 +10,7 @@ from app.services.pdf_operator_context import (
     extract_operator_text_context,
     extract_operator_visual_context,
 )
-from app.services.pdf_preview import render_target_preview_png_bytes
+from app.services.pdf_preview import render_page_jpeg_bytes, render_target_preview_png_bytes
 from app.services.font_actualtext import apply_actualtext_to_context
 
 
@@ -128,6 +128,15 @@ def test_render_target_preview_png_bytes_returns_png(tmp_path):
 
     with Image.open(BytesIO(image_bytes)) as image:
         assert image.format == "PNG"
+        assert image.width > 0
+        assert image.height > 0
+
+
+def test_render_page_jpeg_bytes_returns_jpeg():
+    image_bytes = render_page_jpeg_bytes(TEST_SAMPLE_PDF, 1)
+
+    with Image.open(BytesIO(image_bytes)) as image:
+        assert image.format == "JPEG"
         assert image.width > 0
         assert image.height > 0
 

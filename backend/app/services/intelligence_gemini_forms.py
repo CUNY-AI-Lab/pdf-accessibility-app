@@ -7,7 +7,7 @@ from app.models import Job
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
 from app.services.intelligence_llm_utils import job_pdf_path, request_llm_json
 from app.services.llm_client import LlmClient
-from app.services.pdf_preview import render_page_png_data_url
+from app.services.pdf_preview import render_page_jpeg_data_url
 from app.services.semantic_units import SemanticUnit
 
 FORM_BATCH_PROMPT = """You are a PDF accessibility form-label assistant.
@@ -161,7 +161,7 @@ async def generate_form_intelligence_for_page(
         return []
 
     pdf_path = job_pdf_path(job)
-    page_preview_url = render_page_png_data_url(pdf_path, page_number)
+    page_preview_url = render_page_jpeg_data_url(pdf_path, page_number)
     payload = {
         "job_filename": getattr(job, "original_filename", ""),
         "page": page_number,

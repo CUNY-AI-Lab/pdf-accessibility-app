@@ -12,6 +12,9 @@ from app.services.pdf_operator_context import extract_operator_visual_context
 
 RENDER_DPI = 144
 MAX_IMAGE_WIDTH = 1400
+SEMANTIC_RENDER_DPI = 110
+SEMANTIC_MAX_IMAGE_WIDTH = 1100
+SEMANTIC_JPEG_QUALITY = 72
 TARGET_MIN_BOX_PX = 18
 TARGET_BOX_PADDING_PX = 6
 TARGET_OUTLINE_COLOR = (220, 38, 38, 255)
@@ -79,6 +82,57 @@ def render_page_png_bytes(
 def render_page_png_data_url(pdf_path: Path, page_number: int) -> str:
     encoded = base64.b64encode(render_page_png_bytes(pdf_path, page_number)).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+
+def render_page_jpeg_bytes(
+    pdf_path: Path,
+    page_number: int,
+    *,
+    dpi: int = SEMANTIC_RENDER_DPI,
+    max_width: int = SEMANTIC_MAX_IMAGE_WIDTH,
+    quality: int = SEMANTIC_JPEG_QUALITY,
+    timeout: int = 30,
+) -> bytes:
+    png_bytes = render_page_png_bytes(
+        pdf_path,
+        page_number,
+        dpi=dpi,
+        max_width=max_width,
+        timeout=timeout,
+    )
+    with Image.open(BytesIO(png_bytes)) as image:
+        rendered = image.convert("RGB")
+        output_bytes = tempfile.SpooledTemporaryFile()
+        rendered.save(
+            output_bytes,
+            format="JPEG",
+            quality=max(1, min(int(quality), 95)),
+            optimize=True,
+        )
+        output_bytes.seek(0)
+        return output_bytes.read()
+
+
+def render_page_jpeg_data_url(
+    pdf_path: Path,
+    page_number: int,
+    *,
+    dpi: int = SEMANTIC_RENDER_DPI,
+    max_width: int = SEMANTIC_MAX_IMAGE_WIDTH,
+    quality: int = SEMANTIC_JPEG_QUALITY,
+    timeout: int = 30,
+) -> str:
+    encoded = base64.b64encode(
+        render_page_jpeg_bytes(
+            pdf_path,
+            page_number,
+            dpi=dpi,
+            max_width=max_width,
+            quality=quality,
+            timeout=timeout,
+        )
+    ).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
 
 
 def _page_dimensions_points(pdf_path: Path, page_number: int) -> tuple[float, float]:

@@ -7,7 +7,7 @@ from app.models import Job
 from app.services.intelligence_gemini import confidence_score
 from app.services.intelligence_llm_utils import job_pdf_path, request_llm_json
 from app.services.llm_client import LlmClient
-from app.services.pdf_preview import render_bbox_preview_png_data_url, render_page_png_data_url
+from app.services.pdf_preview import render_bbox_preview_png_data_url, render_page_jpeg_data_url
 from app.services.semantic_units import SemanticDecision, SemanticUnit
 
 SEMANTIC_ADJUDICATION_PROMPT = """You are a PDF accessibility semantic adjudication assistant.
@@ -220,7 +220,7 @@ async def adjudicate_semantic_unit(
             page_images.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": render_page_png_data_url(pdf_path, unit.page)},
+                    "image_url": {"url": render_page_jpeg_data_url(pdf_path, unit.page)},
                 }
             )
             extra_pages = unit.metadata.get("extra_page_numbers") if isinstance(unit.metadata, dict) else None
@@ -231,7 +231,7 @@ async def adjudicate_semantic_unit(
                             page_images.append(
                                 {
                                     "type": "image_url",
-                                    "image_url": {"url": render_page_png_data_url(pdf_path, page_number)},
+                                    "image_url": {"url": render_page_jpeg_data_url(pdf_path, page_number)},
                                 }
                             )
                         except Exception:

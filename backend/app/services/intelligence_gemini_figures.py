@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,7 @@ from app.pipeline.structure import FigureInfo
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
 from app.services.intelligence_llm_utils import job_pdf_path, request_llm_json
 from app.services.llm_client import LlmClient
-from app.services.pdf_preview import render_page_png_data_url
+from app.services.pdf_preview import render_page_jpeg_data_url
 from app.services.semantic_units import SemanticUnit
 
 MAX_FIGURES_PER_BATCH = 4
@@ -29,6 +30,9 @@ Rules:
 - Preserve visible meaning.
 - Use the full page preview and each crop together.
 - Prefer reclassification when the crop is clearly not a standalone figure.
+- When the same page also contains a much larger screenshot or interface image, tiny icon or button crops are usually child UI details, not standalone figures.
+- In those cases, prefer `mark_decorative` unless the small crop has clear standalone instructional meaning that would be lost if it were hidden.
+- Do not create separate alt text like "magnifying glass icon" or "printer icon" for child UI details when the larger screenshot already conveys the workflow.
 - Use `resolved_kind` only when `suggested_action` is `reclassify_region`.
 - `resolved_kind` must be one of: `table`, `form_region`, `artifact`.
 - Use `set_alt_text` only when one concise factual description is clearly supported.
@@ -105,6 +109,69 @@ def _normalize_figure_result(*, figure_index: int, raw: dict[str, Any]) -> dict[
         "resolved_kind": resolved_kind,
         "is_decorative": bool(raw.get("is_decorative", False)),
     }
+
+
+def _bbox_area(bbox: dict[str, Any] | None) -> float:
+    if not isinstance(bbox, dict):
+        return 0.0
+    try:
+        width = max(0.0, float(bbox.get("r", 0.0)) - float(bbox.get("l", 0.0)))
+        height = max(0.0, float(bbox.get("t", 0.0)) - float(bbox.get("b", 0.0)))
+    except Exception:
+        return 0.0
+    return width * height
+
+
+def _figure_page_context(page_figures: list[FigureInfo]) -> dict[int, dict[str, Any]]:
+    areas = {figure.index: _bbox_area(figure.bbox) for figure in page_figures}
+    page_max_area = max(areas.values(), default=0.0)
+    context: dict[int, dict[str, Any]] = {}
+    for figure in page_figures:
+        area = areas.get(figure.index, 0.0)
+        larger_siblings = [
+            sibling for sibling in page_figures
+            if sibling.index != figure.index and areas.get(sibling.index, 0.0) > area * 8.0
+        ]
+        likely_child_ui = bool(
+            figure.caption in (None, "")
+            and area > 0.0
+            and page_max_area > 0.0
+            and area / page_max_area <= 0.02
+            and larger_siblings
+        )
+        context[figure.index] = {
+            "bbox_area": round(area, 2),
+            "relative_area": round(area / page_max_area, 4) if page_max_area > 0.0 else 0.0,
+            "likely_child_ui_figure": likely_child_ui,
+            "larger_sibling_indexes": [sibling.index for sibling in larger_siblings[:4]],
+        }
+    return context
+
+
+_GENERIC_CHILD_UI_ALT_RE = re.compile(
+    r"\b(icon|button|symbol|triangle|arrow|magnifying glass|printer|paper icon|pencil icon|star)\b",
+    re.IGNORECASE,
+)
+
+
+def _should_suppress_child_ui_alt(*, raw: dict[str, Any], figure_context: dict[str, Any] | None) -> bool:
+    if not isinstance(figure_context, dict) or not figure_context.get("likely_child_ui_figure"):
+        return False
+    if str(raw.get("suggested_action") or "").strip() != "set_alt_text":
+        return False
+    alt_text = str(raw.get("alt_text") or "").strip()
+    if not alt_text:
+        return False
+    normalized = " ".join(alt_text.split())
+    if len(normalized) > 80:
+        return False
+    if normalized.lower().startswith("screenshot of"):
+        return False
+    if normalized.lower().startswith("dialog showing"):
+        return False
+    if _GENERIC_CHILD_UI_ALT_RE.search(normalized) is None:
+        return False
+    return True
 
 
 async def generate_figure_intelligence(
@@ -190,6 +257,7 @@ async def generate_figures_intelligence(
 
     for page in sorted(grouped):
         page_figures = sorted(grouped[page], key=lambda fig: fig.index)
+        page_context = _figure_page_context(page_figures)
         for start in range(0, len(page_figures), MAX_FIGURES_PER_BATCH):
             chunk = page_figures[start:start + MAX_FIGURES_PER_BATCH]
             page_images: list[dict[str, Any]] = []
@@ -198,7 +266,7 @@ async def generate_figures_intelligence(
                     page_images.append(
                         {
                             "type": "image_url",
-                            "image_url": {"url": render_page_png_data_url(pdf_path, page)},
+                            "image_url": {"url": render_page_jpeg_data_url(pdf_path, page)},
                         }
                     )
                 except Exception:
@@ -210,6 +278,7 @@ async def generate_figures_intelligence(
                     "caption": str(figure.caption or "").strip(),
                     "page": page,
                     "bbox": figure.bbox,
+                    **page_context.get(figure.index, {}),
                 }
                 for figure in chunk
             ]
@@ -259,6 +328,16 @@ async def generate_figures_intelligence(
                     figure_index = item.get("figure_index")
                     if not isinstance(figure_index, int) or figure_index not in chunk_index_set:
                         continue
+                    figure_context = page_context.get(figure_index)
+                    if _should_suppress_child_ui_alt(raw=item, figure_context=figure_context):
+                        item = {
+                            **item,
+                            "summary": str(item.get("summary") or "").strip() or "Redundant child UI detail inside a larger screenshot.",
+                            "suggested_action": "mark_decorative",
+                            "reason": str(item.get("reason") or "").strip() or "Tiny child UI figure is redundant with the larger screenshot on the page.",
+                            "alt_text": "",
+                            "is_decorative": True,
+                        }
                     results[figure_index] = _normalize_figure_result(figure_index=figure_index, raw=item)
                     seen.add(figure_index)
 

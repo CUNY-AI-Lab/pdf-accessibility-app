@@ -4,6 +4,8 @@ from pathlib import Path
 from app.pipeline.alt_text import generate_alt_text
 from app.pipeline.structure import FigureInfo
 from app.services.intelligence_gemini_figures import (
+    _figure_page_context,
+    _should_suppress_child_ui_alt,
     generate_figure_intelligence,
     generate_figures_intelligence,
 )
@@ -209,6 +211,42 @@ def test_generate_figures_intelligence_batches_by_page_and_falls_back(monkeypatc
     assert results[1]["suggested_action"] == "mark_decorative"
     assert results[2]["suggested_action"] == "manual_only"
     assert fallback_calls == [3]
+
+
+def test_figure_page_context_marks_tiny_child_ui_figures(tmp_path):
+    image_a = tmp_path / "a.png"
+    image_b = tmp_path / "b.png"
+    image_a.write_bytes(b"fake-image")
+    image_b.write_bytes(b"fake-image")
+
+    context = _figure_page_context(
+        [
+            FigureInfo(index=1, path=image_a, page=0, bbox={"l": 0, "b": 0, "r": 500, "t": 300}),
+            FigureInfo(index=2, path=image_b, page=0, bbox={"l": 10, "b": 10, "r": 35, "t": 35}),
+        ]
+    )
+
+    assert context[1]["likely_child_ui_figure"] is False
+    assert context[2]["likely_child_ui_figure"] is True
+    assert context[2]["larger_sibling_indexes"] == [1]
+
+
+def test_suppress_child_ui_alt_for_generic_icon_label():
+    assert _should_suppress_child_ui_alt(
+        raw={
+            "suggested_action": "set_alt_text",
+            "alt_text": "Magnifying glass icon",
+        },
+        figure_context={"likely_child_ui_figure": True},
+    )
+
+    assert not _should_suppress_child_ui_alt(
+        raw={
+            "suggested_action": "set_alt_text",
+            "alt_text": "Screenshot of the filing table with the magnifying glass icon highlighted.",
+        },
+        figure_context={"likely_child_ui_figure": True},
+    )
 
 
 def test_generate_alt_text_uses_batched_figure_intelligence(monkeypatch, tmp_path):
