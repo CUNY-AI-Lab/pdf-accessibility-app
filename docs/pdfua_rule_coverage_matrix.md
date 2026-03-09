@@ -1,6 +1,6 @@
 # PDF/UA-1 Rule Coverage Matrix
 
-Updated: 2026-03-07
+Updated: 2026-03-09
 
 Source rule set: veraPDF PDF/UA-1 validation profile (`106` rules).
 
@@ -12,12 +12,14 @@ Status legend:
 
 ## Summary
 
+This matrix is intentionally conservative. It reflects explicit implementation coverage and direct evidence, not just whether the current corpora happened to pass.
+
 - Total rules assessed: `106`
 - Covered: `43`
 - Partial: `53`
 - Unproven: `10`
 - Gap: `0`
-- Evidence base: Benchmark evidence: backend/data/benchmarks/corpus_20260307_094934/corpus_report.md; scanned OCR fixture sweep: backend/data/benchmarks/scanned_fixture_corpus_20260307_rerun/workflow.sqlite3
+- Evidence base: Exact curated corpus: backend/data/benchmarks/corpus_20260308_202258/corpus_report.md; representative CUNY-like corpus: backend/data/benchmarks/corpus_20260309_134955/corpus_report.md; official form set: backend/data/benchmarks/corpus_20260309_123540/corpus_report.md; scanned OCR fixture sweep: backend/data/benchmarks/scanned_fixture_corpus_20260307_rerun/workflow.sqlite3
 
 ## Highest-Priority Gaps
 

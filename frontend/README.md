@@ -1,73 +1,66 @@
-# React + TypeScript + Vite
+# Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The frontend is a React + TypeScript application that exposes:
 
-Currently, two official plugins are available:
+- upload and job tracking
+- outcome and validation reporting
+- review workflows for unresolved semantics
+- structure editing for reading order and table/header adjustments
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+## Main pages
 
-## React Compiler
+- [src/pages/DashboardPage.tsx](src/pages/DashboardPage.tsx)
+- [src/pages/UploadPage.tsx](src/pages/UploadPage.tsx)
+- [src/pages/JobDetailPage.tsx](src/pages/JobDetailPage.tsx)
+- [src/pages/ReviewPage.tsx](src/pages/ReviewPage.tsx)
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Important components
 
-## Expanding the ESLint configuration
+- [src/components/OutcomeHero.tsx](src/components/OutcomeHero.tsx)
+- [src/components/ValidationReport.tsx](src/components/ValidationReport.tsx)
+- [src/components/ReviewTaskCard.tsx](src/components/ReviewTaskCard.tsx)
+- [src/components/StructureEditor.tsx](src/components/StructureEditor.tsx)
+- [src/components/FontTargetPanel.tsx](src/components/FontTargetPanel.tsx)
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## UI model
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+The UI is organized around three questions:
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+1. is the PDF release-ready?
+2. what did the app change automatically?
+3. what still requires review?
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+That is why the frontend separates:
+- outcome summary
+- technical report
+- targeted review tasks
+
+## Development
+
+Run the dev server:
+
+```bash
+cd /Users/stephenzweibel/Apps/pdf-accessibility-app/frontend
+bun dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Build production assets:
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+cd /Users/stephenzweibel/Apps/pdf-accessibility-app/frontend
+bun run build
 ```
+
+The frontend expects the backend at `http://127.0.0.1:8001` during local development.
+
+## Current review capabilities
+
+The UI supports:
+- reading-order editing
+- table-by-table review cards
+- alt-text review
+- form semantics review tasks
+- font-text review context
+- Gemini-backed review suggestions with deterministic apply paths
+
+The frontend is intentionally not the source of truth for remediation logic. It renders review context and sends constrained edits back to the backend.

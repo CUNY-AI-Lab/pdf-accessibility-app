@@ -21,7 +21,9 @@ STATUS_LABELS = {
     "gap": "Gap",
 }
 EVIDENCE_TEXT = (
-    "Benchmark evidence: backend/data/benchmarks/corpus_20260307_094934/corpus_report.md; "
+    "Exact curated corpus: backend/data/benchmarks/corpus_20260308_202258/corpus_report.md; "
+    "representative CUNY-like corpus: backend/data/benchmarks/corpus_20260309_134955/corpus_report.md; "
+    "official form set: backend/data/benchmarks/corpus_20260309_123540/corpus_report.md; "
     "scanned OCR fixture sweep: backend/data/benchmarks/scanned_fixture_corpus_20260307_rerun/workflow.sqlite3"
 )
 
@@ -290,7 +292,7 @@ def write_outputs(rows: list[dict[str, str]]) -> None:
 
     with MD_PATH.open('w', encoding='utf-8') as f:
         f.write('# PDF/UA-1 Rule Coverage Matrix\n\n')
-        f.write('Updated: 2026-03-07\n\n')
+        f.write('Updated: 2026-03-09\n\n')
         f.write('Source rule set: veraPDF PDF/UA-1 validation profile (`106` rules).\n\n')
         f.write('Status legend:\n')
         f.write('- `Covered`: explicit implementation path plus current benchmark evidence.\n')
@@ -298,6 +300,9 @@ def write_outputs(rows: list[dict[str, str]]) -> None:
         f.write('- `Unproven`: current outputs may pass, but there is no dedicated rule-specific implementation or enough direct evidence yet.\n')
         f.write('- `Gap`: no meaningful support today.\n\n')
         f.write('## Summary\n\n')
+        f.write(
+            'This matrix is intentionally conservative. It reflects explicit implementation coverage and direct evidence, not just whether the current corpora happened to pass.\n\n'
+        )
         f.write(f"- Total rules assessed: `{len(rows)}`\n")
         for status in STATUS_ORDER:
             f.write(f"- {STATUS_LABELS[status]}: `{counts.get(status, 0)}`\n")

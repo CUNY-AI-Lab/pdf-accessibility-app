@@ -1,158 +1,246 @@
-# PDF Accessibility Remediation Tool
+# PDF Accessibility App
 
-Automated PDF/UA compliance remediation developed at the CUNY AI Lab. Upload a PDF and the tool analyzes its structure, generates alt text for images, adds accessibility tags, and validates the result against PDF/UA-1 (ISO 14289-1).
+CUNY AI Lab's PDF remediation app turns uploaded PDFs into accessible output PDFs with a strict release gate:
 
-## What it does
+- PDF/UA-1 compliance via `veraPDF`
+- fidelity checks for text, reading order, tables, forms, links, and figures
+- human review only where semantics still need judgment
 
-The pipeline runs six steps on each uploaded PDF:
+The current design is Gemini-first for hard semantic decisions, but deterministic for PDF mutation.
 
-1. **Classify** — Detects whether the document is scanned, digital, or mixed
-2. **OCR** — Adds a searchable text layer to scanned pages (via OCRmyPDF)
-3. **Structure** — Extracts document structure using Docling (headings, tables, lists, figures, links)
-4. **Alt Text** — Generates image descriptions using a vision LLM; marks decorative images as artifacts
-5. **Tag** — Writes PDF/UA structure tags, bookmarks, metadata, and link annotations (via pikepdf)
-6. **Validate** — Checks compliance against PDF/UA-1 using veraPDF
+## What The App Does
 
-After processing, the tool produces a tagged PDF, a compliance report, and (when needed) a set of review tasks for issues that require human judgment.
+The runtime pipeline is:
 
-For a detailed breakdown of which accessibility requirements are fully addressed, partially addressed, and not covered, see [ACCESSIBILITY_COVERAGE.md](ACCESSIBILITY_COVERAGE.md).
+1. `classify` - decide whether the PDF is digital, mixed, or scanned
+2. `ocr` - add searchable text when needed
+3. `structure` - extract document structure and build a canonical document model
+4. `semantic adjudication` - ground Gemini against page images, native extraction, OCR candidates, and local context
+5. `tag` - write the accessible PDF deterministically with `pikepdf`
+6. `validate` - run `veraPDF` against PDF/UA-1
+7. `fidelity` - decide whether the output is faithful enough for release
+8. `review` - create targeted review tasks only for unresolved semantics
 
 ## Architecture
 
-```
-frontend/          React + Vite + TypeScript (Tailwind CSS 4, TanStack Query)
-backend/           FastAPI + SQLAlchemy async (Python 3.12)
-data/              Runtime storage: uploads, processing, output, SQLite DB (git-ignored)
+```mermaid
+flowchart LR
+    A["Upload PDF"] --> B["Classify"]
+    B --> C{"Scanned or mixed?"}
+    C -->|Yes| D["OCR + page renders"]
+    C -->|No| E["Native PDF extraction"]
+    D --> F["Structure extraction"]
+    E --> F
+    F --> G["Canonical document model"]
+    G --> H["Semantic units"]
+    E --> H
+    D --> H
+    H --> I["Gemini structured outputs via OpenRouter"]
+    I --> J["Resolved document model"]
+    J --> K["Deterministic PDF writer\n(tags, ActualText, tables, forms, TOC)"]
+    K --> L["veraPDF"]
+    K --> M["Fidelity checks"]
+    L --> N{"Compliant?"}
+    M --> O{"Faithful enough?"}
+    N -->|Yes| P{"Review clear?"}
+    O -->|Yes| P
+    N -->|No| Q["Blocking review tasks"]
+    O -->|No| Q
+    P -->|Yes| R["Release-ready PDF"]
+    P -->|No| Q
 ```
 
-The frontend proxies `/api` and `/health` to the backend via Vite dev server config.
+More detail: [docs/architecture.md](docs/architecture.md)
+
+## Current Evidence
+
+### Exact curated corpus
+
+Artifact: [backend/data/benchmarks/corpus_20260308_202258/corpus_report.md](backend/data/benchmarks/corpus_20260308_202258/corpus_report.md)
+
+- `25 / 25` successful outputs complete, compliant, and fidelity-passed
+- `2` remaining failures are damaged input PDFs
+
+### Representative CUNY-like corpus
+
+Artifact: [backend/data/benchmarks/corpus_20260309_134955/corpus_report.md](backend/data/benchmarks/corpus_20260309_134955/corpus_report.md)
+
+Corpus mix:
+- faculty/admin guides
+- articles and readings
+- syllabi/course materials
+- scans
+
+Results:
+- `10 / 10` complete
+- `10 / 10` compliant
+- `10 / 10` fidelity-passed
+- average OpenRouter cost per PDF: `$0.275192`
+- median OpenRouter cost per PDF: `$0.134327`
+- average cost per page: `$0.025163`
+
+### Official form set (stress suite)
+
+Artifact: [backend/data/benchmarks/corpus_20260309_123540/corpus_report.md](backend/data/benchmarks/corpus_20260309_123540/corpus_report.md)
+
+- `7 / 7` complete
+- `7 / 7` compliant
+- `7 / 7` fidelity-passed
+
+### Benchmarks and cost notes
+
+See [docs/benchmarks.md](docs/benchmarks.md)
+
+## Semantics Strategy
+
+The app does not rely on one extractor.
+
+- native PDF extraction anchors geometry and text where possible
+- OCR provides local candidate text on hard regions
+- Gemini decides meaning for hard units such as:
+  - suspicious text blocks
+  - complex tables
+  - form labels
+  - figures vs non-figures
+  - TOC groups
+  - complex reading-order pages
+- deterministic code writes the final PDF objects
+
+That split matters:
+- Gemini decides semantics
+- code decides PDF mutation
+- `veraPDF` and fidelity decide release
+
+## What Is Strong Today
+
+- PDF/UA-1 tagging and metadata
+- font remediation and Unicode repair
+- link and annotation tagging
+- TOC generation
+- form labeling
+- table risk detection and review targeting
+- figure reclassification when a "figure" is really a table or form region
+- OpenRouter structured outputs with prompt caching, retries, and cost tracking
+
+## What Is Still Partial
+
+- complex table semantics beyond header-row and row-header modeling
+- visual accessibility audits such as color contrast and color-only meaning
+- rich media and math semantics
+- some PDF/UA rule families still remain `partial` or `unproven` in the coverage matrix even though the current corpora pass cleanly
+
+See:
+- [ACCESSIBILITY_COVERAGE.md](ACCESSIBILITY_COVERAGE.md)
+- [docs/a11y_coverage_matrix.md](docs/a11y_coverage_matrix.md)
+- [docs/pdfua_rule_coverage_matrix.md](docs/pdfua_rule_coverage_matrix.md)
+
+## Repository Layout
+
+```text
+backend/
+  app/
+    api/                 FastAPI endpoints
+    pipeline/            classify, ocr, structure, tag, validate, fidelity
+    services/            semantic adjudication, previews, storage, LLM client
+    models.py            SQLAlchemy models
+    config.py            app settings
+  scripts/               benchmark and docs utilities
+  tests/                 backend test suite
+
+frontend/
+  src/
+    pages/               dashboard, review, job detail
+    components/          review/editor/report UI
+    api/                 client calls and query hooks
+    types/               shared TS types
+
+data/
+  uploads/, processing/, output/, benchmarks/
+```
 
 ## Prerequisites
 
-| Dependency | Purpose | Install |
-|---|---|---|
-| Python 3.12+ | Backend runtime | — |
-| [uv](https://docs.astral.sh/uv/) | Python package manager | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
-| [Bun](https://bun.sh/) | Frontend runtime & package manager | `curl -fsSL https://bun.sh/install \| bash` |
-| [OCRmyPDF](https://ocrmypdf.readthedocs.io/) | OCR for scanned PDFs | `brew install ocrmypdf` / `apt install ocrmypdf` |
-| [Ghostscript](https://www.ghostscript.com/) | Font embedding | `brew install ghostscript` / `apt install ghostscript` |
-| [veraPDF](https://verapdf.org/) | PDF/UA validation | [Install guide](https://docs.verapdf.org/install/) |
-| [Poppler](https://poppler.freedesktop.org/) | Page preview rendering (`pdftoppm`) | `brew install poppler` / `apt install poppler-utils` |
+| Dependency | Purpose |
+|---|---|
+| Python 3.12+ | backend runtime |
+| [uv](https://docs.astral.sh/uv/) | Python package manager |
+| [Bun](https://bun.sh/) | frontend package manager/runtime |
+| [OCRmyPDF](https://ocrmypdf.readthedocs.io/) | OCR for scanned pages |
+| [Ghostscript](https://www.ghostscript.com/) | font embedding and PDF rewriting |
+| [veraPDF](https://verapdf.org/) | PDF/UA validation |
+| [Poppler](https://poppler.freedesktop.org/) | page preview rendering |
+| `tesseract` | local crop OCR grounding |
 
 ## Setup
 
 ```bash
-# Clone and enter the project
-git clone <repo-url> && cd pdf-accessibility-app
-
-# Backend dependencies
-cd backend && uv sync && cd ..
-
-# Frontend dependencies
-cd frontend && bun install && cd ..
-
-# Configure environment
-cp .env.example .env   # then edit .env with your LLM API key
+cp .env.example .env
+cd backend && uv sync
+cd ../frontend && bun install
 ```
 
-### Environment variables
-
-Create a `.env` file in the project root:
+Important environment variables:
 
 ```env
-# LLM — any OpenAI-compatible API (OpenRouter, local Ollama, etc.)
 LLM_BASE_URL=https://openrouter.ai/api/v1
-LLM_API_KEY=your-api-key-here
+LLM_API_KEY=...
 LLM_MODEL=google/gemini-3-flash-preview
-
-# Optional: OCR language (default: eng)
+LLM_MAX_CONCURRENCY=4
+LLM_RETRY_MAX_BACKOFF_SECONDS=30
 OCR_LANGUAGE=eng
-
-# Optional: veraPDF path if not on PATH
 VERAPDF_PATH=verapdf
-
-# Optional: job TTL in hours (default: 24)
-JOB_TTL_HOURS=24
-
-# Optional: max upload size in bytes (default: 500 MB)
-MAX_UPLOAD_SIZE_BYTES=524288000
 ```
-
-The tool calls this endpoint for alt text generation and font-mapping assistance. Any OpenAI-compatible API works (OpenRouter, a local Ollama instance, etc.). Set `LLM_STRICT_VALIDATION=false` for local endpoints that don't require an API key.
 
 ## Development
 
-Start both servers:
+Start the app locally:
 
 ```bash
-# Terminal 1 — Backend (port 8001)
-cd backend
+# backend
+cd /Users/stephenzweibel/Apps/pdf-accessibility-app/backend
 uv run uvicorn app.main:app --reload --port 8001
 
-# Terminal 2 — Frontend (port 5173)
-cd frontend
+# frontend
+cd /Users/stephenzweibel/Apps/pdf-accessibility-app/frontend
 bun dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173).
+Endpoints:
+- frontend: <http://127.0.0.1:5173>
+- backend: <http://127.0.0.1:8001>
 
-### Running tests
+## Tests
 
 ```bash
-# Backend
-cd backend && uv run pytest tests/ -q
+cd /Users/stephenzweibel/Apps/pdf-accessibility-app/backend
+PYTHONPATH=. uv run pytest tests -q
 
-# Frontend type check
-cd frontend && bun run tsc --noEmit
-
-# Production build
-cd frontend && bun run build
+cd /Users/stephenzweibel/Apps/pdf-accessibility-app/frontend
+bun run build
 ```
 
-## Project structure
+## Benchmarks
 
-```
-backend/
-  app/
-    api/             Route handlers (jobs, documents, review)
-    pipeline/        6-step processing pipeline
-      orchestrator.py   Coordinates all steps
-      ocr.py            OCRmyPDF integration
-      structure.py      Docling structure extraction
-      alt_text.py       Vision LLM alt text generation
-      tagger.py         pikepdf PDF/UA tag writing
-      validator.py      veraPDF compliance checking
-    services/        Business logic (LLM client, file storage, job management)
-    models.py        SQLAlchemy ORM (Job, JobStep, AltTextEntry, ReviewTask)
-    config.py        Pydantic settings from .env
-  tests/             pytest suite
+Representative corpus:
 
-frontend/
-  src/
-    pages/           Upload, Dashboard, JobDetail, Review
-    components/      UI components (OutcomeHero, RemediationSummary, ValidationReport, ...)
-    hooks/           Custom hooks (useJobProgress SSE, useToast)
-    api/             TanStack Query hooks for API calls
-    utils/           Shared utilities (typeGuards, format)
+```bash
+cd /Users/stephenzweibel/Apps/pdf-accessibility-app/backend
+PYTHONPATH=. uv run python scripts/corpus_benchmark.py --exclude-wac
 ```
 
-## How results appear
+Regenerate the PDF/UA matrix:
 
-Job results use progressive disclosure so non-expert users aren't overwhelmed:
+```bash
+cd /Users/stephenzweibel/Apps/pdf-accessibility-app/backend
+PYTHONPATH=. uv run python scripts/generate_pdfua_rule_coverage.py
+```
 
-1. **Outcome Hero** — A single card answering "is my PDF accessible?" with a download button
-2. **What We Did** — Plain-language summary of remediation actions taken
-3. **Technical Details** — Collapsible section with the full validation report, metadata, and violation details
+## Documentation Map
 
-When issues require human judgment, the tool generates review tasks categorized by type (font fidelity, alt text accuracy, table semantics, reading order, etc.) with blocking/advisory severity levels.
-
-## Conventions
-
-- **Python**: ruff for linting/formatting, async everywhere, type hints required
-- **TypeScript**: strict mode, TanStack Query for server state, Tailwind CSS 4
-- **Database**: SQLite via SQLAlchemy async + aiosqlite
-- **API**: RESTful under `/api/`, Pydantic schemas for request/response validation
-
-## License
-
-Internal tool — CUNY AI Lab.
+- [docs/architecture.md](docs/architecture.md)
+- [docs/benchmarks.md](docs/benchmarks.md)
+- [ACCESSIBILITY_COVERAGE.md](ACCESSIBILITY_COVERAGE.md)
+- [docs/a11y_coverage_matrix.md](docs/a11y_coverage_matrix.md)
+- [docs/pdfua_rule_coverage_matrix.md](docs/pdfua_rule_coverage_matrix.md)
+- [backend/README.md](backend/README.md)
+- [frontend/README.md](frontend/README.md)
