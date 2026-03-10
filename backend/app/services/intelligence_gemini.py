@@ -3,8 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 
-def confidence_score(value: Any) -> float:
+def confidence_label(value: Any, *, default: str = "low") -> str:
     normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"high", "medium", "low"} else default
+
+
+def confidence_score(value: Any) -> float:
+    normalized = confidence_label(value, default="")
     if normalized == "high":
         return 0.9
     if normalized == "medium":

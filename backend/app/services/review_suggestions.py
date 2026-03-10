@@ -138,29 +138,36 @@ def _document_model(job: Job):
     return build_document_model(job=job)
 
 
+def _collect_structure_fragments_from_document(document) -> list[dict[str, Any]]:
+    return collect_structure_fragments(document, max_fragments=MAX_STRUCTURE_FRAGMENTS)
+
+
 def _collect_structure_fragments(job: Job) -> list[dict[str, Any]]:
-    return collect_structure_fragments(_document_model(job), max_fragments=MAX_STRUCTURE_FRAGMENTS)
+    return _collect_structure_fragments_from_document(_document_model(job))
 
 
-def _page_structure_fragments(job: Job, page_numbers: list[int]) -> list[dict[str, Any]]:
+def _page_structure_fragments_from_document(document, page_numbers: list[int]) -> list[dict[str, Any]]:
     allowed_pages = {page for page in page_numbers if isinstance(page, int) and page > 0}
     if not allowed_pages:
         return []
 
     fragments: list[dict[str, Any]] = []
-    for fragment in _collect_structure_fragments(job):
+    for fragment in _collect_structure_fragments_from_document(document):
         page = fragment.get("page")
         if isinstance(page, int) and page in allowed_pages:
             fragments.append(fragment)
     return fragments[:MAX_STRUCTURE_FRAGMENTS]
 
 
-def _page_blocks_for_review(job: Job, page_numbers: list[int]) -> list[dict[str, Any]]:
+def _page_structure_fragments(job: Job, page_numbers: list[int]) -> list[dict[str, Any]]:
+    return _page_structure_fragments_from_document(_document_model(job), page_numbers)
+
+
+def _page_blocks_for_review_from_document(document, page_numbers: list[int]) -> list[dict[str, Any]]:
     allowed_pages = {page for page in page_numbers if isinstance(page, int) and page > 0}
     if not allowed_pages:
         return []
 
-    document = _document_model(job)
     blocks_by_page: dict[int, list[dict[str, Any]]] = {}
     for page in document.pages:
         if page.page_number not in allowed_pages:
@@ -195,10 +202,13 @@ def _page_blocks_for_review(job: Job, page_numbers: list[int]) -> list[dict[str,
     return page_blocks
 
 
-def _suspicious_reading_blocks(job: Job, page_numbers: list[int]) -> list[dict[str, Any]]:
+def _page_blocks_for_review(job: Job, page_numbers: list[int]) -> list[dict[str, Any]]:
+    return _page_blocks_for_review_from_document(_document_model(job), page_numbers)
+
+
+def _suspicious_reading_blocks_from_page_blocks(job: Job, page_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     suspicious_blocks: list[dict[str, Any]] = []
     pdf_path = job_pdf_path(job)
-    page_blocks = _page_blocks_for_review(job, page_numbers)
     for page_block in page_blocks:
         page_entries = [
             block for block in page_block.get("blocks", [])
@@ -260,7 +270,12 @@ def _suspicious_reading_blocks(job: Job, page_numbers: list[int]) -> list[dict[s
     return suspicious_blocks
 
 
-def _table_targets_for_review(job: Job, metadata: dict[str, Any]) -> list[dict[str, Any]]:
+def _suspicious_reading_blocks(job: Job, page_numbers: list[int]) -> list[dict[str, Any]]:
+    page_blocks = _page_blocks_for_review(job, page_numbers)
+    return _suspicious_reading_blocks_from_page_blocks(job, page_blocks)
+
+
+def _table_targets_for_review_from_document(document, metadata: dict[str, Any]) -> list[dict[str, Any]]:
     requested_pages = {
         page for page in metadata.get("pages_to_check", [])
         if isinstance(page, int) and page > 0
@@ -273,7 +288,6 @@ def _table_targets_for_review(job: Job, metadata: dict[str, Any]) -> list[dict[s
     ] if isinstance(raw_targets, list) else []
     requested_ids = set(requested_order)
 
-    document = _document_model(job)
     targets_by_id: dict[str, dict[str, Any]] = {}
     for page in document.pages:
         for table in page.tables:
@@ -310,6 +324,10 @@ def _table_targets_for_review(job: Job, metadata: dict[str, Any]) -> list[dict[s
             key=lambda item: (int(item["page"]), str(item["table_review_id"])),
         )
     return ordered_targets[:MAX_TABLE_TARGETS]
+
+
+def _table_targets_for_review(job: Job, metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    return _table_targets_for_review_from_document(_document_model(job), metadata)
 
 
 def _dedupe_preserving_order(values: list[str]) -> list[str]:
@@ -779,9 +797,10 @@ async def generate_review_suggestion(
         suggestion = await request_llm_json(llm_client=llm_client, content=content)
     elif task.task_type == "reading_order":
         metadata = _parse_metadata(task)
-        structure_fragments = _collect_structure_fragments(job)
+        structure_fragments = _collect_structure_fragments_from_document(document)
         page_numbers = _reading_order_pages(metadata, structure_fragments)
-        suspicious_blocks = _suspicious_reading_blocks(job, page_numbers)
+        page_blocks = _page_blocks_for_review_from_document(document, page_numbers)
+        suspicious_blocks = _suspicious_reading_blocks_from_page_blocks(job, page_blocks)
         page_intelligence = await generate_suspicious_text_intelligence(
             job=job,
             page_numbers=page_numbers,
@@ -789,16 +808,16 @@ async def generate_review_suggestion(
             llm_client=llm_client,
         )
         reading_order_intelligence = []
-        for page_blocks in _page_blocks_for_review(job, page_numbers):
-            page = page_blocks.get("page")
+        for page_block in page_blocks:
+            page = page_block.get("page")
             if not isinstance(page, int) or page < 1:
                 continue
             reading_order_intelligence.append(
                 await generate_reading_order_intelligence(
                     job=job,
                     page_number=page,
-                    page_blocks=page_blocks,
-                    page_structure_fragments=_page_structure_fragments(job, [page]),
+                    page_blocks=page_block,
+                    page_structure_fragments=_page_structure_fragments_from_document(document, [page]),
                     page_text_intelligence_blocks=[
                         item
                         for item in page_intelligence.get("blocks", [])
@@ -813,7 +832,7 @@ async def generate_review_suggestion(
         )
     elif task.task_type == "table_semantics":
         metadata = _parse_metadata(task)
-        table_targets = _table_targets_for_review(job, metadata)
+        table_targets = _table_targets_for_review_from_document(document, metadata)
         if not table_targets:
             suggestion = {
                 "task_type": "table_semantics",
@@ -832,8 +851,8 @@ async def generate_review_suggestion(
                     await generate_table_intelligence(
                         job=job,
                         target=target,
-                        page_structure_fragments=_page_structure_fragments(
-                            job,
+                        page_structure_fragments=_page_structure_fragments_from_document(
+                            document,
                             [int(target["page"])] if isinstance(target.get("page"), int) else [1],
                         ),
                         llm_client=llm_client,

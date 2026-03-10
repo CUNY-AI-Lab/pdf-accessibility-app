@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -9,10 +8,10 @@ from typing import Any
 
 from app.models import Job
 from app.pipeline.structure import FigureInfo
+from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
-from app.services.intelligence_llm_utils import job_pdf_path, request_llm_json
+from app.services.intelligence_llm_utils import context_json_part, page_preview_parts, request_llm_json
 from app.services.llm_client import LlmClient
-from app.services.pdf_preview import render_page_jpeg_data_url
 from app.services.semantic_units import SemanticUnit
 
 MAX_FIGURES_PER_BATCH = 4
@@ -91,7 +90,7 @@ def _image_data_url(path: Path) -> str:
 
 
 def _normalize_figure_result(*, figure_index: int, raw: dict[str, Any]) -> dict[str, object]:
-    confidence = str(raw.get("confidence") or "low").strip() or "low"
+    confidence = confidence_label(raw.get("confidence"))
     suggested_action = str(raw.get("suggested_action") or "manual_only").strip() or "manual_only"
     resolved_kind = str(raw.get("resolved_kind") or "").strip() or None
     if suggested_action == "reclassify_region" and resolved_kind not in {"table", "form_region", "artifact"}:
@@ -101,13 +100,28 @@ def _normalize_figure_result(*, figure_index: int, raw: dict[str, Any]) -> dict[
         "task_type": "figure_intelligence",
         "summary": str(raw.get("summary") or "Figure review required.").strip() or "Figure review required.",
         "confidence": confidence,
-        "confidence_score": 0.9 if confidence == "high" else 0.6 if confidence == "medium" else 0.0,
+        "confidence_score": confidence_score(confidence),
         "suggested_action": suggested_action,
         "reason": str(raw.get("reason") or "").strip(),
         "figure_index": figure_index,
         "alt_text": str(raw.get("alt_text") or "").strip(),
         "resolved_kind": resolved_kind,
         "is_decorative": bool(raw.get("is_decorative", False)),
+    }
+
+
+def _manual_only_figure_result(*, figure_index: int, reason: str) -> dict[str, object]:
+    return {
+        "task_type": "figure_intelligence",
+        "summary": "Figure review required.",
+        "confidence": "low",
+        "confidence_score": confidence_score("low"),
+        "suggested_action": "manual_only",
+        "reason": reason,
+        "figure_index": figure_index,
+        "alt_text": "",
+        "resolved_kind": None,
+        "is_decorative": False,
     }
 
 
@@ -174,12 +188,33 @@ def _should_suppress_child_ui_alt(*, raw: dict[str, Any], figure_context: dict[s
     return True
 
 
+def _finalize_figure_result(
+    *,
+    figure_index: int,
+    raw: dict[str, Any],
+    figure_context: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    if _should_suppress_child_ui_alt(raw=raw, figure_context=figure_context):
+        raw = {
+            **raw,
+            "summary": str(raw.get("summary") or "").strip()
+            or "Redundant child UI detail inside a larger screenshot.",
+            "suggested_action": "mark_decorative",
+            "reason": str(raw.get("reason") or "").strip()
+            or "Tiny child UI figure is redundant with the larger screenshot on the page.",
+            "alt_text": "",
+            "is_decorative": True,
+        }
+    return _normalize_figure_result(figure_index=figure_index, raw=raw)
+
+
 async def generate_figure_intelligence(
     *,
     figure: FigureInfo,
     llm_client: LlmClient,
     job: Job | Any | None = None,
     original_filename: str = "",
+    figure_context: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     unit = SemanticUnit(
         unit_id=f"figure-{figure.index}",
@@ -206,30 +241,23 @@ async def generate_figure_intelligence(
     try:
         decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)
     except Exception as exc:
-        return {
-            "task_type": "figure_intelligence",
-            "summary": "Figure review required.",
-            "confidence": "low",
-            "confidence_score": 0.0,
-            "suggested_action": "manual_only",
-            "reason": f"Figure semantics fallback: {exc}",
-            "figure_index": figure.index,
-            "alt_text": "",
-            "resolved_kind": None,
-            "is_decorative": False,
-        }
-    return {
-        "task_type": "figure_intelligence",
-        "summary": decision.summary,
-        "confidence": decision.confidence,
-        "confidence_score": decision.confidence_score,
-        "suggested_action": decision.suggested_action,
-        "reason": decision.reason,
-        "figure_index": figure.index,
-        "alt_text": decision.alt_text or decision.resolved_text or "",
-        "resolved_kind": decision.resolved_kind,
-        "is_decorative": decision.is_decorative,
-    }
+        return _manual_only_figure_result(
+            figure_index=figure.index,
+            reason=f"Figure semantics fallback: {exc}",
+        )
+    return _finalize_figure_result(
+        figure_index=figure.index,
+        figure_context=figure_context,
+        raw={
+            "summary": decision.summary,
+            "confidence": decision.confidence,
+            "suggested_action": decision.suggested_action,
+            "reason": decision.reason,
+            "alt_text": decision.alt_text or decision.resolved_text or "",
+            "resolved_kind": decision.resolved_kind,
+            "is_decorative": decision.is_decorative,
+        },
+    )
 
 
 async def generate_figures_intelligence(
@@ -248,29 +276,12 @@ async def generate_figures_intelligence(
         grouped[page].append(figure)
 
     results: dict[int, dict[str, object]] = {}
-    pdf_path: Path | None = None
-    if job is not None:
-        try:
-            pdf_path = job_pdf_path(job)
-        except Exception:
-            pdf_path = None
-
     for page in sorted(grouped):
         page_figures = sorted(grouped[page], key=lambda fig: fig.index)
         page_context = _figure_page_context(page_figures)
         for start in range(0, len(page_figures), MAX_FIGURES_PER_BATCH):
             chunk = page_figures[start:start + MAX_FIGURES_PER_BATCH]
-            page_images: list[dict[str, Any]] = []
-            if pdf_path is not None:
-                try:
-                    page_images.append(
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": render_page_jpeg_data_url(pdf_path, page)},
-                        }
-                    )
-                except Exception:
-                    page_images = []
+            page_images: list[dict[str, Any]] = page_preview_parts(job, [page])
 
             payload_candidates = [
                 {
@@ -285,18 +296,13 @@ async def generate_figures_intelligence(
             content: list[dict[str, Any]] = [
                 {"type": "text", "text": FIGURE_BATCH_PROMPT},
                 *page_images,
-                {
-                    "type": "text",
-                    "text": "Context JSON:\n" + json.dumps(
-                        {
-                            "job_filename": getattr(job, "original_filename", original_filename) if job is not None else original_filename,
-                            "page": page,
-                            "candidates": payload_candidates,
-                        },
-                        indent=2,
-                        ensure_ascii=True,
-                    ),
-                },
+                context_json_part(
+                    {
+                        "job_filename": getattr(job, "original_filename", original_filename) if job is not None else original_filename,
+                        "page": page,
+                        "candidates": payload_candidates,
+                    }
+                ),
             ]
             for figure in chunk:
                 if figure.path.exists():
@@ -328,17 +334,11 @@ async def generate_figures_intelligence(
                     figure_index = item.get("figure_index")
                     if not isinstance(figure_index, int) or figure_index not in chunk_index_set:
                         continue
-                    figure_context = page_context.get(figure_index)
-                    if _should_suppress_child_ui_alt(raw=item, figure_context=figure_context):
-                        item = {
-                            **item,
-                            "summary": str(item.get("summary") or "").strip() or "Redundant child UI detail inside a larger screenshot.",
-                            "suggested_action": "mark_decorative",
-                            "reason": str(item.get("reason") or "").strip() or "Tiny child UI figure is redundant with the larger screenshot on the page.",
-                            "alt_text": "",
-                            "is_decorative": True,
-                        }
-                    results[figure_index] = _normalize_figure_result(figure_index=figure_index, raw=item)
+                    results[figure_index] = _finalize_figure_result(
+                        figure_index=figure_index,
+                        figure_context=page_context.get(figure_index),
+                        raw=item,
+                    )
                     seen.add(figure_index)
 
             for figure in chunk:
@@ -349,6 +349,7 @@ async def generate_figures_intelligence(
                     llm_client=llm_client,
                     job=job,
                     original_filename=original_filename,
+                    figure_context=page_context.get(figure.index),
                 )
 
     return [results[figure.index] for figure in sorted(figures, key=lambda fig: fig.index)]

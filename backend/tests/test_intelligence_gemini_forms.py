@@ -127,8 +127,8 @@ def test_generate_form_intelligence_for_page_normalizes_batch_response(monkeypat
         _fake_request_llm_json,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.render_page_png_data_url",
-        lambda pdf_path, page_number: "data:image/png;base64,page",
+        "app.services.intelligence_gemini_forms.page_preview_parts",
+        lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": "data:image/png;base64,page"}}],
     )
 
     result = asyncio.run(
@@ -172,5 +172,7 @@ def test_generate_form_intelligence_for_page_normalizes_batch_response(monkeypat
     assert result[0]["suggested_action"] == "set_field_label"
     assert result[0]["accessible_label"] == "First name and middle initial"
     assert result[0]["batch_generated"] is True
+    assert result[0]["confidence_score"] == 0.9
     assert result[1]["field_review_id"] == "field-widget-11-0"
     assert result[1]["suggested_action"] == "manual_only"
+    assert result[1]["confidence_score"] == 0.4

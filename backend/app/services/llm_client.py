@@ -5,6 +5,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from typing import Any
 
 import httpx
 
@@ -205,3 +206,16 @@ class LlmClient:
 
     async def close(self):
         await self.client.aclose()
+
+
+def make_llm_client(settings: Any) -> LlmClient:
+    return LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+        timeout=settings.llm_timeout,
+        max_retries=settings.llm_max_retries,
+        retry_backoff_base=settings.llm_retry_backoff_base,
+        max_backoff_seconds=settings.llm_retry_max_backoff_seconds,
+        max_concurrency=settings.llm_max_concurrency,
+    )

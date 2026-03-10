@@ -3,10 +3,11 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from app.models import Job
 from app.services.llm_client import LlmClient
+from app.services.pdf_preview import render_page_jpeg_data_url
 
 
 def job_pdf_path(job: Job) -> Path:
@@ -20,6 +21,39 @@ def job_pdf_path(job: Job) -> Path:
             return pdf_path
     preferred = candidates[0] if candidates else None
     raise RuntimeError(f"PDF file not found for page intelligence: {preferred}")
+
+
+def context_json_part(payload: Any, *, prefix: str = "Context JSON:\n") -> dict[str, str]:
+    return {
+        "type": "text",
+        "text": prefix + json.dumps(payload, indent=2, ensure_ascii=True),
+    }
+
+
+def page_preview_parts(job: Job | Any | None, page_numbers: Iterable[int]) -> list[dict[str, Any]]:
+    if job is None:
+        return []
+    try:
+        pdf_path = job_pdf_path(job)
+    except Exception:
+        return []
+
+    parts: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for page_number in page_numbers:
+        if not isinstance(page_number, int) or page_number <= 0 or page_number in seen:
+            continue
+        seen.add(page_number)
+        try:
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": render_page_jpeg_data_url(pdf_path, page_number)},
+                }
+            )
+        except Exception:
+            continue
+    return parts
 
 
 def extract_json_object(raw_text: str) -> dict[str, Any]:

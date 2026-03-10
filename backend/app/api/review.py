@@ -35,7 +35,7 @@ from app.services.font_actualtext import (
 )
 from app.services.font_unicode_override import apply_unicode_override_to_context
 from app.services.job_manager import get_job_manager
-from app.services.llm_client import LlmClient
+from app.services.llm_client import make_llm_client
 from app.services.path_safety import safe_filename, validate_path_within_allowed_roots
 from app.services.pdf_preview import (
     render_bbox_preview_png_bytes,
@@ -110,6 +110,41 @@ def _allowed_table_targets(task_metadata: dict) -> dict[str, dict]:
     }
 
 
+def _resolve_font_review_target(
+    *,
+    task_metadata: dict,
+    page_number: int,
+    operator_index: int,
+) -> tuple[dict, str]:
+    matched_target = _allowed_font_targets(task_metadata).get((page_number, operator_index))
+    if matched_target is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Requested page/operator is not one of the task's flagged font targets",
+        )
+    context_path = str(matched_target.get("context_path") or "").strip()
+    if not context_path:
+        raise HTTPException(
+            status_code=400,
+            detail="Task target did not include a usable veraPDF context path",
+        )
+    return matched_target, context_path
+
+
+def _resolve_table_review_target(
+    *,
+    task_metadata: dict,
+    table_review_id: str,
+) -> dict:
+    matched_target = _allowed_table_targets(task_metadata).get(table_review_id.strip())
+    if matched_target is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Requested table target is not one of the task's flagged table targets",
+        )
+    return matched_target
+
+
 def _manual_font_remediation_preservation(
     *,
     task: ReviewTask,
@@ -155,6 +190,43 @@ def _existing_job_pdf_path(job: Job) -> Path:
         if resolved.exists():
             return resolved
     raise HTTPException(status_code=404, detail="PDF file not found for review preview")
+
+
+async def _load_job(
+    *,
+    job_id: str,
+    db: AsyncSession,
+) -> Job:
+    job_result = await db.execute(select(Job).where(Job.id == job_id))
+    job = job_result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+async def _load_review_task(
+    *,
+    job_id: str,
+    task_id: int,
+    db: AsyncSession,
+    expected_task_type: str | None = None,
+    invalid_type_detail: str | None = None,
+) -> ReviewTask:
+    task_result = await db.execute(
+        select(ReviewTask).where(
+            ReviewTask.job_id == job_id,
+            ReviewTask.id == task_id,
+        )
+    )
+    task = task_result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="Review task not found")
+    if expected_task_type is not None and task.task_type != expected_task_type:
+        raise HTTPException(
+            status_code=400,
+            detail=invalid_type_detail or "Unsupported review task type",
+        )
+    return task
 
 
 def _manual_review_completion_state(
@@ -400,6 +472,66 @@ def _validation_result_from_payload(payload: dict) -> ValidationResult:
         violations=violations,
         raw_report={},
     )
+
+
+async def _load_font_review_context(
+    *,
+    job_id: str,
+    task_id: int,
+    db: AsyncSession,
+) -> tuple[Job, ReviewTask, Path, dict, dict[tuple[int, int], dict]]:
+    job = await _load_job(job_id=job_id, db=db)
+    if not job.output_path:
+        raise HTTPException(status_code=400, detail="Job does not have a tagged PDF output yet")
+    if not job.validation_json:
+        raise HTTPException(status_code=400, detail="Validation report is not available for this job")
+
+    task = await _load_review_task(
+        job_id=job_id,
+        task_id=task_id,
+        db=db,
+        expected_task_type="font_text_fidelity",
+        invalid_type_detail="This remediation is only supported for font review tasks",
+    )
+
+    output_pdf = Path(job.output_path)
+    if not output_pdf.exists():
+        raise HTTPException(status_code=404, detail="Tagged PDF output file not found")
+
+    task_metadata = _parse_json(task.metadata_json)
+    return job, task, output_pdf, task_metadata, _allowed_font_targets(task_metadata)
+
+
+async def _refresh_after_manual_post_tagging_remediation(
+    *,
+    job: Job,
+    db: AsyncSession,
+    output_pdf: Path,
+    preserved_task_metadata: dict[tuple[str, str], dict],
+    manual_claims: dict[str, bool],
+    failure_detail: str,
+) -> None:
+    job.status = "processing"
+    await db.commit()
+
+    settings = get_settings()
+    try:
+        await _refresh_post_tagging_reports(
+            job=job,
+            db=db,
+            settings=settings,
+            output_pdf=output_pdf,
+            preserved_task_metadata=preserved_task_metadata,
+            manual_claims=manual_claims,
+        )
+    except Exception as exc:
+        job.status = "needs_manual_review"
+        await db.commit()
+        logger.exception(failure_detail)
+        raise HTTPException(
+            status_code=502,
+            detail="Remediation applied but validation refresh failed",
+        ) from exc
 
 
 async def _refresh_post_tagging_reports(
@@ -695,32 +827,11 @@ async def suggest_review_task(
     task_id: int,
     db: AsyncSession = Depends(get_db),
 ):
-    job_result = await db.execute(select(Job).where(Job.id == job_id))
-    job = job_result.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    task_result = await db.execute(
-        select(ReviewTask).where(
-            ReviewTask.job_id == job_id,
-            ReviewTask.id == task_id,
-        )
-    )
-    task = task_result.scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Review task not found")
+    job = await _load_job(job_id=job_id, db=db)
+    task = await _load_review_task(job_id=job_id, task_id=task_id, db=db)
 
     settings = get_settings()
-    llm_client = LlmClient(
-        base_url=settings.llm_base_url,
-        api_key=settings.llm_api_key,
-        model=settings.llm_model,
-        timeout=settings.llm_timeout,
-        max_retries=settings.llm_max_retries,
-        retry_backoff_base=settings.llm_retry_backoff_base,
-        max_backoff_seconds=settings.llm_retry_max_backoff_seconds,
-        max_concurrency=settings.llm_max_concurrency,
-    )
+    llm_client = make_llm_client(settings)
 
     metadata = _parse_json(task.metadata_json)
     try:
@@ -758,35 +869,21 @@ async def get_font_target_preview(
     operator_index: int = Query(..., ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    job_result = await db.execute(select(Job).where(Job.id == job_id))
-    job = job_result.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    task_result = await db.execute(
-        select(ReviewTask).where(
-            ReviewTask.job_id == job_id,
-            ReviewTask.id == task_id,
-        )
+    job = await _load_job(job_id=job_id, db=db)
+    task = await _load_review_task(
+        job_id=job_id,
+        task_id=task_id,
+        db=db,
+        expected_task_type="font_text_fidelity",
+        invalid_type_detail="Font target previews are only supported for font review tasks",
     )
-    task = task_result.scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Review task not found")
-    if task.task_type != "font_text_fidelity":
-        raise HTTPException(status_code=400, detail="Font target previews are only supported for font review tasks")
 
     task_metadata = _parse_json(task.metadata_json)
-    allowed_targets = _allowed_font_targets(task_metadata)
-    matched_target = allowed_targets.get((page_number, operator_index))
-    if matched_target is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Requested page/operator is not one of the task's flagged font targets",
-        )
-
-    context_path = str(matched_target.get("context_path") or "").strip()
-    if not context_path:
-        raise HTTPException(status_code=400, detail="Task target did not include a usable veraPDF context path")
+    matched_target, context_path = _resolve_font_review_target(
+        task_metadata=task_metadata,
+        page_number=page_number,
+        operator_index=operator_index,
+    )
 
     pdf_path = _existing_job_pdf_path(job)
     try:
@@ -811,31 +908,20 @@ async def get_table_target_preview(
     table_review_id: str = Query(..., min_length=1),
     db: AsyncSession = Depends(get_db),
 ):
-    job_result = await db.execute(select(Job).where(Job.id == job_id))
-    job = job_result.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    task_result = await db.execute(
-        select(ReviewTask).where(
-            ReviewTask.job_id == job_id,
-            ReviewTask.id == task_id,
-        )
+    job = await _load_job(job_id=job_id, db=db)
+    task = await _load_review_task(
+        job_id=job_id,
+        task_id=task_id,
+        db=db,
+        expected_task_type="table_semantics",
+        invalid_type_detail="Table target previews are only supported for table review tasks",
     )
-    task = task_result.scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Review task not found")
-    if task.task_type != "table_semantics":
-        raise HTTPException(status_code=400, detail="Table target previews are only supported for table review tasks")
 
     task_metadata = _parse_json(task.metadata_json)
-    allowed_targets = _allowed_table_targets(task_metadata)
-    matched_target = allowed_targets.get(table_review_id.strip())
-    if matched_target is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Requested table target is not one of the task's flagged table targets",
-        )
+    matched_target = _resolve_table_review_target(
+        task_metadata=task_metadata,
+        table_review_id=table_review_id,
+    )
 
     page_number = matched_target.get("page")
     bbox = matched_target.get("bbox")
@@ -865,45 +951,16 @@ async def apply_font_actualtext(
     request: FontActualTextRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    job_result = await db.execute(select(Job).where(Job.id == job_id))
-    job = job_result.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not job.output_path:
-        raise HTTPException(status_code=400, detail="Job does not have a tagged PDF output yet")
-    if not job.validation_json:
-        raise HTTPException(status_code=400, detail="Validation report is not available for this job")
-
-    task_result = await db.execute(
-        select(ReviewTask).where(
-            ReviewTask.job_id == job_id,
-            ReviewTask.id == task_id,
-        )
+    job, task, output_pdf, task_metadata, _ = await _load_font_review_context(
+        job_id=job_id,
+        task_id=task_id,
+        db=db,
     )
-    task = task_result.scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Review task not found")
-    if task.task_type != "font_text_fidelity":
-        raise HTTPException(status_code=400, detail="ActualText remediation is only supported for font review tasks")
-
-    output_pdf = Path(job.output_path)
-    if not output_pdf.exists():
-        raise HTTPException(status_code=404, detail="Tagged PDF output file not found")
-
-    task_metadata = _parse_json(task.metadata_json)
-    allowed_targets = _allowed_font_targets(task_metadata)
-    matched_target = allowed_targets.get((request.page_number, request.operator_index))
-    if matched_target is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Requested page/operator is not one of the task's flagged font targets",
-        )
-    context_path = str(matched_target.get("context_path") or "").strip()
-    if not context_path:
-        raise HTTPException(
-            status_code=400,
-            detail="Task target did not include a usable veraPDF context path",
-        )
+    _, context_path = _resolve_font_review_target(
+        task_metadata=task_metadata,
+        page_number=request.page_number,
+        operator_index=request.operator_index,
+    )
 
     patched_output = get_output_path(
         job_id,
@@ -924,10 +981,6 @@ async def apply_font_actualtext(
         logger.exception("Failed to apply ActualText remediation")
         raise HTTPException(status_code=502, detail="Internal processing error") from exc
 
-    job.status = "processing"
-    await db.commit()
-
-    settings = get_settings()
     preserved_task_metadata = _manual_font_remediation_preservation(
         task=task,
         task_metadata=task_metadata,
@@ -941,23 +994,14 @@ async def apply_font_actualtext(
             }
         ],
     )
-    try:
-        await _refresh_post_tagging_reports(
-            job=job,
-            db=db,
-            settings=settings,
-            output_pdf=patched_output,
-            preserved_task_metadata=preserved_task_metadata,
-            manual_claims={"manual_post_tagging_actualtext": True},
-        )
-    except Exception as exc:
-        job.status = "needs_manual_review"
-        await db.commit()
-        logger.exception("Validation refresh failed after ActualText remediation")
-        raise HTTPException(
-            status_code=502,
-            detail="Remediation applied but validation refresh failed",
-        ) from exc
+    await _refresh_after_manual_post_tagging_remediation(
+        job=job,
+        db=db,
+        output_pdf=patched_output,
+        preserved_task_metadata=preserved_task_metadata,
+        manual_claims={"manual_post_tagging_actualtext": True},
+        failure_detail="Validation refresh failed after ActualText remediation",
+    )
 
     return {
         "status": "ok",
@@ -972,35 +1016,13 @@ async def apply_font_actualtext_batch(
     request: FontActualTextBatchRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    job_result = await db.execute(select(Job).where(Job.id == job_id))
-    job = job_result.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not job.output_path:
-        raise HTTPException(status_code=400, detail="Job does not have a tagged PDF output yet")
-    if not job.validation_json:
-        raise HTTPException(status_code=400, detail="Validation report is not available for this job")
-
-    task_result = await db.execute(
-        select(ReviewTask).where(
-            ReviewTask.job_id == job_id,
-            ReviewTask.id == task_id,
-        )
+    job, task, output_pdf, task_metadata, _ = await _load_font_review_context(
+        job_id=job_id,
+        task_id=task_id,
+        db=db,
     )
-    task = task_result.scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Review task not found")
-    if task.task_type != "font_text_fidelity":
-        raise HTTPException(status_code=400, detail="ActualText remediation is only supported for font review tasks")
     if not request.targets:
         raise HTTPException(status_code=400, detail="At least one batch target is required")
-
-    output_pdf = Path(job.output_path)
-    if not output_pdf.exists():
-        raise HTTPException(status_code=404, detail="Tagged PDF output file not found")
-
-    task_metadata = _parse_json(task.metadata_json)
-    allowed_targets = _allowed_font_targets(task_metadata)
 
     batch_patches: list[dict[str, str]] = []
     seen_pairs: set[tuple[int, int]] = set()
@@ -1013,18 +1035,19 @@ async def apply_font_actualtext_batch(
             )
         seen_pairs.add(pair)
 
-        matched_target = allowed_targets.get(pair)
-        if matched_target is None:
-            raise HTTPException(
-                status_code=400,
-                detail="One or more requested page/operator pairs are not flagged font targets",
+        try:
+            _, context_path = _resolve_font_review_target(
+                task_metadata=task_metadata,
+                page_number=target_request.page_number,
+                operator_index=target_request.operator_index,
             )
-        context_path = str(matched_target.get("context_path") or "").strip()
-        if not context_path:
-            raise HTTPException(
-                status_code=400,
-                detail="A flagged target did not include a usable veraPDF context path",
-            )
+        except HTTPException as exc:
+            if exc.status_code == 400:
+                raise HTTPException(
+                    status_code=400,
+                    detail="One or more requested page/operator pairs are not flagged font targets",
+                ) from exc
+            raise
         batch_patches.append({
             "context_path": context_path,
             "actual_text": target_request.actual_text,
@@ -1048,10 +1071,6 @@ async def apply_font_actualtext_batch(
         logger.exception("Failed to apply ActualText batch remediation")
         raise HTTPException(status_code=502, detail="Internal processing error") from exc
 
-    job.status = "processing"
-    await db.commit()
-
-    settings = get_settings()
     preserved_task_metadata = _manual_font_remediation_preservation(
         task=task,
         task_metadata=task_metadata,
@@ -1066,23 +1085,14 @@ async def apply_font_actualtext_batch(
             for target_request in request.targets
         ],
     )
-    try:
-        await _refresh_post_tagging_reports(
-            job=job,
-            db=db,
-            settings=settings,
-            output_pdf=patched_output,
-            preserved_task_metadata=preserved_task_metadata,
-            manual_claims={"manual_post_tagging_actualtext": True},
-        )
-    except Exception as exc:
-        job.status = "needs_manual_review"
-        await db.commit()
-        logger.exception("Validation refresh failed after ActualText batch remediation")
-        raise HTTPException(
-            status_code=502,
-            detail="Remediation applied but validation refresh failed",
-        ) from exc
+    await _refresh_after_manual_post_tagging_remediation(
+        job=job,
+        db=db,
+        output_pdf=patched_output,
+        preserved_task_metadata=preserved_task_metadata,
+        manual_claims={"manual_post_tagging_actualtext": True},
+        failure_detail="Validation refresh failed after ActualText batch remediation",
+    )
 
     return {
         "status": "ok",
@@ -1097,45 +1107,16 @@ async def apply_font_unicode_override(
     request: FontUnicodeOverrideRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    job_result = await db.execute(select(Job).where(Job.id == job_id))
-    job = job_result.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not job.output_path:
-        raise HTTPException(status_code=400, detail="Job does not have a tagged PDF output yet")
-    if not job.validation_json:
-        raise HTTPException(status_code=400, detail="Validation report is not available for this job")
-
-    task_result = await db.execute(
-        select(ReviewTask).where(
-            ReviewTask.job_id == job_id,
-            ReviewTask.id == task_id,
-        )
+    job, task, output_pdf, task_metadata, _ = await _load_font_review_context(
+        job_id=job_id,
+        task_id=task_id,
+        db=db,
     )
-    task = task_result.scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Review task not found")
-    if task.task_type != "font_text_fidelity":
-        raise HTTPException(status_code=400, detail="Font-map remediation is only supported for font review tasks")
-
-    output_pdf = Path(job.output_path)
-    if not output_pdf.exists():
-        raise HTTPException(status_code=404, detail="Tagged PDF output file not found")
-
-    task_metadata = _parse_json(task.metadata_json)
-    allowed_targets = _allowed_font_targets(task_metadata)
-    matched_target = allowed_targets.get((request.page_number, request.operator_index))
-    if matched_target is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Requested page/operator is not one of the task's flagged font targets",
-        )
-    context_path = str(matched_target.get("context_path") or "").strip()
-    if not context_path:
-        raise HTTPException(
-            status_code=400,
-            detail="Task target did not include a usable veraPDF context path",
-        )
+    _, context_path = _resolve_font_review_target(
+        task_metadata=task_metadata,
+        page_number=request.page_number,
+        operator_index=request.operator_index,
+    )
 
     patched_output = get_output_path(
         job_id,
@@ -1156,10 +1137,6 @@ async def apply_font_unicode_override(
         logger.exception("Failed to apply font-map remediation")
         raise HTTPException(status_code=502, detail="Internal processing error") from exc
 
-    job.status = "processing"
-    await db.commit()
-
-    settings = get_settings()
     preserved_task_metadata = _manual_font_remediation_preservation(
         task=task,
         task_metadata=task_metadata,
@@ -1174,23 +1151,14 @@ async def apply_font_unicode_override(
             }
         ],
     )
-    try:
-        await _refresh_post_tagging_reports(
-            job=job,
-            db=db,
-            settings=settings,
-            output_pdf=patched_output,
-            preserved_task_metadata=preserved_task_metadata,
-            manual_claims={"manual_post_tagging_font_map": True},
-        )
-    except Exception as exc:
-        job.status = "needs_manual_review"
-        await db.commit()
-        logger.exception("Validation refresh failed after font-map remediation")
-        raise HTTPException(
-            status_code=502,
-            detail="Remediation applied but validation refresh failed",
-        ) from exc
+    await _refresh_after_manual_post_tagging_remediation(
+        job=job,
+        db=db,
+        output_pdf=patched_output,
+        preserved_task_metadata=preserved_task_metadata,
+        manual_claims={"manual_post_tagging_font_map": True},
+        failure_detail="Validation refresh failed after font-map remediation",
+    )
 
     return {
         "status": "ok",

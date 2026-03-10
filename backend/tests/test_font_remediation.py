@@ -17,11 +17,6 @@ from app.pipeline.orchestrator import (
     _apply_pretag_grounded_text_resolutions,
     _apply_pretag_form_intelligence,
     _apply_pretag_table_intelligence,
-    _apply_grounded_text_adjudication,
-    _should_auto_apply_grounded_encoding_block,
-    _should_auto_apply_grounded_code_block,
-    _should_auto_apply_form_intelligence,
-    _has_grounded_text_candidate_task,
     _embed_lane_should_skip_local,
     _font_remediation_lanes,
     _ghostscript_embed_command,
@@ -41,6 +36,18 @@ from app.pipeline.orchestrator import (
     _simple_font_unicode_map,
     _simple_font_zero_byte_repair_candidate,
     _unicode_repair_gate_from_diagnostics,
+)
+from app.services.grounded_text_apply import (
+    has_grounded_text_candidate_task as _has_grounded_text_candidate_task,
+    should_auto_apply_grounded_code_block as _should_auto_apply_grounded_code_block,
+    should_auto_apply_grounded_encoding_block as _should_auto_apply_grounded_encoding_block,
+)
+from app.services.grounded_text_review import (
+    apply_grounded_text_adjudication as _apply_grounded_text_adjudication,
+)
+from app.services import font_review_auto, semantic_pretag_policy
+from app.services.semantic_pretag_policy import (
+    should_auto_apply_form_intelligence as _should_auto_apply_form_intelligence,
 )
 
 
@@ -373,7 +380,7 @@ async def test_pretag_grounded_text_resolutions_apply_safe_spacing_fix(monkeypat
             ],
         },
     )
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+    monkeypatch.setattr(font_review_auto, "make_llm_client", lambda settings: _FakeLlmClient())
 
     async def _fake_generate(**kwargs):
         return {
@@ -1889,14 +1896,14 @@ def test_form_targets_for_intelligence_prefers_local_nearby_fields(monkeypatch, 
     page = SimpleNamespace(page_number=1, fields=[field, far_same_type, close_other_type, close_same_type])
     document = SimpleNamespace(pages=[page])
 
-    monkeypatch.setattr(orchestrator, "build_document_model", lambda **kwargs: document)
+    monkeypatch.setattr(semantic_pretag_policy, "build_document_model", lambda **kwargs: document)
     monkeypatch.setattr(
-        orchestrator,
+        semantic_pretag_policy,
         "collect_nearby_blocks",
         lambda *args, **kwargs: [{"review_id": "review-1", "type": "paragraph", "text": "Nearby label"}],
     )
 
-    targets = orchestrator._form_targets_for_intelligence(
+    targets = semantic_pretag_policy.form_targets_for_intelligence(
         working_pdf=tmp_path / "dummy.pdf",
         structure_json={"elements": []},
     )
@@ -1928,13 +1935,9 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
             "model": "google/gemini-3-flash-preview",
         }
 
+    monkeypatch.setattr(font_review_auto, "generate_review_suggestion", _generate_review_suggestion)
     monkeypatch.setattr(
-        orchestrator,
-        "generate_review_suggestion",
-        _generate_review_suggestion,
-    )
-    monkeypatch.setattr(
-        orchestrator,
+        font_review_auto,
         "select_auto_font_review_resolution",
         lambda **kwargs: {
             "resolution_type": "font_map",
@@ -1951,7 +1954,7 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
     def _copy_apply(*, input_pdf, output_pdf, context_path, unicode_text):
         output_pdf.write_bytes(Path(input_pdf).read_bytes())
 
-    monkeypatch.setattr(orchestrator, "apply_unicode_override_to_context", _copy_apply)
+    monkeypatch.setattr(font_review_auto, "apply_unicode_override_to_context", _copy_apply)
 
     current_validation = SimpleNamespace(
         compliant=False,
@@ -1967,7 +1970,7 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
     async def _validate_pdf(**kwargs):
         return improved_validation
 
-    monkeypatch.setattr(orchestrator, "validate_pdf", _validate_pdf)
+    monkeypatch.setattr(font_review_auto, "validate_pdf", _validate_pdf)
 
     job = SimpleNamespace(
         id="job-1",
@@ -2019,7 +2022,7 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
         async def close(self):
             return None
 
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+    monkeypatch.setattr(font_review_auto, "make_llm_client", lambda settings: _FakeLlmClient())
 
     async def _generate_review_suggestion(**kwargs):
         return {
@@ -2030,13 +2033,9 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
             "model": "google/gemini-3-flash-preview",
         }
 
+    monkeypatch.setattr(font_review_auto, "generate_review_suggestion", _generate_review_suggestion)
     monkeypatch.setattr(
-        orchestrator,
-        "generate_review_suggestion",
-        _generate_review_suggestion,
-    )
-    monkeypatch.setattr(
-        orchestrator,
+        font_review_auto,
         "select_auto_font_review_resolution",
         lambda **kwargs: {
             "resolution_type": "artifact",
@@ -2056,7 +2055,7 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
         assert context_paths == ["ctx-1", "ctx-2"]
         output_pdf.write_bytes(Path(input_pdf).read_bytes())
 
-    monkeypatch.setattr(orchestrator, "apply_artifact_batch_to_contexts", _copy_artifact)
+    monkeypatch.setattr(font_review_auto, "apply_artifact_batch_to_contexts", _copy_artifact)
 
     current_validation = SimpleNamespace(
         compliant=False,
@@ -2072,7 +2071,7 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
     async def _validate_pdf(**kwargs):
         return improved_validation
 
-    monkeypatch.setattr(orchestrator, "validate_pdf", _validate_pdf)
+    monkeypatch.setattr(font_review_auto, "validate_pdf", _validate_pdf)
 
     job = SimpleNamespace(
         id="job-1",
@@ -2125,7 +2124,7 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
         async def close(self):
             return None
 
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+    monkeypatch.setattr(font_review_auto, "make_llm_client", lambda settings: _FakeLlmClient())
 
     async def _generate_review_suggestion(**kwargs):
         return {
@@ -2136,13 +2135,9 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
             "model": "google/gemini-3-flash-preview",
         }
 
+    monkeypatch.setattr(font_review_auto, "generate_review_suggestion", _generate_review_suggestion)
     monkeypatch.setattr(
-        orchestrator,
-        "generate_review_suggestion",
-        _generate_review_suggestion,
-    )
-    monkeypatch.setattr(
-        orchestrator,
+        font_review_auto,
         "select_auto_font_review_resolution",
         lambda **kwargs: {
             "resolution_type": "artifact",
@@ -2166,8 +2161,8 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
         assert unicode_text == "►"
         output_pdf.write_bytes(Path(input_pdf).read_bytes())
 
-    monkeypatch.setattr(orchestrator, "apply_artifact_batch_to_contexts", _copy_artifact)
-    monkeypatch.setattr(orchestrator, "apply_unicode_override_to_context", _copy_font_map)
+    monkeypatch.setattr(font_review_auto, "apply_artifact_batch_to_contexts", _copy_artifact)
+    monkeypatch.setattr(font_review_auto, "apply_unicode_override_to_context", _copy_font_map)
 
     current_validation = SimpleNamespace(
         compliant=False,
@@ -2190,7 +2185,7 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
     async def _validate_pdf(**kwargs):
         return validations.pop(0)
 
-    monkeypatch.setattr(orchestrator, "validate_pdf", _validate_pdf)
+    monkeypatch.setattr(font_review_auto, "validate_pdf", _validate_pdf)
 
     job = SimpleNamespace(
         id="job-1",

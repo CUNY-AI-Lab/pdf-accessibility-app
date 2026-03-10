@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from app.models import Job
+from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
-from app.services.intelligence_llm_utils import job_pdf_path, request_llm_json
+from app.services.intelligence_llm_utils import context_json_part, page_preview_parts, request_llm_json
 from app.services.llm_client import LlmClient
-from app.services.pdf_preview import render_page_jpeg_data_url
 from app.services.semantic_units import SemanticUnit
 
 FORM_BATCH_PROMPT = """You are a PDF accessibility form-label assistant.
@@ -64,6 +63,36 @@ FORM_BATCH_SCHEMA: dict[str, Any] = {
     },
     "required": ["task_type", "page", "summary", "decisions"],
 }
+
+
+def _normalize_form_intelligence_result(
+    *,
+    field_review_id: str,
+    page_number: int,
+    current_accessible_name: str,
+    current_field_name: str,
+    raw: dict[str, Any],
+    batch_generated: bool = False,
+) -> dict[str, Any]:
+    suggested_action = str(raw.get("suggested_action") or "manual_only").strip() or "manual_only"
+    accessible_label = str(raw.get("accessible_label") or "").strip()
+    if suggested_action == "set_field_label" and not accessible_label:
+        suggested_action = "manual_only"
+    confidence = confidence_label(raw.get("confidence"))
+    return {
+        "task_type": "form_intelligence",
+        "summary": str(raw.get("summary") or "").strip(),
+        "confidence": confidence,
+        "confidence_score": confidence_score(confidence),
+        "suggested_action": suggested_action,
+        "reason": str(raw.get("reason") or "").strip(),
+        "field_review_id": field_review_id,
+        "page": page_number,
+        "accessible_label": accessible_label,
+        "current_accessible_name": current_accessible_name,
+        "current_field_name": current_field_name,
+        "batch_generated": batch_generated,
+    }
 
 
 def _batch_prompt_target(target: dict[str, Any]) -> dict[str, Any]:
@@ -135,19 +164,19 @@ async def generate_form_intelligence(
         },
     )
     decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)
-    return {
-        "task_type": "form_intelligence",
-        "summary": decision.summary,
-        "confidence": decision.confidence,
-        "confidence_score": decision.confidence_score,
-        "suggested_action": decision.suggested_action,
-        "reason": decision.reason,
-        "field_review_id": unit.unit_id,
-        "page": unit.page,
-        "accessible_label": decision.accessible_label or "",
-        "current_accessible_name": str(target.get("accessible_name") or "").strip(),
-        "current_field_name": str(target.get("field_name") or "").strip(),
-    }
+    return _normalize_form_intelligence_result(
+        field_review_id=unit.unit_id,
+        page_number=unit.page,
+        current_accessible_name=str(target.get("accessible_name") or "").strip(),
+        current_field_name=str(target.get("field_name") or "").strip(),
+        raw={
+            "summary": decision.summary,
+            "confidence": decision.confidence,
+            "suggested_action": decision.suggested_action,
+            "reason": decision.reason,
+            "accessible_label": decision.accessible_label or "",
+        },
+    )
 
 
 async def generate_form_intelligence_for_page(
@@ -160,8 +189,6 @@ async def generate_form_intelligence_for_page(
     if not targets:
         return []
 
-    pdf_path = job_pdf_path(job)
-    page_preview_url = render_page_jpeg_data_url(pdf_path, page_number)
     payload = {
         "job_filename": getattr(job, "original_filename", ""),
         "page": page_number,
@@ -169,11 +196,8 @@ async def generate_form_intelligence_for_page(
     }
     content = [
         {"type": "text", "text": FORM_BATCH_PROMPT},
-        {"type": "image_url", "image_url": {"url": page_preview_url}},
-        {
-            "type": "text",
-            "text": "Context JSON:\n" f"{json.dumps(payload, indent=2, ensure_ascii=True)}",
-        },
+        *page_preview_parts(job, [page_number]),
+        context_json_part(payload),
     ]
     parsed = await request_llm_json(
         llm_client=llm_client,
@@ -194,27 +218,14 @@ async def generate_form_intelligence_for_page(
                 continue
             decision_map[field_review_id] = item
 
-    normalized: list[dict[str, Any]] = []
-    for target in targets:
-        field_review_id = str(target.get("field_review_id") or "").strip()
-        item = decision_map.get(field_review_id) or {}
-        suggested_action = str(item.get("suggested_action") or "manual_only").strip() or "manual_only"
-        accessible_label = str(item.get("accessible_label") or "").strip()
-        if suggested_action == "set_field_label" and not accessible_label:
-            suggested_action = "manual_only"
-        normalized.append(
-            {
-                "task_type": "form_intelligence",
-                "summary": str(item.get("summary") or "").strip(),
-                "confidence": str(item.get("confidence") or "low").strip() or "low",
-                "suggested_action": suggested_action,
-                "reason": str(item.get("reason") or "").strip(),
-                "field_review_id": field_review_id,
-                "page": page_number,
-                "accessible_label": accessible_label,
-                "current_accessible_name": str(target.get("accessible_name") or "").strip(),
-                "current_field_name": str(target.get("field_name") or "").strip(),
-                "batch_generated": True,
-            }
+    return [
+        _normalize_form_intelligence_result(
+            field_review_id=str(target.get("field_review_id") or "").strip(),
+            page_number=page_number,
+            current_accessible_name=str(target.get("accessible_name") or "").strip(),
+            current_field_name=str(target.get("field_name") or "").strip(),
+            raw=decision_map.get(str(target.get("field_review_id") or "").strip()) or {},
+            batch_generated=True,
         )
-    return normalized
+        for target in targets
+    ]

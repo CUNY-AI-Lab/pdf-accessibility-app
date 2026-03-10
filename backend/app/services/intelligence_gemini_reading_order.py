@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from app.models import Job
-from app.services.intelligence_gemini import confidence_score
-from app.services.intelligence_llm_utils import job_pdf_path, request_llm_json
+from app.services.intelligence_gemini import confidence_label, confidence_score
+from app.services.intelligence_llm_utils import context_json_part, page_preview_parts, request_llm_json
 from app.services.llm_client import LlmClient
-from app.services.pdf_preview import render_page_jpeg_data_url
 
 READING_ORDER_INTELLIGENCE_PROMPT = """You are a PDF accessibility reading-order assistant.
 
@@ -80,7 +78,7 @@ def _normalize_reading_order_intelligence(parsed: dict[str, Any], *, page_number
     return {
         "task_type": "reading_order_intelligence",
         "summary": str(parsed.get("summary") or "").strip(),
-        "confidence": str(parsed.get("confidence") or "low").strip() or "low",
+        "confidence": confidence_label(parsed.get("confidence")),
         "confidence_score": confidence_score(parsed.get("confidence")),
         "suggested_action": str(parsed.get("suggested_action") or "manual_only").strip() or "manual_only",
         "reason": str(parsed.get("reason") or "").strip(),
@@ -99,7 +97,6 @@ async def generate_reading_order_intelligence(
     page_text_intelligence_blocks: list[dict[str, Any]],
     llm_client: LlmClient,
 ) -> dict[str, Any]:
-    pdf_path = job_pdf_path(job)
     payload = {
         "job_filename": job.original_filename,
         "accessibility_goal": (
@@ -116,15 +113,11 @@ async def generate_reading_order_intelligence(
             "type": "text",
             "text": (
                 f"{READING_ORDER_INTELLIGENCE_PROMPT}\n\n"
-                "Image order: one full-page preview only.\n\n"
-                "Context JSON:\n"
-                f"{json.dumps(payload, indent=2, ensure_ascii=True)}"
+                "Image order: one full-page preview only."
             ),
         },
-        {
-            "type": "image_url",
-            "image_url": {"url": render_page_jpeg_data_url(pdf_path, page_number)},
-        },
+        *page_preview_parts(job, [page_number]),
+        context_json_part(payload),
     ]
 
     parsed = await request_llm_json(llm_client=llm_client, content=content)

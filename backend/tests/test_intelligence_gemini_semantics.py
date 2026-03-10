@@ -31,8 +31,8 @@ def _job(tmp_path):
 def test_adjudicate_semantic_unit_normalizes_text_block(monkeypatch, tmp_path):
     monkeypatch.setattr(
         intelligence_gemini_semantics,
-        "render_page_png_data_url",
-        lambda pdf_path, page_number: f"data:image/png;base64:page-{page_number}",
+        "page_preview_parts",
+        lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": f"data:image/png;base64:page-{next(iter(page_numbers), 1)}"}}],
     )
     monkeypatch.setattr(
         intelligence_gemini_semantics,
@@ -87,8 +87,8 @@ def test_adjudicate_semantic_unit_normalizes_text_block(monkeypatch, tmp_path):
 def test_adjudicate_semantic_units_preserves_order(monkeypatch, tmp_path):
     monkeypatch.setattr(
         intelligence_gemini_semantics,
-        "render_page_png_data_url",
-        lambda pdf_path, page_number: f"data:image/png;base64:page-{page_number}",
+        "page_preview_parts",
+        lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": f"data:image/png;base64:page-{next(iter(page_numbers), 1)}"}}],
     )
     llm = _FakeLlmClient([
         {
@@ -132,8 +132,8 @@ def test_adjudicate_semantic_units_preserves_order(monkeypatch, tmp_path):
 def test_adjudicate_semantic_unit_repairs_missing_required_payload(monkeypatch, tmp_path):
     monkeypatch.setattr(
         intelligence_gemini_semantics,
-        "render_page_png_data_url",
-        lambda pdf_path, page_number: f"data:image/png;base64:page-{page_number}",
+        "page_preview_parts",
+        lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": f"data:image/png;base64:page-{next(iter(page_numbers), 1)}"}}],
     )
     llm = _FakeLlmClient([
         {

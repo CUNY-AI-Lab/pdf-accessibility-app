@@ -94,8 +94,8 @@ def test_job_pdf_path_falls_back_to_input_when_output_missing(tmp_path):
 def test_font_task_payload_uses_review_targets_and_page_structure_context(monkeypatch, tmp_path):
     monkeypatch.setattr(
         review_suggestions,
-        "render_page_png_data_url",
-        lambda pdf_path, page_number: f"data:image/png;base64,page-{page_number}",
+        "render_page_jpeg_data_url",
+        lambda pdf_path, page_number: f"data:image/jpeg;base64,page-{page_number}",
     )
     monkeypatch.setattr(
         review_suggestions,
@@ -137,8 +137,8 @@ def test_font_task_payload_uses_review_targets_and_page_structure_context(monkey
     assert '"page_structure_fragments": [' in prompt_text
     assert "Arrow marker precedes this list entry in the source." in prompt_text
     assert len(content) == 4
-    assert content[1]["image_url"]["url"] == "data:image/png;base64,page-2"
-    assert content[2]["image_url"]["url"] == "data:image/png;base64,page-5"
+    assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,page-2"
+    assert content[2]["image_url"]["url"] == "data:image/jpeg;base64,page-5"
     assert content[3]["image_url"]["url"].startswith("data:image/png;base64,target-")
 
 def test_page_blocks_for_review_collects_structure_fragments(tmp_path):
@@ -280,8 +280,8 @@ def test_generate_review_suggestion_supports_reading_order(monkeypatch, tmp_path
 def test_generate_review_suggestion_keeps_font_actualtext_candidates(monkeypatch, tmp_path):
     monkeypatch.setattr(
         review_suggestions,
-        "render_page_png_data_url",
-        lambda pdf_path, page_number: f"data:image/png;base64,page-{page_number}",
+        "render_page_jpeg_data_url",
+        lambda pdf_path, page_number: f"data:image/jpeg;base64,page-{page_number}",
     )
 
     fake_llm = _FakeLlmClient(

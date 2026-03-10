@@ -4,10 +4,10 @@ import json
 from typing import Any
 
 from app.models import Job
-from app.services.intelligence_gemini import confidence_score
-from app.services.intelligence_llm_utils import job_pdf_path, request_llm_json
+from app.services.intelligence_gemini import confidence_label, confidence_score
+from app.services.intelligence_llm_utils import context_json_part, page_preview_parts, request_llm_json
 from app.services.llm_client import LlmClient
-from app.services.pdf_preview import render_bbox_preview_png_data_url, render_page_jpeg_data_url
+from app.services.pdf_preview import render_bbox_preview_png_data_url
 from app.services.semantic_units import SemanticDecision, SemanticUnit
 
 SEMANTIC_ADJUDICATION_PROMPT = """You are a PDF accessibility semantic adjudication assistant.
@@ -214,35 +214,21 @@ async def adjudicate_semantic_unit(
 ) -> SemanticDecision:
     page_images: list[dict[str, Any]] = []
     unit_images: list[dict[str, Any]] = []
+    extra_pages = unit.metadata.get("extra_page_numbers") if isinstance(unit.metadata, dict) else None
+    page_numbers = [unit.page]
+    if isinstance(extra_pages, list):
+        page_numbers.extend(page_number for page_number in extra_pages if isinstance(page_number, int))
+    page_images = page_preview_parts(job, page_numbers)
     try:
-        if job is not None:
+        if job is not None and unit.bbox:
+            from app.services.intelligence_llm_utils import job_pdf_path
             pdf_path = job_pdf_path(job)
-            page_images.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": render_page_jpeg_data_url(pdf_path, unit.page)},
-                }
-            )
-            extra_pages = unit.metadata.get("extra_page_numbers") if isinstance(unit.metadata, dict) else None
-            if isinstance(extra_pages, list):
-                for page_number in extra_pages:
-                    if isinstance(page_number, int) and page_number > 0 and page_number != unit.page:
-                        try:
-                            page_images.append(
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": render_page_jpeg_data_url(pdf_path, page_number)},
-                                }
-                            )
-                        except Exception:
-                            continue
-            if unit.bbox:
-                try:
-                    preview_url = render_bbox_preview_png_data_url(pdf_path, unit.page, unit.bbox)
-                except Exception:
-                    preview_url = None
-                if preview_url:
-                    unit_images.append({"type": "image_url", "image_url": {"url": preview_url}})
+            try:
+                preview_url = render_bbox_preview_png_data_url(pdf_path, unit.page, unit.bbox)
+            except Exception:
+                preview_url = None
+            if preview_url:
+                unit_images.append({"type": "image_url", "image_url": {"url": preview_url}})
     except Exception:
         pass
 
@@ -267,10 +253,7 @@ async def adjudicate_semantic_unit(
             "text": prompt_text,
         },
         *page_images,
-        {
-            "type": "text",
-            "text": "Context JSON:\n" f"{json.dumps(payload, indent=2, ensure_ascii=True)}",
-        },
+        context_json_part(payload),
         *unit_images,
     ]
     cache_breakpoint_index = len(page_images) if page_images else 0
@@ -296,7 +279,7 @@ async def adjudicate_semantic_unit(
         unit_id=unit.unit_id,
         unit_type=unit.unit_type,
         summary=str(parsed.get("summary") or "").strip(),
-        confidence=str(parsed.get("confidence") or "low").strip() or "low",
+        confidence=confidence_label(parsed.get("confidence")),
         confidence_score=confidence_score(parsed.get("confidence")),
         suggested_action=str(parsed.get("suggested_action") or "manual_only").strip() or "manual_only",
         reason=str(parsed.get("reason") or "").strip(),

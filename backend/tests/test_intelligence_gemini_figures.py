@@ -249,6 +249,42 @@ def test_suppress_child_ui_alt_for_generic_icon_label():
     )
 
 
+def test_generate_figure_intelligence_suppresses_generic_child_ui_alt(monkeypatch, tmp_path):
+    image_path = tmp_path / "figure.png"
+    image_path.write_bytes(b"fake-image")
+
+    async def _fake_adjudicate(*, job, unit, llm_client):
+        return SemanticDecision(
+            unit_id="figure-18",
+            unit_type="figure",
+            summary="Tiny icon crop.",
+            confidence="high",
+            confidence_score=0.9,
+            suggested_action="set_alt_text",
+            reason="The crop is a small icon.",
+            alt_text="Magnifying glass icon",
+            is_decorative=False,
+        )
+
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.adjudicate_semantic_unit",
+        _fake_adjudicate,
+    )
+
+    result = asyncio.run(
+        generate_figure_intelligence(
+            figure=FigureInfo(index=18, path=image_path, page=8),
+            llm_client=object(),
+            original_filename="doc.pdf",
+            figure_context={"likely_child_ui_figure": True},
+        )
+    )
+
+    assert result["suggested_action"] == "mark_decorative"
+    assert result["is_decorative"] is True
+    assert result["alt_text"] == ""
+
+
 def test_generate_alt_text_uses_batched_figure_intelligence(monkeypatch, tmp_path):
     image_a = tmp_path / "a.png"
     image_b = tmp_path / "b.png"
