@@ -16,10 +16,11 @@ def test_extract_ocr_text_from_bbox_returns_normalized_tesseract_output(monkeypa
         lambda pdf_path, page_number, bbox, crop_margin_points=8.0, highlight=False: b"png-bytes",
     )
 
-    def _fake_run(cmd, capture_output, check, timeout, text):
+    def _fake_run(cmd, capture_output, check, timeout, text, env):
         assert cmd[:3] == ["/usr/bin/tesseract", cmd[1], "stdout"]
         assert "--psm" in cmd
         assert "-l" in cmd
+        assert "/opt/homebrew/bin" in env["PATH"]
         return CompletedProcess(cmd, 0, stdout="Data   Book\n", stderr="")
 
     monkeypatch.setattr(text_grounding.subprocess, "run", _fake_run)

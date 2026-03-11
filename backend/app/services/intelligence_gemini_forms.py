@@ -141,6 +141,8 @@ async def generate_form_intelligence(
     target: dict[str, Any],
     nearby_blocks: list[dict[str, Any]],
     llm_client: LlmClient,
+    reviewer_feedback: str | None = None,
+    previous_suggestion: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     unit = SemanticUnit(
         unit_id=str(target.get("field_review_id") or "").strip(),
@@ -161,6 +163,8 @@ async def generate_form_intelligence(
         metadata={
             "field_review_target": target,
             "nearby_fields": list(target.get("nearby_fields") or []),
+            "reviewer_feedback": reviewer_feedback or "",
+            "previous_suggestion": previous_suggestion or {},
         },
     )
     decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)

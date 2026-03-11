@@ -25,6 +25,8 @@ Rules:
 - Only decide for the provided unit_id and unit_type.
 - Preserve visible meaning. Do not invent document content that is not supported by the image and local evidence.
 - Use the page image, local crop, native_text_candidate, ocr_text_candidate, nearby_context, structure_context, and metadata together.
+- When semantic_unit.metadata.reviewer_feedback is present, treat it as a human correction of a previous recommendation. Use it as high-value context, but only follow it when it still matches the visible evidence and accessibility goal.
+- When semantic_unit.metadata.previous_suggestion is present, treat it as the prior recommendation for this same local unit. Revise it minimally when it still matches the visible evidence, and diverge from it explicitly when the visible evidence or reviewer feedback requires a different interpretation.
 - Prefer one of the provided text candidates when it clearly matches the visible content.
 - Use chosen_source="llm_inferred" only when neither provided candidate is good enough and the visible content is still locally clear.
 - Prefer precision over recall.
@@ -34,30 +36,44 @@ Definitions:
 - form_region: a region that belongs to a larger form/page layout and should not be treated as a standalone figure.
 - decorative: visible content that does not add meaning beyond nearby text or structure and should not be announced by assistive technology.
 - meaningful: visible content that carries information users need to understand.
+- layout_grid: a region arranged in rows/columns for visual organization, but not a true data table with consistent header logic.
+- org_chart: a hierarchical relationship diagram laid out in boxes or cells, where forcing table semantics would misrepresent the meaning.
+- code_block: preformatted code or command text where line breaks and indentation carry meaning.
+- caption: text whose purpose is to label or explain a nearby figure, table, or region.
+- instructions: explanatory text that supports a control or region but is not itself the control label.
 - header_rows: zero-based table row indexes that should be announced as column headers for the cells beneath them.
 - row_header_columns: zero-based table column indexes that should be announced as row headers for cells to their right.
 - group label: text that applies to a set of related controls such as a checkbox or radio group, not just one field.
 - faithful accessible reading: what assistive technology should announce so that a user receives the same meaning as a sighted reader, even if the PDF extraction is imperfect.
 
+Cross-type rule:
+- If the proposed unit_type is clearly wrong, use reclassify_region and set resolved_kind to the better semantic kind.
+- Prefer reclassification over forcing a misleading within-type fix.
+- Only reclassify when the visible evidence is strong. Otherwise use manual_only.
+
 Text-block rules:
 - Use confirm_current_text when the native/current semantic text is already acceptable for assistive technology.
 - Use set_resolved_text when a corrected local reading is clearly supported.
+- Use reclassify_region when the current text-block candidate is clearly the wrong kind of content entirely, such as a caption, instructions, or a code block.
 - Use mark_decorative when the extracted block is really redundant screenshot/UI text, repeated page furniture, or other non-narrative content that should be hidden from assistive technology instead of being read aloud.
 - Use manual_only when the local text is too ambiguous.
 - Set should_block_accessibility=true only when the current extracted text would likely mislead assistive technology.
 - Use spacing_only when the meaning is clear but spacing is broken.
 - Use encoding_problem when characters are materially wrong or garbled.
 - For code blocks, preserve visible line breaks and indentation in resolved_text.
+- When using reclassify_region from a text block candidate, prefer resolved_kind values like code_block, caption, or instructions.
 
 Table rules:
 - Use confirm_current_headers when the current header_rows and row_header_columns already provide an acceptable accessible reading.
 - Use set_table_headers when simple header rows and row-header columns clearly improve assistive-tech understanding.
 - Use manual_only only when simple header rows and row-header columns would still clearly misrepresent the table.
+- Use reclassify_region when the candidate is not really a data table at all, such as an org chart, layout grid, form region, or decorative layout block.
 - Treat grouped, stacked, or multi-row headers as acceptable for set_table_headers when marking the visible header band and row-header columns would give a faithful accessible reading.
 - Multi-row or grouped headers do not require manual_only by themselves if marking all visible header rows and the right row-header columns is faithful enough.
 - Prefer a faithful first-pass accessible reading over visual perfection.
 - If semantic_unit.metadata.confirm_existing is true, treat the current headers as the default and only change them when a different simple assignment is clearly better.
 - If semantic_unit.metadata.aggressive is true, prefer set_table_headers over manual_only whenever a plausible simple accessible reading is still faithful.
+- When using reclassify_region from a table candidate, prefer resolved_kind values like org_chart, layout_grid, form_region, or artifact.
 
 Form-field rules:
 - Use confirm_current_label when the current accessible label is already good.
@@ -127,7 +143,23 @@ SEMANTIC_DECISION_SCHEMA: dict[str, Any] = {
         "row_header_columns": {"type": "array", "items": {"type": "integer", "minimum": 0}},
         "accessible_label": {"type": "string"},
         "alt_text": {"type": "string"},
-        "resolved_kind": {"type": "string", "enum": ["table", "form_region", "artifact"]},
+        "resolved_kind": {
+            "type": "string",
+            "enum": [
+                "text_block",
+                "table",
+                "form_field",
+                "figure",
+                "toc_group",
+                "artifact",
+                "form_region",
+                "layout_grid",
+                "org_chart",
+                "code_block",
+                "caption",
+                "instructions",
+            ],
+        },
         "is_decorative": {"type": "boolean"},
         "is_toc": {"type": "boolean"},
         "entry_indexes": {"type": "array", "items": {"type": "integer", "minimum": 0}},

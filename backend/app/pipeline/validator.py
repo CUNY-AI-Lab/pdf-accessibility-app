@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.pipeline.subprocess_utils import SubprocessTimeout, communicate_with_timeout
+from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
 
 logger = logging.getLogger(__name__)
 
@@ -135,8 +136,11 @@ async def _validate_with_verapdf(
     timeout_seconds: int | None = None,
 ) -> ValidationResult:
     """Full validation via veraPDF CLI."""
+    resolved_verapdf = resolve_binary("verapdf", explicit=verapdf_path)
+    if not resolved_verapdf:
+        raise FileNotFoundError(verapdf_path)
     proc = await asyncio.create_subprocess_exec(
-        verapdf_path,
+        resolved_verapdf,
         "-f",
         flavour,
         "--format",
@@ -146,6 +150,7 @@ async def _validate_with_verapdf(
         str(pdf_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=enriched_subprocess_env(),
     )
     try:
         stdout, stderr = await communicate_with_timeout(proc, timeout_seconds)
@@ -255,4 +260,3 @@ async def _validate_with_verapdf(
         violations=violations,
         raw_report=report,
     )
-

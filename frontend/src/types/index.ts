@@ -1,8 +1,7 @@
 export type JobStatus =
   | "queued"
   | "processing"
-  | "awaiting_review"
-  | "needs_manual_review"
+  | "awaiting_recommendation_review"
   | "complete"
   | "failed";
 
@@ -54,6 +53,13 @@ export interface AltText {
   generated_text?: string;
   edited_text?: string;
   status: AltTextStatus;
+}
+
+export interface AltTextRecommendationApplyResult {
+  status: string;
+  message: string;
+  job_status: JobStatus;
+  alt_text: AltText;
 }
 
 export interface ReviewTask {

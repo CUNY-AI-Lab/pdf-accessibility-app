@@ -16,6 +16,8 @@ async def generate_table_intelligence(
     llm_client: LlmClient,
     aggressive: bool = False,
     confirm_existing: bool = False,
+    reviewer_feedback: str | None = None,
+    previous_suggestion: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     unit = SemanticUnit(
         unit_id=str(target.get("table_review_id") or "").strip(),
@@ -35,10 +37,12 @@ async def generate_table_intelligence(
             "table_review_target": target,
             "aggressive": aggressive,
             "confirm_existing": confirm_existing,
+            "reviewer_feedback": reviewer_feedback or "",
+            "previous_suggestion": previous_suggestion or {},
         },
     )
     decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)
-    return {
+    result = {
         "task_type": "table_intelligence",
         "summary": decision.summary,
         "confidence": decision.confidence,
@@ -50,3 +54,6 @@ async def generate_table_intelligence(
         "header_rows": decision.header_rows,
         "row_header_columns": decision.row_header_columns,
     }
+    if decision.resolved_kind:
+        result["resolved_kind"] = decision.resolved_kind
+    return result

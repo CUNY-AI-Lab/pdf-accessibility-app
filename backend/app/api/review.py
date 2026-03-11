@@ -1,11 +1,9 @@
 import json
 import logging
 from datetime import datetime, timezone
-from io import BytesIO
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,56 +20,34 @@ from app.pipeline.orchestrator import (
 )
 from app.pipeline.validator import ValidationResult, Violation, validate_pdf
 from app.schemas import (
-    FontActualTextBatchRequest,
-    FontActualTextRequest,
-    FontUnicodeOverrideRequest,
+    ReviewRecommendationApplyResponse,
     ReviewTaskResponse,
-    ReviewTaskUpdateRequest,
+    ReviewSuggestionRequest,
 )
 from app.services.file_storage import get_output_path
 from app.services.font_actualtext import (
     apply_actualtext_batch_to_contexts,
-    apply_actualtext_to_context,
 )
+from app.services.font_artifact import apply_artifact_batch_to_contexts
 from app.services.font_unicode_override import apply_unicode_override_to_context
 from app.services.job_manager import get_job_manager
 from app.services.llm_client import make_llm_client
-from app.services.path_safety import safe_filename, validate_path_within_allowed_roots
-from app.services.pdf_preview import (
-    render_bbox_preview_png_bytes,
-    render_target_preview_png_bytes,
+from app.services.path_safety import safe_filename
+from app.services.recommendation_apply import (
+    applicable_actualtext_candidates,
+    apply_reading_order_recommendation,
+    apply_table_recommendation,
+    can_accept_reading_order_recommendation,
+    can_accept_table_recommendation,
 )
-from app.services.review_suggestions import generate_review_suggestion
+from app.services.review_suggestions import (
+    generate_review_suggestion,
+    select_auto_font_review_resolution,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/jobs/{job_id}", tags=["review"])
-
-TASK_EVIDENCE_REQUIREMENTS: dict[str, tuple[tuple[str, str], ...]] = {
-    "reading_order": (
-        ("verification_method", "verification method"),
-        ("pages_checked", "pages checked"),
-    ),
-    "font_text_fidelity": (
-        ("assistive_tech", "assistive technology"),
-        ("sample_scope", "sample scope"),
-    ),
-    "table_semantics": (
-        ("tables_checked", "tables checked"),
-        ("verification_method", "verification method"),
-    ),
-    "form_semantics": (
-        ("fields_checked", "fields checked"),
-        ("verification_method", "verification method"),
-    ),
-    "content_fidelity": (
-        ("comparison_method", "comparison method"),
-        ("pages_checked", "pages checked"),
-    ),
-    "alt_text": (
-        ("figures_checked", "figures checked"),
-    ),
-}
 
 LLM_GARBLED_TEXT_FOLLOWUP_KIND = "garbled_text_hint"
 
@@ -100,16 +76,6 @@ def _allowed_font_targets(task_metadata: dict) -> dict[tuple[int, int], dict]:
     }
 
 
-def _allowed_table_targets(task_metadata: dict) -> dict[str, dict]:
-    raw_targets = task_metadata.get("table_review_targets", [])
-    return {
-        str(target.get("table_review_id")).strip(): target
-        for target in raw_targets
-        if isinstance(target, dict)
-        and str(target.get("table_review_id") or "").strip()
-    }
-
-
 def _resolve_font_review_target(
     *,
     task_metadata: dict,
@@ -131,21 +97,7 @@ def _resolve_font_review_target(
     return matched_target, context_path
 
 
-def _resolve_table_review_target(
-    *,
-    task_metadata: dict,
-    table_review_id: str,
-) -> dict:
-    matched_target = _allowed_table_targets(task_metadata).get(table_review_id.strip())
-    if matched_target is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Requested table target is not one of the task's flagged table targets",
-        )
-    return matched_target
-
-
-def _manual_font_remediation_preservation(
+def _post_tagging_font_remediation_preservation(
     *,
     task: ReviewTask,
     task_metadata: dict,
@@ -158,8 +110,8 @@ def _manual_font_remediation_preservation(
         preserved["llm_suggestion"] = llm_suggestion
 
     for key, new_attempts in (
-        ("manual_actualtext_attempts", actualtext_attempts),
-        ("manual_font_mapping_attempts", font_mapping_attempts),
+        ("post_tagging_actualtext_attempts", actualtext_attempts),
+        ("post_tagging_font_mapping_attempts", font_mapping_attempts),
     ):
         merged_attempts: list[dict[str, object]] = []
         existing_attempts = task_metadata.get(key)
@@ -177,19 +129,6 @@ def _manual_font_remediation_preservation(
     return {
         (task.task_type, task.source): preserved,
     }
-
-
-def _existing_job_pdf_path(job: Job) -> Path:
-    candidates = []
-    if job.output_path:
-        candidates.append(Path(job.output_path))
-    if job.input_path:
-        candidates.append(Path(job.input_path))
-    for candidate in candidates:
-        resolved = validate_path_within_allowed_roots(candidate)
-        if resolved.exists():
-            return resolved
-    raise HTTPException(status_code=404, detail="PDF file not found for review preview")
 
 
 async def _load_job(
@@ -227,32 +166,6 @@ async def _load_review_task(
             detail=invalid_type_detail or "Unsupported review task type",
         )
     return task
-
-
-def _manual_review_completion_state(
-    validation_payload: dict,
-    tasks: list[ReviewTask],
-) -> tuple[bool, str | None]:
-    if not bool(validation_payload.get("compliant", False)):
-        return False, "Validation still reports unresolved PDF/UA errors"
-
-    blocking_validation = [
-        task for task in tasks if bool(task.blocking) and task.source == "validation"
-    ]
-    if blocking_validation:
-        return False, "Validation-derived remediation tasks cannot be cleared in-app"
-
-    pending_blocking = [
-        task
-        for task in tasks
-        if bool(task.blocking)
-        and task.source != "validation"
-        and task.status == "pending_review"
-    ]
-    if pending_blocking:
-        return False, f"{len(pending_blocking)} blocking review task(s) still need review"
-
-    return True, None
 
 
 def _task_to_response(task: ReviewTask) -> ReviewTaskResponse:
@@ -401,51 +314,16 @@ async def _sync_llm_followup_tasks(
         await db.delete(duplicate)
 
 
-def _validated_task_metadata(
-    task: ReviewTask,
-    update: ReviewTaskUpdateRequest,
+def _accepted_recommendation_metadata(
+    task_metadata: dict,
+    *,
+    suggested_action: str,
 ) -> dict:
-    task_type = getattr(task, "task_type", "")
-    metadata = _parse_json(task.metadata_json)
-    if update.resolution_note is not None:
-        normalized = update.resolution_note.strip()
-        if normalized:
-            metadata["resolution_note"] = normalized
-        else:
-            metadata.pop("resolution_note", None)
-    if update.evidence is not None:
-        normalized_evidence = {
-            str(key): str(value).strip()
-            for key, value in update.evidence.items()
-            if str(key).strip()
-        }
-        if normalized_evidence:
-            metadata["evidence"] = normalized_evidence
-        else:
-            metadata.pop("evidence", None)
-
-    next_status = update.status or task.status
-    if next_status == "resolved" and not str(metadata.get("resolution_note") or "").strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Resolution note is required before marking a review task resolved",
-        )
-    if next_status == "resolved":
-        evidence = metadata.get("evidence")
-        evidence_dict = evidence if isinstance(evidence, dict) else {}
-        missing_fields = [
-            label
-            for key, label in TASK_EVIDENCE_REQUIREMENTS.get(task_type, ())
-            if not str(evidence_dict.get(key) or "").strip()
-        ]
-        if missing_fields:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Missing required review evidence: "
-                    + ", ".join(missing_fields)
-                ),
-            )
+    metadata = dict(task_metadata)
+    metadata["accepted_recommendation"] = {
+        "suggested_action": suggested_action,
+        "accepted_at": datetime.now(timezone.utc).isoformat(),
+    }
     return metadata
 
 
@@ -502,13 +380,13 @@ async def _load_font_review_context(
     return job, task, output_pdf, task_metadata, _allowed_font_targets(task_metadata)
 
 
-async def _refresh_after_manual_post_tagging_remediation(
+async def _refresh_after_post_tagging_remediation(
     *,
     job: Job,
     db: AsyncSession,
     output_pdf: Path,
     preserved_task_metadata: dict[tuple[str, str], dict],
-    manual_claims: dict[str, bool],
+    remediation_claims: dict[str, bool],
     failure_detail: str,
 ) -> None:
     job.status = "processing"
@@ -522,16 +400,91 @@ async def _refresh_after_manual_post_tagging_remediation(
             settings=settings,
             output_pdf=output_pdf,
             preserved_task_metadata=preserved_task_metadata,
-            manual_claims=manual_claims,
+            remediation_claims=remediation_claims,
         )
     except Exception as exc:
-        job.status = "needs_manual_review"
+        job.status = "awaiting_recommendation_review"
         await db.commit()
         logger.exception(failure_detail)
         raise HTTPException(
             status_code=502,
             detail="Remediation applied but validation refresh failed",
         ) from exc
+
+
+async def _refresh_recommendation_review_status(
+    *,
+    job: Job,
+    db: AsyncSession,
+) -> None:
+    validation_payload = _parse_json(job.validation_json)
+    result = await db.execute(
+        select(ReviewTask).where(
+            ReviewTask.job_id == job.id,
+            ReviewTask.blocking.is_(True),
+            ReviewTask.status == "pending_review",
+        )
+    )
+    pending_blocking = result.scalars().all()
+    job.status = (
+        "complete"
+        if bool(validation_payload.get("compliant", False)) and not pending_blocking
+        else "awaiting_recommendation_review"
+    )
+    await db.commit()
+
+
+async def _accept_recommendation_without_changes(
+    *,
+    job: Job,
+    task: ReviewTask,
+    task_metadata: dict,
+    suggested_action: str,
+    db: AsyncSession,
+) -> ReviewRecommendationApplyResponse:
+    task.status = "resolved"
+    task.metadata_json = json.dumps(
+        _accepted_recommendation_metadata(
+            task_metadata,
+            suggested_action=suggested_action,
+        )
+    )
+    await db.commit()
+    await _refresh_recommendation_review_status(job=job, db=db)
+    return ReviewRecommendationApplyResponse(
+        status="accepted",
+        message="Accepted the recommendation. No PDF changes were needed.",
+    )
+
+
+async def _restart_tagging_with_structure_recommendation(
+    *,
+    job: Job,
+    db: AsyncSession,
+    structure_payload: dict,
+) -> None:
+    job.structure_json = json.dumps(structure_payload)
+    job.status = "processing"
+    await db.commit()
+
+    settings = get_settings()
+    session_maker = get_session_maker()
+    job_manager = get_job_manager()
+
+    async def _resume(jid, sm, s, jm, structure_json):
+        async with sm() as resume_db:
+            await run_tagging_and_validation(
+                jid,
+                resume_db,
+                s,
+                jm,
+                structure_json=structure_json,
+            )
+
+    await job_manager.submit_job(
+        job.id,
+        _resume(job.id, session_maker, settings, job_manager, structure_payload),
+    )
 
 
 async def _refresh_post_tagging_reports(
@@ -541,7 +494,7 @@ async def _refresh_post_tagging_reports(
     settings,
     output_pdf: Path,
     preserved_task_metadata: dict[tuple[str, str], dict] | None = None,
-    manual_claims: dict[str, bool] | None = None,
+    remediation_claims: dict[str, bool] | None = None,
 ) -> None:
     previous_payload = _parse_json(job.validation_json)
     baseline_validation = _validation_result_from_payload(previous_payload)
@@ -594,11 +547,11 @@ async def _refresh_post_tagging_reports(
     reviewed_alt_entries = result.scalars().all()
     structure_json = _parse_json(job.structure_json)
 
-    normalized_manual_claims = {"manual_post_tagging_review_edit": True}
-    if isinstance(manual_claims, dict):
-        normalized_manual_claims.update({
+    normalized_remediation_claims = {"post_tagging_review_edit": True}
+    if isinstance(remediation_claims, dict):
+        normalized_remediation_claims.update({
             str(key): bool(value)
-            for key, value in manual_claims.items()
+            for key, value in remediation_claims.items()
             if str(key).strip()
         })
 
@@ -648,12 +601,12 @@ async def _refresh_post_tagging_reports(
             "errors_reduced": baseline_errors - post_errors,
             "warnings_reduced": baseline_warnings - post_warnings,
             "font_remediation": previous_remediation.get("font_remediation", {}),
-            **normalized_manual_claims,
+            **normalized_remediation_claims,
         },
         "tagging": tagging_metrics,
         "claims": {
             **(previous_payload.get("claims", {}) if isinstance(previous_payload.get("claims"), dict) else {}),
-            **normalized_manual_claims,
+            **normalized_remediation_claims,
         },
     }
 
@@ -687,7 +640,7 @@ async def _refresh_post_tagging_reports(
         if not isinstance(metadata, dict):
             metadata = {}
         key = (
-            str(task.get("task_type") or "manual_review"),
+            str(task.get("task_type") or "review_task"),
             str(task.get("source") or "fidelity"),
         )
         preserved = (
@@ -699,8 +652,8 @@ async def _refresh_post_tagging_reports(
             metadata = {**preserved, **metadata}
         db.add(ReviewTask(
             job_id=job.id,
-            task_type=str(task.get("task_type") or "manual_review"),
-            title=str(task.get("title") or "Manual review required"),
+            task_type=str(task.get("task_type") or "review_task"),
+            title=str(task.get("title") or "Recommendation review required"),
             detail=str(task.get("detail") or ""),
             severity=str(task.get("severity") or "medium"),
             blocking=bool(task.get("blocking", True)),
@@ -713,7 +666,7 @@ async def _refresh_post_tagging_reports(
     await _update_step(db, job.id, "validation", "complete", result={
         "compliant": selected_validation.compliant,
         "violations_count": len(selected_validation.violations),
-        "manual_post_tagging_actualtext": True,
+        "post_tagging_actualtext": True,
     })
     await _update_step(db, job.id, "fidelity", "complete", result={
         "passed": bool(fidelity_report.get("passed", False)),
@@ -721,7 +674,7 @@ async def _refresh_post_tagging_reports(
         "advisory_tasks": len(review_tasks) - blocking_task_count,
     })
 
-    job.status = "complete" if selected_validation.compliant and not blocking_task_count else "needs_manual_review"
+    job.status = "complete" if selected_validation.compliant and not blocking_task_count else "awaiting_recommendation_review"
     await db.commit()
 
 
@@ -735,96 +688,26 @@ async def approve_review(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job.status == "awaiting_review":
-        # Check that all alt texts have been reviewed
-        result = await db.execute(
-            select(AltTextEntry).where(
-                AltTextEntry.job_id == job_id,
-                AltTextEntry.status == "pending_review",
-            )
-        )
-        pending = result.scalars().all()
-        if pending:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{len(pending)} figure(s) still need review",
-            )
-
-        # Update status and trigger remaining pipeline steps
-        job.status = "processing"
-        await db.commit()
-
-        # Submit tagging + validation to run in background
-        settings = get_settings()
-        session_maker = get_session_maker()
-        job_manager = get_job_manager()
-
-        async def _resume(jid, sm, s, jm):
-            async with sm() as resume_db:
-                await run_tagging_and_validation(jid, resume_db, s, jm)
-
-        await job_manager.submit_job(
-            job_id,
-            _resume(job_id, session_maker, settings, job_manager),
-        )
-
-        return {"status": "approved", "message": "Tagging and validation started"}
-
-    if job.status != "needs_manual_review":
+    if job.status == "awaiting_recommendation_review":
         raise HTTPException(
             status_code=400,
-            detail=f"Job is not awaiting review (current status: {job.status})",
+            detail=(
+                "Recommendation review completes automatically when the remaining "
+                "blocking recommendations are accepted."
+            ),
         )
 
-    result = await db.execute(
-        select(ReviewTask).where(ReviewTask.job_id == job_id).order_by(ReviewTask.id)
+    raise HTTPException(
+        status_code=400,
+        detail=f"Job is not awaiting review (current status: {job.status})",
     )
-    tasks = result.scalars().all()
-    ok_to_complete, reason = _manual_review_completion_state(_parse_json(job.validation_json), tasks)
-    if not ok_to_complete:
-        raise HTTPException(status_code=400, detail=reason or "Manual review is not complete")
-
-    job.status = "complete"
-    await db.commit()
-    return {"status": "approved", "message": "Manual fidelity review recorded"}
-
-
-@router.put("/review-tasks/{task_id}", response_model=ReviewTaskResponse)
-async def update_review_task(
-    job_id: str,
-    task_id: int,
-    update: ReviewTaskUpdateRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        select(ReviewTask).where(
-            ReviewTask.job_id == job_id,
-            ReviewTask.id == task_id,
-        )
-    )
-    task = result.scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Review task not found")
-    if task.source == "validation":
-        raise HTTPException(
-            status_code=400,
-            detail="Validation-derived tasks cannot be resolved in-app",
-        )
-
-    metadata = _validated_task_metadata(task, update)
-    if update.status is not None:
-        task.status = update.status
-    task.metadata_json = json.dumps(metadata) if metadata else None
-
-    await db.commit()
-    await db.refresh(task)
-    return _task_to_response(task)
 
 
 @router.post("/review-tasks/{task_id}/suggest", response_model=ReviewTaskResponse)
 async def suggest_review_task(
     job_id: str,
     task_id: int,
+    request: ReviewSuggestionRequest | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     job = await _load_job(job_id=job_id, db=db)
@@ -835,7 +718,12 @@ async def suggest_review_task(
 
     metadata = _parse_json(task.metadata_json)
     try:
-        suggestion = await generate_review_suggestion(job=job, task=task, llm_client=llm_client)
+        suggestion = await generate_review_suggestion(
+            job=job,
+            task=task,
+            llm_client=llm_client,
+            reviewer_feedback=(request.feedback.strip() if request and request.feedback else None),
+        )
     except ValueError as exc:
         logger.exception("Invalid review suggestion request")
         raise HTTPException(status_code=400, detail="Invalid suggestion request") from exc
@@ -861,306 +749,273 @@ async def suggest_review_task(
     return _task_to_response(task)
 
 
-@router.get("/review-tasks/{task_id}/font-target-preview")
-async def get_font_target_preview(
+@router.post(
+    "/review-tasks/{task_id}/apply-recommendation",
+    response_model=ReviewRecommendationApplyResponse,
+)
+async def apply_review_recommendation(
     job_id: str,
     task_id: int,
-    page_number: int = Query(..., ge=1),
-    operator_index: int = Query(..., ge=0),
     db: AsyncSession = Depends(get_db),
 ):
     job = await _load_job(job_id=job_id, db=db)
-    task = await _load_review_task(
-        job_id=job_id,
-        task_id=task_id,
-        db=db,
-        expected_task_type="font_text_fidelity",
-        invalid_type_detail="Font target previews are only supported for font review tasks",
-    )
+    task = await _load_review_task(job_id=job_id, task_id=task_id, db=db)
 
     task_metadata = _parse_json(task.metadata_json)
-    matched_target, context_path = _resolve_font_review_target(
-        task_metadata=task_metadata,
-        page_number=page_number,
-        operator_index=operator_index,
-    )
+    suggestion = task_metadata.get("llm_suggestion")
+    if not isinstance(suggestion, dict) or not suggestion:
+        raise HTTPException(status_code=400, detail="No recommendation is available for this task")
+    suggested_action = str(suggestion.get("suggested_action") or "").strip()
 
-    pdf_path = _existing_job_pdf_path(job)
-    try:
-        image_bytes = render_target_preview_png_bytes(pdf_path, context_path)
-    except FileNotFoundError as exc:
-        logger.exception("PDF file not found for font target preview")
-        raise HTTPException(status_code=404, detail="PDF file not found") from exc
-    except ValueError as exc:
-        logger.exception("Invalid font target preview request")
-        raise HTTPException(status_code=400, detail="Invalid preview request") from exc
-    except Exception as exc:
-        logger.exception("Failed to render font target preview")
-        raise HTTPException(status_code=502, detail="Failed to render preview") from exc
-
-    return StreamingResponse(BytesIO(image_bytes), media_type="image/png")
-
-
-@router.get("/review-tasks/{task_id}/table-target-preview")
-async def get_table_target_preview(
-    job_id: str,
-    task_id: int,
-    table_review_id: str = Query(..., min_length=1),
-    db: AsyncSession = Depends(get_db),
-):
-    job = await _load_job(job_id=job_id, db=db)
-    task = await _load_review_task(
-        job_id=job_id,
-        task_id=task_id,
-        db=db,
-        expected_task_type="table_semantics",
-        invalid_type_detail="Table target previews are only supported for table review tasks",
-    )
-
-    task_metadata = _parse_json(task.metadata_json)
-    matched_target = _resolve_table_review_target(
-        task_metadata=task_metadata,
-        table_review_id=table_review_id,
-    )
-
-    page_number = matched_target.get("page")
-    bbox = matched_target.get("bbox")
-    if not isinstance(page_number, int) or page_number < 1 or not isinstance(bbox, dict):
-        raise HTTPException(status_code=400, detail="Task target did not include a usable page/bbox preview region")
-
-    pdf_path = _existing_job_pdf_path(job)
-    try:
-        image_bytes = render_bbox_preview_png_bytes(pdf_path, page_number, bbox)
-    except FileNotFoundError as exc:
-        logger.exception("PDF file not found for table target preview")
-        raise HTTPException(status_code=404, detail="PDF file not found") from exc
-    except ValueError as exc:
-        logger.exception("Invalid table target preview request")
-        raise HTTPException(status_code=400, detail="Invalid preview request") from exc
-    except Exception as exc:
-        logger.exception("Failed to render table target preview")
-        raise HTTPException(status_code=502, detail="Failed to render preview") from exc
-
-    return StreamingResponse(BytesIO(image_bytes), media_type="image/png")
-
-
-@router.post("/review-tasks/{task_id}/actualtext", status_code=200)
-async def apply_font_actualtext(
-    job_id: str,
-    task_id: int,
-    request: FontActualTextRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    job, task, output_pdf, task_metadata, _ = await _load_font_review_context(
-        job_id=job_id,
-        task_id=task_id,
-        db=db,
-    )
-    _, context_path = _resolve_font_review_target(
-        task_metadata=task_metadata,
-        page_number=request.page_number,
-        operator_index=request.operator_index,
-    )
-
-    patched_output = get_output_path(
-        job_id,
-        f"accessible_manual_actualtext_{task_id}_{safe_filename(job.original_filename)}",
-    )
-
-    try:
-        apply_actualtext_to_context(
-            input_pdf=output_pdf,
-            output_pdf=patched_output,
-            context_path=context_path,
-            actual_text=request.actual_text,
-        )
-    except ValueError as exc:
-        logger.exception("Invalid ActualText remediation request")
-        raise HTTPException(status_code=400, detail="Invalid remediation request") from exc
-    except Exception as exc:
-        logger.exception("Failed to apply ActualText remediation")
-        raise HTTPException(status_code=502, detail="Internal processing error") from exc
-
-    preserved_task_metadata = _manual_font_remediation_preservation(
-        task=task,
-        task_metadata=task_metadata,
-        actualtext_attempts=[
-            {
-                "page_number": request.page_number,
-                "operator_index": request.operator_index,
-                "actual_text": request.actual_text,
-                "applied_at": datetime.now(timezone.utc).isoformat(),
-                "mode": "single",
-            }
-        ],
-    )
-    await _refresh_after_manual_post_tagging_remediation(
-        job=job,
-        db=db,
-        output_pdf=patched_output,
-        preserved_task_metadata=preserved_task_metadata,
-        manual_claims={"manual_post_tagging_actualtext": True},
-        failure_detail="Validation refresh failed after ActualText remediation",
-    )
-
-    return {
-        "status": "ok",
-        "message": "Applied ActualText remediation and refreshed validation.",
-    }
-
-
-@router.post("/review-tasks/{task_id}/actualtext/batch", status_code=200)
-async def apply_font_actualtext_batch(
-    job_id: str,
-    task_id: int,
-    request: FontActualTextBatchRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    job, task, output_pdf, task_metadata, _ = await _load_font_review_context(
-        job_id=job_id,
-        task_id=task_id,
-        db=db,
-    )
-    if not request.targets:
-        raise HTTPException(status_code=400, detail="At least one batch target is required")
-
-    batch_patches: list[dict[str, str]] = []
-    seen_pairs: set[tuple[int, int]] = set()
-    for target_request in request.targets:
-        pair = (target_request.page_number, target_request.operator_index)
-        if pair in seen_pairs:
+    if task.task_type == "reading_order":
+        structure_payload = _parse_json(job.structure_json)
+        if suggested_action == "confirm_current_order":
+            return await _accept_recommendation_without_changes(
+                job=job,
+                task=task,
+                task_metadata=task_metadata,
+                suggested_action=suggested_action,
+                db=db,
+            )
+        if not can_accept_reading_order_recommendation(structure_payload, suggestion):
             raise HTTPException(
                 status_code=400,
-                detail="Duplicate page/operator pair provided in batch request",
+                detail="This recommendation is not ready to apply automatically yet. Suggest an alternative instead.",
             )
-        seen_pairs.add(pair)
+        next_structure = apply_reading_order_recommendation(structure_payload, suggestion)
+        if not next_structure:
+            raise HTTPException(
+                status_code=400,
+                detail="This recommendation is not ready to apply automatically yet. Suggest an alternative instead.",
+            )
+        await _restart_tagging_with_structure_recommendation(
+            job=job,
+            db=db,
+            structure_payload=next_structure,
+        )
+        return ReviewRecommendationApplyResponse(
+            status="accepted",
+            message="Applied the recommendation and restarted tagging.",
+        )
 
-        try:
-            _, context_path = _resolve_font_review_target(
+    if task.task_type == "table_semantics":
+        structure_payload = _parse_json(job.structure_json)
+        if suggested_action == "confirm_current_headers":
+            return await _accept_recommendation_without_changes(
+                job=job,
+                task=task,
                 task_metadata=task_metadata,
-                page_number=target_request.page_number,
-                operator_index=target_request.operator_index,
+                suggested_action=suggested_action,
+                db=db,
             )
-        except HTTPException as exc:
-            if exc.status_code == 400:
+        if not can_accept_table_recommendation(structure_payload, suggestion):
+            raise HTTPException(
+                status_code=400,
+                detail="This recommendation is not ready to apply automatically yet. Suggest an alternative instead.",
+            )
+        next_structure = apply_table_recommendation(structure_payload, suggestion)
+        if not next_structure:
+            raise HTTPException(
+                status_code=400,
+                detail="This recommendation is not ready to apply automatically yet. Suggest an alternative instead.",
+            )
+        await _restart_tagging_with_structure_recommendation(
+            job=job,
+            db=db,
+            structure_payload=next_structure,
+        )
+        return ReviewRecommendationApplyResponse(
+            status="accepted",
+            message="Applied the recommendation and restarted tagging.",
+        )
+
+    if task.task_type == "font_text_fidelity":
+        _, _, output_pdf, _, _ = await _load_font_review_context(
+            job_id=job_id,
+            task_id=task_id,
+            db=db,
+        )
+        if suggested_action == "artifact_if_decorative":
+            selected = select_auto_font_review_resolution(
+                job=job,
+                task=task,
+                suggestion=suggestion,
+            )
+            if not isinstance(selected, dict) or str(selected.get("resolution_type") or "") != "artifact":
                 raise HTTPException(
                     status_code=400,
-                    detail="One or more requested page/operator pairs are not flagged font targets",
-                ) from exc
-            raise
-        batch_patches.append({
-            "context_path": context_path,
-            "actual_text": target_request.actual_text,
-        })
+                    detail="This recommendation is not ready to apply automatically yet. Suggest an alternative instead.",
+                )
+            targets = selected.get("targets")
+            if not isinstance(targets, list) or not targets:
+                raise HTTPException(status_code=400, detail="Invalid recommendation request")
+            context_paths = [
+                str(target.get("context_path") or "").strip()
+                for target in targets
+                if isinstance(target, dict)
+            ]
+            if any(not context_path for context_path in context_paths):
+                raise HTTPException(status_code=400, detail="Invalid recommendation request")
+            patched_output = get_output_path(
+                job_id,
+                f"accessible_recommendation_artifact_{task_id}_{safe_filename(job.original_filename)}",
+            )
+            try:
+                apply_artifact_batch_to_contexts(
+                    input_pdf=output_pdf,
+                    output_pdf=patched_output,
+                    context_paths=context_paths,
+                )
+            except ValueError as exc:
+                logger.exception("Invalid recommendation remediation request")
+                raise HTTPException(status_code=400, detail="Invalid recommendation request") from exc
+            except Exception as exc:
+                logger.exception("Failed to apply recommendation remediation")
+                raise HTTPException(status_code=502, detail="Internal processing error") from exc
+            preserved_task_metadata = _post_tagging_font_remediation_preservation(
+                task=task,
+                task_metadata=task_metadata,
+            )
+            await _refresh_after_post_tagging_remediation(
+                job=job,
+                db=db,
+                output_pdf=patched_output,
+                preserved_task_metadata=preserved_task_metadata,
+                remediation_claims={"post_tagging_artifact": True},
+                failure_detail="Validation refresh failed after accepted recommendation remediation",
+            )
+            return ReviewRecommendationApplyResponse(
+                status="accepted",
+                message="Accepted the recommendation and refreshed validation.",
+            )
 
-    patched_output = get_output_path(
-        job_id,
-        f"accessible_manual_actualtext_batch_{task_id}_{safe_filename(job.original_filename)}",
-    )
+        if suggested_action == "font_map_candidate":
+            selected = select_auto_font_review_resolution(
+                job=job,
+                task=task,
+                suggestion=suggestion,
+            )
+            if not isinstance(selected, dict) or str(selected.get("resolution_type") or "") != "font_map":
+                raise HTTPException(
+                    status_code=400,
+                    detail="This recommendation is not ready to apply automatically yet. Suggest an alternative instead.",
+                )
+            _, context_path = _resolve_font_review_target(
+                task_metadata=task_metadata,
+                page_number=int(selected["page_number"]),
+                operator_index=int(selected["operator_index"]),
+            )
+            patched_output = get_output_path(
+                job_id,
+                f"accessible_recommendation_fontmap_{task_id}_{safe_filename(job.original_filename)}",
+            )
+            try:
+                applied = apply_unicode_override_to_context(
+                    input_pdf=output_pdf,
+                    output_pdf=patched_output,
+                    context_path=context_path,
+                    unicode_text=str(selected["unicode_text"]),
+                )
+            except ValueError as exc:
+                logger.exception("Invalid recommendation remediation request")
+                raise HTTPException(status_code=400, detail="Invalid recommendation request") from exc
+            except Exception as exc:
+                logger.exception("Failed to apply recommendation remediation")
+                raise HTTPException(status_code=502, detail="Internal processing error") from exc
+            preserved_task_metadata = _post_tagging_font_remediation_preservation(
+                task=task,
+                task_metadata=task_metadata,
+                font_mapping_attempts=[
+                    {
+                        "page_number": int(selected["page_number"]),
+                        "operator_index": int(selected["operator_index"]),
+                        "unicode_text": str(selected["unicode_text"]),
+                        "font_base_name": applied.get("font_base_name"),
+                        "font_code_hex": f"{int(applied.get('font_code', 0)):02X}",
+                        "applied_at": datetime.now(timezone.utc).isoformat(),
+                        "mode": "accepted_recommendation",
+                    }
+                ],
+            )
+            await _refresh_after_post_tagging_remediation(
+                job=job,
+                db=db,
+                output_pdf=patched_output,
+                preserved_task_metadata=preserved_task_metadata,
+                remediation_claims={"post_tagging_font_map": True},
+                failure_detail="Validation refresh failed after accepted recommendation remediation",
+            )
+            return ReviewRecommendationApplyResponse(
+                status="accepted",
+                message="Accepted the recommendation and refreshed validation.",
+            )
 
-    try:
-        apply_actualtext_batch_to_contexts(
-            input_pdf=output_pdf,
-            output_pdf=patched_output,
-            patches=batch_patches,
+        candidates = applicable_actualtext_candidates(suggestion, task_metadata)
+        if not candidates:
+            raise HTTPException(
+                status_code=400,
+                detail="This recommendation is not ready to apply automatically yet. Suggest an alternative instead.",
+            )
+
+        batch_patches: list[dict[str, str]] = []
+        for candidate in candidates:
+            _, context_path = _resolve_font_review_target(
+                task_metadata=task_metadata,
+                page_number=int(candidate["page"]),
+                operator_index=int(candidate["operator_index"]),
+            )
+            batch_patches.append(
+                {
+                    "context_path": context_path,
+                    "actual_text": str(candidate["proposed_actualtext"]),
+                }
+            )
+
+        patched_output = get_output_path(
+            job_id,
+            f"accessible_recommendation_actualtext_{task_id}_{safe_filename(job.original_filename)}",
         )
-    except ValueError as exc:
-        logger.exception("Invalid ActualText batch remediation request")
-        raise HTTPException(status_code=400, detail="Invalid remediation request") from exc
-    except Exception as exc:
-        logger.exception("Failed to apply ActualText batch remediation")
-        raise HTTPException(status_code=502, detail="Internal processing error") from exc
+        try:
+            apply_actualtext_batch_to_contexts(
+                input_pdf=output_pdf,
+                output_pdf=patched_output,
+                patches=batch_patches,
+            )
+        except ValueError as exc:
+            logger.exception("Invalid recommendation remediation request")
+            raise HTTPException(status_code=400, detail="Invalid recommendation request") from exc
+        except Exception as exc:
+            logger.exception("Failed to apply recommendation remediation")
+            raise HTTPException(status_code=502, detail="Internal processing error") from exc
 
-    preserved_task_metadata = _manual_font_remediation_preservation(
-        task=task,
-        task_metadata=task_metadata,
-        actualtext_attempts=[
-            {
-                "page_number": target_request.page_number,
-                "operator_index": target_request.operator_index,
-                "actual_text": target_request.actual_text,
-                "applied_at": datetime.now(timezone.utc).isoformat(),
-                "mode": "batch",
-            }
-            for target_request in request.targets
-        ],
-    )
-    await _refresh_after_manual_post_tagging_remediation(
-        job=job,
-        db=db,
-        output_pdf=patched_output,
-        preserved_task_metadata=preserved_task_metadata,
-        manual_claims={"manual_post_tagging_actualtext": True},
-        failure_detail="Validation refresh failed after ActualText batch remediation",
-    )
-
-    return {
-        "status": "ok",
-        "message": "Applied ActualText batch remediation and refreshed validation.",
-    }
-
-
-@router.post("/review-tasks/{task_id}/font-map", status_code=200)
-async def apply_font_unicode_override(
-    job_id: str,
-    task_id: int,
-    request: FontUnicodeOverrideRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    job, task, output_pdf, task_metadata, _ = await _load_font_review_context(
-        job_id=job_id,
-        task_id=task_id,
-        db=db,
-    )
-    _, context_path = _resolve_font_review_target(
-        task_metadata=task_metadata,
-        page_number=request.page_number,
-        operator_index=request.operator_index,
-    )
-
-    patched_output = get_output_path(
-        job_id,
-        f"accessible_manual_fontmap_{task_id}_{safe_filename(job.original_filename)}",
-    )
-
-    try:
-        applied = apply_unicode_override_to_context(
-            input_pdf=output_pdf,
-            output_pdf=patched_output,
-            context_path=context_path,
-            unicode_text=request.unicode_text,
+        preserved_task_metadata = _post_tagging_font_remediation_preservation(
+            task=task,
+            task_metadata=task_metadata,
+            actualtext_attempts=[
+                {
+                    "page_number": candidate["page"],
+                    "operator_index": candidate["operator_index"],
+                    "actual_text": candidate["proposed_actualtext"],
+                    "applied_at": datetime.now(timezone.utc).isoformat(),
+                    "mode": "accepted_recommendation",
+                }
+                for candidate in candidates
+            ],
         )
-    except ValueError as exc:
-        logger.exception("Invalid font-map remediation request")
-        raise HTTPException(status_code=400, detail="Invalid remediation request") from exc
-    except Exception as exc:
-        logger.exception("Failed to apply font-map remediation")
-        raise HTTPException(status_code=502, detail="Internal processing error") from exc
+        await _refresh_after_post_tagging_remediation(
+            job=job,
+            db=db,
+            output_pdf=patched_output,
+            preserved_task_metadata=preserved_task_metadata,
+            remediation_claims={"post_tagging_actualtext": True},
+            failure_detail="Validation refresh failed after accepted recommendation remediation",
+        )
+        return ReviewRecommendationApplyResponse(
+            status="accepted",
+            message="Accepted the recommendation and refreshed validation.",
+        )
 
-    preserved_task_metadata = _manual_font_remediation_preservation(
-        task=task,
-        task_metadata=task_metadata,
-        font_mapping_attempts=[
-            {
-                "page_number": request.page_number,
-                "operator_index": request.operator_index,
-                "unicode_text": request.unicode_text,
-                "font_base_name": applied.get("font_base_name"),
-                "font_code_hex": f"{int(applied.get('font_code', 0)):02X}",
-                "applied_at": datetime.now(timezone.utc).isoformat(),
-            }
-        ],
+    raise HTTPException(
+        status_code=400,
+        detail="This task type does not support direct recommendation application",
     )
-    await _refresh_after_manual_post_tagging_remediation(
-        job=job,
-        db=db,
-        output_pdf=patched_output,
-        preserved_task_metadata=preserved_task_metadata,
-        manual_claims={"manual_post_tagging_font_map": True},
-        failure_detail="Validation refresh failed after font-map remediation",
-    )
-
-    return {
-        "status": "ok",
-        "message": "Applied font-map remediation and refreshed validation.",
-    }

@@ -38,6 +38,7 @@ Respond with strict JSON only using this schema:
 
 Rules:
 - Use only the provided review_id values from page_blocks.
+- When reviewer_feedback is present, treat it as a human correction of the previous recommendation. Follow it when it matches the visible page evidence and accessibility goal.
 - If you provide ordered_review_ids, include every page block exactly once.
 - Use `artifact_headers_footers` only for repeated running heads, page numbers, or purely decorative side material.
 - Use `reorder_review` when the main issue is block order or block role.
@@ -96,6 +97,8 @@ async def generate_reading_order_intelligence(
     page_structure_fragments: list[dict[str, Any]],
     page_text_intelligence_blocks: list[dict[str, Any]],
     llm_client: LlmClient,
+    reviewer_feedback: str | None = None,
+    previous_suggestion: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "job_filename": job.original_filename,
@@ -107,6 +110,8 @@ async def generate_reading_order_intelligence(
         "page_blocks": page_blocks,
         "page_structure_fragments": page_structure_fragments,
         "page_text_intelligence_blocks": page_text_intelligence_blocks,
+        "reviewer_feedback": reviewer_feedback or "",
+        "previous_suggestion": previous_suggestion or {},
     }
     content = [
         {

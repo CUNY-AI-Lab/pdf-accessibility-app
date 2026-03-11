@@ -22,14 +22,8 @@ const STATUS_CONFIG: Record<
     bg: "bg-info-light",
     dot: "bg-info animate-pulse-soft",
   },
-  awaiting_review: {
-    label: "Needs Review",
-    color: "text-warning",
-    bg: "bg-warning-light",
-    dot: "bg-warning",
-  },
-  needs_manual_review: {
-    label: "Needs Manual Fix",
+  awaiting_recommendation_review: {
+    label: "Recommendations",
     color: "text-warning",
     bg: "bg-warning-light",
     dot: "bg-warning",
@@ -89,9 +83,7 @@ export default function JobCard({ job }: JobCardProps) {
   const reviewItemCount = blockingTasks + advisoryTasks;
 
   const linkTo =
-    job.status === "awaiting_review"
-      ? `/jobs/${job.id}/review`
-      : `/jobs/${job.id}`;
+    job.status === "awaiting_recommendation_review" ? `/jobs/${job.id}/review` : `/jobs/${job.id}`;
 
   const handleDelete = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -174,9 +166,9 @@ export default function JobCard({ job }: JobCardProps) {
         </p>
       )}
 
-      {job.status === "needs_manual_review" && reviewItemCount > 0 && (
+      {job.status === "awaiting_recommendation_review" && reviewItemCount > 0 && (
         <p className="text-xs text-warning font-medium mb-3">
-          {reviewItemCount} {pluralize(reviewItemCount, "item")} {pluralize(reviewItemCount, "needs", "need")} review
+          {reviewItemCount} {pluralize(reviewItemCount, "recommendation")} {pluralize(reviewItemCount, "is", "are")} ready
         </p>
       )}
 

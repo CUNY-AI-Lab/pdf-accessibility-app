@@ -1,5 +1,4 @@
 import base64
-import shutil
 import subprocess
 import tempfile
 from io import BytesIO
@@ -8,7 +7,9 @@ from pathlib import Path
 import pikepdf
 from PIL import Image, ImageDraw
 
+from app.config import get_settings
 from app.services.pdf_operator_context import extract_operator_visual_context
+from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
 
 RENDER_DPI = 144
 MAX_IMAGE_WIDTH = 1400
@@ -24,7 +25,7 @@ TARGET_CENTER_COLOR = (220, 38, 38, 255)
 
 
 def pdftoppm_path() -> str:
-    binary = shutil.which("pdftoppm")
+    binary = resolve_binary("pdftoppm", explicit=get_settings().pdftoppm_path)
     if not binary:
         raise RuntimeError("pdftoppm is required for PDF page previews but was not found")
     return binary
@@ -59,7 +60,13 @@ def render_page_png_bytes(
             str(output_prefix),
         ]
         try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=timeout)
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                timeout=timeout,
+                env=enriched_subprocess_env(),
+            )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
                 f"Page preview timed out after {timeout}s"

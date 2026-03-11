@@ -16,7 +16,7 @@ import pikepdf
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.models import AltTextEntry, Job, JobStep, ReviewTask
 from app.pipeline.alt_text import generate_alt_text
 from app.pipeline.classify import classify_pdf
@@ -54,8 +54,9 @@ from app.services.intelligence_gemini_tables import generate_table_intelligence
 from app.services.file_storage import create_job_dir, get_output_path
 from app.services.job_manager import JobManager
 from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
-from app.services.llm_client import make_llm_client
+from app.services.llm_client import LlmClient as _LlmClient, make_llm_client
 from app.services.page_intelligence import collect_grounded_text_candidates
+from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
 from app.services.semantic_pretag_policy import (
     apply_table_intelligence_to_element as _apply_table_intelligence_to_element,
     form_targets_for_intelligence as _form_targets_for_intelligence,
@@ -70,6 +71,9 @@ from app.services.toc_suggestions import enhance_toc_structure_with_llm
 from app.services.validation_compare import is_better_validation as _is_better_validation
 
 logger = logging.getLogger(__name__)
+
+# Preserved for test monkeypatch compatibility around LLM-backed pre-tag helpers.
+LlmClient = _LlmClient
 
 
 FONT_RULE_FRAGMENT = "-7.21."
@@ -1642,7 +1646,7 @@ def _system_font_program(font_name: str) -> tuple[bytes | None, str | None]:
 
 @lru_cache(maxsize=1)
 def _ghostscript_resource_font_dir() -> Path | None:
-    gs = shutil.which("gs")
+    gs = resolve_binary("gs", explicit=get_settings().ghostscript_path)
     if not gs:
         return None
 
@@ -1661,7 +1665,7 @@ def _ghostscript_resource_font_dir() -> Path | None:
 
 @lru_cache(maxsize=1)
 def _ghostscript_font_metrics_dir() -> Path | None:
-    gs = shutil.which("gs")
+    gs = resolve_binary("gs", explicit=get_settings().ghostscript_path)
     if not gs:
         return None
 
@@ -4084,7 +4088,7 @@ async def _rewrite_pdf_with_ghostscript_embed(
     timeout_seconds: int = 120,
 ) -> tuple[bool, str]:
     """Rewrite PDF through Ghostscript with aggressive font embedding options."""
-    gs = shutil.which("gs")
+    gs = resolve_binary("gs", explicit=get_settings().ghostscript_path)
     if not gs:
         return False, "Ghostscript not found in PATH"
 
@@ -4092,6 +4096,7 @@ async def _rewrite_pdf_with_ghostscript_embed(
         *_ghostscript_embed_command(gs, input_path, output_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=enriched_subprocess_env(),
     )
     try:
         stdout, stderr = await communicate_with_timeout(proc, timeout_seconds)
@@ -4603,10 +4608,14 @@ async def run_pipeline(
                 )
 
                 if pending_count > 0:
-                    # Pause for review when generation failed or produced undecidable output.
-                    job.status = "awaiting_review"
+                    # Pause for recommendation review when generation produced undecidable output.
+                    job.status = "awaiting_recommendation_review"
                     await db.commit()
-                    job_manager.emit_progress(job_id, step="review", status="awaiting_review")
+                    job_manager.emit_progress(
+                        job_id,
+                        step="review",
+                        status="awaiting_recommendation_review",
+                    )
                     return  # Pipeline resumes after user approval
 
                 # All generated alt entries are actionable (approved/rejected), continue directly.
@@ -5166,8 +5175,8 @@ async def run_tagging_and_validation(
                 metadata = {}
             db.add(ReviewTask(
                 job_id=job_id,
-                task_type=str(task.get("task_type") or "manual_review"),
-                title=str(task.get("title") or "Manual review required"),
+                task_type=str(task.get("task_type") or "review_task"),
+                title=str(task.get("title") or "Recommendation review required"),
                 detail=str(task.get("detail") or ""),
                 severity=str(task.get("severity") or "medium"),
                 blocking=bool(task.get("blocking", True)),
@@ -5197,7 +5206,7 @@ async def run_tagging_and_validation(
         final_status = (
             "complete"
             if selected_validation.compliant and bool(fidelity_report.get("passed", False))
-            else "needs_manual_review"
+            else "awaiting_recommendation_review"
         )
         job.status = final_status
         await db.commit()

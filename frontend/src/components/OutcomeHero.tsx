@@ -4,7 +4,7 @@ import { pluralize } from "../utils/format";
 import DownloadButton from "./DownloadButton";
 import { ArrowRightIcon, CheckIcon, WarningIcon, XIcon } from "./Icons";
 
-type TerminalStatus = Extract<JobStatus, "complete" | "needs_manual_review" | "failed">;
+type TerminalStatus = Extract<JobStatus, "complete" | "awaiting_recommendation_review" | "failed">;
 
 interface OutcomeHeroProps {
   jobId: string;
@@ -88,11 +88,11 @@ export default function OutcomeHero({
               : "Some issues need your attention"}
           </h2>
           <p className="text-sm text-ink-muted leading-relaxed">
-            Automated remediation fixed most issues. A few need manual review
-            before the document is fully accessible.
+            Automated remediation fixed most issues. A few recommendation-backed
+            decisions still need attention before the document is fully accessible.
           </p>
           <div className="flex flex-wrap items-center gap-3 mt-4">
-            {status === "needs_manual_review" ? (
+            {status === "awaiting_recommendation_review" ? (
               <Link
                 to={`/jobs/${jobId}/review`}
                 className="
@@ -102,7 +102,7 @@ export default function OutcomeHero({
                   transition-all duration-200 no-underline
                 "
               >
-                Review Tasks
+                Review Recommendations
                 <ArrowRightIcon size={14} />
               </Link>
             ) : (

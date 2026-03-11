@@ -10,6 +10,9 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.config import get_settings
+from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
+
 logger = logging.getLogger(__name__)
 
 # Optional lingua-py language detection (Rust-backed, fast, offline).
@@ -708,7 +711,7 @@ def _repair_pdf_with_ghostscript(
     input_path: Path, output_path: Path, timeout: int = 120
 ) -> bool:
     """Try to rewrite a damaged PDF into a parser-friendly file using Ghostscript."""
-    gs = shutil.which("gs")
+    gs = resolve_binary("gs", explicit=get_settings().ghostscript_path)
     if not gs:
         return False
 
@@ -725,7 +728,12 @@ def _repair_pdf_with_ghostscript(
     ]
     try:
         proc = subprocess.run(
-            cmd, check=False, capture_output=True, text=True, timeout=timeout
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=enriched_subprocess_env(),
         )
     except subprocess.TimeoutExpired:
         logger.warning(

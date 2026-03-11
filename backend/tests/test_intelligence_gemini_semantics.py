@@ -63,7 +63,15 @@ def test_adjudicate_semantic_unit_normalizes_text_block(monkeypatch, tmp_path):
         bbox={"l": 10, "t": 20, "r": 50, "b": 40},
         native_text_candidate="D a t a  B o o k",
         ocr_text_candidate="Data Book",
-        metadata={"signals": ["letters separated by spaces"]},
+        metadata={
+            "signals": ["letters separated by spaces"],
+            "previous_suggestion": {
+                "summary": "Previous recommendation",
+                "suggested_action": "set_resolved_text",
+                "reason": "Old reason",
+                "resolved_text": "Data Book",
+            },
+        },
     )
     decision = asyncio.run(adjudicate_semantic_unit(job=_job(tmp_path), unit=unit, llm_client=llm))
 
@@ -81,6 +89,8 @@ def test_adjudicate_semantic_unit_normalizes_text_block(monkeypatch, tmp_path):
     assert '"unit_type": "text_block"' in context
     assert '"native_text_candidate": "D a t a  B o o k"' in context
     assert '"ocr_text_candidate": "Data Book"' in context
+    assert '"previous_suggestion": {' in context
+    assert '"summary": "Previous recommendation"' in context
     assert llm.calls[0]["messages"][0]["content"][1]["cache_control"] == {"type": "ephemeral"}
 
 
@@ -173,3 +183,35 @@ def test_adjudicate_semantic_unit_repairs_missing_required_payload(monkeypatch, 
     assert len(llm.calls) == 2
     repair_prompt = llm.calls[1]["messages"][0]["content"][1]["text"]
     assert "populate `accessible_label`" in repair_prompt
+
+
+def test_adjudicate_semantic_unit_allows_cross_type_reclassification_for_table(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        intelligence_gemini_semantics,
+        "page_preview_parts",
+        lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": f"data:image/png;base64:page-{next(iter(page_numbers), 1)}"}}],
+    )
+    llm = _FakeLlmClient([
+        {
+            "task_type": "semantic_unit_adjudication",
+            "summary": "This is a hierarchical org chart, not a data table.",
+            "confidence": "high",
+            "unit_id": "table-1",
+            "unit_type": "table",
+            "suggested_action": "reclassify_region",
+            "reason": "The boxes show reporting relationships instead of row and column headers.",
+            "resolved_kind": "org_chart",
+        }
+    ])
+
+    unit = SemanticUnit(
+        unit_id="table-1",
+        unit_type="table",
+        page=1,
+        accessibility_goal="Interpret the table faithfully for assistive technology.",
+        current_semantics={"header_rows": [0], "row_header_columns": [0]},
+    )
+    decision = asyncio.run(adjudicate_semantic_unit(job=_job(tmp_path), unit=unit, llm_client=llm))
+
+    assert decision.suggested_action == "reclassify_region"
+    assert decision.resolved_kind == "org_chart"

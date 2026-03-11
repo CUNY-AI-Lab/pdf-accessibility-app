@@ -123,12 +123,12 @@ def _resolve_target_font_details(pdf: pikepdf.Pdf, context_path: str) -> dict[st
     if not isinstance(current_font, pikepdf.Dictionary):
         raise ValueError("Could not resolve the active font for the target operator")
     if current_font.get("/Subtype") not in SIMPLE_FONT_SUBTYPES:
-        raise ValueError("Manual font-map override currently supports simple Type1/TrueType fonts only")
+        raise ValueError("Font-map override currently supports simple Type1/TrueType fonts only")
 
     operands = list(target_instruction.operands) if hasattr(target_instruction, "operands") else []
     raw_bytes = _raw_text_bytes(target_operator, operands)
     if len(raw_bytes) != 1:
-        raise ValueError("Manual font-map override currently requires a localized single-byte target")
+        raise ValueError("Font-map override currently requires a localized single-byte target")
 
     return {
         "resolved_target": resolved_target,

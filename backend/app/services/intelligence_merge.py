@@ -28,6 +28,9 @@ def _apply_block_resolution(block, hint: dict[str, Any], *, confidence: float) -
     issue_type = str(hint.get("issue_type") or "").strip()
     if issue_type:
         block.semantic_issue_type = issue_type
+    resolved_kind = str(hint.get("resolved_kind") or "").strip()
+    if resolved_kind:
+        block.semantic_resolved_kind = resolved_kind
     chosen_source = str(hint.get("chosen_source") or "llm_inferred").strip() or "llm_inferred"
     block.resolution_source = chosen_source
     reason = str(hint.get("reason") or "").strip()

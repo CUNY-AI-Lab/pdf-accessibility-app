@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -8,10 +7,11 @@ from pathlib import Path
 from app.config import get_settings
 from app.services.page_intelligence import normalize_visible_text
 from app.services.pdf_preview import render_bbox_preview_png_bytes
+from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
 
 
 def _tesseract_path() -> str | None:
-    return shutil.which("tesseract")
+    return resolve_binary("tesseract", explicit=get_settings().tesseract_path)
 
 
 def extract_ocr_text_from_bbox(
@@ -60,6 +60,7 @@ def extract_ocr_text_from_bbox(
                 check=False,
                 timeout=timeout,
                 text=True,
+                env=enriched_subprocess_env(),
             )
         except Exception:
             return ""

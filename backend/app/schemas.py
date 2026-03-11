@@ -45,9 +45,15 @@ class AltTextResponse(BaseModel):
     status: str
 
 
-class AltTextUpdateRequest(BaseModel):
-    edited_text: str | None = None
-    status: Literal["pending_review", "approved", "rejected"] | None = None
+class AltTextSuggestionRequest(BaseModel):
+    feedback: str | None = None
+
+
+class AltTextRecommendationApplyResponse(BaseModel):
+    status: str
+    message: str
+    job_status: str
+    alt_text: AltTextResponse
 
 
 class ReviewTaskResponse(BaseModel):
@@ -61,37 +67,13 @@ class ReviewTaskResponse(BaseModel):
     source: str
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-
-class ReviewTaskUpdateRequest(BaseModel):
-    status: Literal["pending_review", "resolved"] | None = None
-    resolution_note: str | None = None
-    evidence: dict[str, str] | None = None
+class ReviewSuggestionRequest(BaseModel):
+    feedback: str | None = None
 
 
-class StructureUpdateRequest(BaseModel):
-    structure: dict[str, Any]
-
-
-class FontActualTextRequest(BaseModel):
-    page_number: int
-    operator_index: int
-    actual_text: str
-
-
-class FontActualTextBatchItem(BaseModel):
-    page_number: int
-    operator_index: int
-    actual_text: str
-
-
-class FontActualTextBatchRequest(BaseModel):
-    targets: list[FontActualTextBatchItem]
-
-
-class FontUnicodeOverrideRequest(BaseModel):
-    page_number: int
-    operator_index: int
-    unicode_text: str
+class ReviewRecommendationApplyResponse(BaseModel):
+    status: str
+    message: str
 
 
 class ValidationViolation(BaseModel):

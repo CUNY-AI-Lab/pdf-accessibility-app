@@ -654,7 +654,7 @@ def _task_for_violation(violation: dict[str, Any]) -> tuple[str, str, str]:
         return (
             "form_semantics",
             "Verify form field labels",
-            "Some form fields still need manual review for accessible labeling.",
+            "Some form fields still need recommendation review for accessible labeling.",
         )
     if category == "fonts" or FONT_RULE_FRAGMENT in rule_id:
         return (
@@ -672,19 +672,19 @@ def _task_for_violation(violation: dict[str, Any]) -> tuple[str, str, str]:
         return (
             "alt_text",
             "Verify figure descriptions",
-            "Some figure descriptions still require manual review for accuracy.",
+            "Some figure descriptions still require recommendation review for accuracy.",
         )
     if category in {"annotations", "links"}:
         return (
             "annotation_description",
             "Verify annotations and link descriptions",
-            "Annotations or links still need manual review for accessible naming and structure.",
+            "Annotations or links still need recommendation review for accessible naming and structure.",
         )
     if category == "tables" or any(keyword in description for keyword in TABLE_KEYWORDS):
         return (
             "table_semantics",
             "Verify table semantics",
-            "Table structure still needs manual review for headers and reading order.",
+            "Table structure still needs recommendation review for headers and reading order.",
         )
     return (
         "reading_order",
@@ -1262,7 +1262,7 @@ def assess_fidelity(
                 blocking = True
                 severity = "high"
                 detail = (
-                    "Complex tables with dense layouts, weak header signals, or merged cells need manual review "
+                    "Complex tables with dense layouts, weak header signals, or merged cells need recommendation review "
                     "to confirm accessible table semantics."
                 )
 
@@ -1561,7 +1561,7 @@ def assess_fidelity(
         checks.append({
             "check": "font_text_fidelity",
             "status": "fail",
-            "message": "Font-related compliance or visible-text risk requires manual review.",
+            "message": "Font-related compliance or visible-text risk requires recommendation review.",
             "metrics": {
                 "remaining_font_errors": remaining_font_errors,
                 "review_pages": len(pages_to_check),

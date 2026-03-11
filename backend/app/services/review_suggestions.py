@@ -117,6 +117,117 @@ def _parse_metadata(task: ReviewTask) -> dict[str, Any]:
         return {}
     return data if isinstance(data, dict) else {}
 
+
+def _reviewer_correction_context(
+    *,
+    task: ReviewTask,
+    reviewer_feedback: str | None,
+) -> dict[str, Any] | None:
+    feedback = _normalize_text(reviewer_feedback)
+    if not feedback:
+        return None
+
+    metadata = _parse_metadata(task)
+    previous = metadata.get("llm_suggestion")
+    previous_suggestion = previous if isinstance(previous, dict) else {}
+    return {
+        "reviewer_feedback": feedback,
+        "previous_suggestion": {
+            "summary": _normalize_text(previous_suggestion.get("summary")),
+            "suggested_action": _normalize_text(previous_suggestion.get("suggested_action")),
+            "reason": _normalize_text(previous_suggestion.get("reason")),
+        },
+    }
+
+
+def _previous_llm_suggestion(task: ReviewTask) -> dict[str, Any]:
+    metadata = _parse_metadata(task)
+    previous = metadata.get("llm_suggestion")
+    return previous if isinstance(previous, dict) else {}
+
+
+def _compact_previous_suggestion(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    for key in (
+        "summary",
+        "suggested_action",
+        "reason",
+        "resolved_kind",
+        "resolved_text",
+        "accessible_label",
+    ):
+        value = payload.get(key)
+        text = _normalize_text(value)
+        if text:
+            compact[key] = text
+    for key in ("header_rows", "row_header_columns"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            compact[key] = [int(item) for item in value if isinstance(item, int) and item >= 0]
+    return compact
+
+
+def _previous_text_suggestions(previous: dict[str, Any]) -> dict[tuple[int, str], dict[str, Any]]:
+    items = []
+    page_text = previous.get("page_text_intelligence")
+    if isinstance(page_text, dict) and isinstance(page_text.get("blocks"), list):
+        items.extend(item for item in page_text["blocks"] if isinstance(item, dict))
+    for item in previous.get("readable_text_hints", []) if isinstance(previous.get("readable_text_hints"), list) else []:
+        if isinstance(item, dict):
+            items.append(item)
+
+    by_key: dict[tuple[int, str], dict[str, Any]] = {}
+    for item in items:
+        page = item.get("page")
+        review_id = str(item.get("review_id") or "").strip()
+        if not isinstance(page, int) or page < 1 or not review_id:
+            continue
+        by_key[(page, review_id)] = _compact_previous_suggestion(item)
+    return by_key
+
+
+def _previous_reading_order_suggestions(previous: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    by_page: dict[int, dict[str, Any]] = {}
+    items = previous.get("reading_order_intelligence")
+    if not isinstance(items, list):
+        return by_page
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        page = item.get("page")
+        if not isinstance(page, int) or page < 1:
+            continue
+        compact = _compact_previous_suggestion(item)
+        ordered_ids = item.get("ordered_review_ids")
+        compact["ordered_review_ids"] = [
+            str(review_id).strip()
+            for review_id in ordered_ids
+            if str(review_id).strip()
+        ] if isinstance(ordered_ids, list) else []
+        element_updates = item.get("element_updates")
+        compact["element_updates"] = [
+            update for update in element_updates if isinstance(update, dict)
+        ] if isinstance(element_updates, list) else []
+        by_page[page] = compact
+    return by_page
+
+
+def _previous_table_suggestions(previous: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    items = previous.get("table_intelligence")
+    if not isinstance(items, list):
+        return by_id
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        table_review_id = str(item.get("table_review_id") or "").strip()
+        if not table_review_id:
+            continue
+        by_id[table_review_id] = _compact_previous_suggestion(item)
+    return by_id
+
 def _normalize_text(value: Any) -> str:
     return " ".join(str(value or "").split())
 
@@ -417,7 +528,12 @@ def _group_font_review_targets(targets: list[dict[str, Any]]) -> list[dict[str, 
     return groups
 
 
-def _font_task_payload(job: Job, task: ReviewTask) -> tuple[str, list[dict[str, Any]]]:
+def _font_task_payload(
+    job: Job,
+    task: ReviewTask,
+    *,
+    reviewer_feedback: str | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     metadata = _parse_metadata(task)
     pages = metadata.get("pages_to_check")
     page_numbers = [
@@ -485,6 +601,9 @@ def _font_task_payload(job: Job, task: ReviewTask) -> tuple[str, list[dict[str, 
         "font_diagnostics_summary": metadata.get("font_diagnostics_summary", {}),
         "top_font_profiles": metadata.get("top_font_profiles", []),
     }
+    correction_context = _reviewer_correction_context(task=task, reviewer_feedback=reviewer_feedback)
+    if correction_context:
+        payload["correction_context"] = correction_context
     prompt_text = (
         f"{FONT_REVIEW_PROMPT}\n\n"
         "Image order: full-page previews first, then target crop previews in the same order as target_previews.\n\n"
@@ -518,11 +637,13 @@ def _aggregate_table_suggestions(
     total_targets: int,
 ) -> dict[str, Any]:
     proposed_updates: list[dict[str, Any]] = []
+    reclassification_updates: list[dict[str, Any]] = []
     reviewer_checklist: list[str] = []
     reasons: list[str] = []
     summary_parts: list[str] = []
     manual_only_count = 0
     confirm_count = 0
+    reclassify_count = 0
     confidence_rank = 2
     seen_table_ids: set[str] = set()
 
@@ -533,6 +654,8 @@ def _aggregate_table_suggestions(
             manual_only_count += 1
         elif action == "confirm_current_headers":
             confirm_count += 1
+        elif action == "reclassify_region":
+            reclassify_count += 1
 
         reason = _normalize_text(suggestion.get("reason"))
         if reason:
@@ -551,7 +674,10 @@ def _aggregate_table_suggestions(
                 if not table_review_id or table_review_id in seen_table_ids:
                     continue
                 seen_table_ids.add(table_review_id)
-                proposed_updates.append(update)
+                if str(update.get("suggested_action") or "").strip() == "set_table_headers":
+                    proposed_updates.append(update)
+                elif str(update.get("suggested_action") or "").strip() == "reclassify_region":
+                    reclassification_updates.append(update)
 
         raw_checklist = suggestion.get("reviewer_checklist")
         if isinstance(raw_checklist, list):
@@ -563,6 +689,8 @@ def _aggregate_table_suggestions(
 
     if proposed_updates:
         suggested_action = "set_table_headers"
+    elif reclassification_updates or reclassify_count:
+        suggested_action = "reclassify_region"
     elif manual_only_count:
         suggested_action = "manual_only"
     else:
@@ -576,14 +704,19 @@ def _aggregate_table_suggestions(
     if proposed_count and unresolved_count:
         summary = (
             f"Reviewed {total_targets} tables; proposed header updates for {proposed_count} "
-            f"and left {unresolved_count} for manual review."
+            f"and left {unresolved_count} needing another recommendation pass."
         )
     elif proposed_count:
         summary = f"Reviewed {total_targets} tables; proposed header updates for {proposed_count}."
+    elif reclassify_count:
+        summary = (
+            f"Reviewed {total_targets} tables; {reclassify_count} "
+            f"{'region was' if reclassify_count == 1 else 'regions were'} identified as not actually being data tables."
+        )
     elif confirm_count == total_targets and total_targets:
         summary = f"Reviewed {total_targets} tables; current header flags look acceptable."
     else:
-        summary = f"Reviewed {total_targets} tables; manual review is still required."
+        summary = f"Reviewed {total_targets} tables; recommendation review is still required."
 
     return {
         "task_type": "table_semantics",
@@ -591,7 +724,7 @@ def _aggregate_table_suggestions(
         "confidence": _confidence_label(confidence_rank),
         "suggested_action": suggested_action,
         "reason": " ".join(_dedupe_preserving_order(reasons))[:1000],
-        "proposed_table_updates": proposed_updates,
+        "proposed_table_updates": [*proposed_updates, *reclassification_updates],
         "reviewer_checklist": _dedupe_preserving_order(reviewer_checklist),
         "per_table_summaries": summary_parts,
     }
@@ -612,6 +745,7 @@ def _aggregate_table_intelligence(
                 "confidence": item.get("confidence"),
                 "suggested_action": item.get("suggested_action"),
                 "reason": item.get("reason"),
+                "resolved_kind": item.get("resolved_kind"),
                 "proposed_table_updates": (
                     [
                         {
@@ -620,9 +754,12 @@ def _aggregate_table_intelligence(
                             "header_rows": item.get("header_rows", []),
                             "row_header_columns": item.get("row_header_columns", []),
                             "reason": item.get("reason"),
+                            "suggested_action": item.get("suggested_action"),
+                            "resolved_kind": item.get("resolved_kind"),
                         }
                     ]
-                    if str(item.get("suggested_action") or "").strip() == "set_table_headers"
+                    if str(item.get("suggested_action") or "").strip()
+                    in {"set_table_headers", "reclassify_region"}
                     else []
                 ),
                 "reviewer_checklist": [],
@@ -726,7 +863,7 @@ def _aggregate_reading_order_intelligence(
     elif suggested_action == "confirm_current_order":
         summary = "Current reading order looks acceptable on the reviewed pages."
     elif suggested_action == "manual_only":
-        summary = "Reading order still needs manual review."
+        summary = "Reading order still needs another recommendation pass."
     else:
         summary = "Review the proposed reading order changes."
 
@@ -787,13 +924,15 @@ async def generate_review_suggestion(
     job: Job,
     task: ReviewTask,
     llm_client: LlmClient,
+    reviewer_feedback: str | None = None,
 ) -> dict[str, Any]:
     if task.task_type not in SUPPORTED_SUGGESTION_TASK_TYPES:
         raise ValueError(f"Suggestions are not supported for task type '{task.task_type}'")
 
     document = _document_model(job)
+    previous_suggestion = _previous_llm_suggestion(task)
     if task.task_type == "font_text_fidelity":
-        _prompt_text, content = _font_task_payload(job, task)
+        _prompt_text, content = _font_task_payload(job, task, reviewer_feedback=reviewer_feedback)
         suggestion = await request_llm_json(llm_client=llm_client, content=content)
     elif task.task_type == "reading_order":
         metadata = _parse_metadata(task)
@@ -806,7 +945,10 @@ async def generate_review_suggestion(
             page_numbers=page_numbers,
             suspicious_blocks=suspicious_blocks,
             llm_client=llm_client,
+            reviewer_feedback=reviewer_feedback,
+            previous_suggestions=_previous_text_suggestions(previous_suggestion),
         )
+        previous_page_suggestions = _previous_reading_order_suggestions(previous_suggestion)
         reading_order_intelligence = []
         for page_block in page_blocks:
             page = page_block.get("page")
@@ -824,6 +966,8 @@ async def generate_review_suggestion(
                         if isinstance(item, dict) and item.get("page") == page
                     ],
                     llm_client=llm_client,
+                    reviewer_feedback=reviewer_feedback,
+                    previous_suggestion=previous_page_suggestions.get(page, {}),
                 )
             )
         suggestion = _aggregate_reading_order_intelligence(
@@ -836,7 +980,7 @@ async def generate_review_suggestion(
         if not table_targets:
             suggestion = {
                 "task_type": "table_semantics",
-                "summary": "No concrete table targets are available for Gemini review on this task.",
+                "summary": "No concrete table targets are available for model review on this task.",
                 "confidence": "low",
                 "suggested_action": "manual_only",
                 "reason": "Table review targets were missing from task metadata.",
@@ -846,6 +990,7 @@ async def generate_review_suggestion(
             }
         else:
             per_table_intelligence: list[dict[str, Any]] = []
+            previous_table_suggestions = _previous_table_suggestions(previous_suggestion)
             for target in table_targets:
                 per_table_intelligence.append(
                     await generate_table_intelligence(
@@ -856,6 +1001,11 @@ async def generate_review_suggestion(
                             [int(target["page"])] if isinstance(target.get("page"), int) else [1],
                         ),
                         llm_client=llm_client,
+                        reviewer_feedback=reviewer_feedback,
+                        previous_suggestion=previous_table_suggestions.get(
+                            str(target.get("table_review_id") or "").strip(),
+                            {},
+                        ),
                     )
                 )
             suggestion = _aggregate_table_intelligence(
@@ -872,6 +1022,8 @@ async def generate_review_suggestion(
     suggestion["document_overlay"] = document_overlay_for_suggestion(document, suggestion)
     suggestion["generated_at"] = datetime.now(UTC).isoformat()
     suggestion["model"] = llm_client.model
+    if reviewer_feedback and reviewer_feedback.strip():
+        suggestion["reviewer_feedback"] = reviewer_feedback.strip()
     return suggestion
 
 

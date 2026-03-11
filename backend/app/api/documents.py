@@ -12,30 +12,23 @@ from app.config import get_settings
 from app.database import get_db, get_session_maker
 from app.models import AltTextEntry, Job, ReviewTask
 from app.pipeline.orchestrator import run_tagging_and_validation
+from app.pipeline.structure import FigureInfo
 from app.schemas import (
     AltTextResponse,
-    AltTextUpdateRequest,
+    AltTextRecommendationApplyResponse,
+    AltTextSuggestionRequest,
     ReviewTaskResponse,
-    StructureUpdateRequest,
     ValidationReportResponse,
 )
+from app.services.intelligence_gemini_figures import generate_figure_intelligence
 from app.services.job_manager import get_job_manager
+from app.services.llm_client import make_llm_client
 from app.services.path_safety import safe_filename, validate_path_within_allowed_roots
 from app.services.pdf_preview import render_page_png_bytes
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/jobs/{job_id}", tags=["documents"])
-ALLOWED_STRUCTURE_TYPES = {
-    "heading",
-    "paragraph",
-    "figure",
-    "table",
-    "list_item",
-    "code",
-    "formula",
-    "artifact",
-}
 
 
 def _job_pdf_path(job: Job) -> Path:
@@ -45,109 +38,41 @@ def _job_pdf_path(job: Job) -> Path:
     return candidate
 
 
-def _sanitize_structure_payload(structure: dict) -> dict:
-    sanitized = dict(structure)
-    raw_elements = structure.get("elements", [])
-    if not isinstance(raw_elements, list):
-        raise HTTPException(status_code=400, detail="Structure must include an elements list")
+def _figure_info_for_alt_entry(job: Job, entry: AltTextEntry) -> FigureInfo:
+    image_path = validate_path_within_allowed_roots(Path(entry.image_path))
+    caption: str | None = None
+    page: int | None = None
+    bbox: dict | None = None
 
-    cleaned_elements: list[dict] = []
-    for index, raw_element in enumerate(raw_elements):
-        if not isinstance(raw_element, dict):
-            raise HTTPException(status_code=400, detail="All structure elements must be objects")
+    if job.structure_json:
+        try:
+            structure = json.loads(job.structure_json)
+        except json.JSONDecodeError:
+            structure = {}
+        elements = structure.get("elements", []) if isinstance(structure, dict) else []
+        if isinstance(elements, list):
+            for element in elements:
+                if not isinstance(element, dict):
+                    continue
+                if element.get("type") != "figure":
+                    continue
+                if element.get("figure_index") != entry.figure_index:
+                    continue
+                raw_caption = element.get("caption")
+                raw_page = element.get("page")
+                raw_bbox = element.get("bbox")
+                caption = str(raw_caption).strip() if isinstance(raw_caption, str) and raw_caption.strip() else None
+                page = raw_page if isinstance(raw_page, int) else None
+                bbox = raw_bbox if isinstance(raw_bbox, dict) else None
+                break
 
-        element = {
-            key: value
-            for key, value in raw_element.items()
-            if key not in {"review_id", "_manual_original_type"}
-        }
-
-        element_type = str(element.get("type") or "").strip()
-        if element_type and element_type not in ALLOWED_STRUCTURE_TYPES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported structure element type at index {index}: {element_type}",
-            )
-
-        page_value = element.get("page")
-        if page_value is not None and not isinstance(page_value, int):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid page value at element index {index}",
-            )
-
-        if element_type == "heading":
-            level = element.get("level", 1)
-            if isinstance(level, bool) or not isinstance(level, int):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid heading level at element index {index}",
-                )
-            element["level"] = max(1, min(6, level))
-
-        cleaned_elements.append(element)
-
-    sanitized["elements"] = cleaned_elements
-    return sanitized
-
-
-@router.get("/structure")
-async def get_structure(job_id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Job).where(Job.id == job_id))
-    job = result.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not job.structure_json:
-        raise HTTPException(status_code=404, detail="Structure not yet extracted")
-    return json.loads(job.structure_json)
-
-
-@router.put("/structure")
-async def update_structure(
-    job_id: str,
-    update: StructureUpdateRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(select(Job).where(Job.id == job_id))
-    job = result.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    if job.status not in {"needs_manual_review", "complete"}:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Structure edits are not allowed while job status is {job.status}",
-        )
-
-    structure = _sanitize_structure_payload(update.structure)
-
-    job.structure_json = json.dumps(structure)
-    job.status = "processing"
-    await db.commit()
-
-    settings = get_settings()
-    session_maker = get_session_maker()
-    job_manager = get_job_manager()
-
-    async def _resume(jid, sm, s, jm, structure_payload):
-        async with sm() as resume_db:
-            await run_tagging_and_validation(
-                jid,
-                resume_db,
-                s,
-                jm,
-                structure_json=structure_payload,
-            )
-
-    await job_manager.submit_job(
-        job_id,
-        _resume(job_id, session_maker, settings, job_manager, structure),
+    return FigureInfo(
+        index=entry.figure_index,
+        path=image_path,
+        caption=caption,
+        page=page,
+        bbox=bbox,
     )
-
-    return {
-        "status": "accepted",
-        "message": "Structure updated. Tagging and validation restarted.",
-    }
 
 
 @router.get("/alt-texts", response_model=list[AltTextResponse])
@@ -203,26 +128,58 @@ async def list_review_tasks(job_id: str, db: AsyncSession = Depends(get_db)):
     ]
 
 
-@router.put("/alt-texts/{figure_index}", response_model=AltTextResponse)
-async def update_alt_text(
+@router.post("/alt-texts/{figure_index}/suggest", response_model=AltTextResponse)
+async def suggest_alt_text(
     job_id: str,
     figure_index: int,
-    update: AltTextUpdateRequest,
+    request: AltTextSuggestionRequest | None = None,
     db: AsyncSession = Depends(get_db),
 ):
+    job_result = await db.execute(select(Job).where(Job.id == job_id))
+    job = job_result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "awaiting_recommendation_review":
+        raise HTTPException(status_code=400, detail="This job is not awaiting figure recommendation review")
+
     result = await db.execute(
         select(AltTextEntry).where(
-            AltTextEntry.job_id == job_id, AltTextEntry.figure_index == figure_index
+            AltTextEntry.job_id == job_id,
+            AltTextEntry.figure_index == figure_index,
         )
     )
     entry = result.scalar_one_or_none()
     if not entry:
         raise HTTPException(status_code=404, detail="Alt text entry not found")
 
-    if update.edited_text is not None:
-        entry.edited_text = update.edited_text
-    if update.status is not None:
-        entry.status = update.status
+    settings = get_settings()
+    llm_client = make_llm_client(settings)
+    try:
+        decision = await generate_figure_intelligence(
+            figure=_figure_info_for_alt_entry(job, entry),
+            llm_client=llm_client,
+            job=job,
+            original_filename=job.original_filename,
+            reviewer_feedback=(request.feedback.strip() if request and request.feedback else None),
+        )
+    finally:
+        await llm_client.close()
+
+    suggested_action = str(decision.get("suggested_action") or "").strip()
+    if suggested_action == "set_alt_text":
+        revised_text = str(decision.get("alt_text") or "").strip()
+        if not revised_text:
+            raise HTTPException(status_code=502, detail="Model did not return a revised figure description")
+        entry.edited_text = revised_text
+        entry.status = "pending_review"
+    elif suggested_action == "mark_decorative" or bool(decision.get("is_decorative", False)):
+        entry.edited_text = "decorative"
+        entry.status = "pending_review"
+    else:
+        raise HTTPException(
+            status_code=409,
+            detail="This figure needs a different kind of review. Try another instruction or download the PDF for external QA.",
+        )
 
     await db.commit()
     await db.refresh(entry)
@@ -234,6 +191,98 @@ async def update_alt_text(
         generated_text=entry.generated_text,
         edited_text=entry.edited_text,
         status=entry.status,
+    )
+
+
+@router.post(
+    "/alt-texts/{figure_index}/accept-recommendation",
+    response_model=AltTextRecommendationApplyResponse,
+)
+async def accept_alt_text_recommendation(
+    job_id: str,
+    figure_index: int,
+    db: AsyncSession = Depends(get_db),
+):
+    job_result = await db.execute(select(Job).where(Job.id == job_id))
+    job = job_result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "awaiting_recommendation_review":
+        raise HTTPException(status_code=400, detail="This job is not awaiting figure recommendation review")
+
+    result = await db.execute(
+        select(AltTextEntry).where(
+            AltTextEntry.job_id == job_id,
+            AltTextEntry.figure_index == figure_index,
+        )
+    )
+    entry = result.scalar_one_or_none()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Alt text entry not found")
+
+    recommendation = str(entry.edited_text or entry.generated_text or "").strip()
+    if not recommendation:
+        raise HTTPException(status_code=400, detail="No recommendation is available for this figure")
+
+    if recommendation.lower() == "decorative":
+        entry.edited_text = "decorative"
+        entry.status = "rejected"
+        message = "Accepted the recommendation and marked this figure decorative."
+    else:
+        entry.edited_text = recommendation
+        entry.status = "approved"
+        message = "Accepted the recommendation for this figure."
+
+    await db.commit()
+    await db.refresh(entry)
+
+    pending_result = await db.execute(
+        select(AltTextEntry).where(
+            AltTextEntry.job_id == job_id,
+            AltTextEntry.status == "pending_review",
+        )
+    )
+    pending = pending_result.scalars().all()
+
+    if not pending:
+        job.status = "processing"
+        await db.commit()
+
+        settings = get_settings()
+        session_maker = get_session_maker()
+        job_manager = get_job_manager()
+
+        async def _resume(jid: str) -> None:
+            async with session_maker() as resume_db:
+                await run_tagging_and_validation(jid, resume_db, settings, job_manager)
+
+        await job_manager.submit_job(job_id, _resume(job_id))
+        return AltTextRecommendationApplyResponse(
+            status="accepted",
+            message="Accepted the recommendation and resumed accessibility processing.",
+            job_status="processing",
+            alt_text=AltTextResponse(
+                id=entry.id,
+                figure_index=entry.figure_index,
+                image_url=f"/api/jobs/{job_id}/figures/{entry.figure_index}/image",
+                generated_text=entry.generated_text,
+                edited_text=entry.edited_text,
+                status=entry.status,
+            ),
+        )
+
+    return AltTextRecommendationApplyResponse(
+        status="accepted",
+        message=message,
+        job_status=str(job.status),
+        alt_text=AltTextResponse(
+            id=entry.id,
+            figure_index=entry.figure_index,
+            image_url=f"/api/jobs/{job_id}/figures/{entry.figure_index}/image",
+            generated_text=entry.generated_text,
+            edited_text=entry.edited_text,
+            status=entry.status,
+        ),
     )
 
 

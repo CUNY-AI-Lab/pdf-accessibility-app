@@ -171,6 +171,10 @@ data/
 | [Poppler](https://poppler.freedesktop.org/) | page preview rendering |
 | `tesseract` | local crop OCR grounding |
 
+Server/runtime packages commonly needed:
+- Ubuntu/Debian: `ghostscript`, `poppler-utils`, `tesseract-ocr`, Java runtime for `veraPDF`
+- macOS (local only): Homebrew packages are fine, but deployment should rely on explicit paths or standard `PATH`
+
 ## Setup
 
 ```bash
@@ -189,7 +193,17 @@ LLM_MAX_CONCURRENCY=4
 LLM_RETRY_MAX_BACKOFF_SECONDS=30
 OCR_LANGUAGE=eng
 VERAPDF_PATH=verapdf
+GHOSTSCRIPT_PATH=gs
+TESSERACT_PATH=tesseract
+PDFTOPPM_PATH=pdftoppm
+BINARY_SEARCH_DIRS=/usr/bin,/usr/local/bin
 ```
+
+Binary resolution order:
+1. explicit setting or env var (`*_PATH`)
+2. normal `PATH`
+3. `BINARY_SEARCH_DIRS`
+4. local fallback directories used for development convenience
 
 ## Development
 

@@ -61,6 +61,30 @@ Main files:
 - [app/services/llm_client.py](app/services/llm_client.py)
 - [app/services/intelligence_llm_utils.py](app/services/intelligence_llm_utils.py)
 
+## External binaries
+
+The backend depends on system binaries for OCR, previews, and validation:
+- `ghostscript`
+- `pdftoppm` (Poppler)
+- `tesseract`
+- `verapdf`
+
+Use explicit paths in deployment instead of relying on Homebrew-style locations:
+
+```env
+VERAPDF_PATH=verapdf
+GHOSTSCRIPT_PATH=gs
+TESSERACT_PATH=tesseract
+PDFTOPPM_PATH=pdftoppm
+BINARY_SEARCH_DIRS=/usr/bin,/usr/local/bin
+```
+
+Resolution order is:
+1. explicit `*_PATH`
+2. normal `PATH`
+3. `BINARY_SEARCH_DIRS`
+4. local development fallbacks
+
 ## Development
 
 Run the API:

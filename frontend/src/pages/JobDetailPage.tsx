@@ -19,9 +19,11 @@ export default function JobDetailPage() {
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
   const isActive = job?.status === "processing" || job?.status === "queued";
   const { steps } = useJobProgress(id!, isActive);
-  const hasFinalOutput = job?.status === "complete" || job?.status === "needs_manual_review";
+  const hasFinalOutput = job?.status === "complete" || job?.status === "awaiting_recommendation_review";
+  const needsBlockingReview = job?.status === "awaiting_recommendation_review";
   const { data: validationReport } = useValidation(id!, hasFinalOutput);
-  const { data: reviewTasks } = useReviewTasks(id!, job?.status === "needs_manual_review");
+  const { data: reviewTasks } = useReviewTasks(id!, needsBlockingReview);
+  const openReviewTasks = reviewTasks?.filter((task) => task.status === "pending_review") ?? [];
   const [showDetails, setShowDetails] = useState(false);
 
   // Use SSE steps when actively processing, otherwise use API data
@@ -114,42 +116,16 @@ export default function JobDetailPage() {
       </div>
 
       {/* Actions based on status */}
-      {job.status === "awaiting_review" && (
-        <div className="rounded-xl border border-warning/30 bg-warning-light/30 p-5 mb-6 animate-slide-up">
-          <div className="flex items-center justify-between">
-            <div>
-              <h3 className="font-display text-lg text-ink mb-1">
-                Review Required
-              </h3>
-              <p className="text-sm text-ink-muted">
-                Review the generated alt text before finalizing.
-              </p>
-            </div>
-            <Link
-              to={`/jobs/${job.id}/review`}
-              className="
-                px-5 py-2.5 rounded-xl
-                bg-accent text-white text-sm font-medium
-                hover:bg-accent/90 shadow-sm
-                transition-all duration-200 no-underline
-              "
-            >
-              Review &rarr;
-            </Link>
-          </div>
-        </div>
-      )}
-
-      {job.status === "needs_manual_review" && (
+      {job.status === "awaiting_recommendation_review" && (
         <div className="rounded-xl border border-warning/30 bg-warning-light/30 p-5 mb-6 animate-slide-up">
           <div className="flex items-center justify-between gap-4">
             <div>
               <h3 className="font-display text-lg text-ink mb-1">
-                Manual Accessibility Review Needed
+                Recommendations Ready
               </h3>
               <p className="text-sm text-ink-muted">
-                {reviewTasks && reviewTasks.length > 0
-                  ? `${reviewTasks.length} review ${pluralize(reviewTasks.length, "task")} were generated from compliance and fidelity checks.`
+                {openReviewTasks.length > 0
+                  ? `${openReviewTasks.length} recommendation ${pluralize(openReviewTasks.length, "task")} ${pluralize(openReviewTasks.length, "is", "are")} ready to accept or revise.`
                   : "Automated remediation stopped short of a trustworthy accessible output."}
               </p>
             </div>
@@ -162,7 +138,7 @@ export default function JobDetailPage() {
                 transition-all duration-200 no-underline
               "
             >
-              Review Tasks &rarr;
+              Review Recommendations &rarr;
             </Link>
           </div>
         </div>
@@ -174,10 +150,26 @@ export default function JobDetailPage() {
           <OutcomeHero
             jobId={job.id}
             filename={job.original_filename}
-            status={job.status as "complete" | "needs_manual_review" | "failed"}
+            status={job.status as "complete" | "awaiting_recommendation_review" | "failed"}
             compliant={validationReport?.compliant}
-            pendingCount={reviewTasks?.length || validationReport?.violations.length || 0}
+            pendingCount={
+              needsBlockingReview
+                ? openReviewTasks.length || validationReport?.violations.length || 0
+                : validationReport?.violations.length || 0
+            }
           />
+
+          {job.status === "complete" && (
+            <div className="rounded-xl border border-info/25 bg-info-light/20 p-5">
+              <h3 className="font-display text-lg text-ink mb-1">
+                Optional external QA
+              </h3>
+              <p className="text-sm text-ink-muted">
+                This PDF passed release checks. Download it and, if needed, spot-check it with a
+                screen reader, PAC, or Acrobat instead of using the in-app review workflow.
+              </p>
+            </div>
+          )}
 
           {/* Layer 2: What We Did */}
           {validationReport && (

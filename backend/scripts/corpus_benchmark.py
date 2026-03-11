@@ -1079,7 +1079,7 @@ async def _finalize_review_if_needed(
 ) -> None:
     async with session_maker() as db:
         job = await db.get(Job, job_id)
-        if not job or job.status != "awaiting_review":
+        if not job or job.status != "awaiting_recommendation_review":
             return
 
         result = await db.execute(
@@ -1339,7 +1339,7 @@ async def benchmark_one_workflow(
                 shutil.copy2(output_path, dest)
 
             if not validation_json and not error:
-                if job.status == "awaiting_review":
+                if job.status == "awaiting_recommendation_review":
                     result = await db.execute(
                         select(AltTextEntry).where(
                             AltTextEntry.job_id == job_id,
@@ -1347,7 +1347,16 @@ async def benchmark_one_workflow(
                         )
                     )
                     pending_review = len(result.scalars().all())
-                    error = f"Manual review required: {pending_review} figure(s) pending alt text review"
+                    if pending_review:
+                        error = (
+                            "Recommendation review required: "
+                            f"{pending_review} figure recommendation(s) still pending"
+                        )
+                    else:
+                        error = (
+                            "Workflow finished in recommendation review without validation "
+                            "or pending figure recommendations"
+                        )
                 else:
                     error = f"Workflow finished with status={job.status} but no validation payload"
 
@@ -1645,7 +1654,7 @@ async def benchmark_one(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
             if selected_validation.raw_report.get("report")
             else selected_validation.raw_report.get("validator", "unknown")
         )
-        final_status = "complete" if compliant else "needs_manual_review"
+        final_status = "complete" if compliant else "awaiting_recommendation_review"
         fidelity_passed = compliant
     except Exception as exc:
         error = re.sub(r"\s+", " ", str(exc)).strip()
@@ -1744,10 +1753,10 @@ def write_outputs(output_dir: Path, rows: list[DocMetrics], mode: str) -> None:
     compliant = [r for r in completed if r.compliant]
     fidelity_passed = [r for r in completed if r.fidelity_passed]
     release_ready = [r for r in completed if r.final_status == "complete"]
-    needs_manual_review = [
+    awaiting_recommendation_review = [
         r
         for r in completed
-        if r.final_status == "needs_manual_review" and r.compliant
+        if r.final_status == "awaiting_recommendation_review" and r.compliant
     ]
     non_compliant = [r for r in completed if not r.compliant]
     font_attempted = [r for r in completed if r.font_lane_attempted]
@@ -1797,7 +1806,10 @@ def write_outputs(output_dir: Path, rows: list[DocMetrics], mode: str) -> None:
         f.write(f"- Compliant outputs: {len(compliant)} / {len(completed) if completed else 0}\n")
         f.write(f"- Fidelity-passed outputs: {len(fidelity_passed)} / {len(completed) if completed else 0}\n")
         f.write(f"- Release-ready outputs: {len(release_ready)} / {len(completed) if completed else 0}\n")
-        f.write(f"- Compliant but manual review required: {len(needs_manual_review)}\n")
+        f.write(
+            "- Compliant but recommendation review required: "
+            f"{len(awaiting_recommendation_review)}\n"
+        )
         f.write(f"- Non-compliant outputs: {len(non_compliant)}\n")
         f.write(
             f"- Validation errors before/after: {baseline_errors} -> {remediated_errors} "

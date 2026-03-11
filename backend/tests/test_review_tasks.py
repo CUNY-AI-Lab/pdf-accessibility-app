@@ -2,169 +2,44 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.review import (
+    _accept_recommendation_without_changes,
     _garbled_text_followup_spec,
-    _manual_font_remediation_preservation,
-    _manual_review_completion_state,
+    _post_tagging_font_remediation_preservation,
+    _refresh_recommendation_review_status,
     _sync_llm_followup_tasks,
-    _validated_task_metadata,
 )
 from app.models import Base, Job, ReviewTask
-from app.schemas import ReviewTaskUpdateRequest
 
 
-def _task(*, blocking: bool, source: str, status: str):
-    return SimpleNamespace(blocking=blocking, source=source, status=status)
-
-
-def _review_task(
-    *,
-    status: str = "pending_review",
-    task_type: str = "generic",
-    metadata_json: str | None = None,
-):
-    return SimpleNamespace(
-        status=status,
-        task_type=task_type,
-        metadata_json=metadata_json,
-    )
-
-
-def test_manual_review_cannot_complete_when_validation_not_compliant():
-    ok, reason = _manual_review_completion_state(
-        {"compliant": False},
-        [_task(blocking=True, source="fidelity", status="resolved")],
-    )
-
-    assert ok is False
-    assert reason == "Validation still reports unresolved PDF/UA errors"
-
-
-def test_manual_review_cannot_complete_with_validation_tasks():
-    ok, reason = _manual_review_completion_state(
-        {"compliant": True},
-        [_task(blocking=True, source="validation", status="pending_review")],
-    )
-
-    assert ok is False
-    assert reason == "Validation-derived remediation tasks cannot be cleared in-app"
-
-
-def test_manual_review_cannot_complete_with_pending_blocking_fidelity_tasks():
-    ok, reason = _manual_review_completion_state(
-        {"compliant": True},
-        [_task(blocking=True, source="fidelity", status="pending_review")],
-    )
-
-    assert ok is False
-    assert reason == "1 blocking review task(s) still need review"
-
-
-def test_manual_review_can_complete_when_only_fidelity_tasks_are_resolved():
-    ok, reason = _manual_review_completion_state(
-        {"compliant": True},
-        [
-            _task(blocking=True, source="fidelity", status="resolved"),
-            _task(blocking=False, source="fidelity", status="pending_review"),
-        ],
-    )
-
-    assert ok is True
-    assert reason is None
-
-
-def test_resolving_task_requires_resolution_note():
-    task = _review_task()
-
-    with pytest.raises(HTTPException) as exc:
-        _validated_task_metadata(
-            task,
-            ReviewTaskUpdateRequest(status="resolved", resolution_note=""),
-        )
-
-    assert exc.value.status_code == 400
-    assert exc.value.detail == "Resolution note is required before marking a review task resolved"
-
-
-def test_resolution_note_is_persisted_in_metadata():
-    task = _review_task()
-
-    metadata = _validated_task_metadata(
-        task,
-        ReviewTaskUpdateRequest(status="resolved", resolution_note="Checked with NVDA"),
-    )
-
-    assert metadata["resolution_note"] == "Checked with NVDA"
-
-
-def test_resolving_task_requires_required_evidence_fields():
-    task = _review_task(task_type="reading_order")
-
-    with pytest.raises(HTTPException) as exc:
-        _validated_task_metadata(
-            task,
-            ReviewTaskUpdateRequest(
-                status="resolved",
-                resolution_note="Checked in NVDA",
-                evidence={"verification_method": "NVDA"},
-            ),
-        )
-
-    assert exc.value.status_code == 400
-    assert exc.value.detail == "Missing required review evidence: pages checked"
-
-
-def test_required_evidence_is_persisted_in_metadata():
-    task = _review_task(task_type="reading_order")
-
-    metadata = _validated_task_metadata(
-        task,
-        ReviewTaskUpdateRequest(
-            status="resolved",
-            resolution_note="Checked in NVDA",
-            evidence={
-                "verification_method": "NVDA and text export",
-                "pages_checked": "Pages 1-5",
-            },
-        ),
-    )
-
-    assert metadata["resolution_note"] == "Checked in NVDA"
-    assert metadata["evidence"] == {
-        "verification_method": "NVDA and text export",
-        "pages_checked": "Pages 1-5",
-    }
-
-
-def test_manual_font_remediation_preservation_keeps_suggestion_and_attempts():
+def test_post_tagging_font_remediation_preservation_keeps_suggestion_and_attempts():
     task = SimpleNamespace(task_type="font_text_fidelity", source="validation")
-    preserved = _manual_font_remediation_preservation(
+    preserved = _post_tagging_font_remediation_preservation(
         task=task,
         task_metadata={
             "llm_suggestion": {"summary": "triangle glyph"},
-            "manual_actualtext_attempts": [{"page_number": 2, "operator_index": 132, "actual_text": "pointer"}],
+            "post_tagging_actualtext_attempts": [{"page_number": 2, "operator_index": 132, "actual_text": "pointer"}],
         },
         actualtext_attempts=[{"page_number": 2, "operator_index": 194, "actual_text": "pointer"}],
     )
 
     metadata = preserved[("font_text_fidelity", "validation")]
     assert metadata["llm_suggestion"] == {"summary": "triangle glyph"}
-    assert metadata["manual_actualtext_attempts"] == [
+    assert metadata["post_tagging_actualtext_attempts"] == [
         {"page_number": 2, "operator_index": 132, "actual_text": "pointer"},
         {"page_number": 2, "operator_index": 194, "actual_text": "pointer"},
     ]
 
 
-def test_manual_font_remediation_preservation_keeps_font_mapping_attempts():
+def test_post_tagging_font_remediation_preservation_keeps_font_mapping_attempts():
     task = SimpleNamespace(task_type="font_text_fidelity", source="validation")
-    preserved = _manual_font_remediation_preservation(
+    preserved = _post_tagging_font_remediation_preservation(
         task=task,
         task_metadata={
-            "manual_font_mapping_attempts": [
+            "post_tagging_font_mapping_attempts": [
                 {"page_number": 2, "operator_index": 132, "unicode_text": "►", "font_code_hex": "01"},
             ],
         },
@@ -174,7 +49,7 @@ def test_manual_font_remediation_preservation_keeps_font_mapping_attempts():
     )
 
     metadata = preserved[("font_text_fidelity", "validation")]
-    assert metadata["manual_font_mapping_attempts"] == [
+    assert metadata["post_tagging_font_mapping_attempts"] == [
         {"page_number": 2, "operator_index": 132, "unicode_text": "►", "font_code_hex": "01"},
         {"page_number": 2, "operator_index": 194, "unicode_text": "►", "font_code_hex": "01"},
     ]
@@ -245,7 +120,7 @@ async def test_sync_llm_followup_tasks_creates_and_removes_garbled_text_task():
             id="job-1",
             filename="sample.pdf",
             original_filename="sample.pdf",
-            status="needs_manual_review",
+            status="awaiting_recommendation_review",
             input_path="/tmp/sample.pdf",
         )
         parent_task = ReviewTask(
@@ -328,5 +203,114 @@ async def test_sync_llm_followup_tasks_creates_and_removes_garbled_text_task():
             )
         )
         assert result.scalars().all() == []
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_accept_recommendation_without_changes_resolves_task_and_completes_job():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_maker() as db:
+        job = Job(
+            id="job-accept",
+            filename="sample.pdf",
+            original_filename="sample.pdf",
+            status="awaiting_recommendation_review",
+            input_path="/tmp/sample.pdf",
+            validation_json=json.dumps({"compliant": True, "violations": []}),
+        )
+        task = ReviewTask(
+            job_id="job-accept",
+            task_type="table_semantics",
+            title="Review table headers",
+            detail="Confirm the current table interpretation.",
+            severity="high",
+            blocking=True,
+            status="pending_review",
+            source="fidelity",
+            metadata_json=json.dumps(
+                {
+                    "llm_suggestion": {
+                        "suggested_action": "confirm_current_headers",
+                    }
+                }
+            ),
+        )
+        db.add(job)
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        response = await _accept_recommendation_without_changes(
+            job=job,
+            task=task,
+            task_metadata=json.loads(task.metadata_json or "{}"),
+            suggested_action="confirm_current_headers",
+            db=db,
+        )
+
+        await db.refresh(job)
+        await db.refresh(task)
+        metadata = json.loads(task.metadata_json or "{}")
+
+        assert response.status == "accepted"
+        assert task.status == "resolved"
+        assert metadata["accepted_recommendation"]["suggested_action"] == "confirm_current_headers"
+        assert metadata["llm_suggestion"]["suggested_action"] == "confirm_current_headers"
+        assert job.status == "complete"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_refresh_recommendation_review_status_keeps_job_blocked_when_tasks_remain():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_maker() as db:
+        job = Job(
+            id="job-blocked",
+            filename="sample.pdf",
+            original_filename="sample.pdf",
+            status="awaiting_recommendation_review",
+            input_path="/tmp/sample.pdf",
+            validation_json=json.dumps({"compliant": True, "violations": []}),
+        )
+        resolved_task = ReviewTask(
+            job_id="job-blocked",
+            task_type="reading_order",
+            title="Review reading order",
+            detail="Confirm the current order.",
+            severity="high",
+            blocking=True,
+            status="resolved",
+            source="fidelity",
+        )
+        pending_task = ReviewTask(
+            job_id="job-blocked",
+            task_type="font_text_fidelity",
+            title="Review garbled text",
+            detail="Confirm the spoken text fix.",
+            severity="high",
+            blocking=True,
+            status="pending_review",
+            source="fidelity",
+        )
+        db.add(job)
+        db.add_all([resolved_task, pending_task])
+        await db.commit()
+
+        await _refresh_recommendation_review_status(job=job, db=db)
+        await db.refresh(job)
+
+        assert job.status == "awaiting_recommendation_review"
 
     await engine.dispose()

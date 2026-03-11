@@ -1,6 +1,8 @@
 from pathlib import Path
 
+from app.config import Settings
 from app.pipeline.ocr import _build_ocrmypdf_args
+from app.services import runtime_paths
 
 
 def test_build_ocrmypdf_args_enables_rotate_and_deskew():
@@ -48,3 +50,34 @@ def test_build_ocrmypdf_args_omits_deskew_in_redo_mode():
     assert "--rotate-pages" in args
     assert "--redo-ocr" in args
     assert "--deskew" not in args
+
+
+def test_enriched_subprocess_env_adds_common_binary_dirs(monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setattr(runtime_paths.Path, "exists", lambda self: str(self) == "/opt/homebrew/bin")
+    env = runtime_paths.enriched_subprocess_env()
+
+    assert "/opt/homebrew/bin" in env["PATH"]
+
+
+def test_resolve_binary_prefers_explicit_path(tmp_path):
+    binary = tmp_path / "tesseract"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+
+    resolved = runtime_paths.resolve_binary("tesseract", explicit=str(binary))
+
+    assert resolved == str(binary.resolve())
+
+
+def test_enriched_subprocess_env_adds_configured_binary_dirs(monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setattr(
+        "app.config.get_settings",
+        lambda: Settings(binary_search_dirs="/srv/bin,/opt/tools/bin"),
+    )
+
+    env = runtime_paths.enriched_subprocess_env()
+
+    assert "/srv/bin" in env["PATH"]
+    assert "/opt/tools/bin" in env["PATH"]

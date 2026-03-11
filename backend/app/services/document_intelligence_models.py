@@ -37,6 +37,7 @@ class BlockModel:
     bbox: BBoxModel | None = None
     semantic_text_hint: str | None = None
     semantic_issue_type: str | None = None
+    semantic_resolved_kind: str | None = None
     semantic_blocking: bool = False
     provenance: str = "legacy_structure"
     confidence: float = 0.5

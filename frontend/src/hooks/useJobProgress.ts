@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import type { PipelineStep, ProgressEvent, StepName } from "../types";
 
 const INITIAL_STEPS: PipelineStep[] = [
@@ -62,55 +62,58 @@ export function useJobProgress(jobId: string, active = true) {
     });
   }, [jobId]);
 
-  const connect = useCallback(() => {
-    // Clean up any existing connection
-    if (sourceRef.current) {
-      sourceRef.current.close();
-      sourceRef.current = null;
-    }
+  const connect = useEffectEvent(() => {
+    const openConnection = () => {
+      if (sourceRef.current) {
+        sourceRef.current.close();
+        sourceRef.current = null;
+      }
 
-    const source = new EventSource(`/api/jobs/${jobId}/progress`);
-    sourceRef.current = source;
+      const source = new EventSource(`/api/jobs/${jobId}/progress`);
+      sourceRef.current = source;
 
-    source.onopen = () => {
-      retryCountRef.current = 0;
-      setConnected(true);
+      source.onopen = () => {
+        retryCountRef.current = 0;
+        setConnected(true);
+      };
+
+      source.addEventListener("progress", (e) => {
+        try {
+          const data: ProgressEvent = JSON.parse(e.data);
+          updateStep(data);
+
+          if (data.status === "complete" || data.status === "failed") {
+            queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
+          }
+          if (data.step === "review") {
+            queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
+          }
+        } catch {
+          // ignore parse errors
+        }
+      });
+
+      source.onerror = () => {
+        setConnected(false);
+        source.close();
+        sourceRef.current = null;
+
+        if (retryCountRef.current < MAX_RETRIES) {
+          const backoffMs = Math.min(
+            1000 * 2 ** retryCountRef.current,
+            MAX_BACKOFF_MS,
+          );
+          retryCountRef.current += 1;
+          reconnectTimerRef.current = setTimeout(() => {
+            reconnectTimerRef.current = null;
+            openConnection();
+          }, backoffMs);
+        }
+      };
     };
 
-    source.addEventListener("progress", (e) => {
-      try {
-        const data: ProgressEvent = JSON.parse(e.data);
-        updateStep(data);
-
-        if (data.status === "complete" || data.status === "failed") {
-          queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
-        }
-        if (data.step === "review") {
-          queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
-        }
-      } catch {
-        // ignore parse errors
-      }
-    });
-
-    source.onerror = () => {
-      setConnected(false);
-      source.close();
-      sourceRef.current = null;
-
-      if (retryCountRef.current < MAX_RETRIES) {
-        const backoffMs = Math.min(
-          1000 * 2 ** retryCountRef.current,
-          MAX_BACKOFF_MS,
-        );
-        retryCountRef.current += 1;
-        reconnectTimerRef.current = setTimeout(() => {
-          reconnectTimerRef.current = null;
-          connect();
-        }, backoffMs);
-      }
-    };
-  }, [jobId, updateStep, queryClient]);
+    openConnection();
+  });
 
   useEffect(() => {
     if (!active) return;
@@ -128,7 +131,7 @@ export function useJobProgress(jobId: string, active = true) {
       }
       setConnected(false);
     };
-  }, [active, connect]);
+  }, [active, jobId]);
 
   return { steps, connected };
 }

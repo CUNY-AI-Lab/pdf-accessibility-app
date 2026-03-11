@@ -22,7 +22,7 @@ For each candidate, decide whether it should:
 - keep figure semantics with short alt text
 - be marked decorative
 - be reclassified because it is actually a table, form region, or artifact
-- fall back to manual review
+- fall back to another recommendation pass
 
 Rules:
 - Decide each figure candidate independently.
@@ -214,6 +214,8 @@ async def generate_figure_intelligence(
     llm_client: LlmClient,
     job: Job | Any | None = None,
     original_filename: str = "",
+    reviewer_feedback: str | None = None,
+    previous_suggestion: dict[str, Any] | None = None,
     figure_context: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     unit = SemanticUnit(
@@ -232,6 +234,8 @@ async def generate_figure_intelligence(
         metadata={
             "extra_image_data_urls": [_image_data_url(figure.path)] if figure.path.exists() else [],
             "figure_index": figure.index,
+            "reviewer_feedback": reviewer_feedback or "",
+            "previous_suggestion": previous_suggestion or {},
         },
     )
     if job is None and original_filename:

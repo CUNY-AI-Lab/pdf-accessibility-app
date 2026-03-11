@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     verapdf_path: str = "verapdf"
     verapdf_flavour: str = "ua1"
 
+    # External binaries
+    ghostscript_path: str = "gs"
+    tesseract_path: str = "tesseract"
+    pdftoppm_path: str = "pdftoppm"
+    binary_search_dirs: str = ""
+
     # OCR
     ocr_language: str = "eng"
     ocr_rotate_pages: bool = True

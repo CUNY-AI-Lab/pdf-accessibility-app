@@ -141,6 +141,34 @@ def test_font_task_payload_uses_review_targets_and_page_structure_context(monkey
     assert content[2]["image_url"]["url"] == "data:image/jpeg;base64,page-5"
     assert content[3]["image_url"]["url"].startswith("data:image/png;base64,target-")
 
+
+def test_font_task_payload_includes_reviewer_feedback_context(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        review_suggestions,
+        "render_page_jpeg_data_url",
+        lambda pdf_path, page_number: f"data:image/jpeg;base64,page-{page_number}",
+    )
+
+    prompt_text, _content = _font_task_payload(
+        _job(tmp_path),
+        _task(
+            "font_text_fidelity",
+            metadata={
+                "pages_to_check": [1],
+                "llm_suggestion": {
+                    "summary": "Previous recommendation",
+                    "suggested_action": "manual_only",
+                    "reason": "Previous reason",
+                },
+            },
+        ),
+        reviewer_feedback="This is a bullet marker, not a decorative glyph.",
+    )
+
+    assert '"reviewer_feedback": "This is a bullet marker, not a decorative glyph."' in prompt_text
+    assert '"previous_suggestion": {' in prompt_text
+    assert '"suggested_action": "manual_only"' in prompt_text
+
 def test_page_blocks_for_review_collects_structure_fragments(tmp_path):
     page_blocks = _page_blocks_for_review(
         _job(
@@ -275,6 +303,121 @@ def test_generate_review_suggestion_supports_reading_order(monkeypatch, tmp_path
     assert suggestion["document_overlay"]["pages"][0]["page_number"] == 1
     assert suggestion["model"] == "google/gemini-3-flash-preview"
     assert fake_llm.calls == []
+
+
+def test_generate_review_suggestion_passes_reviewer_feedback_to_reading_order(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    async def _fake_page_intelligence(**kwargs):
+        captured["page_feedback"] = kwargs.get("reviewer_feedback")
+        captured["page_previous_suggestions"] = kwargs.get("previous_suggestions")
+        return {
+            "task_type": "page_text_intelligence",
+            "summary": "",
+            "confidence": "low",
+            "confidence_score": 0.2,
+            "blocks": [],
+        }
+
+    async def _fake_reading_order_intelligence(**kwargs):
+        captured["order_feedback"] = kwargs.get("reviewer_feedback")
+        captured["order_previous_suggestion"] = kwargs.get("previous_suggestion")
+        return {
+            "task_type": "reading_order_intelligence",
+            "summary": "Current order is acceptable.",
+            "confidence": "high",
+            "confidence_score": 0.9,
+            "suggested_action": "confirm_current_order",
+            "reason": "No change needed.",
+            "page": 1,
+            "ordered_review_ids": [],
+            "element_updates": [],
+        }
+
+    monkeypatch.setattr(review_suggestions, "generate_suspicious_text_intelligence", _fake_page_intelligence)
+    monkeypatch.setattr(review_suggestions, "generate_reading_order_intelligence", _fake_reading_order_intelligence)
+
+    suggestion = asyncio.run(
+        generate_review_suggestion(
+            job=_job(tmp_path, structure={"elements": [{"type": "paragraph", "page": 0, "text": "Hello"}]}),
+            task=_task(
+                "reading_order",
+                metadata={
+                    "llm_suggestion": {
+                        "summary": "Previous recommendation",
+                        "suggested_action": "reorder_review",
+                        "reason": "Previous reason",
+                        "page_text_intelligence": {
+                            "blocks": [
+                                {
+                                    "page": 1,
+                                    "review_id": "review-0",
+                                    "summary": "Previous text hint",
+                                    "suggested_action": "set_resolved_text",
+                                    "reason": "Spacing issue",
+                                    "resolved_text": "Hello",
+                                }
+                            ]
+                        },
+                        "reading_order_intelligence": [
+                            {
+                                "page": 1,
+                                "summary": "Previous page order",
+                                "suggested_action": "reorder_review",
+                                "reason": "Old ordering",
+                                "ordered_review_ids": ["review-0"],
+                            }
+                        ],
+                    }
+                },
+            ),
+            llm_client=_FakeLlmClient({}),
+            reviewer_feedback="The sidebar should stay in the main flow.",
+        )
+    )
+
+    assert captured["page_feedback"] == "The sidebar should stay in the main flow."
+    assert captured["order_feedback"] == "The sidebar should stay in the main flow."
+    assert captured["page_previous_suggestions"] == {
+        (1, "review-0"): {
+            "summary": "Previous text hint",
+            "suggested_action": "set_resolved_text",
+            "reason": "Spacing issue",
+            "resolved_text": "Hello",
+        }
+    }
+    assert captured["order_previous_suggestion"] == {
+        "summary": "Previous page order",
+        "suggested_action": "reorder_review",
+        "reason": "Old ordering",
+        "ordered_review_ids": ["review-0"],
+        "element_updates": [],
+    }
+    assert suggestion["reviewer_feedback"] == "The sidebar should stay in the main flow."
+
+
+def test_aggregate_table_intelligence_preserves_reclassification():
+    aggregated = review_suggestions._aggregate_table_intelligence(
+        [
+            {
+                "summary": "This is an org chart, not a data table.",
+                "confidence": "high",
+                "suggested_action": "reclassify_region",
+                "reason": "Hierarchy is visual, not tabular.",
+                "table_review_id": "review-table-1",
+                "page": 3,
+                "header_rows": [],
+                "row_header_columns": [],
+                "resolved_kind": "org_chart",
+            }
+        ],
+        total_targets=1,
+    )
+
+    assert aggregated["suggested_action"] == "reclassify_region"
+    assert "not actually being data tables" in aggregated["summary"]
+    assert aggregated["proposed_table_updates"][0]["suggested_action"] == "reclassify_region"
+    assert aggregated["proposed_table_updates"][0]["resolved_kind"] == "org_chart"
 
 
 def test_generate_review_suggestion_keeps_font_actualtext_candidates(monkeypatch, tmp_path):
@@ -465,7 +608,7 @@ def test_generate_review_suggestion_supports_table_semantics(monkeypatch, tmp_pa
     assert len(suggestion["table_intelligence"]) == 2
     assert suggestion["document_overlay"]["provenance"] == "gemini_review_suggestion"
     assert suggestion["document_overlay"]["pages"][0]["page_number"] == 1
-    assert "manual review" in suggestion["summary"].lower()
+    assert "recommendation" in suggestion["summary"].lower()
     assert fake_llm.calls == []
 
 
