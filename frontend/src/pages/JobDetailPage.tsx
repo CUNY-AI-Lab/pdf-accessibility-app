@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { useDeleteJob, useJob, useReviewTasks, useValidation } from "../api/jobs";
+import { useAppliedChanges, useDeleteJob, useJob, useReviewTasks, useValidation } from "../api/jobs";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { ChevronLeftIcon, ChevronRightIcon } from "../components/Icons";
 import OutcomeHero from "../components/OutcomeHero";
@@ -23,7 +23,11 @@ export default function JobDetailPage() {
   const needsBlockingReview = job?.status === "awaiting_recommendation_review";
   const { data: validationReport } = useValidation(id!, hasFinalOutput);
   const { data: reviewTasks } = useReviewTasks(id!, needsBlockingReview);
+  const { data: appliedChanges } = useAppliedChanges(id!, hasFinalOutput);
   const openReviewTasks = reviewTasks?.filter((task) => task.status === "pending_review") ?? [];
+  const pendingAppliedChanges = appliedChanges?.filter((change) => change.review_status === "pending_review") ?? [];
+  const blockingRecommendationCount = openReviewTasks.length;
+  const appliedChangeCount = pendingAppliedChanges.length;
   const [showDetails, setShowDetails] = useState(false);
 
   // Use SSE steps when actively processing, otherwise use API data
@@ -124,8 +128,10 @@ export default function JobDetailPage() {
                 Recommendations Ready
               </h3>
               <p className="text-sm text-ink-muted">
-                {openReviewTasks.length > 0
-                  ? `${openReviewTasks.length} recommendation ${pluralize(openReviewTasks.length, "task")} ${pluralize(openReviewTasks.length, "is", "are")} ready to accept or revise.`
+                {blockingRecommendationCount > 0
+                  ? `${blockingRecommendationCount} remaining question ${pluralize(blockingRecommendationCount, "needs", "need")} your input${appliedChangeCount > 0 ? `, and ${appliedChangeCount} applied ${pluralize(appliedChangeCount, "change")} ${pluralize(appliedChangeCount, "is", "are")} ready to review` : ""}.`
+                  : appliedChangeCount > 0
+                    ? `${appliedChangeCount} applied ${pluralize(appliedChangeCount, "change")} ${pluralize(appliedChangeCount, "is", "are")} ready to review.`
                   : "Automated remediation stopped short of a trustworthy accessible output."}
               </p>
             </div>
@@ -154,12 +160,38 @@ export default function JobDetailPage() {
             compliant={validationReport?.compliant}
             pendingCount={
               needsBlockingReview
-                ? openReviewTasks.length || validationReport?.violations.length || 0
-                : validationReport?.violations.length || 0
+                ? blockingRecommendationCount || appliedChangeCount || validationReport?.violations.length || 0
+                : appliedChangeCount || validationReport?.violations.length || 0
             }
           />
 
-          {job.status === "complete" && (
+          {job.status === "complete" && appliedChangeCount > 0 && (
+            <div className="rounded-xl border border-accent/20 bg-accent-glow/30 p-5">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <h3 className="font-display text-lg text-ink mb-1">
+                    Important changes ready for review
+                  </h3>
+                  <p className="text-sm text-ink-muted">
+                    The app already fixed this PDF. Review {appliedChangeCount} important {pluralize(appliedChangeCount, "change")} and decide whether to keep or revise them.
+                  </p>
+                </div>
+                <Link
+                  to={`/jobs/${job.id}/review`}
+                  className="
+                    px-5 py-2.5 rounded-xl
+                    bg-accent text-white text-sm font-medium
+                    hover:bg-accent/90 shadow-sm
+                    transition-all duration-200 no-underline
+                  "
+                >
+                  Review Changes &rarr;
+                </Link>
+              </div>
+            </div>
+          )}
+
+          {job.status === "complete" && appliedChangeCount === 0 && (
             <div className="rounded-xl border border-info/25 bg-info-light/20 p-5">
               <h3 className="font-display text-lg text-ink mb-1">
                 Optional external QA

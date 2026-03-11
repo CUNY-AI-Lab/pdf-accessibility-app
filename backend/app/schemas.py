@@ -35,27 +35,6 @@ class JobListResponse(BaseModel):
     jobs: list[JobResponse]
     total: int
 
-
-class AltTextResponse(BaseModel):
-    id: int
-    figure_index: int
-    image_url: str
-    generated_text: str | None = None
-    edited_text: str | None = None
-    status: str
-
-
-class AltTextSuggestionRequest(BaseModel):
-    feedback: str | None = None
-
-
-class AltTextRecommendationApplyResponse(BaseModel):
-    status: str
-    message: str
-    job_status: str
-    alt_text: AltTextResponse
-
-
 class ReviewTaskResponse(BaseModel):
     id: int
     task_type: str
@@ -67,6 +46,20 @@ class ReviewTaskResponse(BaseModel):
     source: str
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+
+class AppliedChangeResponse(BaseModel):
+    id: int
+    change_type: str
+    title: str
+    detail: str
+    importance: Literal["high", "medium", "low"]
+    review_status: Literal["pending_review", "kept", "undone"]
+    reviewable: bool
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    before: dict[str, Any] = Field(default_factory=dict)
+    after: dict[str, Any] = Field(default_factory=dict)
+
+
 class ReviewSuggestionRequest(BaseModel):
     feedback: str | None = None
 
@@ -74,6 +67,12 @@ class ReviewSuggestionRequest(BaseModel):
 class ReviewRecommendationApplyResponse(BaseModel):
     status: str
     message: str
+
+
+class AppliedChangeActionResponse(BaseModel):
+    status: str
+    message: str
+    job_status: str
 
 
 class ValidationViolation(BaseModel):

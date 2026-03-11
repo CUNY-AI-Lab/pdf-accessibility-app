@@ -4,8 +4,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import type {
-  AltText,
-  AltTextRecommendationApplyResult,
+  AppliedChange,
   Job,
   ReviewTask,
   ValidationReport,
@@ -33,18 +32,18 @@ export function useJob(id: string) {
   });
 }
 
-export function useAltTexts(jobId: string, enabled = true) {
-  return useQuery({
-    queryKey: ["jobs", jobId, "alt-texts"],
-    queryFn: () => apiFetch<AltText[]>(`/jobs/${jobId}/alt-texts`),
-    enabled,
-  });
-}
-
 export function useReviewTasks(jobId: string, enabled = true) {
   return useQuery({
     queryKey: ["jobs", jobId, "review-tasks"],
     queryFn: () => apiFetch<ReviewTask[]>(`/jobs/${jobId}/review-tasks`),
+    enabled,
+  });
+}
+
+export function useAppliedChanges(jobId: string, enabled = true) {
+  return useQuery({
+    queryKey: ["jobs", jobId, "applied-changes"],
+    queryFn: () => apiFetch<AppliedChange[]>(`/jobs/${jobId}/applied-changes`),
     enabled,
   });
 }
@@ -80,6 +79,61 @@ export function useApplyReviewRecommendation(jobId: string) {
       queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
       queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
       queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "applied-changes"] });
+    },
+  });
+}
+
+export function useKeepAppliedChange(jobId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ changeId }: { changeId: number }) =>
+      apiFetch<{ status: string; message: string; job_status: string }>(
+        `/jobs/${jobId}/applied-changes/${changeId}/keep`,
+        { method: "POST" },
+      ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "applied-changes"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
+    },
+  });
+}
+
+export function useUndoAppliedChange(jobId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ changeId }: { changeId: number }) =>
+      apiFetch<{ status: string; message: string; job_status: string }>(
+        `/jobs/${jobId}/applied-changes/${changeId}/undo`,
+        { method: "POST" },
+      ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "applied-changes"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
+    },
+  });
+}
+
+export function useSuggestAppliedChange(jobId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ changeId, feedback }: { changeId: number; feedback?: string }) =>
+      apiFetch<{ status: string; message: string; job_status: string }>(
+        `/jobs/${jobId}/applied-changes/${changeId}/suggest`,
+        {
+          method: "POST",
+          body: JSON.stringify({ feedback }),
+        },
+      ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "applied-changes"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
     },
   });
 }
@@ -107,46 +161,6 @@ export function useCreateJobs() {
       });
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
-  });
-}
-
-export function useAcceptAltTextRecommendation(jobId: string) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: async ({ figureIndex }: { figureIndex: number }) =>
-      apiFetch<AltTextRecommendationApplyResult>(
-        `/jobs/${jobId}/alt-texts/${figureIndex}/accept-recommendation`,
-        {
-          method: "POST",
-        },
-      ),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "alt-texts"] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
-    },
-  });
-}
-
-export function useSuggestAltText(jobId: string) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: async ({
-      figureIndex,
-      feedback,
-    }: {
-      figureIndex: number;
-      feedback?: string;
-    }) =>
-      apiFetch<AltText>(`/jobs/${jobId}/alt-texts/${figureIndex}/suggest`, {
-        method: "POST",
-        body: JSON.stringify({ feedback }),
-      }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "alt-texts"] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
-    },
   });
 }
 

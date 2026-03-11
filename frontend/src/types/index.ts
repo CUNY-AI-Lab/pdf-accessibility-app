@@ -21,8 +21,6 @@ export type StepName =
   | "validation"
   | "fidelity";
 
-export type AltTextStatus = "pending_review" | "approved" | "rejected";
-
 export interface PipelineStep {
   step_name: StepName;
   status: StepStatus;
@@ -46,22 +44,6 @@ export interface Job {
   steps: PipelineStep[];
 }
 
-export interface AltText {
-  id: number;
-  figure_index: number;
-  image_url: string;
-  generated_text?: string;
-  edited_text?: string;
-  status: AltTextStatus;
-}
-
-export interface AltTextRecommendationApplyResult {
-  status: string;
-  message: string;
-  job_status: JobStatus;
-  alt_text: AltText;
-}
-
 export interface ReviewTask {
   id: number;
   task_type: string;
@@ -72,6 +54,19 @@ export interface ReviewTask {
   status: "pending_review" | "resolved";
   source: string;
   metadata: Record<string, unknown>;
+}
+
+export interface AppliedChange {
+  id: number;
+  change_type: string;
+  title: string;
+  detail: string;
+  importance: "high" | "medium" | "low";
+  review_status: "pending_review" | "kept" | "undone";
+  reviewable: boolean;
+  metadata: Record<string, unknown>;
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
 }
 
 export interface ValidationViolation {

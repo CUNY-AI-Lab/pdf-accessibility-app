@@ -33,15 +33,15 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db():
-    from app.models import Base, ReviewTask
+    from app.models import AppliedChange, Base, ReviewTask
 
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        await conn.run_sync(_ensure_schema, ReviewTask.__table__)
+        await conn.run_sync(_ensure_schema, ReviewTask.__table__, AppliedChange.__table__)
 
 
-def _ensure_schema(sync_conn, review_tasks_table) -> None:
+def _ensure_schema(sync_conn, review_tasks_table, applied_changes_table) -> None:
     inspector = inspect(sync_conn)
     table_names = set(inspector.get_table_names())
 
@@ -52,6 +52,8 @@ def _ensure_schema(sync_conn, review_tasks_table) -> None:
 
     if "review_tasks" not in table_names:
         review_tasks_table.create(bind=sync_conn, checkfirst=True)
+    if "applied_changes" not in table_names:
+        applied_changes_table.create(bind=sync_conn, checkfirst=True)
 
     # Ensure indexes exist for databases created before index definitions were added
     sync_conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status)"))
@@ -67,5 +69,15 @@ def _ensure_schema(sync_conn, review_tasks_table) -> None:
     sync_conn.execute(
         text(
             "CREATE INDEX IF NOT EXISTS idx_review_tasks_job_id ON review_tasks (job_id)"
+        )
+    )
+    sync_conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_applied_changes_job_id ON applied_changes (job_id)"
+        )
+    )
+    sync_conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_applied_changes_review_status ON applied_changes (review_status)"
         )
     )

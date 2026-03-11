@@ -1,79 +1,50 @@
 import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
-  useAltTexts,
-  useAcceptAltTextRecommendation,
+  useAppliedChanges,
   useApplyReviewRecommendation,
   useJob,
+  useKeepAppliedChange,
   useReviewTasks,
+  useSuggestAppliedChange,
   useSuggestReviewTask,
-  useSuggestAltText,
+  useUndoAppliedChange,
 } from "../api/jobs";
-import AltTextRecommendationCard from "../components/AltTextRecommendationCard";
+import AppliedChangeCard from "../components/AppliedChangeCard";
 import { ChevronLeftIcon } from "../components/Icons";
 import ReviewTaskCard from "../components/ReviewTaskCard";
 import type { TaskMutationState } from "../components/ReviewTaskCard";
-import type { ReviewTask } from "../types";
-import { pluralize } from "../utils/format";
+import type { AppliedChange, ReviewTask } from "../types";
 
 export default function ReviewPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const { data: job } = useJob(id!);
-  const { data: altTexts, isLoading } = useAltTexts(id!, true);
+  const canReviewOutput = job?.status === "complete" || job?.status === "awaiting_recommendation_review";
+  const isLoading = false;
   const canReviewTasks = job?.status === "awaiting_recommendation_review";
   const { data: reviewTasks, isLoading: tasksLoading } = useReviewTasks(id!, canReviewTasks);
+  const { data: appliedChanges, isLoading: appliedChangesLoading } = useAppliedChanges(id!, canReviewOutput);
 
-  const acceptAltTextRecommendation = useAcceptAltTextRecommendation(id!);
-  const suggestAltText = useSuggestAltText(id!);
   const suggestReviewTask = useSuggestReviewTask(id!);
   const applyReviewRecommendation = useApplyReviewRecommendation(id!);
+  const keepAppliedChange = useKeepAppliedChange(id!);
+  const undoAppliedChange = useUndoAppliedChange(id!);
+  const suggestAppliedChange = useSuggestAppliedChange(id!);
 
-  const [acceptingFigure, setAcceptingFigure] = useState<number | null>(null);
-  const [acceptAltErrorFigure, setAcceptAltErrorFigure] = useState<number | null>(null);
-  const [acceptAltError, setAcceptAltError] = useState<Error | null>(null);
-  const [suggestingFigure, setSuggestingFigure] = useState<number | null>(null);
-  const [suggestAltErrorFigure, setSuggestAltErrorFigure] = useState<number | null>(null);
-  const [suggestAltError, setSuggestAltError] = useState<Error | null>(null);
   const [suggestingTask, setSuggestingTask] = useState<number | null>(null);
   const [suggestErrorTask, setSuggestErrorTask] = useState<number | null>(null);
   const [acceptingRecommendationTaskId, setAcceptingRecommendationTaskId] = useState<number | null>(null);
   const [acceptRecommendationErrorTaskId, setAcceptRecommendationErrorTaskId] = useState<number | null>(null);
   const [acceptRecommendationError, setAcceptRecommendationError] = useState<Error | null>(null);
+  const [keepingChangeId, setKeepingChangeId] = useState<number | null>(null);
+  const [undoingChangeId, setUndoingChangeId] = useState<number | null>(null);
+  const [suggestingChangeId, setSuggestingChangeId] = useState<number | null>(null);
+  const [changeActionErrorId, setChangeActionErrorId] = useState<number | null>(null);
+  const [changeActionError, setChangeActionError] = useState<Error | null>(null);
 
   const isRecommendationReview = job?.status === "awaiting_recommendation_review";
   const isComplete = job?.status === "complete";
-
-  const handleAcceptAltRecommendation = async (figureIndex: number) => {
-    setAcceptingFigure(figureIndex);
-    setAcceptAltErrorFigure(null);
-    setAcceptAltError(null);
-    try {
-      const result = await acceptAltTextRecommendation.mutateAsync({ figureIndex });
-      if (result.job_status !== "awaiting_recommendation_review") {
-        navigate(`/jobs/${id}`);
-      }
-    } catch (error) {
-      setAcceptAltErrorFigure(figureIndex);
-      setAcceptAltError(error instanceof Error ? error : new Error("Failed to apply the recommendation"));
-    } finally {
-      setAcceptingFigure(null);
-    }
-  };
-
-  const handleSuggestAltRecommendation = async (figureIndex: number, feedback?: string) => {
-    setSuggestingFigure(figureIndex);
-    setSuggestAltErrorFigure(null);
-    setSuggestAltError(null);
-    try {
-      await suggestAltText.mutateAsync({ figureIndex, feedback });
-    } catch (error) {
-      setSuggestAltErrorFigure(figureIndex);
-      setSuggestAltError(error instanceof Error ? error : new Error("Failed to revise the recommendation"));
-    } finally {
-      setSuggestingFigure(null);
-    }
-  };
 
   const handleSuggestTask = async (task: ReviewTask, feedback?: string) => {
     setSuggestingTask(task.id);
@@ -104,9 +75,54 @@ export default function ReviewPage() {
     }
   };
 
-  const pendingAltTexts = altTexts?.filter((a) => a.status === "pending_review") ?? [];
+  const handleKeepAppliedChange = async (change: AppliedChange) => {
+    setChangeActionErrorId(null);
+    setChangeActionError(null);
+    setKeepingChangeId(change.id);
+    try {
+      await keepAppliedChange.mutateAsync({ changeId: change.id });
+    } catch (error) {
+      setChangeActionErrorId(change.id);
+      setChangeActionError(error instanceof Error ? error : new Error("Failed to keep this change"));
+    } finally {
+      setKeepingChangeId(null);
+    }
+  };
+
+  const handleUndoAppliedChange = async (change: AppliedChange) => {
+    setChangeActionErrorId(null);
+    setChangeActionError(null);
+    setUndoingChangeId(change.id);
+    try {
+      const result = await undoAppliedChange.mutateAsync({ changeId: change.id });
+      if (result.job_status === "processing" || result.job_status === "failed") {
+        navigate(`/jobs/${id}`);
+      }
+    } catch (error) {
+      setChangeActionErrorId(change.id);
+      setChangeActionError(error instanceof Error ? error : new Error("Failed to undo this change"));
+    } finally {
+      setUndoingChangeId(null);
+    }
+  };
+
+  const handleSuggestAppliedChange = async (change: AppliedChange, feedback?: string) => {
+    setChangeActionErrorId(null);
+    setChangeActionError(null);
+    setSuggestingChangeId(change.id);
+    try {
+      await suggestAppliedChange.mutateAsync({ changeId: change.id, feedback });
+    } catch (error) {
+      setChangeActionErrorId(change.id);
+      setChangeActionError(error instanceof Error ? error : new Error("Failed to revise this change"));
+    } finally {
+      setSuggestingChangeId(null);
+    }
+  };
+
   const openReviewTasks = reviewTasks?.filter((task) => task.status === "pending_review") ?? [];
   const blockingTasks = openReviewTasks.filter((task) => task.blocking);
+  const pendingAppliedChanges = appliedChanges?.filter((change) => change.review_status === "pending_review") ?? [];
 
   const sharedTaskMutation: TaskMutationState = {
     suggestTask: {
@@ -120,7 +136,7 @@ export default function ReviewPage() {
     acceptRecommendationError,
   };
 
-  if (isLoading || tasksLoading) {
+  if (isLoading || tasksLoading || appliedChangesLoading) {
     return (
       <div className="max-w-3xl mx-auto animate-pulse-soft">
         <div className="h-6 bg-paper-warm rounded w-48 mb-8" />
@@ -143,13 +159,39 @@ export default function ReviewPage() {
           <ChevronLeftIcon size={14} />
           Back to job
         </Link>
-        <div className="rounded-xl border border-info/25 bg-info-light/20 p-6">
-          <h1 className="text-2xl text-ink tracking-tight mb-2">External QA only</h1>
-          <p className="text-sm text-ink-muted">
-            This PDF already passed release checks. Download the file and, if needed, test it with a
-            screen reader, PAC, or Acrobat.
-          </p>
-        </div>
+        {pendingAppliedChanges.length > 0 ? (
+          <div className="space-y-6">
+            <div className="rounded-xl border border-ink/6 bg-cream p-5">
+              <h1 className="text-2xl text-ink tracking-tight mb-2">Review important applied changes</h1>
+              <p className="text-sm text-ink-muted">
+                The app already fixed this PDF. Review the few changes most likely to matter, keep the ones that look right, or describe what should change and the model will revise them.
+              </p>
+            </div>
+            <div className="space-y-4">
+              {pendingAppliedChanges.map((change) => (
+                <AppliedChangeCard
+                  key={change.id}
+                  change={change}
+                  onKeep={handleKeepAppliedChange}
+                  onUndo={handleUndoAppliedChange}
+                  onSuggestAlternative={handleSuggestAppliedChange}
+                  keeping={keepingChangeId === change.id}
+                  undoing={undoingChangeId === change.id}
+                  suggesting={suggestingChangeId === change.id}
+                  actionError={changeActionErrorId === change.id ? changeActionError : null}
+                />
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="rounded-xl border border-info/25 bg-info-light/20 p-6">
+            <h1 className="text-2xl text-ink tracking-tight mb-2">External QA only</h1>
+            <p className="text-sm text-ink-muted">
+              This PDF already passed release checks. Download the file and, if needed, test it with a
+              screen reader, PAC, or Acrobat.
+            </p>
+          </div>
+        )}
       </div>
     );
   }
@@ -171,11 +213,6 @@ export default function ReviewPage() {
           </h1>
           <p className="text-sm text-ink-muted">
             {job?.original_filename}
-            {isRecommendationReview && altTexts && pendingAltTexts.length > 0 && (
-              <span>
-                {" "}&middot; {pendingAltTexts.length} {pluralize(pendingAltTexts.length, "figure")}
-              </span>
-            )}
           </p>
         </div>
       </div>
@@ -183,42 +220,40 @@ export default function ReviewPage() {
       {isRecommendationReview && (
         <div className="mb-8 rounded-xl border border-ink/6 bg-cream p-5">
           <p className="text-sm text-ink-muted">
-            The model has already analyzed the hard parts of this PDF. For each remaining question, accept the recommendation when it is ready or describe what is wrong so the model can revise that part.
+            The app already fixed most of this PDF. First review the important changes it applied. Then answer any remaining questions by accepting the recommendation or describing what is wrong so the model can revise that part.
           </p>
         </div>
       )}
 
-      {isRecommendationReview && pendingAltTexts.length > 0 && (
-        <div className="space-y-6 mb-8">
-          <div className="rounded-xl border border-ink/6 bg-cream p-5">
+      {pendingAppliedChanges.length > 0 && (
+        <section className="space-y-4 mb-8">
+          <div className="rounded-xl border border-accent/20 bg-accent-glow/20 p-5">
+            <h2 className="text-lg text-ink mb-1">Important changes already applied</h2>
             <p className="text-sm text-ink-muted">
-              The model found figure descriptions that still need your judgment. Accept the recommendation when it looks right, or describe what should change and the model will revise it.
+              These fixes are already in the current PDF. Keep them if they look right, undo them, or suggest a better alternative.
             </p>
           </div>
-          {pendingAltTexts.map((altText) => (
-            <AltTextRecommendationCard
-              key={altText.id}
-              altText={altText}
-              onAccept={handleAcceptAltRecommendation}
-              onSuggestAlternative={handleSuggestAltRecommendation}
-              accepting={acceptingFigure === altText.figure_index}
-              acceptError={
-                acceptAltErrorFigure === altText.figure_index ? acceptAltError : null
-              }
-              suggesting={suggestingFigure === altText.figure_index}
-              suggestError={
-                suggestAltErrorFigure === altText.figure_index ? suggestAltError : null
-              }
+          {pendingAppliedChanges.map((change) => (
+            <AppliedChangeCard
+              key={change.id}
+              change={change}
+              onKeep={handleKeepAppliedChange}
+              onUndo={handleUndoAppliedChange}
+              onSuggestAlternative={handleSuggestAppliedChange}
+              keeping={keepingChangeId === change.id}
+              undoing={undoingChangeId === change.id}
+              suggesting={suggestingChangeId === change.id}
+              actionError={changeActionErrorId === change.id ? changeActionError : null}
             />
           ))}
-        </div>
+        </section>
       )}
 
       {isRecommendationReview && reviewTasks && reviewTasks.length > 0 && (
         <div className="space-y-8 mb-8">
           {blockingTasks.length > 0 ? (
             <section>
-              <h2 className="text-lg text-ink mb-4">Questions for you</h2>
+              <h2 className="text-lg text-ink mb-4">Remaining questions</h2>
               <div className="space-y-4">
                 {blockingTasks.map((task) => (
                   <ReviewTaskCard

@@ -53,6 +53,9 @@ class Job(Base):
     review_tasks: Mapped[list["ReviewTask"]] = relationship(
         back_populates="job", cascade="all, delete-orphan"
     )
+    applied_changes: Mapped[list["AppliedChange"]] = relationship(
+        back_populates="job", cascade="all, delete-orphan"
+    )
 
 
 class JobStep(Base):
@@ -126,3 +129,34 @@ class ReviewTask(Base):
     )
 
     job: Mapped["Job"] = relationship(back_populates="review_tasks")
+
+
+class AppliedChange(Base):
+    __tablename__ = "applied_changes"
+    __table_args__ = (
+        Index("idx_applied_changes_job_id", "job_id"),
+        Index("idx_applied_changes_review_status", "review_status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(
+        String, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    change_type: Mapped[str] = mapped_column(String, nullable=False)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    detail: Mapped[str] = mapped_column(Text, nullable=False)
+    importance: Mapped[str] = mapped_column(String, nullable=False, default="medium")
+    review_status: Mapped[str] = mapped_column(String, nullable=False, default="pending_review")
+    reviewable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    before_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    after_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    undo_payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, server_default=func.now(), onupdate=utcnow
+    )
+
+    job: Mapped["Job"] = relationship(back_populates="applied_changes")

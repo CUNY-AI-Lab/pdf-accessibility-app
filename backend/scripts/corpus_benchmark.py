@@ -21,8 +21,9 @@ import pikepdf
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.api.review import apply_review_recommendation, keep_applied_change
 from app.config import get_settings
-from app.models import AltTextEntry, Base, Job, JobStep, ReviewTask
+from app.models import AppliedChange, Base, Job, JobStep, ReviewTask
 from app.pipeline.classify import classify_pdf
 from app.pipeline.ocr import run_ocr
 from app.pipeline.orchestrator import run_pipeline, run_tagging_and_validation
@@ -1053,16 +1054,6 @@ def _step_duration_secs(step: JobStep | None) -> float:
     return max(0.0, (step.completed_at - step.started_at).total_seconds())
 
 
-def _normalize_review_text(text: str | None) -> str:
-    normalized = (text or "").strip()
-    if not normalized:
-        return ""
-    if normalized.startswith("[") and normalized.endswith("]"):
-        # Placeholder/error token from generation path.
-        return ""
-    return normalized
-
-
 async def _init_workflow_db(db_path: Path) -> tuple:
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
     async with engine.begin() as conn:
@@ -1077,42 +1068,56 @@ async def _finalize_review_if_needed(
     settings,
     job_manager: JobManager,
 ) -> None:
-    async with session_maker() as db:
-        job = await db.get(Job, job_id)
-        if not job or job.status != "awaiting_recommendation_review":
-            return
+    while True:
+        async with session_maker() as db:
+            job = await db.get(Job, job_id)
+            if not job:
+                return
+            if job.status == "processing":
+                pass
+            elif job.status != "awaiting_recommendation_review":
+                return
+            else:
+                change_result = await db.execute(
+                    select(AppliedChange)
+                    .where(
+                        AppliedChange.job_id == job_id,
+                        AppliedChange.review_status == "pending_review",
+                        AppliedChange.reviewable.is_(True),
+                    )
+                    .order_by(AppliedChange.created_at.asc())
+                )
+                pending_changes = change_result.scalars().all()
+                if pending_changes:
+                    for change in pending_changes:
+                        await keep_applied_change(job_id=job_id, change_id=change.id, db=db)
+                    continue
 
-        result = await db.execute(
-            select(AltTextEntry).where(
-                AltTextEntry.job_id == job_id,
-                AltTextEntry.status == "pending_review",
-            )
-        )
-        pending_entries = result.scalars().all()
-        for entry in pending_entries:
-            normalized = _normalize_review_text(entry.edited_text or entry.generated_text)
-            if normalized:
-                entry.status = "approved"
-                entry.edited_text = normalized
-        if pending_entries:
-            await db.commit()
+                task_result = await db.execute(
+                    select(ReviewTask)
+                    .where(
+                        ReviewTask.job_id == job_id,
+                        ReviewTask.status == "pending_review",
+                        ReviewTask.blocking.is_(True),
+                    )
+                    .order_by(ReviewTask.created_at.asc())
+                )
+                blocking_tasks = task_result.scalars().all()
+                if not blocking_tasks:
+                    validation_json = _parse_json(job.validation_json)
+                    fidelity_json = _parse_json(job.fidelity_json)
+                    if bool(validation_json.get("compliant", False)) and bool(fidelity_json.get("passed", False)):
+                        job.status = "complete"
+                        await db.commit()
+                    return
 
-        result = await db.execute(
-            select(AltTextEntry).where(
-                AltTextEntry.job_id == job_id,
-                AltTextEntry.status == "pending_review",
-            )
-        )
-        remaining_pending = result.scalars().all()
-        if remaining_pending:
-            return
+                await apply_review_recommendation(
+                    job_id=job_id,
+                    task_id=blocking_tasks[0].id,
+                    db=db,
+                )
 
-        job = await db.get(Job, job_id)
-        if job:
-            job.status = "processing"
-            await db.commit()
-
-        await run_tagging_and_validation(job_id, db, settings, job_manager)
+        await asyncio.sleep(0.1)
 
 
 async def benchmark_one_workflow(
@@ -1340,22 +1345,30 @@ async def benchmark_one_workflow(
 
             if not validation_json and not error:
                 if job.status == "awaiting_recommendation_review":
-                    result = await db.execute(
-                        select(AltTextEntry).where(
-                            AltTextEntry.job_id == job_id,
-                            AltTextEntry.status == "pending_review",
+                    blocking_pending = sum(
+                        1
+                        for task in review_tasks
+                        if bool(task.blocking) and str(task.status) == "pending_review"
+                    )
+                    pending_changes = await db.execute(
+                        select(AppliedChange).where(
+                            AppliedChange.job_id == job_id,
+                            AppliedChange.review_status == "pending_review",
+                            AppliedChange.reviewable.is_(True),
                         )
                     )
-                    pending_review = len(result.scalars().all())
-                    if pending_review:
-                        error = (
-                            "Recommendation review required: "
-                            f"{pending_review} figure recommendation(s) still pending"
-                        )
+                    pending_change_count = len(pending_changes.scalars().all())
+                    if blocking_pending or pending_change_count:
+                        pending_parts: list[str] = []
+                        if pending_change_count:
+                            pending_parts.append(f"{pending_change_count} applied change recommendation(s)")
+                        if blocking_pending:
+                            pending_parts.append(f"{blocking_pending} blocking recommendation question(s)")
+                        error = "Recommendation review required: " + " and ".join(pending_parts) + " still pending"
                     else:
                         error = (
                             "Workflow finished in recommendation review without validation "
-                            "or pending figure recommendations"
+                            "or pending recommendations"
                         )
                 else:
                     error = f"Workflow finished with status={job.status} but no validation payload"

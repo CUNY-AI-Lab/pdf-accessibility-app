@@ -17,8 +17,8 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
-from app.models import AltTextEntry, Job, JobStep, ReviewTask
-from app.pipeline.alt_text import generate_alt_text
+from app.models import AltTextEntry, AppliedChange, Job, JobStep, ReviewTask
+from app.pipeline.alt_text import figure_applied_change_specs, generate_alt_text
 from app.pipeline.classify import classify_pdf
 from app.pipeline.fidelity import _table_semantics_risk, assess_fidelity
 from app.pipeline.ocr import run_ocr
@@ -56,6 +56,8 @@ from app.services.job_manager import JobManager
 from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
 from app.services.llm_client import LlmClient as _LlmClient, make_llm_client
 from app.services.page_intelligence import collect_grounded_text_candidates
+from app.services.applied_changes import add_applied_change
+from app.services.auto_review_apply import auto_apply_structure_review_tasks
 from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
 from app.services.semantic_pretag_policy import (
     apply_table_intelligence_to_element as _apply_table_intelligence_to_element,
@@ -4541,10 +4543,9 @@ async def run_pipeline(
                     job.structure_json = json.dumps(structure.document_json)
                     await db.commit()
 
-                # Save alt text entries to database
+                # Save figure semantics to database and continue directly into tagging.
                 approved_count = 0
                 rejected_count = 0
-                pending_count = 0
                 reclassified_count = 0
                 for alt in alt_texts:
                     if alt.figure_index < 0 or alt.figure_index >= len(structure.figures):
@@ -4566,7 +4567,7 @@ async def run_pipeline(
                             status = "approved"
                             generated_text = caption_fallback
                         elif not generated_text or (generated_text.startswith("[") and generated_text.endswith("]")):
-                            status = "pending_review"
+                            status = "approved"
                         else:
                             status = "approved"
 
@@ -4574,9 +4575,6 @@ async def run_pipeline(
                         approved_count += 1
                     elif status == "rejected":
                         rejected_count += 1
-                    else:
-                        pending_count += 1
-
                     db.add(AltTextEntry(
                         job_id=job_id,
                         figure_index=alt.figure_index,
@@ -4585,12 +4583,16 @@ async def run_pipeline(
                         status=status,
                     ))
                 await db.commit()
+                figure_change_specs = figure_applied_change_specs(
+                    figures=structure.figures,
+                    alt_texts=alt_texts,
+                )
 
                 await _update_step(db, job_id, "alt_text", "complete", result={
                     "count": len(alt_texts),
                     "approved": approved_count,
                     "rejected": rejected_count,
-                    "pending_review": pending_count,
+                    "reviewable_changes": len(figure_change_specs),
                     "reclassified": reclassified_count,
                     "figure_reclassification": figure_reclassification,
                     "auto_approve_enabled": settings.auto_approve_generated_alt_text,
@@ -4601,26 +4603,21 @@ async def run_pipeline(
                         "count": len(alt_texts),
                         "approved": approved_count,
                         "rejected": rejected_count,
-                        "pending_review": pending_count,
+                        "reviewable_changes": len(figure_change_specs),
                         "reclassified": reclassified_count,
                         "auto_approve_enabled": settings.auto_approve_generated_alt_text,
                     },
                 )
 
-                if pending_count > 0:
-                    # Pause for recommendation review when generation produced undecidable output.
-                    job.status = "awaiting_recommendation_review"
-                    await db.commit()
-                    job_manager.emit_progress(
-                        job_id,
-                        step="review",
-                        status="awaiting_recommendation_review",
-                    )
-                    return  # Pipeline resumes after user approval
-
                 # All generated alt entries are actionable (approved/rejected), continue directly.
                 await run_tagging_and_validation(
-                    job_id, db, settings, job_manager, working_pdf, structure.document_json
+                    job_id,
+                    db,
+                    settings,
+                    job_manager,
+                    working_pdf,
+                    structure.document_json,
+                    pre_applied_change_specs=figure_change_specs,
                 )
                 return
 
@@ -4663,6 +4660,7 @@ async def run_tagging_and_validation(
     job_manager: JobManager,
     working_pdf: Path | None = None,
     structure_json: dict | None = None,
+    pre_applied_change_specs: list[dict[str, object]] | None = None,
 ):
     """Run steps 5-6 (tagging + validation). Called after review approval."""
     job = await db.get(Job, job_id)
@@ -5101,6 +5099,7 @@ async def run_tagging_and_validation(
         )
         llm_font_map_auto = auto_audit
         review_task_metadata_overrides.update(metadata_overrides)
+        auto_applied_change_specs: list[dict[str, object]] = list(pre_applied_change_specs or [])
         validation_payload = _build_validation_payload(
             baseline_validation=baseline_validation,
             selected_validation=selected_validation,
@@ -5109,6 +5108,76 @@ async def run_tagging_and_validation(
             tagging_result=selected_tagging_result,
             llm_font_map_auto=llm_font_map_auto,
         )
+
+        if structure_json and _blocking_task_count(review_tasks) > 0:
+            suggested_review_tasks, auto_structure_json, applied_specs = await auto_apply_structure_review_tasks(
+                job=job,
+                settings=settings,
+                review_tasks=review_tasks,
+                structure_json=structure_json,
+            )
+            review_tasks = suggested_review_tasks
+            if applied_specs and auto_structure_json != structure_json:
+                auto_output_path = get_output_path(job_id, f"accessible_auto_review_{job.original_filename}")
+                auto_tagging_result = await tag_pdf(
+                    input_path=working_pdf,
+                    output_path=auto_output_path,
+                    structure_json=auto_structure_json,
+                    alt_texts=reviewed_alts,
+                    original_filename=job.original_filename or "",
+                )
+                auto_validation = await validate_pdf(
+                    pdf_path=auto_tagging_result.output_path,
+                    verapdf_path=settings.verapdf_path,
+                    flavour=settings.verapdf_flavour,
+                    timeout_seconds=settings.subprocess_timeout_validation,
+                )
+                auto_validation_payload = _build_validation_payload(
+                    baseline_validation=baseline_validation,
+                    selected_validation=auto_validation,
+                    settings=settings,
+                    font_remediation=font_remediation,
+                    tagging_result=auto_tagging_result,
+                    llm_font_map_auto=llm_font_map_auto,
+                )
+                auto_fidelity_report, auto_review_tasks = assess_fidelity(
+                    input_pdf=Path(job.input_path),
+                    output_pdf=auto_tagging_result.output_path,
+                    comparison_source_pdf=fidelity_source_pdf,
+                    structure_json=auto_structure_json,
+                    alt_entries=[
+                        {
+                            "figure_index": entry.figure_index,
+                            "generated_text": entry.generated_text,
+                            "edited_text": entry.edited_text,
+                            "status": entry.status,
+                        }
+                        for entry in reviewed_alt_entries
+                    ],
+                    validation_report=auto_validation_payload,
+                    raw_validation_report=auto_validation.raw_report,
+                    tagging_metrics=auto_validation_payload["tagging"],
+                    classification=job.classification,
+                )
+                auto_review_tasks, auto_fidelity_report, _ = await _adjudicate_grounded_text_candidates(
+                    job=job,
+                    settings=settings,
+                    review_tasks=auto_review_tasks,
+                    fidelity_report=auto_fidelity_report,
+                )
+                if (
+                    auto_validation.compliant
+                    and _blocking_task_count(auto_review_tasks) < _blocking_task_count(review_tasks)
+                ):
+                    structure_json = auto_structure_json
+                    job.structure_json = json.dumps(auto_structure_json)
+                    job.output_path = str(auto_tagging_result.output_path)
+                    selected_tagging_result = auto_tagging_result
+                    selected_validation = auto_validation
+                    validation_payload = auto_validation_payload
+                    fidelity_report = auto_fidelity_report
+                    review_tasks = auto_review_tasks
+                    auto_applied_change_specs.extend(applied_specs)
 
         if candidate_validation is not None and candidate_output_pdf is not None:
             candidate_validation_payload = _build_validation_payload(
@@ -5169,6 +5238,55 @@ async def run_tagging_and_validation(
         job.fidelity_json = json.dumps(fidelity_report)
 
         await db.execute(delete(ReviewTask).where(ReviewTask.job_id == job_id))
+        await db.execute(
+            delete(AppliedChange).where(
+                AppliedChange.job_id == job_id,
+                AppliedChange.review_status == "pending_review",
+            )
+        )
+        reviewed_alt_by_index = {entry.figure_index: entry for entry in reviewed_alt_entries}
+        for change_spec in auto_applied_change_specs:
+            task_type = str(change_spec.get("task_type") or "review_change")
+            metadata = change_spec.get("metadata") if isinstance(change_spec.get("metadata"), dict) else {}
+            before = change_spec.get("before") if isinstance(change_spec.get("before"), dict) else {}
+            after = change_spec.get("after") if isinstance(change_spec.get("after"), dict) else {}
+            undo_payload = change_spec.get("undo_payload") if isinstance(change_spec.get("undo_payload"), dict) else {}
+            if task_type == "figure_semantics":
+                figure_index_raw = metadata.get("figure_index", undo_payload.get("figure_index"))
+                try:
+                    figure_index = int(figure_index_raw)
+                except (TypeError, ValueError):
+                    figure_index = -1
+                entry = reviewed_alt_by_index.get(figure_index)
+                if entry is not None:
+                    before = {
+                        "generated_text": undo_payload.get("generated_text"),
+                        "edited_text": undo_payload.get("edited_text"),
+                        "status": undo_payload.get("status"),
+                    }
+                    after = {
+                        "generated_text": entry.generated_text,
+                        "edited_text": entry.edited_text,
+                        "status": entry.status,
+                    }
+                    undo_payload = {
+                        **undo_payload,
+                        "entry_id": entry.id,
+                        "figure_index": figure_index,
+                    }
+            await add_applied_change(
+                db=db,
+                job=job,
+                change_type=task_type,
+                title=str(change_spec.get("title") or "Applied recommendation"),
+                detail=str(change_spec.get("detail") or "The model applied a semantic recommendation."),
+                importance=str(change_spec.get("importance") or "high"),
+                reviewable=True,
+                metadata=metadata,
+                before=before,
+                after=after,
+                undo_payload=undo_payload,
+            )
         for task in review_tasks:
             metadata = task.get("metadata", {})
             if not isinstance(metadata, dict):
