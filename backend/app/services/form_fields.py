@@ -5,7 +5,6 @@ from typing import Any
 
 import pikepdf
 
-
 BUTTON_FLAG_RADIO = 1 << 15
 BUTTON_FLAG_PUSHBUTTON = 1 << 16
 CHOICE_FLAG_COMBO = 1 << 17
@@ -25,6 +24,10 @@ def _objgen_str(obj: Any) -> str | None:
 
 def _resolve_dictionary(obj: Any) -> pikepdf.Dictionary | None:
     return obj if isinstance(obj, pikepdf.Dictionary) else None
+
+
+def _resolve_array(obj: Any) -> pikepdf.Array | None:
+    return obj if isinstance(obj, pikepdf.Array) else None
 
 
 def _normalize_text(value: Any) -> str:
@@ -106,7 +109,7 @@ def _field_type_name(ft_value: Any, ff_value: Any) -> str:
     return ft.lstrip("/") or "unknown"
 
 
-def _is_technical_field_name(value: str) -> bool:
+def is_technical_field_name(value: str) -> bool:
     text = _normalize_text(value)
     if not text:
         return False
@@ -129,9 +132,9 @@ def field_label_quality(*, accessible_name: str, field_name: str) -> str:
     technical_name = _normalize_text(field_name)
     if not label:
         return "missing"
-    if _is_technical_field_name(label):
+    if is_technical_field_name(label):
         return "weak"
-    if technical_name and label == technical_name and _is_technical_field_name(technical_name):
+    if technical_name and label == technical_name and is_technical_field_name(technical_name):
         return "weak"
     return "good"
 
@@ -249,5 +252,129 @@ def apply_field_accessible_names(
                 applied.append(review_id)
             except Exception:
                 continue
+        pdf.save(output_pdf)
+    return applied
+
+
+def _same_pdf_object(left: Any, right: Any) -> bool:
+    left_objgen = getattr(left, "objgen", None)
+    right_objgen = getattr(right, "objgen", None)
+    if (
+        isinstance(left_objgen, tuple)
+        and len(left_objgen) == 2
+        and isinstance(right_objgen, tuple)
+        and len(right_objgen) == 2
+    ):
+        return left_objgen == right_objgen
+    return left is right
+
+
+def _remove_object_from_array(container: pikepdf.Array | None, target: Any) -> bool:
+    if not isinstance(container, pikepdf.Array):
+        return False
+    removed_indexes = [
+        idx for idx, item in enumerate(container) if _same_pdf_object(item, target)
+    ]
+    for idx in reversed(removed_indexes):
+        del container[idx]
+    return bool(removed_indexes)
+
+
+def _field_parent(field: pikepdf.Dictionary) -> pikepdf.Dictionary | None:
+    parent = field.get("/Parent")
+    return parent if isinstance(parent, pikepdf.Dictionary) else None
+
+
+def _remove_field_from_tree(
+    *,
+    field: pikepdf.Dictionary,
+    root_fields: pikepdf.Array | None,
+) -> bool:
+    removed = False
+    parent = _field_parent(field)
+    if parent is not None:
+        kids = _resolve_array(parent.get("/Kids"))
+        removed = _remove_object_from_array(kids, field)
+        if removed and isinstance(kids, pikepdf.Array):
+            if len(kids) > 0:
+                return True
+            try:
+                del parent["/Kids"]
+            except Exception:
+                pass
+            _remove_field_from_tree(field=parent, root_fields=root_fields)
+        return removed
+    return _remove_object_from_array(root_fields, field)
+
+
+def _cleanup_empty_acroform(pdf: pikepdf.Pdf) -> None:
+    acroform = _resolve_dictionary(pdf.Root.get("/AcroForm"))
+    if not isinstance(acroform, pikepdf.Dictionary):
+        return
+    fields = _resolve_array(acroform.get("/Fields"))
+    if isinstance(fields, pikepdf.Array) and len(fields) > 0:
+        return
+    try:
+        del pdf.Root["/AcroForm"]
+    except Exception:
+        pass
+
+
+def remove_widget_fields(
+    *,
+    input_pdf: Path,
+    output_pdf: Path,
+    review_ids_to_remove: set[str] | list[str] | tuple[str, ...],
+) -> list[str]:
+    normalized_ids = {
+        str(review_id).strip()
+        for review_id in review_ids_to_remove
+        if str(review_id).strip()
+    }
+    if not normalized_ids:
+        output_pdf.write_bytes(input_pdf.read_bytes())
+        return []
+
+    applied: list[str] = []
+    with pikepdf.Pdf.open(input_pdf) as pdf:
+        entries = list(_iter_widget_field_entries(pdf))
+        acroform = _resolve_dictionary(pdf.Root.get("/AcroForm"))
+        root_fields = (
+            _resolve_array(acroform.get("/Fields"))
+            if isinstance(acroform, pikepdf.Dictionary)
+            else None
+        )
+
+        for entry in entries:
+            review_id = str(entry.get("field_review_id") or "").strip()
+            if review_id not in normalized_ids:
+                continue
+
+            page_number = entry.get("page")
+            if not isinstance(page_number, int) or page_number <= 0 or page_number > len(pdf.pages):
+                continue
+
+            page = pdf.pages[page_number - 1]
+            widget = entry.get("_widget")
+            if not isinstance(widget, pikepdf.Dictionary):
+                continue
+
+            annots = _resolve_array(page.get("/Annots"))
+            _remove_object_from_array(annots, widget)
+            if isinstance(annots, pikepdf.Array) and len(annots) == 0:
+                try:
+                    del page["/Annots"]
+                except Exception:
+                    pass
+
+            terminal_field = entry.get("_field")
+            if isinstance(terminal_field, pikepdf.Dictionary):
+                _remove_field_from_tree(field=terminal_field, root_fields=root_fields)
+            else:
+                _remove_field_from_tree(field=widget, root_fields=root_fields)
+
+            applied.append(review_id)
+
+        _cleanup_empty_acroform(pdf)
         pdf.save(output_pdf)
     return applied

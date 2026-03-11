@@ -1,7 +1,7 @@
 export type JobStatus =
   | "queued"
   | "processing"
-  | "awaiting_recommendation_review"
+  | "manual_remediation"
   | "complete"
   | "failed";
 

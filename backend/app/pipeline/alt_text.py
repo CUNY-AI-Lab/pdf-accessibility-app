@@ -32,7 +32,7 @@ class AltTextResult:
     used_placeholder_fallback: bool = False
     reviewable: bool = False
     importance: str = "medium"
-    llm_suggestion: dict[str, Any] | None = None
+    remediation_intelligence: dict[str, Any] | None = None
 
 
 def _figure_reviewability(
@@ -87,7 +87,7 @@ def figure_applied_change_specs(
             "reason": result.reason,
             "confidence": result.confidence,
             "suggested_action": result.suggested_action,
-            "llm_suggestion": result.llm_suggestion or {},
+            "remediation_intelligence": result.remediation_intelligence or {},
         }
         if figure.page is not None:
             metadata["page"] = int(figure.page) + 1
@@ -156,7 +156,7 @@ async def generate_alt_text(
                 used_placeholder_fallback=not bool(fallback),
                 reviewable=True,
                 importance="high",
-                llm_suggestion={
+                remediation_intelligence={
                     "suggested_action": "manual_only",
                     "confidence": "low",
                     "summary": "The image file was missing, so the app used the best available fallback.",
@@ -188,7 +188,7 @@ async def generate_alt_text(
                     confidence=confidence,
                     summary=str(adjudication.get("summary") or "").strip(),
                     reason=str(adjudication.get("reason") or "").strip(),
-                    llm_suggestion=dict(adjudication),
+                    remediation_intelligence=dict(adjudication),
                 )
                 continue
             is_decorative = bool(suggested_action == "mark_decorative" or adjudication.get("is_decorative"))
@@ -227,7 +227,7 @@ async def generate_alt_text(
                 used_placeholder_fallback=used_placeholder_fallback,
                 reviewable=reviewable,
                 importance=importance,
-                llm_suggestion=dict(adjudication),
+                remediation_intelligence=dict(adjudication),
             )
         except Exception as e:
             logger.error(f"Alt text generation failed for figure {fig.index}: {e}")
@@ -246,7 +246,7 @@ async def generate_alt_text(
                 used_placeholder_fallback=not bool(fallback),
                 reviewable=True,
                 importance="high",
-                llm_suggestion={
+                remediation_intelligence={
                     "suggested_action": "manual_only",
                     "confidence": "low",
                     "summary": "The app used a fallback because the semantic analysis failed.",
@@ -272,7 +272,7 @@ async def generate_alt_text(
                 used_placeholder_fallback=not bool(fallback),
                 reviewable=True,
                 importance="high",
-                llm_suggestion={
+                remediation_intelligence={
                     "suggested_action": "manual_only",
                     "confidence": "low",
                     "summary": "The app used a fallback because no semantic decision was available.",

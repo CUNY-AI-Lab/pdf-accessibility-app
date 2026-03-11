@@ -3,7 +3,7 @@ from app.services.intelligence_merge import (
     apply_reading_order_overlay,
     apply_table_intelligence,
     apply_table_overlay,
-    document_overlay_for_suggestion,
+    document_overlay_for_intelligence,
 )
 
 
@@ -51,7 +51,7 @@ def test_apply_reading_order_overlay_reorders_and_relabels():
     page = document.pages[0]
     assert [block.review_id for block in page.blocks] == ["review-2", "review-1"]
     assert page.blocks[1].role == "artifact"
-    assert page.blocks[0].provenance == "gemini_review_suggestion"
+    assert page.blocks[0].provenance == "gemini_remediation_intelligence"
 
 
 def test_apply_table_overlay_updates_header_flags():
@@ -77,7 +77,7 @@ def test_apply_table_overlay_updates_header_flags():
     assert table.row_header_columns == [0]
     assert table.cells[0].column_header is True
     assert table.cells[2].row_header is True
-    assert table.provenance == "gemini_review_suggestion"
+    assert table.provenance == "gemini_remediation_intelligence"
 
 
 def test_apply_table_intelligence_updates_headers_and_tracks_provenance():
@@ -100,11 +100,11 @@ def test_apply_table_intelligence_updates_headers_and_tracks_provenance():
     table = document.pages[0].tables[0]
     assert table.header_rows == [0]
     assert table.row_header_columns == [0]
-    assert table.provenance == "gemini_review_suggestion"
+    assert table.provenance == "gemini_remediation_intelligence"
 
 
-def test_document_overlay_for_suggestion_returns_affected_pages_only():
-    overlay = document_overlay_for_suggestion(
+def test_document_overlay_for_intelligence_returns_affected_pages_only():
+    overlay = document_overlay_for_intelligence(
         _document(),
         {
             "task_type": "reading_order",
@@ -116,13 +116,13 @@ def test_document_overlay_for_suggestion_returns_affected_pages_only():
         },
     )
 
-    assert overlay["provenance"] == "gemini_review_suggestion"
+    assert overlay["provenance"] == "gemini_remediation_intelligence"
     assert len(overlay["pages"]) == 1
     assert overlay["pages"][0]["page_number"] == 1
 
 
-def test_document_overlay_for_suggestion_uses_direct_table_intelligence():
-    overlay = document_overlay_for_suggestion(
+def test_document_overlay_for_intelligence_uses_direct_table_intelligence():
+    overlay = document_overlay_for_intelligence(
         _document(),
         {
             "task_type": "table_semantics",
@@ -140,7 +140,7 @@ def test_document_overlay_for_suggestion_uses_direct_table_intelligence():
         },
     )
 
-    assert overlay["provenance"] == "gemini_review_suggestion"
+    assert overlay["provenance"] == "gemini_remediation_intelligence"
     assert len(overlay["pages"]) == 1
     assert overlay["pages"][0]["page_number"] == 1
 

@@ -1,4 +1,3 @@
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -6,7 +5,6 @@ from typing import Any
 from app.pipeline.structure import _expand_toc_item_tables
 from app.services.intelligence_gemini_toc import generate_toc_group_intelligence
 from app.services.llm_client import LlmClient
-from app.services.pdf_preview import render_page_png_data_url
 
 TOC_HEADING_TEXTS = {
     "contents",
@@ -113,9 +111,9 @@ def collect_toc_candidates(structure_json: dict[str, Any]) -> list[dict[str, Any
     return candidates[:MAX_TOC_GROUPS]
 
 
-def apply_toc_llm_suggestion(
+def apply_toc_intelligence(
     structure_json: dict[str, Any],
-    suggestion: dict[str, Any],
+    intelligence: dict[str, Any],
 ) -> dict[str, Any]:
     elements = structure_json.get("elements")
     if not isinstance(elements, list):
@@ -127,7 +125,7 @@ def apply_toc_llm_suggestion(
         }
 
     candidate_groups = {group["caption_index"]: group for group in collect_toc_candidates(structure_json)}
-    groups = suggestion.get("groups")
+    groups = intelligence.get("groups")
     if not isinstance(groups, list):
         return {
             "attempted": True,
@@ -160,7 +158,7 @@ def apply_toc_llm_suggestion(
         if not valid_entry_indexes:
             continue
 
-        toc_group_ref = f"toc-llm-{caption_index}"
+        toc_group_ref = f"toc-intelligence-{caption_index}"
         elements[caption_index]["type"] = "toc_caption"
         elements[caption_index]["toc_group_ref"] = toc_group_ref
 
@@ -192,7 +190,7 @@ def apply_toc_llm_suggestion(
     }
 
 
-async def enhance_toc_structure_with_llm(
+async def enhance_toc_structure_with_intelligence(
     *,
     pdf_path: Path,
     structure_json: dict[str, Any],
@@ -220,12 +218,12 @@ async def enhance_toc_structure_with_llm(
             )
         )
 
-    suggestion = {
+    intelligence = {
         "groups": groups,
         "generated_at": datetime.now(UTC).isoformat(),
         "model": llm_client.model,
     }
-    audit = apply_toc_llm_suggestion(structure_json, suggestion)
+    audit = apply_toc_intelligence(structure_json, intelligence)
     audit["groups_considered"] = len(candidate_groups)
-    audit["suggestion"] = suggestion
+    audit["intelligence"] = intelligence
     return structure_json, audit

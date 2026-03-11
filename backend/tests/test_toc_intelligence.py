@@ -1,4 +1,4 @@
-from app.services.toc_suggestions import apply_toc_llm_suggestion, collect_toc_candidates
+from app.services.toc_intelligence import apply_toc_intelligence, collect_toc_candidates
 
 
 def test_collect_toc_candidates_detects_heading_and_table_entries():
@@ -38,7 +38,7 @@ def test_collect_toc_candidates_skips_when_toc_already_present():
     assert collect_toc_candidates(structure_json) == []
 
 
-def test_apply_toc_llm_suggestion_marks_caption_and_entries():
+def test_apply_toc_intelligence_marks_caption_and_entries():
     structure_json = {
         "elements": [
             {"type": "heading", "text": "Contents", "page": 0},
@@ -68,7 +68,7 @@ def test_apply_toc_llm_suggestion_marks_caption_and_entries():
         ]
     }
 
-    audit = apply_toc_llm_suggestion(structure_json, suggestion)
+    audit = apply_toc_intelligence(structure_json, suggestion)
 
     assert audit["applied"] is True
     assert structure_json["elements"][0]["type"] == "toc_caption"

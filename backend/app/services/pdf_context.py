@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-
 PAGE_SEGMENT_RE = re.compile(r"pages\[(\d+)\]")
 ANNOT_SEGMENT_RE = re.compile(r"(?:annotations|annots)\[(\d+)\]")
 XOBJECT_SEGMENT_RE = re.compile(r"xObject\[(\d+)\](?:\(([^)]*)\))?")

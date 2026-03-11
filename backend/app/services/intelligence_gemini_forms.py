@@ -5,7 +5,11 @@ from typing import Any
 from app.models import Job
 from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
-from app.services.intelligence_llm_utils import context_json_part, page_preview_parts, request_llm_json
+from app.services.intelligence_llm_utils import (
+    context_json_part,
+    page_preview_parts,
+    request_llm_json,
+)
 from app.services.llm_client import LlmClient
 from app.services.semantic_units import SemanticUnit
 
@@ -142,7 +146,7 @@ async def generate_form_intelligence(
     nearby_blocks: list[dict[str, Any]],
     llm_client: LlmClient,
     reviewer_feedback: str | None = None,
-    previous_suggestion: dict[str, Any] | None = None,
+    previous_intelligence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     unit = SemanticUnit(
         unit_id=str(target.get("field_review_id") or "").strip(),
@@ -164,7 +168,7 @@ async def generate_form_intelligence(
             "field_review_target": target,
             "nearby_fields": list(target.get("nearby_fields") or []),
             "reviewer_feedback": reviewer_feedback or "",
-            "previous_suggestion": previous_suggestion or {},
+            "previous_intelligence": previous_intelligence or {},
         },
     )
     decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)

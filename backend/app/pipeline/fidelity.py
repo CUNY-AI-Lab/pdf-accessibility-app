@@ -12,30 +12,51 @@ from pathlib import Path
 from typing import Any
 
 import pikepdf
-from PIL import Image
 from pdfminer.high_level import extract_text
+from PIL import Image
 
-from app.services.document_intelligence import build_document_model
 from app.services.form_fields import extract_widget_fields
 from app.services.page_intelligence import (
     collect_grounded_text_candidates,
 )
-from app.services.pdf_operator_context import extract_operator_text_context
 from app.services.pdf_context import parse_verapdf_context_path
+from app.services.pdf_operator_context import extract_operator_text_context
 from app.services.pdf_preview import render_page_png_bytes
+from app.services.semantic_pretag_policy import (
+    widget_targets_for_rationalization as _widget_targets_for_rationalization,
+)
+from app.services.visual_figure_rationalization import (
+    collect_missing_visual_figure_targets as _collect_missing_visual_figure_targets,
+)
 
 FONT_RULE_FRAGMENT = "-7.21."
 
 # Link text quality patterns (1A)
-_POOR_LINK_TEXT_EXACT = frozenset({
-    "click here", "here", "link", "read more", "learn more", "more",
-    "details", "more info", "more information", "this link", "go",
-    "click", "click this", "this", "page", "website", "site",
-})
+_POOR_LINK_TEXT_EXACT = frozenset(
+    {
+        "click here",
+        "here",
+        "link",
+        "read more",
+        "learn more",
+        "more",
+        "details",
+        "more info",
+        "more information",
+        "this link",
+        "go",
+        "click",
+        "click this",
+        "this",
+        "page",
+        "website",
+        "site",
+    }
+)
 _POOR_LINK_TEXT_RE = re.compile(
-    r"^https?://\S+$"      # bare URL
-    r"|^.{0,1}$"            # single character or empty
-    r"|^[\d\s]+$"           # only digits/whitespace
+    r"^https?://\S+$"  # bare URL
+    r"|^.{0,1}$"  # single character or empty
+    r"|^[\d\s]+$"  # only digits/whitespace
     r"|^link\s*to\s+https?://",  # "Link to http://..." (our inferred fallback)
     re.IGNORECASE,
 )
@@ -147,9 +168,7 @@ def _sample_visual_ink(path: Path) -> dict[str, Any]:
         nonwhite_pixels = sum(histogram[:OCR_VISUAL_NONWHITE_THRESHOLD])
         ratios.append(nonwhite_pixels / total_pixels)
 
-    pages_with_visible_ink = sum(
-        1 for ratio in ratios if ratio >= OCR_VISUAL_MIN_INK_RATIO
-    )
+    pages_with_visible_ink = sum(1 for ratio in ratios if ratio >= OCR_VISUAL_MIN_INK_RATIO)
     mean_ratio = (sum(ratios) / len(ratios)) if ratios else 0.0
     max_ratio = max(ratios, default=0.0)
     return {
@@ -187,7 +206,9 @@ def _collect_structural_fragments(structure_json: dict[str, Any]) -> list[str]:
     return fragments
 
 
-def _table_review_targets(structure_json: dict[str, Any], *, limit: int = 3) -> list[dict[str, Any]]:
+def _table_review_targets(
+    structure_json: dict[str, Any], *, limit: int = 3
+) -> list[dict[str, Any]]:
     elements = structure_json.get("elements", [])
     if not isinstance(elements, list):
         return []
@@ -203,13 +224,15 @@ def _table_review_targets(structure_json: dict[str, Any], *, limit: int = 3) -> 
         page = int(page_raw) + 1 if isinstance(page_raw, int) and page_raw >= 0 else None
         if page is None:
             continue
-        targets.append({
-            "table_review_id": str(element.get("review_id") or f"review-{index}"),
-            "page": page,
-            "bbox": element.get("bbox") if isinstance(element.get("bbox"), dict) else None,
-            "num_rows": int(element.get("num_rows", 0) or 0),
-            "num_cols": int(element.get("num_cols", 0) or 0),
-        })
+        targets.append(
+            {
+                "table_review_id": str(element.get("review_id") or f"review-{index}"),
+                "page": page,
+                "bbox": element.get("bbox") if isinstance(element.get("bbox"), dict) else None,
+                "num_rows": int(element.get("num_rows", 0) or 0),
+                "num_cols": int(element.get("num_cols", 0) or 0),
+            }
+        )
         if len(targets) >= limit:
             break
     return targets
@@ -262,8 +285,12 @@ def _table_semantics_risk(structure_json: dict[str, Any]) -> dict[str, Any]:
             if bool(cell.get("row_header", False)) and isinstance(col, int):
                 row_header_columns.add(col)
                 header_cell_count += 1
-            row_span = int(cell.get("row_span", 1) or 1) if isinstance(cell.get("row_span"), int) else 1
-            col_span = int(cell.get("col_span", 1) or 1) if isinstance(cell.get("col_span"), int) else 1
+            row_span = (
+                int(cell.get("row_span", 1) or 1) if isinstance(cell.get("row_span"), int) else 1
+            )
+            col_span = (
+                int(cell.get("col_span", 1) or 1) if isinstance(cell.get("col_span"), int) else 1
+            )
             if row_span > 1 or col_span > 1:
                 spans_present = True
             if _normalize_text(cell.get("text")):
@@ -271,16 +298,16 @@ def _table_semantics_risk(structure_json: dict[str, Any]) -> dict[str, Any]:
 
         dense_matrix = num_rows >= 8 and num_cols >= 6
         very_dense_matrix = num_rows >= 12 and num_cols >= 8
-        weak_header_signal = header_cell_count == 0 or (
-            num_cols >= 4 and len(header_rows) == 0
-        )
+        weak_header_signal = header_cell_count == 0 or (num_cols >= 4 and len(header_rows) == 0)
         multi_level_headers = len(header_rows) > 1 or len(row_header_columns) > 1
         sparse_text = nonempty_cells < max(4, len(cells) * 0.35)
-        llm_confirmed = bool(element.get("table_llm_confirmed", False)) and (
-            str(element.get("table_llm_confidence") or "").strip() == "high"
-        ) and (
-            str(element.get("table_llm_action") or "").strip()
-            in {"confirm_current_headers", "set_table_headers"}
+        llm_confirmed = (
+            bool(element.get("table_llm_confirmed", False))
+            and (str(element.get("table_llm_confidence") or "").strip() == "high")
+            and (
+                str(element.get("table_llm_action") or "").strip()
+                in {"confirm_current_headers", "set_table_headers"}
+            )
         )
 
         risk_score = 0.0
@@ -312,19 +339,21 @@ def _table_semantics_risk(structure_json: dict[str, Any]) -> dict[str, Any]:
             high_risk_tables += 1
 
         total_risk_score += risk_score
-        targets.append({
-            "table_review_id": str(element.get("review_id") or f"review-{index}"),
-            "page": page,
-            "bbox": element.get("bbox") if isinstance(element.get("bbox"), dict) else None,
-            "num_rows": num_rows,
-            "num_cols": num_cols,
-            "risk_score": round(risk_score, 2),
-            "risk_reasons": reasons,
-            "header_rows": sorted(header_rows),
-            "row_header_columns": sorted(row_header_columns),
-            "llm_confirmed": llm_confirmed,
-            "text_excerpt": _normalize_text(element.get("text"))[:240],
-        })
+        targets.append(
+            {
+                "table_review_id": str(element.get("review_id") or f"review-{index}"),
+                "page": page,
+                "bbox": element.get("bbox") if isinstance(element.get("bbox"), dict) else None,
+                "num_rows": num_rows,
+                "num_cols": num_cols,
+                "risk_score": round(risk_score, 2),
+                "risk_reasons": reasons,
+                "header_rows": sorted(header_rows),
+                "row_header_columns": sorted(row_header_columns),
+                "llm_confirmed": llm_confirmed,
+                "text_excerpt": _normalize_text(element.get("text"))[:240],
+            }
+        )
 
     targets.sort(
         key=lambda item: (
@@ -335,7 +364,9 @@ def _table_semantics_risk(structure_json: dict[str, Any]) -> dict[str, Any]:
     )
     return {
         "table_count": sum(
-            1 for element in elements if isinstance(element, dict) and element.get("type") == "table"
+            1
+            for element in elements
+            if isinstance(element, dict) and element.get("type") == "table"
         ),
         "complex_tables": complex_tables,
         "high_risk_tables": high_risk_tables,
@@ -542,16 +573,20 @@ def _check_link_text_quality(output_pdf: Path) -> list[dict[str, Any]]:
                         if action is not None and hasattr(action, "get"):
                             uri = str(action.get("/URI", "")).strip()
                         has_dest = annotation.get("/Dest") is not None or (
-                            action is not None and hasattr(action, "get") and str(action.get("/S", "")) == "/GoTo"
+                            action is not None
+                            and hasattr(action, "get")
+                            and str(action.get("/S", "")) == "/GoTo"
                         )
                         if _is_generated_link_contents(contents, uri=uri, has_dest=has_dest):
                             continue
                         if not contents or _is_poor_link_text(contents):
-                            poor_links.append({
-                                "page": page_idx,
-                                "text": contents or "(empty)",
-                                "uri": uri,
-                            })
+                            poor_links.append(
+                                {
+                                    "page": page_idx,
+                                    "text": contents or "(empty)",
+                                    "uri": uri,
+                                }
+                            )
                     except Exception:
                         continue
     except Exception:
@@ -593,11 +628,13 @@ def _check_internal_link_destinations(output_pdf: Path) -> list[dict[str, Any]]:
                             dest_name = _canonical_named_destination(dest)
                             if dest_name is not None:
                                 if dest_name not in named_dests:
-                                    broken.append({
-                                        "page": page_idx,
-                                        "dest": dest_name,
-                                        "reason": "Named destination not found",
-                                    })
+                                    broken.append(
+                                        {
+                                            "page": page_idx,
+                                            "dest": dest_name,
+                                            "reason": "Named destination not found",
+                                        }
+                                    )
                                 continue
                             if isinstance(dest, pikepdf.Array) and len(dest) >= 1:
                                 # Direct page reference — verify page object exists
@@ -611,24 +648,30 @@ def _check_internal_link_destinations(output_pdf: Path) -> list[dict[str, Any]]:
                                 dest_name = _canonical_named_destination(goto_dest)
                                 if dest_name is not None:
                                     if dest_name not in named_dests:
-                                        broken.append({
-                                            "page": page_idx,
-                                            "dest": dest_name,
-                                            "reason": "GoTo destination not found",
-                                        })
+                                        broken.append(
+                                            {
+                                                "page": page_idx,
+                                                "dest": dest_name,
+                                                "reason": "GoTo destination not found",
+                                            }
+                                        )
                                 elif isinstance(goto_dest, pikepdf.Array) and len(goto_dest) >= 1:
                                     # Direct page ref in array — try to resolve
                                     try:
                                         page_ref = goto_dest[0]
-                                        if isinstance(page_ref, pikepdf.Object) and hasattr(page_ref, "objgen"):
+                                        if isinstance(page_ref, pikepdf.Object) and hasattr(
+                                            page_ref, "objgen"
+                                        ):
                                             # Verify the referenced object exists
                                             _ = page_ref.get("/Type")
                                     except Exception:
-                                        broken.append({
-                                            "page": page_idx,
-                                            "dest": str(goto_dest),
-                                            "reason": "GoTo page reference unresolvable",
-                                        })
+                                        broken.append(
+                                            {
+                                                "page": page_idx,
+                                                "dest": str(goto_dest),
+                                                "reason": "GoTo page reference unresolvable",
+                                            }
+                                        )
                     except Exception:
                         continue
     except Exception:
@@ -654,7 +697,7 @@ def _task_for_violation(violation: dict[str, Any]) -> tuple[str, str, str]:
         return (
             "form_semantics",
             "Verify form field labels",
-            "Some form fields still need recommendation review for accessible labeling.",
+            "Some form fields still need human follow-up for accessible labeling.",
         )
     if category == "fonts" or FONT_RULE_FRAGMENT in rule_id:
         return (
@@ -672,19 +715,19 @@ def _task_for_violation(violation: dict[str, Any]) -> tuple[str, str, str]:
         return (
             "alt_text",
             "Verify figure descriptions",
-            "Some figure descriptions still require recommendation review for accuracy.",
+            "Some figure descriptions still need a human spot-check for accuracy.",
         )
     if category in {"annotations", "links"}:
         return (
             "annotation_description",
             "Verify annotations and link descriptions",
-            "Annotations or links still need recommendation review for accessible naming and structure.",
+            "Annotations or links still need human review for accessible naming and structure.",
         )
     if category == "tables" or any(keyword in description for keyword in TABLE_KEYWORDS):
         return (
             "table_semantics",
             "Verify table semantics",
-            "Table structure still needs recommendation review for headers and reading order.",
+            "Table structure still needs structural follow-up for headers and reading order.",
         )
     return (
         "reading_order",
@@ -703,13 +746,17 @@ def _rule_id_from_summary(summary: dict[str, Any]) -> str:
 
 
 def _iter_verapdf_rule_summaries(raw_validation_report: dict[str, Any] | None):
-    report_root = raw_validation_report.get("report", {}) if isinstance(raw_validation_report, dict) else {}
+    report_root = (
+        raw_validation_report.get("report", {}) if isinstance(raw_validation_report, dict) else {}
+    )
     jobs = report_root.get("jobs", []) if isinstance(report_root, dict) else []
     for job in jobs:
         if not isinstance(job, dict):
             continue
         validation_raw = job.get("validationResult", {})
-        validation_entries = validation_raw if isinstance(validation_raw, list) else [validation_raw]
+        validation_entries = (
+            validation_raw if isinstance(validation_raw, list) else [validation_raw]
+        )
         for validation in validation_entries:
             if not isinstance(validation, dict):
                 continue
@@ -865,15 +912,17 @@ def assess_fidelity(
     ]
 
     if unresolved_errors:
-        checks.append({
-            "check": "compliance",
-            "status": "fail",
-            "message": f"{len(unresolved_errors)} validation rule(s) still require remediation.",
-            "metrics": {
-                "remaining_rules": len(unresolved_errors),
-                "remaining_errors": validation_report.get("summary", {}).get("errors", 0),
-            },
-        })
+        checks.append(
+            {
+                "check": "compliance",
+                "status": "fail",
+                "message": f"{len(unresolved_errors)} validation rule(s) still require remediation.",
+                "metrics": {
+                    "remaining_rules": len(unresolved_errors),
+                    "remaining_errors": validation_report.get("summary", {}).get("errors", 0),
+                },
+            }
+        )
         grouped: dict[str, dict[str, Any]] = {}
         for violation in unresolved_errors:
             task_type, title, detail = _task_for_violation(violation)
@@ -881,11 +930,11 @@ def assess_fidelity(
             entry = grouped.setdefault(
                 key,
                 {
-                "task_type": task_type,
-                "title": title,
-                "detail": detail,
-                "count": 0,
-                "rules": [],
+                    "task_type": task_type,
+                    "title": title,
+                    "detail": detail,
+                    "count": 0,
+                    "rules": [],
                 },
             )
             count = violation.get("count", 1)
@@ -906,12 +955,14 @@ def assess_fidelity(
                 metadata={"rules": entry["rules"], "count": entry["count"]},
             )
     else:
-        checks.append({
-            "check": "compliance",
-            "status": "pass",
-            "message": "No remaining validation errors.",
-            "metrics": {"remaining_rules": 0, "remaining_errors": 0},
-        })
+        checks.append(
+            {
+                "check": "compliance",
+                "status": "pass",
+                "message": "No remaining validation errors.",
+                "metrics": {"remaining_rules": 0, "remaining_errors": 0},
+            }
+        )
 
     remaining_form_validation_errors = sum(
         int(violation.get("count", 1) or 1)
@@ -924,9 +975,7 @@ def assess_fidelity(
     source_text = _extract_pdf_text_sample(comparison_pdf)
     output_text = _extract_pdf_text_sample(output_pdf)
     original_source_text = (
-        _extract_pdf_text_sample(input_pdf)
-        if using_alternate_source
-        else source_text
+        _extract_pdf_text_sample(input_pdf) if using_alternate_source else source_text
     )
     meaningful_structure_elements = _meaningful_structure_element_count(structure_json)
 
@@ -969,7 +1018,9 @@ def assess_fidelity(
             )
         elif not has_meaningful_ocr_text:
             status = "warning"
-            message = "Scanned document OCR produced limited extractable text; spot-check the result."
+            message = (
+                "Scanned document OCR produced limited extractable text; spot-check the result."
+            )
             add_task(
                 "review:content_fidelity",
                 task_type="content_fidelity",
@@ -987,16 +1038,18 @@ def assess_fidelity(
                 },
             )
 
-        checks.append({
-            "check": "ocr_coverage",
-            "status": status,
-            "message": message,
-            "metrics": {
-                "output_chars": len(output_text),
-                "meaningful_structure_elements": meaningful_structure_elements,
-                **ocr_metrics,
-            },
-        })
+        checks.append(
+            {
+                "check": "ocr_coverage",
+                "status": status,
+                "message": message,
+                "metrics": {
+                    "output_chars": len(output_text),
+                    "meaningful_structure_elements": meaningful_structure_elements,
+                    **ocr_metrics,
+                },
+            }
+        )
 
     if len(source_text) >= TEXT_SAMPLE_MIN_CHARS and len(output_text) >= TEXT_SAMPLE_MIN_CHARS:
         similarity = SequenceMatcher(None, source_text, output_text).ratio()
@@ -1062,43 +1115,49 @@ def assess_fidelity(
                     "length_ratio": round(length_ratio, 4),
                 },
             )
-        checks.append({
-            "check": "text_drift",
-            "status": status,
-            "message": (
-                "Compared the final PDF against the source used for the final tagging pass."
-                if using_alternate_source
-                else "Compared source and remediated text samples."
-            ),
-            "metrics": {
-                "similarity": round(similarity, 4),
-                "length_ratio": round(length_ratio, 4),
-                "source_chars": len(source_text),
-                "output_chars": len(output_text),
-                "comparison_source": "retag_input" if using_alternate_source else "original_input",
-                **(
-                    {"original_similarity": round(original_similarity, 4)}
-                    if original_similarity is not None
-                    else {}
+        checks.append(
+            {
+                "check": "text_drift",
+                "status": status,
+                "message": (
+                    "Compared the final PDF against the source used for the final tagging pass."
+                    if using_alternate_source
+                    else "Compared source and remediated text samples."
                 ),
-                **(
-                    {"original_length_ratio": round(original_length_ratio, 4)}
-                    if original_length_ratio is not None
-                    else {}
-                ),
-            },
-        })
+                "metrics": {
+                    "similarity": round(similarity, 4),
+                    "length_ratio": round(length_ratio, 4),
+                    "source_chars": len(source_text),
+                    "output_chars": len(output_text),
+                    "comparison_source": "retag_input"
+                    if using_alternate_source
+                    else "original_input",
+                    **(
+                        {"original_similarity": round(original_similarity, 4)}
+                        if original_similarity is not None
+                        else {}
+                    ),
+                    **(
+                        {"original_length_ratio": round(original_length_ratio, 4)}
+                        if original_length_ratio is not None
+                        else {}
+                    ),
+                },
+            }
+        )
     else:
-        checks.append({
-            "check": "text_drift",
-            "status": "skip",
-            "message": "Skipped text-drift comparison due to limited extractable text.",
-            "metrics": {
-                "source_chars": len(source_text),
-                "output_chars": len(output_text),
-                "classification": classification or "unknown",
-            },
-        })
+        checks.append(
+            {
+                "check": "text_drift",
+                "status": "skip",
+                "message": "Skipped text-drift comparison due to limited extractable text.",
+                "metrics": {
+                    "source_chars": len(source_text),
+                    "output_chars": len(output_text),
+                    "classification": classification or "unknown",
+                },
+            }
+        )
 
     grounded_text = _grounded_text_risk(output_pdf, structure_json)
     if grounded_text["target_count"] > 0:
@@ -1115,35 +1174,41 @@ def assess_fidelity(
             blocking=False,
             metadata={
                 "grounded_text_candidate": True,
-                "pages_to_check": sorted({
-                    int(target["page"])
-                    for target in grounded_text["targets"]
-                    if isinstance(target.get("page"), int)
-                }),
+                "pages_to_check": sorted(
+                    {
+                        int(target["page"])
+                        for target in grounded_text["targets"]
+                        if isinstance(target.get("page"), int)
+                    }
+                ),
                 "flagged_blocks": grounded_text["targets"],
                 "encoding_problem_count": grounded_text["encoding_problem_count"],
                 "grounded_target_count": grounded_text["target_count"],
             },
         )
-        checks.append({
-            "check": "grounded_text_fidelity",
-            "status": "warning",
-            "message": "Found suspicious extracted blocks with contradictory OCR evidence; awaiting semantic adjudication.",
-            "metrics": {
-                "candidate_blocks": grounded_text["target_count"],
-                "encoding_problem_candidates": grounded_text["encoding_problem_count"],
-            },
-        })
+        checks.append(
+            {
+                "check": "grounded_text_fidelity",
+                "status": "warning",
+                "message": "Found suspicious extracted blocks with contradictory OCR evidence; awaiting semantic adjudication.",
+                "metrics": {
+                    "candidate_blocks": grounded_text["target_count"],
+                    "encoding_problem_candidates": grounded_text["encoding_problem_count"],
+                },
+            }
+        )
     else:
-        checks.append({
-            "check": "grounded_text_fidelity",
-            "status": "pass",
-            "message": "No suspicious text blocks with contradictory OCR evidence were detected.",
-            "metrics": {
-                "candidate_blocks": 0,
-                "encoding_problem_candidates": 0,
-            },
-        })
+        checks.append(
+            {
+                "check": "grounded_text_fidelity",
+                "status": "pass",
+                "message": "No suspicious text blocks with contradictory OCR evidence were detected.",
+                "metrics": {
+                    "candidate_blocks": 0,
+                    "encoding_problem_candidates": 0,
+                },
+            }
+        )
 
     fragments = _collect_structural_fragments(structure_json)
     if fragments and output_text:
@@ -1180,22 +1245,27 @@ def assess_fidelity(
                 metadata=order_metrics,
             )
 
-        checks.append({
-            "check": "reading_order",
-            "status": status,
-            "message": "Compared structural text fragments against remediated text order.",
-            "metrics": order_metrics,
-        })
+        checks.append(
+            {
+                "check": "reading_order",
+                "status": status,
+                "message": "Compared structural text fragments against remediated text order.",
+                "metrics": order_metrics,
+            }
+        )
     else:
-        checks.append({
-            "check": "reading_order",
-            "status": "skip",
-            "message": "Skipped reading-order heuristic due to limited structural text.",
-            "metrics": {"fragments_considered": len(fragments)},
-        })
+        checks.append(
+            {
+                "check": "reading_order",
+                "status": "skip",
+                "message": "Skipped reading-order heuristic due to limited structural text.",
+                "metrics": {"fragments_considered": len(fragments)},
+            }
+        )
 
     elements = structure_json.get("elements", [])
     figure_captions: dict[int, str] = {}
+    figure_pages: dict[int, int] = {}
     table_count = 0
     if isinstance(elements, list):
         for element in elements:
@@ -1203,11 +1273,16 @@ def assess_fidelity(
                 continue
             if element.get("type") == "figure" and isinstance(element.get("figure_index"), int):
                 figure_captions[element["figure_index"]] = _normalize_text(element.get("caption"))
+                page_raw = element.get("page")
+                if isinstance(page_raw, int) and page_raw >= 0:
+                    figure_pages[element["figure_index"]] = page_raw + 1
             elif element.get("type") == "table":
                 table_count += 1
 
     tagged_tables = tagging_metrics.get("tables_tagged", 0)
-    tagged_table_count = tagged_tables if isinstance(tagged_tables, int) and tagged_tables >= 0 else 0
+    tagged_table_count = (
+        tagged_tables if isinstance(tagged_tables, int) and tagged_tables >= 0 else 0
+    )
     if table_count > 0:
         coverage = tagged_table_count / table_count
         status = "pass" if tagged_table_count >= table_count else "warning"
@@ -1227,24 +1302,28 @@ def assess_fidelity(
                     "detected_tables": table_count,
                     "tagged_tables": tagged_table_count,
                     "coverage": round(coverage, 4),
-                    "pages_to_check": sorted({
-                        int(target["page"])
-                        for target in table_targets
-                        if isinstance(target.get("page"), int)
-                    }),
+                    "pages_to_check": sorted(
+                        {
+                            int(target["page"])
+                            for target in table_targets
+                            if isinstance(target.get("page"), int)
+                        }
+                    ),
                     "table_review_targets": table_targets,
                 },
             )
-        checks.append({
-            "check": "table_coverage",
-            "status": status,
-            "message": "Compared detected tables against tagged tables.",
-            "metrics": {
-                "detected_tables": table_count,
-                "tagged_tables": tagged_table_count,
-                "coverage": round(coverage, 4),
-            },
-        })
+        checks.append(
+            {
+                "check": "table_coverage",
+                "status": status,
+                "message": "Compared detected tables against tagged tables.",
+                "metrics": {
+                    "detected_tables": table_count,
+                    "tagged_tables": tagged_table_count,
+                    "coverage": round(coverage, 4),
+                },
+            }
+        )
 
         table_risk = _table_semantics_risk(structure_json)
         if table_risk["complex_tables"] > 0:
@@ -1262,8 +1341,8 @@ def assess_fidelity(
                 blocking = True
                 severity = "high"
                 detail = (
-                    "Complex tables with dense layouts, weak header signals, or merged cells need recommendation review "
-                    "to confirm accessible table semantics."
+                    "Complex tables with dense layouts, weak header signals, or merged cells need further structural "
+                    "processing to confirm accessible table semantics."
                 )
 
             add_task(
@@ -1279,53 +1358,63 @@ def assess_fidelity(
                     "complex_tables": table_risk["complex_tables"],
                     "high_risk_tables": table_risk["high_risk_tables"],
                     "risk_score": table_risk["risk_score"],
-                    "pages_to_check": sorted({
-                        int(target["page"])
-                        for target in risk_targets
-                        if isinstance(target.get("page"), int)
-                    }),
+                    "pages_to_check": sorted(
+                        {
+                            int(target["page"])
+                            for target in risk_targets
+                            if isinstance(target.get("page"), int)
+                        }
+                    ),
                     "table_review_targets": risk_targets,
                 },
             )
 
-            checks.append({
-                "check": "table_risk",
-                "status": risk_status,
-                "message": "Flagged tables with complex structure, weak header signals, or merged cells.",
-                "metrics": {
-                    "complex_tables": table_risk["complex_tables"],
-                    "high_risk_tables": table_risk["high_risk_tables"],
-                    "risk_score": table_risk["risk_score"],
-                },
-            })
+            checks.append(
+                {
+                    "check": "table_risk",
+                    "status": risk_status,
+                    "message": "Flagged tables with complex structure, weak header signals, or merged cells.",
+                    "metrics": {
+                        "complex_tables": table_risk["complex_tables"],
+                        "high_risk_tables": table_risk["high_risk_tables"],
+                        "risk_score": table_risk["risk_score"],
+                    },
+                }
+            )
         else:
-            checks.append({
+            checks.append(
+                {
+                    "check": "table_risk",
+                    "status": "pass",
+                    "message": "No semantically risky tables detected from structure metadata.",
+                    "metrics": {
+                        "complex_tables": 0,
+                        "high_risk_tables": 0,
+                        "risk_score": 0.0,
+                    },
+                }
+            )
+    else:
+        checks.append(
+            {
+                "check": "table_coverage",
+                "status": "skip",
+                "message": "No tables detected in structure extraction.",
+                "metrics": {"detected_tables": 0, "tagged_tables": tagged_table_count},
+            }
+        )
+        checks.append(
+            {
                 "check": "table_risk",
-                "status": "pass",
-                "message": "No semantically risky tables detected from structure metadata.",
+                "status": "skip",
+                "message": "No tables detected in structure extraction.",
                 "metrics": {
                     "complex_tables": 0,
                     "high_risk_tables": 0,
                     "risk_score": 0.0,
                 },
-            })
-    else:
-        checks.append({
-            "check": "table_coverage",
-            "status": "skip",
-            "message": "No tables detected in structure extraction.",
-            "metrics": {"detected_tables": 0, "tagged_tables": tagged_table_count},
-        })
-        checks.append({
-            "check": "table_risk",
-            "status": "skip",
-            "message": "No tables detected in structure extraction.",
-            "metrics": {
-                "complex_tables": 0,
-                "high_risk_tables": 0,
-                "risk_score": 0.0,
-            },
-        })
+            }
+        )
 
     form_risk = _form_semantics_risk(output_pdf)
     if form_risk["field_count"] > 0:
@@ -1349,42 +1438,148 @@ def assess_fidelity(
                     "missing_labels": form_risk["missing_labels"],
                     "weak_labels": form_risk["weak_labels"],
                     "remaining_validation_errors": remaining_form_validation_errors,
-                    "pages_to_check": sorted({
-                        int(target["page"])
-                        for target in form_risk["targets"]
-                        if isinstance(target.get("page"), int)
-                    }),
+                    "pages_to_check": sorted(
+                        {
+                            int(target["page"])
+                            for target in form_risk["targets"]
+                            if isinstance(target.get("page"), int)
+                        }
+                    ),
                     "field_review_targets": form_risk["targets"][:12],
                 },
             )
             form_status = "fail"
         else:
             form_status = "pass"
-        checks.append({
-            "check": "form_semantics",
-            "status": form_status,
-            "message": "Checked whether widget annotations have accessible field labels.",
-            "metrics": {
-                "field_count": form_risk["field_count"],
-                "missing_labels": form_risk["missing_labels"],
-                "weak_labels": form_risk["weak_labels"],
-                "remaining_validation_errors": remaining_form_validation_errors,
-            },
-        })
+        checks.append(
+            {
+                "check": "form_semantics",
+                "status": form_status,
+                "message": "Checked whether widget annotations have accessible field labels.",
+                "metrics": {
+                    "field_count": form_risk["field_count"],
+                    "missing_labels": form_risk["missing_labels"],
+                    "weak_labels": form_risk["weak_labels"],
+                    "remaining_validation_errors": remaining_form_validation_errors,
+                },
+            }
+        )
     else:
-        checks.append({
-            "check": "form_semantics",
-            "status": "skip",
-            "message": "No form fields detected in the output PDF.",
-            "metrics": {
-                "field_count": 0,
-                "missing_labels": 0,
-                "weak_labels": 0,
+        checks.append(
+            {
+                "check": "form_semantics",
+                "status": "skip",
+                "message": "No form fields detected in the output PDF.",
+                "metrics": {
+                    "field_count": 0,
+                    "missing_labels": 0,
+                    "weak_labels": 0,
+                },
+            }
+        )
+
+    suspicious_widgets = _widget_targets_for_rationalization(
+        working_pdf=output_pdf,
+        structure_json=structure_json,
+    )
+    if suspicious_widgets:
+        add_task(
+            "review:form_semantics:static_widgets",
+            task_type="form_semantics",
+            title="Remove static widget artifacts",
+            detail=(
+                "The output still contains text widgets that look like duplicated static content, "
+                "page chrome, or screenshot overlay text rather than real interactive controls."
+            ),
+            severity="high",
+            blocking=True,
+            metadata={
+                "candidate_count": len(suspicious_widgets),
+                "pages_to_check": sorted(
+                    {
+                        int(target["page"])
+                        for target in suspicious_widgets
+                        if isinstance(target.get("page"), int)
+                    }
+                ),
+                "field_review_targets": suspicious_widgets[:12],
             },
-        })
+        )
+        checks.append(
+            {
+                "check": "static_widget_artifacts",
+                "status": "fail",
+                "message": "Detected text widgets that still appear to be static duplicate content.",
+                "metrics": {
+                    "candidate_count": len(suspicious_widgets),
+                },
+            }
+        )
+    else:
+        checks.append(
+            {
+                "check": "static_widget_artifacts",
+                "status": "pass",
+                "message": "No suspicious static text widgets were detected in the output PDF.",
+                "metrics": {
+                    "candidate_count": 0,
+                },
+            }
+        )
+
+    missing_visual_figures = _collect_missing_visual_figure_targets(
+        working_pdf=output_pdf,
+        structure_json=structure_json,
+    )
+    if missing_visual_figures:
+        add_task(
+            "review:content_fidelity:visual_meaning_gap",
+            task_type="content_fidelity",
+            title="Add semantics for meaning-bearing page visuals",
+            detail=(
+                "Some pages still look dominated by charts, screenshots, or diagrams in the rendered PDF, "
+                "but the accessible structure does not expose them as figures with descriptions."
+            ),
+            severity="high",
+            blocking=True,
+            metadata={
+                "visual_meaning_gap": True,
+                "candidate_count": len(missing_visual_figures),
+                "pages_to_check": sorted(
+                    {
+                        int(target["page"])
+                        for target in missing_visual_figures
+                        if isinstance(target.get("page"), int)
+                    }
+                ),
+                "visual_targets": missing_visual_figures[:12],
+            },
+        )
+        checks.append(
+            {
+                "check": "visual_meaning_gap",
+                "status": "fail",
+                "message": "Detected dominant page visuals that are still missing figure semantics.",
+                "metrics": {
+                    "candidate_pages": len(missing_visual_figures),
+                },
+            }
+        )
+    else:
+        checks.append(
+            {
+                "check": "visual_meaning_gap",
+                "status": "pass",
+                "message": "No dominant page visuals were missing figure semantics.",
+                "metrics": {
+                    "candidate_pages": 0,
+                },
+            }
+        )
 
     machine_only_alt = 0
     caption_backed_alt = 0
+    machine_only_alt_pages: set[int] = set()
     for entry in alt_entries:
         if not isinstance(entry, dict) or entry.get("status") != "approved":
             continue
@@ -1398,6 +1593,10 @@ def assess_fidelity(
             caption_backed_alt += 1
         else:
             machine_only_alt += 1
+            if isinstance(figure_index, int):
+                page = figure_pages.get(figure_index)
+                if isinstance(page, int) and page > 0:
+                    machine_only_alt_pages.add(page)
 
     if machine_only_alt > 0:
         add_task(
@@ -1413,52 +1612,74 @@ def assess_fidelity(
             metadata={
                 "machine_only_alt": machine_only_alt,
                 "caption_backed_alt": caption_backed_alt,
+                "pages_to_check": sorted(machine_only_alt_pages),
             },
         )
         status = "warning"
     else:
         status = "pass"
-    checks.append({
-        "check": "alt_text_provenance",
-        "status": status,
-        "message": "Tracked whether approved alt text was human-edited, caption-backed, or machine-only.",
-        "metrics": {
-            "machine_only_alt": machine_only_alt,
-            "caption_backed_alt": caption_backed_alt,
-            "reviewed_alt_entries": len(alt_entries),
-        },
-    })
+    checks.append(
+        {
+            "check": "alt_text_provenance",
+            "status": status,
+            "message": "Tracked whether approved alt text was human-edited, caption-backed, or machine-only.",
+            "metrics": {
+                "machine_only_alt": machine_only_alt,
+                "caption_backed_alt": caption_backed_alt,
+                "reviewed_alt_entries": len(alt_entries),
+            },
+        }
+    )
 
     # ── 1A: Link text quality ─────────────────────────────────────────────
     poor_links = _check_link_text_quality(output_pdf)
     if poor_links:
+        pages_to_check = sorted(
+            {
+                int(item["page"])
+                for item in poor_links[:20]
+                if isinstance(item, dict) and isinstance(item.get("page"), int)
+            }
+        )
         add_task(
             "review:link_text_quality",
             task_type="annotation_description",
             title="Review non-descriptive link text",
             detail=(
                 f"{len(poor_links)} link(s) use non-descriptive text such as "
-                f"\"{poor_links[0]['text']}\". Screen reader users rely on "
+                f'"{poor_links[0]["text"]}". Screen reader users rely on '
                 "meaningful link labels to understand where links lead."
             ),
             severity="medium",
             blocking=False,
-            metadata={"poor_links": poor_links[:20]},
+            metadata={
+                "pages_to_check": pages_to_check,
+                "poor_links": poor_links[:20],
+            },
         )
-    checks.append({
-        "check": "link_text_quality",
-        "status": "warning" if poor_links else "pass",
-        "message": (
-            f"{len(poor_links)} link(s) with non-descriptive text detected."
-            if poor_links
-            else "All link text appears descriptive."
-        ),
-        "metrics": {"poor_link_count": len(poor_links)},
-    })
+    checks.append(
+        {
+            "check": "link_text_quality",
+            "status": "warning" if poor_links else "pass",
+            "message": (
+                f"{len(poor_links)} link(s) with non-descriptive text detected."
+                if poor_links
+                else "All link text appears descriptive."
+            ),
+            "metrics": {"poor_link_count": len(poor_links)},
+        }
+    )
 
     # ── 1C: Internal link destination validation ──────────────────────────
     broken_links = _check_internal_link_destinations(output_pdf)
     if broken_links:
+        pages_to_check = sorted(
+            {
+                int(item["page"])
+                for item in broken_links[:20]
+                if isinstance(item, dict) and isinstance(item.get("page"), int)
+            }
+        )
         add_task(
             "review:broken_internal_links",
             task_type="annotation_description",
@@ -1470,18 +1691,23 @@ def assess_fidelity(
             ),
             severity="medium",
             blocking=False,
-            metadata={"broken_links": broken_links[:20]},
+            metadata={
+                "pages_to_check": pages_to_check,
+                "broken_links": broken_links[:20],
+            },
         )
-    checks.append({
-        "check": "internal_link_destinations",
-        "status": "warning" if broken_links else "pass",
-        "message": (
-            f"{len(broken_links)} broken internal link destination(s) detected."
-            if broken_links
-            else "All internal link destinations resolve."
-        ),
-        "metrics": {"broken_link_count": len(broken_links)},
-    })
+    checks.append(
+        {
+            "check": "internal_link_destinations",
+            "status": "warning" if broken_links else "pass",
+            "message": (
+                f"{len(broken_links)} broken internal link destination(s) detected."
+                if broken_links
+                else "All internal link destinations resolve."
+            ),
+            "metrics": {"broken_link_count": len(broken_links)},
+        }
+    )
 
     # ── Font text fidelity ────────────────────────────────────────────────
     font_remediation = validation_report.get("remediation", {}).get("font_remediation", {})
@@ -1492,9 +1718,7 @@ def assess_fidelity(
         or {}
     )
     font_diagnostics_summary = (
-        font_diagnostics.get("summary")
-        if isinstance(font_diagnostics, dict)
-        else {}
+        font_diagnostics.get("summary") if isinstance(font_diagnostics, dict) else {}
     )
     top_font_profiles = []
     if isinstance(font_diagnostics, dict):
@@ -1503,33 +1727,47 @@ def assess_fidelity(
             for profile in raw_profiles[:3]:
                 if not isinstance(profile, dict):
                     continue
-                top_font_profiles.append({
-                    "base_font": str(profile.get("base_font") or ""),
-                    "subtype": str(profile.get("subtype") or ""),
-                    "issue_tags": profile.get("issue_tags") if isinstance(profile.get("issue_tags"), list) else [],
-                    "missing_used_code_count": int(profile.get("missing_used_code_count", 0) or 0),
-                    "invalid_tounicode_entries": int(profile.get("invalid_tounicode_entries", 0) or 0),
-                    "embedded": bool(profile.get("embedded", False)),
-                })
+                top_font_profiles.append(
+                    {
+                        "base_font": str(profile.get("base_font") or ""),
+                        "subtype": str(profile.get("subtype") or ""),
+                        "issue_tags": profile.get("issue_tags")
+                        if isinstance(profile.get("issue_tags"), list)
+                        else [],
+                        "missing_used_code_count": int(
+                            profile.get("missing_used_code_count", 0) or 0
+                        ),
+                        "invalid_tounicode_entries": int(
+                            profile.get("invalid_tounicode_entries", 0) or 0
+                        ),
+                        "embedded": bool(profile.get("embedded", False)),
+                    }
+                )
     remaining_font_errors = sum(
         (
-            violation.get("count", 1) if isinstance(violation.get("count"), int) and violation.get("count", 1) > 0 else 1
+            violation.get("count", 1)
+            if isinstance(violation.get("count"), int) and violation.get("count", 1) > 0
+            else 1
         )
         for violation in unresolved_errors
-        if isinstance(violation, dict) and (
+        if isinstance(violation, dict)
+        and (
             str(violation.get("category") or "").lower() == "fonts"
             or FONT_RULE_FRAGMENT in str(violation.get("rule_id") or "")
         )
     )
-    font_rule_ids = sorted({
-        str(violation.get("rule_id") or "").strip()
-        for violation in unresolved_errors
-        if isinstance(violation, dict) and (
-            str(violation.get("category") or "").lower() == "fonts"
-            or FONT_RULE_FRAGMENT in str(violation.get("rule_id") or "")
-        )
-        and str(violation.get("rule_id") or "").strip()
-    })
+    font_rule_ids = sorted(
+        {
+            str(violation.get("rule_id") or "").strip()
+            for violation in unresolved_errors
+            if isinstance(violation, dict)
+            and (
+                str(violation.get("category") or "").lower() == "fonts"
+                or FONT_RULE_FRAGMENT in str(violation.get("rule_id") or "")
+            )
+            and str(violation.get("rule_id") or "").strip()
+        }
+    )
     font_review_targets, pages_to_check, fonts_to_check = _extract_font_review_targets(
         raw_validation_report,
         set(font_rule_ids),
@@ -1558,31 +1796,35 @@ def assess_fidelity(
                 "top_font_profiles": top_font_profiles,
             },
         )
-        checks.append({
-            "check": "font_text_fidelity",
-            "status": "fail",
-            "message": "Font-related compliance or visible-text risk requires recommendation review.",
-            "metrics": {
-                "remaining_font_errors": remaining_font_errors,
-                "review_pages": len(pages_to_check),
-                "review_fonts": len(fonts_to_check),
-                "automatic_unicode_allowed": bool(unicode_gate.get("allow_automatic", True))
-                if isinstance(unicode_gate, dict)
-                else True,
-            },
-        })
+        checks.append(
+            {
+                "check": "font_text_fidelity",
+                "status": "fail",
+                "message": "Font-related compliance or visible-text risk requires additional remediation.",
+                "metrics": {
+                    "remaining_font_errors": remaining_font_errors,
+                    "review_pages": len(pages_to_check),
+                    "review_fonts": len(fonts_to_check),
+                    "automatic_unicode_allowed": bool(unicode_gate.get("allow_automatic", True))
+                    if isinstance(unicode_gate, dict)
+                    else True,
+                },
+            }
+        )
     else:
-        checks.append({
-            "check": "font_text_fidelity",
-            "status": "pass",
-            "message": "No residual font-text fidelity risk was detected.",
-            "metrics": {
-                "remaining_font_errors": 0,
-                "automatic_unicode_allowed": bool(unicode_gate.get("allow_automatic", True))
-                if isinstance(unicode_gate, dict)
-                else True,
-            },
-        })
+        checks.append(
+            {
+                "check": "font_text_fidelity",
+                "status": "pass",
+                "message": "No residual font-text fidelity risk was detected.",
+                "metrics": {
+                    "remaining_font_errors": 0,
+                    "automatic_unicode_allowed": bool(unicode_gate.get("allow_automatic", True))
+                    if isinstance(unicode_gate, dict)
+                    else True,
+                },
+            }
+        )
 
     tasks = sorted(
         tasks_by_key.values(),

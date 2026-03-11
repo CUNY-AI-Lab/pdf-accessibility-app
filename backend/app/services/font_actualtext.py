@@ -1,10 +1,8 @@
-import re
 from pathlib import Path
 
 import pikepdf
 
 from app.services.pdf_context import parse_verapdf_context_path
-
 
 TEXT_SHOWING_OPERATORS = {"Tj", "TJ", "'", '"'}
 

@@ -3,7 +3,7 @@ import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -74,8 +74,8 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
         except (TypeError, ValueError, IndexError):
             return None
         if retry_after_dt.tzinfo is None:
-            retry_after_dt = retry_after_dt.replace(tzinfo=timezone.utc)
-        seconds = (retry_after_dt - datetime.now(timezone.utc)).total_seconds()
+            retry_after_dt = retry_after_dt.replace(tzinfo=UTC)
+        seconds = (retry_after_dt - datetime.now(UTC)).total_seconds()
     return max(0.0, seconds)
 
 

@@ -5,10 +5,10 @@ interface AppliedChangeCardProps {
   change: AppliedChange;
   onKeep: (change: AppliedChange) => Promise<void> | void;
   onUndo: (change: AppliedChange) => Promise<void> | void;
-  onSuggestAlternative: (change: AppliedChange, feedback?: string) => Promise<void> | void;
+  onRevise: (change: AppliedChange, feedback?: string) => Promise<void> | void;
   keeping: boolean;
   undoing: boolean;
-  suggesting: boolean;
+  revising: boolean;
   actionError?: Error | null;
 }
 
@@ -16,10 +16,10 @@ export default function AppliedChangeCard({
   change,
   onKeep,
   onUndo,
-  onSuggestAlternative,
+  onRevise,
   keeping,
   undoing,
-  suggesting,
+  revising,
   actionError,
 }: AppliedChangeCardProps) {
   const [feedback, setFeedback] = useState("");
@@ -51,15 +51,15 @@ export default function AppliedChangeCard({
         <button
           type="button"
           onClick={() => onKeep(change)}
-          disabled={keeping || undoing || suggesting}
+          disabled={keeping || undoing || revising}
           className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
         >
-          {keeping ? "Keeping..." : "Keep change"}
+          {keeping ? "Keeping..." : "Keep"}
         </button>
         <button
           type="button"
           onClick={() => onUndo(change)}
-          disabled={keeping || undoing || suggesting}
+          disabled={keeping || undoing || revising}
           className="rounded-lg border border-ink/10 bg-white px-4 py-2 text-sm font-medium text-ink disabled:opacity-50"
         >
           {undoing ? "Undoing..." : "Undo"}
@@ -68,23 +68,23 @@ export default function AppliedChangeCard({
 
       <div className="mt-4 rounded-lg border border-ink/8 bg-white/70 p-3">
         <label className="block text-xs font-medium uppercase tracking-wide text-ink-muted mb-2">
-          Suggest alternative
+          Revise
         </label>
         <textarea
           value={feedback}
           onChange={(event) => setFeedback(event.target.value)}
           rows={3}
           className="w-full rounded-lg border border-ink/10 bg-white px-3 py-2 text-sm text-ink placeholder:text-ink-muted/70"
-          placeholder="Explain what was wrong with this change and the model will revise it."
+          placeholder="Explain what should change and the app will retry this edit."
         />
         <div className="mt-3 flex justify-end">
           <button
             type="button"
-            onClick={() => onSuggestAlternative(change, feedback)}
-            disabled={!feedback.trim() || keeping || undoing || suggesting}
+            onClick={() => onRevise(change, feedback)}
+            disabled={!feedback.trim() || keeping || undoing || revising}
             className="rounded-lg border border-accent/20 bg-accent/10 px-4 py-2 text-sm font-medium text-accent disabled:opacity-50"
           >
-            {suggesting ? "Revising..." : "Suggest alternative"}
+            {revising ? "Revising..." : "Revise"}
           </button>
         </div>
       </div>

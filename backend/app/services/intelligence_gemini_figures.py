@@ -10,7 +10,11 @@ from app.models import Job
 from app.pipeline.structure import FigureInfo
 from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
-from app.services.intelligence_llm_utils import context_json_part, page_preview_parts, request_llm_json
+from app.services.intelligence_llm_utils import (
+    context_json_part,
+    page_preview_parts,
+    request_llm_json,
+)
 from app.services.llm_client import LlmClient
 from app.services.semantic_units import SemanticUnit
 
@@ -22,7 +26,7 @@ For each candidate, decide whether it should:
 - keep figure semantics with short alt text
 - be marked decorative
 - be reclassified because it is actually a table, form region, or artifact
-- fall back to another recommendation pass
+- fall back to manual follow-up
 
 Rules:
 - Decide each figure candidate independently.
@@ -56,11 +60,19 @@ FIGURE_BATCH_SCHEMA: dict[str, Any] = {
                     "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
                     "suggested_action": {
                         "type": "string",
-                        "enum": ["set_alt_text", "mark_decorative", "reclassify_region", "manual_only"],
+                        "enum": [
+                            "set_alt_text",
+                            "mark_decorative",
+                            "reclassify_region",
+                            "manual_only",
+                        ],
                     },
                     "reason": {"type": "string"},
                     "alt_text": {"type": "string"},
-                    "resolved_kind": {"type": "string", "enum": ["table", "form_region", "artifact"]},
+                    "resolved_kind": {
+                        "type": "string",
+                        "enum": ["table", "form_region", "artifact"],
+                    },
                     "is_decorative": {"type": "boolean"},
                 },
                 "required": [
@@ -93,12 +105,17 @@ def _normalize_figure_result(*, figure_index: int, raw: dict[str, Any]) -> dict[
     confidence = confidence_label(raw.get("confidence"))
     suggested_action = str(raw.get("suggested_action") or "manual_only").strip() or "manual_only"
     resolved_kind = str(raw.get("resolved_kind") or "").strip() or None
-    if suggested_action == "reclassify_region" and resolved_kind not in {"table", "form_region", "artifact"}:
+    if suggested_action == "reclassify_region" and resolved_kind not in {
+        "table",
+        "form_region",
+        "artifact",
+    }:
         suggested_action = "manual_only"
         resolved_kind = None
     return {
         "task_type": "figure_intelligence",
-        "summary": str(raw.get("summary") or "Figure review required.").strip() or "Figure review required.",
+        "summary": str(raw.get("summary") or "Figure review required.").strip()
+        or "Figure review required.",
         "confidence": confidence,
         "confidence_score": confidence_score(confidence),
         "suggested_action": suggested_action,
@@ -143,7 +160,8 @@ def _figure_page_context(page_figures: list[FigureInfo]) -> dict[int, dict[str, 
     for figure in page_figures:
         area = areas.get(figure.index, 0.0)
         larger_siblings = [
-            sibling for sibling in page_figures
+            sibling
+            for sibling in page_figures
             if sibling.index != figure.index and areas.get(sibling.index, 0.0) > area * 8.0
         ]
         likely_child_ui = bool(
@@ -168,7 +186,9 @@ _GENERIC_CHILD_UI_ALT_RE = re.compile(
 )
 
 
-def _should_suppress_child_ui_alt(*, raw: dict[str, Any], figure_context: dict[str, Any] | None) -> bool:
+def _should_suppress_child_ui_alt(
+    *, raw: dict[str, Any], figure_context: dict[str, Any] | None
+) -> bool:
     if not isinstance(figure_context, dict) or not figure_context.get("likely_child_ui_figure"):
         return False
     if str(raw.get("suggested_action") or "").strip() != "set_alt_text":
@@ -215,7 +235,7 @@ async def generate_figure_intelligence(
     job: Job | Any | None = None,
     original_filename: str = "",
     reviewer_feedback: str | None = None,
-    previous_suggestion: dict[str, Any] | None = None,
+    previous_intelligence: dict[str, Any] | None = None,
     figure_context: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     unit = SemanticUnit(
@@ -229,13 +249,15 @@ async def generate_figure_intelligence(
         bbox=figure.bbox,
         nearby_context=[
             {"type": "caption", "text": str(figure.caption or "").strip()},
-        ] if figure.caption else [],
+        ]
+        if figure.caption
+        else [],
         current_semantics={"caption": str(figure.caption or "").strip()},
         metadata={
             "extra_image_data_urls": [_image_data_url(figure.path)] if figure.path.exists() else [],
             "figure_index": figure.index,
             "reviewer_feedback": reviewer_feedback or "",
-            "previous_suggestion": previous_suggestion or {},
+            "previous_intelligence": previous_intelligence or {},
         },
     )
     if job is None and original_filename:
@@ -284,7 +306,7 @@ async def generate_figures_intelligence(
         page_figures = sorted(grouped[page], key=lambda fig: fig.index)
         page_context = _figure_page_context(page_figures)
         for start in range(0, len(page_figures), MAX_FIGURES_PER_BATCH):
-            chunk = page_figures[start:start + MAX_FIGURES_PER_BATCH]
+            chunk = page_figures[start : start + MAX_FIGURES_PER_BATCH]
             page_images: list[dict[str, Any]] = page_preview_parts(job, [page])
 
             payload_candidates = [
@@ -302,7 +324,9 @@ async def generate_figures_intelligence(
                 *page_images,
                 context_json_part(
                     {
-                        "job_filename": getattr(job, "original_filename", original_filename) if job is not None else original_filename,
+                        "job_filename": getattr(job, "original_filename", original_filename)
+                        if job is not None
+                        else original_filename,
                         "page": page,
                         "candidates": payload_candidates,
                     }
@@ -313,7 +337,10 @@ async def generate_figures_intelligence(
                     content.extend(
                         [
                             {"type": "text", "text": f"Figure candidate {figure.index} crop:"},
-                            {"type": "image_url", "image_url": {"url": _image_data_url(figure.path)}},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": _image_data_url(figure.path)},
+                            },
                         ]
                     )
 

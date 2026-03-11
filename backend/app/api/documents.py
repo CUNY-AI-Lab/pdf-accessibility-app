@@ -12,8 +12,9 @@ from app.config import get_settings
 from app.database import get_db
 from app.models import Job, ReviewTask
 from app.schemas import ReviewTaskResponse, ValidationReportResponse
-from app.services.path_safety import validate_path_within_allowed_roots
+from app.services.path_safety import safe_filename, validate_path_within_allowed_roots
 from app.services.pdf_preview import render_page_png_bytes
+from app.services.review_surface import is_user_visible_review_task_type
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ async def list_review_tasks(job_id: str, db: AsyncSession = Depends(get_db)):
             metadata=json.loads(task.metadata_json) if task.metadata_json else {},
         )
         for task in tasks
+        if is_user_visible_review_task_type(task.task_type)
     ]
 
 
@@ -73,7 +75,11 @@ async def get_page_preview(
         raise HTTPException(status_code=404, detail="Page number exceeds document length")
 
     try:
-        preview_bytes = render_page_png_bytes(_job_pdf_path(job), page_number, timeout=get_settings().subprocess_timeout_preview)
+        preview_bytes = render_page_png_bytes(
+            _job_pdf_path(job),
+            page_number,
+            timeout=get_settings().subprocess_timeout_preview,
+        )
     except FileNotFoundError as exc:
         logger.exception("PDF file not found for page preview")
         raise HTTPException(status_code=404, detail="PDF file not found") from exc

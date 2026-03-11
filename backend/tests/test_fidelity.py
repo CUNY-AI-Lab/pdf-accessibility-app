@@ -1,22 +1,21 @@
 import logging
 from pathlib import Path
 
-from tests.fixtures import TEST_SAMPLE_PDF
-
 from app.pipeline import fidelity
 from app.pipeline.fidelity import (
     _canonical_named_destination,
-    _collect_structural_fragments,
     _check_internal_link_destinations,
     _check_link_text_quality,
+    _collect_structural_fragments,
     _extract_font_review_targets,
     _form_semantics_risk,
     _grounded_text_risk,
     _iter_name_tree_entries,
-    _table_semantics_risk,
     _reading_order_metrics,
+    _table_semantics_risk,
     assess_fidelity,
 )
+from tests.fixtures import TEST_SAMPLE_PDF
 
 
 def _validation_report(*, compliant: bool, violations: list[dict], unicode_gate=None) -> dict:

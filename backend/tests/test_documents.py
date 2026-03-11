@@ -7,7 +7,7 @@ from app.models import Base, Job, ReviewTask
 
 
 @pytest.mark.asyncio
-async def test_list_review_tasks_returns_current_task_payload():
+async def test_list_review_tasks_returns_only_user_visible_follow_up_tasks():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -20,7 +20,7 @@ async def test_list_review_tasks_returns_current_task_payload():
                 id="job-doc-1",
                 filename="sample.pdf",
                 original_filename="sample.pdf",
-                status="awaiting_recommendation_review",
+                status="manual_remediation",
                 input_path="/tmp/sample.pdf",
             )
         )
@@ -36,14 +36,28 @@ async def test_list_review_tasks_returns_current_task_payload():
                 metadata_json='{"table_review_targets":[{"page":8}]}',
             )
         )
+        db.add(
+            ReviewTask(
+                job_id="job-doc-1",
+                task_type="annotation_description",
+                title="Review non-descriptive link text",
+                detail="Review the affected links before release.",
+                severity="medium",
+                blocking=False,
+                source="fidelity",
+                metadata_json=(
+                    '{"pages_to_check":[3],"poor_links":[{"page":3,"text":"Click here"}]}'
+                ),
+            )
+        )
         await db.commit()
 
         tasks = await documents.list_review_tasks(job_id="job-doc-1", db=db)
 
         assert len(tasks) == 1
-        assert tasks[0].task_type == "table_semantics"
-        assert tasks[0].blocking is True
-        assert tasks[0].metadata["table_review_targets"][0]["page"] == 8
+        assert tasks[0].task_type == "annotation_description"
+        assert tasks[0].blocking is False
+        assert tasks[0].metadata["pages_to_check"] == [3]
 
     await engine.dispose()
 

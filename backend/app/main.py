@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,7 +28,7 @@ async def _periodic_cleanup():
     while True:
         try:
             await asyncio.sleep(3600)  # Run every hour
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.job_ttl_hours)
+            cutoff = datetime.now(UTC) - timedelta(hours=settings.job_ttl_hours)
             total_removed = 0
 
             while True:

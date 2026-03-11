@@ -4,8 +4,6 @@ from types import SimpleNamespace
 import pikepdf
 import pytest
 
-from tests.fixtures import TEST_SAMPLE_PDF
-
 from app.config import Settings
 from app.pipeline import orchestrator
 from app.pipeline.orchestrator import (
@@ -14,18 +12,17 @@ from app.pipeline.orchestrator import (
     FONT_LANE_REPAIR_DICTS,
     FONT_LANE_REPAIR_TOUNICODE,
     _apply_figure_reclassification,
-    _apply_pretag_grounded_text_resolutions,
     _apply_pretag_form_intelligence,
+    _apply_pretag_grounded_text_resolutions,
     _apply_pretag_table_intelligence,
+    _apply_pretag_widget_rationalization,
+    _attempt_auto_llm_font_map,
+    _cid_cff_width_key,
     _embed_lane_should_skip_local,
     _font_remediation_lanes,
     _ghostscript_embed_command,
-    _inspect_pdf_features,
     _inspect_font_diagnostics,
-    _repair_pdf_font_dicts_sync,
-    _sync_pdf_cid_cff_widths_sync,
-    _attempt_auto_llm_font_map,
-    _cid_cff_width_key,
+    _inspect_pdf_features,
     _local_embed_support_kind,
     _local_font_program,
     _merge_tounicode_maps,
@@ -35,20 +32,30 @@ from app.pipeline.orchestrator import (
     _simple_font_auto_unicode_policy,
     _simple_font_unicode_map,
     _simple_font_zero_byte_repair_candidate,
+    _sync_pdf_cid_cff_widths_sync,
     _unicode_repair_gate_from_diagnostics,
 )
+from app.services import font_intelligence_auto, semantic_pretag_policy
+from app.services.form_fields import (
+    extract_widget_fields as _extract_widget_fields,
+)
+from app.services.form_fields import remove_widget_fields as _remove_widget_fields
 from app.services.grounded_text_apply import (
     has_grounded_text_candidate_task as _has_grounded_text_candidate_task,
+)
+from app.services.grounded_text_apply import (
     should_auto_apply_grounded_code_block as _should_auto_apply_grounded_code_block,
+)
+from app.services.grounded_text_apply import (
     should_auto_apply_grounded_encoding_block as _should_auto_apply_grounded_encoding_block,
 )
-from app.services.grounded_text_review import (
+from app.services.grounded_text_intelligence import (
     apply_grounded_text_adjudication as _apply_grounded_text_adjudication,
 )
-from app.services import font_review_auto, semantic_pretag_policy
 from app.services.semantic_pretag_policy import (
     should_auto_apply_form_intelligence as _should_auto_apply_form_intelligence,
 )
+from tests.fixtures import TEST_SAMPLE_PDF
 
 
 def _settings(**overrides) -> Settings:
@@ -150,6 +157,58 @@ def _pdf_with_real_widget(output_path: Path) -> None:
     page["/Annots"] = pikepdf.Array([widget])
     pdf.Root["/AcroForm"] = pikepdf.Dictionary({
         "/Fields": pikepdf.Array([widget]),
+        "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
+        "/DR": pikepdf.Dictionary(),
+    })
+    pdf.save(str(output_path))
+
+
+def _pdf_with_static_text_widgets(output_path: Path) -> None:
+    pdf = pikepdf.new()
+    page_one = pdf.add_blank_page(page_size=(200, 200))
+    page_two = pdf.add_blank_page(page_size=(200, 200))
+
+    widget_one = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Widget"),
+        "/Rect": pikepdf.Array([20, 160, 180, 180]),
+        "/FT": pikepdf.Name("/Tx"),
+        "/T": pikepdf.String("NAVIGATING THE FDS ONLINE FILING SYSTEM"),
+        "/TU": pikepdf.String("NAVIGATING THE FDS ONLINE FILING SYSTEM"),
+        "/F": 4,
+    }))
+    widget_two = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Widget"),
+        "/Rect": pikepdf.Array([20, 12, 120, 24]),
+        "/FT": pikepdf.Name("/Tx"),
+        "/T": pikepdf.String("1 | Page"),
+        "/TU": pikepdf.String("1 | Page"),
+        "/F": 4,
+    }))
+    widget_three = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Widget"),
+        "/Rect": pikepdf.Array([20, 160, 180, 180]),
+        "/FT": pikepdf.Name("/Tx"),
+        "/T": pikepdf.String("NAVIGATING THE FDS ONLINE FILING SYSTEM"),
+        "/TU": pikepdf.String("NAVIGATING THE FDS ONLINE FILING SYSTEM"),
+        "/F": 4,
+    }))
+    widget_four = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Widget"),
+        "/Rect": pikepdf.Array([20, 12, 120, 24]),
+        "/FT": pikepdf.Name("/Tx"),
+        "/T": pikepdf.String("2 | Page"),
+        "/TU": pikepdf.String("2 | Page"),
+        "/F": 4,
+    }))
+
+    page_one["/Annots"] = pikepdf.Array([widget_one, widget_two])
+    page_two["/Annots"] = pikepdf.Array([widget_three, widget_four])
+    pdf.Root["/AcroForm"] = pikepdf.Dictionary({
+        "/Fields": pikepdf.Array([widget_one, widget_two, widget_three, widget_four]),
         "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
         "/DR": pikepdf.Dictionary(),
     })
@@ -380,7 +439,7 @@ async def test_pretag_grounded_text_resolutions_apply_safe_spacing_fix(monkeypat
             ],
         },
     )
-    monkeypatch.setattr(font_review_auto, "make_llm_client", lambda settings: _FakeLlmClient())
+    monkeypatch.setattr(font_intelligence_auto, "make_llm_client", lambda settings: _FakeLlmClient())
 
     async def _fake_generate(**kwargs):
         return {
@@ -983,6 +1042,128 @@ async def test_pretag_form_intelligence_sets_accessible_label(monkeypatch, tmp_p
     with pikepdf.Pdf.open(updated_pdf) as pdf:
         widget = pdf.pages[0]["/Annots"][0]
         assert str(widget["/TU"]) == "First name and middle initial"
+
+
+def test_widget_targets_for_rationalization_ignore_real_fields_and_flag_static_text(tmp_path):
+    real_pdf = tmp_path / "real_form.pdf"
+    static_pdf = tmp_path / "static_widgets.pdf"
+    _pdf_with_real_widget(real_pdf)
+    _pdf_with_static_text_widgets(static_pdf)
+
+    real_targets = semantic_pretag_policy.widget_targets_for_rationalization(
+        working_pdf=real_pdf,
+        structure_json={"elements": []},
+    )
+    static_targets = semantic_pretag_policy.widget_targets_for_rationalization(
+        working_pdf=static_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "review_id": "review-1",
+                    "type": "paragraph",
+                    "page": 0,
+                    "text": "NAVIGATING THE FDS ONLINE FILING SYSTEM",
+                    "bbox": {"l": 20, "t": 180, "r": 180, "b": 160},
+                }
+            ]
+        },
+    )
+
+    assert real_targets == []
+    assert len(static_targets) == 4
+    assert {
+        reason
+        for target in static_targets
+        for reason in target.get("suspicion_reasons", [])
+    } >= {"page_chrome", "repeated_across_pages"}
+
+
+def test_remove_widget_fields_clears_annotations_and_empty_acroform(tmp_path):
+    pdf_path = tmp_path / "static_widgets.pdf"
+    cleaned_pdf = tmp_path / "cleaned.pdf"
+    _pdf_with_static_text_widgets(pdf_path)
+    review_ids = {
+        str(field["field_review_id"])
+        for field in _extract_widget_fields(pdf_path)
+    }
+
+    removed = _remove_widget_fields(
+        input_pdf=pdf_path,
+        output_pdf=cleaned_pdf,
+        review_ids_to_remove=review_ids,
+    )
+
+    assert len(removed) == 4
+    with pikepdf.Pdf.open(cleaned_pdf) as pdf:
+        assert "/AcroForm" not in pdf.Root
+        assert "/Annots" not in pdf.pages[0]
+        assert "/Annots" not in pdf.pages[1]
+
+
+@pytest.mark.asyncio
+async def test_pretag_widget_rationalization_removes_static_widgets(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "static_widgets.pdf"
+    _pdf_with_static_text_widgets(pdf_path)
+
+    async def _fake_generate_page(**kwargs):
+        page_number = kwargs["page_number"]
+        return [
+            {
+                "field_review_id": str(target["field_review_id"]),
+                "page": page_number,
+                "confidence": "high",
+                "confidence_score": 1.0,
+                "suggested_action": "remove_static_widget",
+                "reason": "These are repeated page chrome widgets, not controls.",
+                "summary": "Remove duplicated static widgets.",
+            }
+            for target in kwargs["targets"]
+        ]
+
+    async def _fake_generate(**kwargs):
+        target = kwargs["target"]
+        return {
+            "field_review_id": str(target["field_review_id"]),
+            "page": int(target["page"]),
+            "confidence": "high",
+            "confidence_score": 1.0,
+            "suggested_action": "remove_static_widget",
+            "reason": "This is repeated static page chrome.",
+            "summary": "Remove duplicated static widgets.",
+        }
+
+    monkeypatch.setattr(orchestrator, "generate_widget_intelligence_for_page", _fake_generate_page)
+    monkeypatch.setattr(orchestrator, "generate_widget_intelligence", _fake_generate)
+
+    updated_pdf, audit = await _apply_pretag_widget_rationalization(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="static_widgets.pdf",
+            input_path=str(pdf_path),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_form_intelligence=True),
+        working_pdf=pdf_path,
+        structure_json={
+            "elements": [
+                {
+                    "review_id": "review-1",
+                    "type": "paragraph",
+                    "page": 0,
+                    "text": "NAVIGATING THE FDS ONLINE FILING SYSTEM",
+                    "bbox": {"l": 20, "t": 180, "r": 180, "b": 160},
+                }
+            ]
+        },
+    )
+
+    assert audit["applied"] is True
+    assert audit["applied_count"] == 4
+    assert updated_pdf != pdf_path
+    with pikepdf.Pdf.open(updated_pdf) as pdf:
+        assert "/AcroForm" not in pdf.Root
+        assert "/Annots" not in pdf.pages[0]
+        assert "/Annots" not in pdf.pages[1]
 
 
 @pytest.mark.asyncio
@@ -1803,6 +1984,30 @@ def test_apply_figure_reclassification_removes_matching_figure_elements():
     assert audit["pages"] == [1]
 
 
+def test_apply_figure_reclassification_marks_synthetic_artifact_pages_as_ignored():
+    structure_json = {
+        "elements": [
+            {
+                "type": "figure",
+                "page": 1,
+                "figure_index": 7,
+                "text": "Synthetic page figure",
+                "synthetic_figure": True,
+            },
+        ]
+    }
+
+    alt_texts = [
+        SimpleNamespace(figure_index=7, status="reclassified", resolved_kind="artifact"),
+    ]
+
+    updated, audit = _apply_figure_reclassification(structure_json, alt_texts)
+
+    assert updated["elements"] == []
+    assert updated["visual_meaning_ignored_pages"] == [2]
+    assert audit["artifact_pages"] == [2]
+
+
 def test_auto_apply_form_intelligence_rejects_technical_or_unchanged_labels():
     assert _should_auto_apply_form_intelligence(
         {
@@ -1926,7 +2131,7 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
             return None
 
     monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
-    async def _generate_review_suggestion(**kwargs):
+    async def _generate_remediation_intelligence(**kwargs):
         return {
             "task_type": "font_text_fidelity",
             "confidence": "high",
@@ -1935,10 +2140,10 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
             "model": "google/gemini-3-flash-preview",
         }
 
-    monkeypatch.setattr(font_review_auto, "generate_review_suggestion", _generate_review_suggestion)
+    monkeypatch.setattr(font_intelligence_auto, "generate_remediation_intelligence", _generate_remediation_intelligence)
     monkeypatch.setattr(
-        font_review_auto,
-        "select_auto_font_review_resolution",
+        font_intelligence_auto,
+        "select_auto_font_resolution",
         lambda **kwargs: {
             "resolution_type": "font_map",
             "page_number": 2,
@@ -1954,7 +2159,7 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
     def _copy_apply(*, input_pdf, output_pdf, context_path, unicode_text):
         output_pdf.write_bytes(Path(input_pdf).read_bytes())
 
-    monkeypatch.setattr(font_review_auto, "apply_unicode_override_to_context", _copy_apply)
+    monkeypatch.setattr(font_intelligence_auto, "apply_unicode_override_to_context", _copy_apply)
 
     current_validation = SimpleNamespace(
         compliant=False,
@@ -1970,7 +2175,7 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
     async def _validate_pdf(**kwargs):
         return improved_validation
 
-    monkeypatch.setattr(font_review_auto, "validate_pdf", _validate_pdf)
+    monkeypatch.setattr(font_intelligence_auto, "validate_pdf", _validate_pdf)
 
     job = SimpleNamespace(
         id="job-1",
@@ -2022,9 +2227,9 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
         async def close(self):
             return None
 
-    monkeypatch.setattr(font_review_auto, "make_llm_client", lambda settings: _FakeLlmClient())
+    monkeypatch.setattr(font_intelligence_auto, "make_llm_client", lambda settings: _FakeLlmClient())
 
-    async def _generate_review_suggestion(**kwargs):
+    async def _generate_remediation_intelligence(**kwargs):
         return {
             "task_type": "font_text_fidelity",
             "confidence": "high",
@@ -2033,10 +2238,10 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
             "model": "google/gemini-3-flash-preview",
         }
 
-    monkeypatch.setattr(font_review_auto, "generate_review_suggestion", _generate_review_suggestion)
+    monkeypatch.setattr(font_intelligence_auto, "generate_remediation_intelligence", _generate_remediation_intelligence)
     monkeypatch.setattr(
-        font_review_auto,
-        "select_auto_font_review_resolution",
+        font_intelligence_auto,
+        "select_auto_font_resolution",
         lambda **kwargs: {
             "resolution_type": "artifact",
             "font": "ExampleSymbolFont",
@@ -2055,7 +2260,7 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
         assert context_paths == ["ctx-1", "ctx-2"]
         output_pdf.write_bytes(Path(input_pdf).read_bytes())
 
-    monkeypatch.setattr(font_review_auto, "apply_artifact_batch_to_contexts", _copy_artifact)
+    monkeypatch.setattr(font_intelligence_auto, "apply_artifact_batch_to_contexts", _copy_artifact)
 
     current_validation = SimpleNamespace(
         compliant=False,
@@ -2071,7 +2276,7 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
     async def _validate_pdf(**kwargs):
         return improved_validation
 
-    monkeypatch.setattr(font_review_auto, "validate_pdf", _validate_pdf)
+    monkeypatch.setattr(font_intelligence_auto, "validate_pdf", _validate_pdf)
 
     job = SimpleNamespace(
         id="job-1",
@@ -2124,9 +2329,9 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
         async def close(self):
             return None
 
-    monkeypatch.setattr(font_review_auto, "make_llm_client", lambda settings: _FakeLlmClient())
+    monkeypatch.setattr(font_intelligence_auto, "make_llm_client", lambda settings: _FakeLlmClient())
 
-    async def _generate_review_suggestion(**kwargs):
+    async def _generate_remediation_intelligence(**kwargs):
         return {
             "task_type": "font_text_fidelity",
             "confidence": "high",
@@ -2135,10 +2340,10 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
             "model": "google/gemini-3-flash-preview",
         }
 
-    monkeypatch.setattr(font_review_auto, "generate_review_suggestion", _generate_review_suggestion)
+    monkeypatch.setattr(font_intelligence_auto, "generate_remediation_intelligence", _generate_remediation_intelligence)
     monkeypatch.setattr(
-        font_review_auto,
-        "select_auto_font_review_resolution",
+        font_intelligence_auto,
+        "select_auto_font_resolution",
         lambda **kwargs: {
             "resolution_type": "artifact",
             "font": "ExampleSymbolFont",
@@ -2161,8 +2366,8 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
         assert unicode_text == "►"
         output_pdf.write_bytes(Path(input_pdf).read_bytes())
 
-    monkeypatch.setattr(font_review_auto, "apply_artifact_batch_to_contexts", _copy_artifact)
-    monkeypatch.setattr(font_review_auto, "apply_unicode_override_to_context", _copy_font_map)
+    monkeypatch.setattr(font_intelligence_auto, "apply_artifact_batch_to_contexts", _copy_artifact)
+    monkeypatch.setattr(font_intelligence_auto, "apply_unicode_override_to_context", _copy_font_map)
 
     current_validation = SimpleNamespace(
         compliant=False,
@@ -2185,7 +2390,7 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
     async def _validate_pdf(**kwargs):
         return validations.pop(0)
 
-    monkeypatch.setattr(font_review_auto, "validate_pdf", _validate_pdf)
+    monkeypatch.setattr(font_intelligence_auto, "validate_pdf", _validate_pdf)
 
     job = SimpleNamespace(
         id="job-1",

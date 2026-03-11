@@ -2,9 +2,8 @@ from pathlib import Path
 
 import pikepdf
 
-from tests.fixtures import TEST_SAMPLE_PDF
-
 from app.services.font_artifact import apply_artifact_batch_to_contexts
+from tests.fixtures import TEST_SAMPLE_PDF
 
 
 def _resolve_object(value):

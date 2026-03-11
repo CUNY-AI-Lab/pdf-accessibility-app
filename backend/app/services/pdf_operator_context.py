@@ -20,7 +20,6 @@ from app.services.font_actualtext import (
 )
 from app.services.pdf_context import parse_verapdf_context_path
 
-
 TEXT_SHOWING_OPERATORS = {"Tj", "TJ", "'", '"'}
 
 

@@ -1,11 +1,10 @@
 import json
 
 import pytest
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api import review
-from app.models import AppliedChange, Base, Job, ReviewTask
+from app.models import AppliedChange, Base, Job
 
 
 @pytest.mark.asyncio
@@ -48,7 +47,7 @@ async def test_keep_applied_change_returns_current_job_status():
 
 
 @pytest.mark.asyncio
-async def test_suggest_applied_change_reopens_review_task(monkeypatch):
+async def test_revise_applied_change_rejects_non_figure_changes():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -71,58 +70,24 @@ async def test_suggest_applied_change_reopens_review_task(monkeypatch):
             importance="high",
             review_status="pending_review",
             reviewable=True,
-            metadata_json=json.dumps(
-                {
-                    "reopen_task": {
-                        "task_type": "table_semantics",
-                        "title": "Review complex table semantics",
-                        "detail": "Check whether this is really a table.",
-                        "severity": "high",
-                        "blocking": True,
-                        "source": "fidelity",
-                        "metadata": {"table_review_targets": []},
-                    }
-                }
-            ),
-            undo_payload_json=json.dumps(
-                {
-                    "kind": "structure_json",
-                    "structure_json": {"elements": [{"type": "paragraph", "text": "before"}]},
-                }
-            ),
+            metadata_json=json.dumps({}),
+            undo_payload_json=json.dumps({}),
         )
         db.add(job)
         db.add(change)
         await db.commit()
 
-        async def _fake_restart_tagging_with_structure_recommendation(*, job, db, structure_payload):
-            job.status = "processing"
-            await db.commit()
+        with pytest.raises(review.HTTPException) as exc_info:
+            await review.revise_applied_change(
+                job_id="job-change-2",
+                change_id=1,
+                request=None,
+                db=db,
+            )
 
-        monkeypatch.setattr(
-            review,
-            "_restart_tagging_with_structure_recommendation",
-            _fake_restart_tagging_with_structure_recommendation,
-        )
-
-        response = await review.suggest_applied_change(
-            job_id="job-change-2",
-            change_id=1,
-            request=None,
-            db=db,
-        )
-
-        await db.refresh(job)
         await db.refresh(change)
-        result = await db.execute(
-            select(ReviewTask).where(ReviewTask.job_id == "job-change-2")
-        )
-        tasks = result.scalars().all()
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail == "This change type cannot be revised in the app."
+        assert change.review_status == "pending_review"
 
-        assert response.status == "reopened"
-        assert response.job_status == "awaiting_recommendation_review"
-        assert job.status == "awaiting_recommendation_review"
-        assert change.review_status == "undone"
-        assert len(tasks) == 1
-        assert tasks[0].task_type == "table_semantics"
     await engine.dispose()

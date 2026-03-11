@@ -4,7 +4,7 @@ import { pluralize } from "../utils/format";
 import DownloadButton from "./DownloadButton";
 import { ArrowRightIcon, CheckIcon, WarningIcon, XIcon } from "./Icons";
 
-type TerminalStatus = Extract<JobStatus, "complete" | "awaiting_recommendation_review" | "failed">;
+type TerminalStatus = Extract<JobStatus, "complete" | "manual_remediation" | "failed">;
 
 interface OutcomeHeroProps {
   jobId: string;
@@ -55,11 +55,26 @@ export default function OutcomeHero({
               Your PDF is now accessible
             </h2>
             <p className="text-sm text-ink-muted leading-relaxed">
-              All PDF/UA compliance checks passed. Your document is ready
-              for assistive technologies.
+              {pendingCount > 0
+                ? `All PDF/UA compliance checks passed. You can optionally review ${pendingCount} visible ${pluralize(pendingCount, "item")} in the final output.`
+                : "All PDF/UA compliance checks passed. Your document is ready for assistive technologies."}
             </p>
             <div className="flex flex-wrap items-center gap-3 mt-4">
               <DownloadButton jobId={jobId} filename={filename} type="pdf" />
+              {pendingCount > 0 && (
+                <Link
+                  to={`/jobs/${jobId}/review`}
+                  className="
+                    inline-flex items-center gap-2 px-5 py-3 rounded-xl
+                    bg-accent text-white font-medium text-sm
+                    hover:bg-accent/90 shadow-sm hover:shadow-md
+                    transition-all duration-200 no-underline
+                  "
+                >
+                  Review Output
+                  <ArrowRightIcon size={14} />
+                </Link>
+              )}
               <a
                 href={`/api/jobs/${jobId}/download/report`}
                 download={`report_${filename}.json`}
@@ -74,7 +89,7 @@ export default function OutcomeHero({
     );
   }
 
-  // Needs review / non-compliant
+  // Non-compliant output that still needs manual remediation
   return (
     <div className="rounded-2xl border-2 border-warning/25 bg-warning-light/20 p-6 animate-slide-up">
       <div className="flex items-start gap-4">
@@ -83,31 +98,15 @@ export default function OutcomeHero({
         </div>
         <div className="flex-1">
           <h2 className="font-display text-xl text-ink mb-1">
-            {pendingCount > 0
-              ? `${pendingCount} ${pluralize(pendingCount, "item")} ${pluralize(pendingCount, "needs", "need")} your attention`
-              : "Some issues need your attention"}
+            Manual remediation required
           </h2>
           <p className="text-sm text-ink-muted leading-relaxed">
-            Automated remediation fixed most issues. A few recommendation-backed
-            decisions still need attention before the document is fully accessible.
+            {pendingCount > 0
+              ? `${pendingCount} ${pluralize(pendingCount, "issue")} still block a trustworthy accessible output. Use the current PDF and report for manual follow-up outside the app.`
+              : "Automated remediation stopped short of a trustworthy accessible output. Use the current PDF and report for manual follow-up outside the app."}
           </p>
           <div className="flex flex-wrap items-center gap-3 mt-4">
-            {status === "awaiting_recommendation_review" ? (
-              <Link
-                to={`/jobs/${jobId}/review`}
-                className="
-                  inline-flex items-center gap-2 px-5 py-3 rounded-xl
-                  bg-accent text-white font-medium text-sm
-                  hover:bg-accent/90 shadow-sm hover:shadow-md
-                  transition-all duration-200 no-underline
-                "
-              >
-                Review Recommendations
-                <ArrowRightIcon size={14} />
-              </Link>
-            ) : (
-              <DownloadButton jobId={jobId} filename={filename} type="pdf" />
-            )}
+            <DownloadButton jobId={jobId} filename={filename} type="pdf" />
             <a
               href={`/api/jobs/${jobId}/download/report`}
               download={`report_${filename}.json`}

@@ -1,4 +1,4 @@
-"""Auto-apply helpers for LLM-assisted font review tasks."""
+"""Auto-apply helpers for LLM-assisted font remediation tasks."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ from app.services.file_storage import get_output_path
 from app.services.font_artifact import apply_artifact_batch_to_contexts
 from app.services.font_unicode_override import apply_unicode_override_to_context
 from app.services.llm_client import make_llm_client
-from app.services.review_suggestions import (
-    generate_review_suggestion,
-    select_auto_font_review_resolution,
+from app.services.remediation_intelligence import (
+    generate_remediation_intelligence,
+    select_auto_font_resolution,
 )
 from app.services.validation_compare import is_better_validation
 
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from app.models import Job
 
 
-def summarize_llm_font_map_suggestion(suggestion: dict[str, object]) -> dict[str, object]:
+def summarize_llm_font_intelligence(intelligence: dict[str, object]) -> dict[str, object]:
     summary: dict[str, object] = {}
     for key in (
         "task_type",
@@ -37,8 +37,8 @@ def summarize_llm_font_map_suggestion(suggestion: dict[str, object]) -> dict[str
         "actualtext_candidates",
         "reviewer_checklist",
     ):
-        if key in suggestion:
-            summary[key] = suggestion[key]
+        if key in intelligence:
+            summary[key] = intelligence[key]
     return summary
 
 
@@ -97,30 +97,30 @@ async def attempt_auto_llm_font_map(
     llm_client = make_llm_client(settings)
     audit["attempted"] = True
     try:
-        suggestion = await generate_review_suggestion(
+        intelligence = await generate_remediation_intelligence(
             job=job,
             task=pseudo_task,
             llm_client=llm_client,
         )
     except Exception as exc:
-        audit["reason"] = f"suggestion_failed: {exc}"
+        audit["reason"] = f"intelligence_failed: {exc}"
         return audit, None, None, metadata_overrides
     finally:
         await llm_client.close()
 
-    suggestion_summary = summarize_llm_font_map_suggestion(suggestion)
+    intelligence_summary = summarize_llm_font_intelligence(intelligence)
     metadata_overrides[(task_type, task_source)] = {
-        "llm_suggestion": suggestion_summary,
+        "remediation_intelligence": intelligence_summary,
     }
-    audit["suggestion"] = suggestion_summary
+    audit["intelligence"] = intelligence_summary
 
-    selected = select_auto_font_review_resolution(
+    selected = select_auto_font_resolution(
         job=job,
         task=pseudo_task,
-        suggestion=suggestion,
+        intelligence=intelligence,
     )
     if not isinstance(selected, dict):
-        audit["reason"] = "suggestion_not_eligible"
+        audit["reason"] = "intelligence_not_eligible"
         metadata_overrides[(task_type, task_source)]["llm_auto_font_map"] = {
             "attempted": True,
             "applied": False,
@@ -264,8 +264,8 @@ async def attempt_auto_llm_font_map(
         "font_code_hex": str(selected.get("font_code_hex") or ""),
         "unicode_text": str(selected.get("unicode_text") or ""),
         "target_count": int(selected.get("target_count", 1) or 1),
-        "suggested_action": str(suggestion.get("suggested_action") or ""),
-        "model": str(suggestion.get("model") or settings.llm_model),
+        "suggested_action": str(intelligence.get("suggested_action") or ""),
+        "model": str(intelligence.get("model") or settings.llm_model),
     })
     metadata_overrides[(task_type, task_source)]["llm_auto_font_map"] = {
         "attempted": True,

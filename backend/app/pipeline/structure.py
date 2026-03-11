@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,7 +17,7 @@ logger = logging.getLogger(__name__)
 # Optional lingua-py language detection (Rust-backed, fast, offline).
 # Install with: uv add lingua-language-detector
 try:
-    from lingua import Language, LanguageDetectorBuilder  # type: ignore[import-untyped]
+    from lingua import LanguageDetectorBuilder  # type: ignore[import-untyped]
 
     _LINGUA_DETECTOR = (
         LanguageDetectorBuilder.from_all_languages()

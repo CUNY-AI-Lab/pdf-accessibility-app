@@ -3,14 +3,13 @@ from pathlib import Path
 import pikepdf
 import pytest
 
-from tests.fixtures import TEST_SAMPLE_PDF
-
 from app.services.font_actualtext import (
     apply_actualtext_batch_to_contexts,
     apply_actualtext_to_context,
     apply_actualtext_to_page_operator,
 )
 from app.services.pdf_context import parse_verapdf_context_path
+from tests.fixtures import TEST_SAMPLE_PDF
 
 
 def _resolve_object(value):

@@ -48,42 +48,6 @@ export function useAppliedChanges(jobId: string, enabled = true) {
   });
 }
 
-export function useSuggestReviewTask(jobId: string) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: async ({ taskId, feedback }: { taskId: number; feedback?: string }) =>
-      apiFetch<ReviewTask>(`/jobs/${jobId}/review-tasks/${taskId}/suggest`, {
-        method: "POST",
-        body: JSON.stringify({
-          feedback,
-        }),
-      }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
-    },
-  });
-}
-
-export function useApplyReviewRecommendation(jobId: string) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: async ({ taskId }: { taskId: number }) =>
-      apiFetch<{ status: string; message: string }>(
-        `/jobs/${jobId}/review-tasks/${taskId}/apply-recommendation`,
-        {
-          method: "POST",
-        },
-      ),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "applied-changes"] });
-    },
-  });
-}
-
 export function useKeepAppliedChange(jobId: string) {
   const queryClient = useQueryClient();
   return useMutation({
@@ -118,12 +82,12 @@ export function useUndoAppliedChange(jobId: string) {
   });
 }
 
-export function useSuggestAppliedChange(jobId: string) {
+export function useReviseAppliedChange(jobId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async ({ changeId, feedback }: { changeId: number; feedback?: string }) =>
       apiFetch<{ status: string; message: string; job_status: string }>(
-        `/jobs/${jobId}/applied-changes/${changeId}/suggest`,
+        `/jobs/${jobId}/applied-changes/${changeId}/revise`,
         {
           method: "POST",
           body: JSON.stringify({ feedback }),

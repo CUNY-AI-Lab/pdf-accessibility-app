@@ -35,6 +35,7 @@ class JobListResponse(BaseModel):
     jobs: list[JobResponse]
     total: int
 
+
 class ReviewTaskResponse(BaseModel):
     id: int
     task_type: str
@@ -60,13 +61,8 @@ class AppliedChangeResponse(BaseModel):
     after: dict[str, Any] = Field(default_factory=dict)
 
 
-class ReviewSuggestionRequest(BaseModel):
+class ReviewFeedbackRequest(BaseModel):
     feedback: str | None = None
-
-
-class ReviewRecommendationApplyResponse(BaseModel):
-    status: str
-    message: str
 
 
 class AppliedChangeActionResponse(BaseModel):

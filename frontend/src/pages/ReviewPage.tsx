@@ -2,78 +2,39 @@ import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   useAppliedChanges,
-  useApplyReviewRecommendation,
   useJob,
   useKeepAppliedChange,
+  useReviseAppliedChange,
   useReviewTasks,
-  useSuggestAppliedChange,
-  useSuggestReviewTask,
   useUndoAppliedChange,
 } from "../api/jobs";
 import AppliedChangeCard from "../components/AppliedChangeCard";
 import { ChevronLeftIcon } from "../components/Icons";
 import ReviewTaskCard from "../components/ReviewTaskCard";
-import type { TaskMutationState } from "../components/ReviewTaskCard";
-import type { AppliedChange, ReviewTask } from "../types";
+import type { AppliedChange } from "../types";
 
 export default function ReviewPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const { data: job } = useJob(id!);
-  const canReviewOutput = job?.status === "complete" || job?.status === "awaiting_recommendation_review";
-  const isLoading = false;
-  const canReviewTasks = job?.status === "awaiting_recommendation_review";
-  const { data: reviewTasks, isLoading: tasksLoading } = useReviewTasks(id!, canReviewTasks);
+  const canReviewOutput = job?.status === "complete" || job?.status === "manual_remediation";
+  const { data: reviewTasks, isLoading: tasksLoading } = useReviewTasks(id!, canReviewOutput);
   const { data: appliedChanges, isLoading: appliedChangesLoading } = useAppliedChanges(id!, canReviewOutput);
-
-  const suggestReviewTask = useSuggestReviewTask(id!);
-  const applyReviewRecommendation = useApplyReviewRecommendation(id!);
   const keepAppliedChange = useKeepAppliedChange(id!);
   const undoAppliedChange = useUndoAppliedChange(id!);
-  const suggestAppliedChange = useSuggestAppliedChange(id!);
+  const reviseAppliedChange = useReviseAppliedChange(id!);
 
-  const [suggestingTask, setSuggestingTask] = useState<number | null>(null);
-  const [suggestErrorTask, setSuggestErrorTask] = useState<number | null>(null);
-  const [acceptingRecommendationTaskId, setAcceptingRecommendationTaskId] = useState<number | null>(null);
-  const [acceptRecommendationErrorTaskId, setAcceptRecommendationErrorTaskId] = useState<number | null>(null);
-  const [acceptRecommendationError, setAcceptRecommendationError] = useState<Error | null>(null);
   const [keepingChangeId, setKeepingChangeId] = useState<number | null>(null);
   const [undoingChangeId, setUndoingChangeId] = useState<number | null>(null);
-  const [suggestingChangeId, setSuggestingChangeId] = useState<number | null>(null);
+  const [revisingChangeId, setRevisingChangeId] = useState<number | null>(null);
   const [changeActionErrorId, setChangeActionErrorId] = useState<number | null>(null);
   const [changeActionError, setChangeActionError] = useState<Error | null>(null);
 
-  const isRecommendationReview = job?.status === "awaiting_recommendation_review";
-  const isComplete = job?.status === "complete";
-
-  const handleSuggestTask = async (task: ReviewTask, feedback?: string) => {
-    setSuggestingTask(task.id);
-    setSuggestErrorTask(null);
-    try {
-      await suggestReviewTask.mutateAsync({ taskId: task.id, feedback });
-    } catch {
-      setSuggestErrorTask(task.id);
-    } finally {
-      setSuggestingTask(null);
-    }
-  };
-
-  const handleAcceptRecommendation = async (task: ReviewTask) => {
-    setAcceptRecommendationErrorTaskId(null);
-    setAcceptRecommendationError(null);
-    setAcceptingRecommendationTaskId(task.id);
-    try {
-      await applyReviewRecommendation.mutateAsync({ taskId: task.id });
-      navigate(`/jobs/${id}`);
-    } catch (error) {
-      setAcceptRecommendationErrorTaskId(task.id);
-      setAcceptRecommendationError(
-        error instanceof Error ? error : new Error("Failed to apply the recommendation"),
-      );
-    } finally {
-      setAcceptingRecommendationTaskId(null);
-    }
-  };
+  const isLoading = !job || tasksLoading || appliedChangesLoading;
+  const isManualRemediation = job?.status === "manual_remediation";
+  const openReviewTasks = reviewTasks?.filter((task) => task.status === "pending_review") ?? [];
+  const pendingAppliedChanges = appliedChanges?.filter((change) => change.review_status === "pending_review") ?? [];
+  const hasReviewItems = pendingAppliedChanges.length > 0 || openReviewTasks.length > 0;
 
   const handleKeepAppliedChange = async (change: AppliedChange) => {
     setChangeActionErrorId(null);
@@ -106,37 +67,21 @@ export default function ReviewPage() {
     }
   };
 
-  const handleSuggestAppliedChange = async (change: AppliedChange, feedback?: string) => {
+  const handleReviseAppliedChange = async (change: AppliedChange, feedback?: string) => {
     setChangeActionErrorId(null);
     setChangeActionError(null);
-    setSuggestingChangeId(change.id);
+    setRevisingChangeId(change.id);
     try {
-      await suggestAppliedChange.mutateAsync({ changeId: change.id, feedback });
+      await reviseAppliedChange.mutateAsync({ changeId: change.id, feedback });
     } catch (error) {
       setChangeActionErrorId(change.id);
       setChangeActionError(error instanceof Error ? error : new Error("Failed to revise this change"));
     } finally {
-      setSuggestingChangeId(null);
+      setRevisingChangeId(null);
     }
   };
 
-  const openReviewTasks = reviewTasks?.filter((task) => task.status === "pending_review") ?? [];
-  const blockingTasks = openReviewTasks.filter((task) => task.blocking);
-  const pendingAppliedChanges = appliedChanges?.filter((change) => change.review_status === "pending_review") ?? [];
-
-  const sharedTaskMutation: TaskMutationState = {
-    suggestTask: {
-      isPending: suggestReviewTask.isPending,
-      error: suggestReviewTask.isError ? suggestReviewTask.error : null,
-    },
-    suggestingTask,
-    suggestErrorTask,
-    acceptingRecommendationTaskId,
-    acceptRecommendationErrorTaskId,
-    acceptRecommendationError,
-  };
-
-  if (isLoading || tasksLoading || appliedChangesLoading) {
+  if (isLoading) {
     return (
       <div className="max-w-3xl mx-auto animate-pulse-soft">
         <div className="h-6 bg-paper-warm rounded w-48 mb-8" />
@@ -145,53 +90,6 @@ export default function ReviewPage() {
             <div key={i} className="h-48 bg-paper-warm rounded-xl" />
           ))}
         </div>
-      </div>
-    );
-  }
-
-  if (isComplete) {
-    return (
-      <div className="max-w-3xl mx-auto animate-fade-in">
-        <Link
-          to={`/jobs/${id}`}
-          className="inline-flex items-center gap-1.5 text-sm text-ink-muted hover:text-ink transition-colors no-underline mb-6"
-        >
-          <ChevronLeftIcon size={14} />
-          Back to job
-        </Link>
-        {pendingAppliedChanges.length > 0 ? (
-          <div className="space-y-6">
-            <div className="rounded-xl border border-ink/6 bg-cream p-5">
-              <h1 className="text-2xl text-ink tracking-tight mb-2">Review important applied changes</h1>
-              <p className="text-sm text-ink-muted">
-                The app already fixed this PDF. Review the few changes most likely to matter, keep the ones that look right, or describe what should change and the model will revise them.
-              </p>
-            </div>
-            <div className="space-y-4">
-              {pendingAppliedChanges.map((change) => (
-                <AppliedChangeCard
-                  key={change.id}
-                  change={change}
-                  onKeep={handleKeepAppliedChange}
-                  onUndo={handleUndoAppliedChange}
-                  onSuggestAlternative={handleSuggestAppliedChange}
-                  keeping={keepingChangeId === change.id}
-                  undoing={undoingChangeId === change.id}
-                  suggesting={suggestingChangeId === change.id}
-                  actionError={changeActionErrorId === change.id ? changeActionError : null}
-                />
-              ))}
-            </div>
-          </div>
-        ) : (
-          <div className="rounded-xl border border-info/25 bg-info-light/20 p-6">
-            <h1 className="text-2xl text-ink tracking-tight mb-2">External QA only</h1>
-            <p className="text-sm text-ink-muted">
-              This PDF already passed release checks. Download the file and, if needed, test it with a
-              screen reader, PAC, or Acrobat.
-            </p>
-          </div>
-        )}
       </div>
     );
   }
@@ -209,7 +107,7 @@ export default function ReviewPage() {
       <div className="flex items-end justify-between mb-8">
         <div>
           <h1 className="text-2xl md:text-3xl text-ink tracking-tight mb-1">
-            Review recommendations
+            Review output
           </h1>
           <p className="text-sm text-ink-muted">
             {job?.original_filename}
@@ -217,20 +115,53 @@ export default function ReviewPage() {
         </div>
       </div>
 
-      {isRecommendationReview && (
-        <div className="mb-8 rounded-xl border border-ink/6 bg-cream p-5">
+      <div className="mb-8 rounded-xl border border-ink/6 bg-cream p-5">
+        <p className="text-sm text-ink-muted">
+          {isManualRemediation
+            ? "This run stopped short of a trustworthy accessible output. Use the report for manual remediation. Any cards below are optional visible context from the current PDF."
+            : hasReviewItems
+              ? "The accessible PDF is ready. You can review the visible changes the app made and any follow-up items it flagged."
+              : "The accessible PDF is ready. This page is only needed when you want an extra review pass."}
+        </p>
+      </div>
+
+      {isManualRemediation && (
+        <div className="mb-8 rounded-xl border border-warning/30 bg-warning-light/30 p-6">
+          <h2 className="text-2xl text-ink tracking-tight mb-2">
+            Manual remediation required
+          </h2>
           <p className="text-sm text-ink-muted">
-            The app already fixed most of this PDF. First review the important changes it applied. Then answer any remaining questions by accepting the recommendation or describing what is wrong so the model can revise that part.
+            The app could not finish a trustworthy accessible output automatically. Use the validation report and current PDF for manual follow-up outside the app.
           </p>
+          <div className="mt-4 flex flex-wrap items-center gap-4">
+            <a
+              href={`/api/jobs/${id}/download/report`}
+              download={job ? `report_${job.original_filename}.json` : undefined}
+              className="text-sm text-accent font-medium no-underline hover:underline"
+            >
+              Download report
+            </a>
+            <a
+              href={`/api/jobs/${id}/download`}
+              download={job ? `accessible_${job.original_filename}` : undefined}
+              className="text-sm text-accent font-medium no-underline hover:underline"
+            >
+              Download current PDF
+            </a>
+          </div>
         </div>
       )}
 
       {pendingAppliedChanges.length > 0 && (
         <section className="space-y-4 mb-8">
           <div className="rounded-xl border border-accent/20 bg-accent-glow/20 p-5">
-            <h2 className="text-lg text-ink mb-1">Important changes already applied</h2>
+            <h2 className="text-lg text-ink mb-1">
+              {isManualRemediation ? "Visible changes in the current output" : "Important changes already applied"}
+            </h2>
             <p className="text-sm text-ink-muted">
-              These fixes are already in the current PDF. Keep them if they look right, undo them, or suggest a better alternative.
+              {isManualRemediation
+                ? "These changes may help you inspect what the app did, but they do not replace manual remediation."
+                : "These fixes are already in the current PDF. Keep them if they look right, undo them, or revise them."}
             </p>
           </div>
           {pendingAppliedChanges.map((change) => (
@@ -239,42 +170,53 @@ export default function ReviewPage() {
               change={change}
               onKeep={handleKeepAppliedChange}
               onUndo={handleUndoAppliedChange}
-              onSuggestAlternative={handleSuggestAppliedChange}
+              onRevise={handleReviseAppliedChange}
               keeping={keepingChangeId === change.id}
               undoing={undoingChangeId === change.id}
-              suggesting={suggestingChangeId === change.id}
+              revising={revisingChangeId === change.id}
               actionError={changeActionErrorId === change.id ? changeActionError : null}
             />
           ))}
         </section>
       )}
 
-      {isRecommendationReview && reviewTasks && reviewTasks.length > 0 && (
-        <div className="space-y-8 mb-8">
-          {blockingTasks.length > 0 ? (
-            <section>
-              <h2 className="text-lg text-ink mb-4">Remaining questions</h2>
-              <div className="space-y-4">
-                {blockingTasks.map((task) => (
-                  <ReviewTaskCard
-                    key={task.id}
-                    jobId={id!}
-                    task={task}
-                    taskMutation={sharedTaskMutation}
-                    onAcceptRecommendation={handleAcceptRecommendation}
-                    onSuggestTask={handleSuggestTask}
-                  />
-                ))}
-              </div>
-            </section>
-          ) : (
-            <div className="text-center py-16 rounded-xl bg-cream border border-ink/6 mb-8">
-              <h3 className="font-display text-lg text-ink mb-1">No blocking recommendation issues</h3>
-              <p className="text-sm text-ink-muted">
-                This job is waiting on recommendation review, but there are no blocking tasks left.
-              </p>
-            </div>
-          )}
+      {openReviewTasks.length > 0 && (
+        <section className="space-y-4 mb-8">
+          <div className="rounded-xl border border-ink/6 bg-cream p-5">
+            <h2 className="text-lg text-ink mb-1">Optional visible checks</h2>
+            <p className="text-sm text-ink-muted">
+              {isManualRemediation
+                ? "These checks may help you inspect the current output, but they do not replace manual remediation."
+                : "These are optional advanced checks if you want to spot-check the final output."}
+            </p>
+          </div>
+          <div className="space-y-4">
+            {openReviewTasks.map((task) => (
+              <ReviewTaskCard
+                key={task.id}
+                jobId={id!}
+                task={task}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {!hasReviewItems && !isManualRemediation && (
+        <div className="rounded-xl border border-info/25 bg-info-light/20 p-6">
+          <h2 className="text-2xl text-ink tracking-tight mb-2">
+            External QA only
+          </h2>
+          <p className="text-sm text-ink-muted">
+            This PDF already passed release checks. Download the file and, if needed, test it with a screen reader, PAC, or Acrobat.
+          </p>
+          <a
+            href={`/api/jobs/${id}/download/report`}
+            download={job ? `report_${job.original_filename}.json` : undefined}
+            className="inline-flex mt-4 text-sm text-accent font-medium no-underline hover:underline"
+          >
+            Download report
+          </a>
         </div>
       )}
     </div>

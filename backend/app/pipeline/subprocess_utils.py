@@ -24,7 +24,7 @@ async def communicate_with_timeout(
     """
     try:
         return await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         proc.kill()
         await proc.wait()
         raise SubprocessTimeout(timeout if timeout is not None else 0)

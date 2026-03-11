@@ -56,7 +56,7 @@ async def generate_suspicious_text_intelligence(
     suspicious_blocks: list[dict[str, Any]],
     llm_client: LlmClient,
     reviewer_feedback: str | None = None,
-    previous_suggestions: dict[tuple[int, str], dict[str, Any]] | None = None,
+    previous_intelligence: dict[tuple[int, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not suspicious_blocks:
         return {
@@ -108,8 +108,8 @@ async def generate_suspicious_text_intelligence(
                     "original_text_candidate": str(block.get("original_text_candidate") or "").strip(),
                     "page_numbers_in_scope": page_numbers,
                     "reviewer_feedback": reviewer_feedback or "",
-                    "previous_suggestion": (
-                        previous_suggestions or {}
+                    "previous_intelligence": (
+                        previous_intelligence or {}
                     ).get((page, review_id), {}),
                 },
             )

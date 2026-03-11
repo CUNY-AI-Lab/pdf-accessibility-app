@@ -5,11 +5,11 @@ from typing import Any
 
 from app.services.document_intelligence_models import DocumentModel
 from app.services.intelligence_gemini import (
-    normalize_reading_order_suggestion,
-    normalize_table_suggestion,
+    normalize_reading_order_intelligence,
+    normalize_table_intelligence,
 )
 
-GEMINI_PROVENANCE = "gemini_review_suggestion"
+GEMINI_PROVENANCE = "gemini_remediation_intelligence"
 
 
 def _update_block_metadata(block, *, confidence: float) -> None:
@@ -47,8 +47,10 @@ def _update_table_metadata(table, *, confidence: float) -> None:
         table.source_ids.append(GEMINI_PROVENANCE)
 
 
-def apply_reading_order_overlay(document: DocumentModel, suggestion: dict[str, Any]) -> tuple[DocumentModel, list[int]]:
-    normalized = normalize_reading_order_suggestion(suggestion)
+def apply_reading_order_overlay(
+    document: DocumentModel, intelligence: dict[str, Any]
+) -> tuple[DocumentModel, list[int]]:
+    normalized = normalize_reading_order_intelligence(intelligence)
     result = deepcopy(document)
     affected_pages: set[int] = set()
     confidence = float(normalized["confidence"])
@@ -116,8 +118,10 @@ def apply_suspicious_text_intelligence(document: DocumentModel, intelligence: di
     return result, sorted(affected_pages)
 
 
-def apply_table_overlay(document: DocumentModel, suggestion: dict[str, Any]) -> tuple[DocumentModel, list[int]]:
-    normalized = normalize_table_suggestion(suggestion)
+def apply_table_overlay(
+    document: DocumentModel, intelligence: dict[str, Any]
+) -> tuple[DocumentModel, list[int]]:
+    normalized = normalize_table_intelligence(intelligence)
     result = deepcopy(document)
     affected_pages: set[int] = set()
     confidence = float(normalized["confidence"])
@@ -186,15 +190,19 @@ def apply_table_intelligence(document: DocumentModel, intelligence_items: list[d
     return result, sorted(affected_pages)
 
 
-def document_overlay_for_suggestion(document: DocumentModel, suggestion: dict[str, Any]) -> dict[str, Any]:
-    task_type = str(suggestion.get("task_type") or "").strip()
+def document_overlay_for_intelligence(
+    document: DocumentModel, intelligence: dict[str, Any]
+) -> dict[str, Any]:
+    task_type = str(intelligence.get("task_type") or "").strip()
     if task_type == "reading_order":
-        overlaid, affected_pages = apply_reading_order_overlay(document, suggestion)
+        overlaid, affected_pages = apply_reading_order_overlay(document, intelligence)
     elif task_type == "table_semantics":
-        if isinstance(suggestion.get("table_intelligence"), list):
-            overlaid, affected_pages = apply_table_intelligence(document, suggestion["table_intelligence"])
+        if isinstance(intelligence.get("table_intelligence"), list):
+            overlaid, affected_pages = apply_table_intelligence(
+                document, intelligence["table_intelligence"]
+            )
         else:
-            overlaid, affected_pages = apply_table_overlay(document, suggestion)
+            overlaid, affected_pages = apply_table_overlay(document, intelligence)
     else:
         return {"provenance": GEMINI_PROVENANCE, "pages": []}
 

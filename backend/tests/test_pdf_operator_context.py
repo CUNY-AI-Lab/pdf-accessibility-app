@@ -1,17 +1,16 @@
 from io import BytesIO
 from pathlib import Path
 
-from tests.fixtures import TEST_SAMPLE_PDF
-
 import pikepdf
 from PIL import Image
 
+from app.services.font_actualtext import apply_actualtext_to_context
 from app.services.pdf_operator_context import (
     extract_operator_text_context,
     extract_operator_visual_context,
 )
 from app.services.pdf_preview import render_page_jpeg_bytes, render_target_preview_png_bytes
-from app.services.font_actualtext import apply_actualtext_to_context
+from tests.fixtures import TEST_SAMPLE_PDF
 
 
 def _resolve_object(value):

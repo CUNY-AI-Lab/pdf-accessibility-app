@@ -172,7 +172,7 @@ export default function ValidationReport({ report }: ValidationReportProps) {
                   ? "n/a"
                   : fidelityPassed
                     ? "Passed"
-                    : "Manual review required"}
+                    : "Manual remediation required"}
               </p>
             </div>
             <div className="rounded-lg bg-paper-warm/60 px-3 py-2">

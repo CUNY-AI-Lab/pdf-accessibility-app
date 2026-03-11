@@ -1,5 +1,4 @@
 import asyncio
-from pathlib import Path
 
 from app.pipeline.alt_text import generate_alt_text
 from app.pipeline.structure import FigureInfo

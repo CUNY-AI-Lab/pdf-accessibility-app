@@ -60,7 +60,7 @@ def test_generate_suspicious_text_intelligence_returns_normalized_blocks(monkeyp
                 }
             ],
             llm_client=object(),
-            previous_suggestions={(1, "review-1"): {"summary": "Previous", "suggested_action": "manual_only"}},
+            previous_intelligence={(1, "review-1"): {"summary": "Previous", "suggested_action": "manual_only"}},
         )
     )
 
@@ -89,7 +89,7 @@ def test_generate_suspicious_text_intelligence_returns_normalized_blocks(monkeyp
     assert unit.native_text_candidate == "D a t a  B o o k"
     assert unit.ocr_text_candidate == "Data Book"
     assert unit.metadata["signals"] == ["letters separated by spaces"]
-    assert unit.metadata["previous_suggestion"] == {"summary": "Previous", "suggested_action": "manual_only"}
+    assert unit.metadata["previous_intelligence"] == {"summary": "Previous", "suggested_action": "manual_only"}
 
 
 def test_generate_suspicious_text_intelligence_keeps_mark_decorative_blocks(monkeypatch, tmp_path):

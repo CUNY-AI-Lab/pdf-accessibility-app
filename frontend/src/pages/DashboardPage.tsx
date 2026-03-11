@@ -9,7 +9,7 @@ const FILTERS: { label: string; value: string | undefined }[] = [
   { label: "All", value: undefined },
   { label: "Queued", value: "queued" },
   { label: "Processing", value: "processing" },
-  { label: "Recommendations", value: "awaiting_recommendation_review" },
+  { label: "Manual Remediation", value: "manual_remediation" },
   { label: "Complete", value: "complete" },
   { label: "Failed", value: "failed" },
 ];

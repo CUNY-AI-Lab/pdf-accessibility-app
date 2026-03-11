@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 ALLOWED_REVIEW_STRUCTURE_TYPES = {
     "paragraph",
     "heading",
@@ -68,8 +67,8 @@ def font_review_targets(task_metadata: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)]
 
 
-def _reading_order_page_orders(llm_suggestion: dict[str, Any]) -> list[dict[str, Any]]:
-    value = llm_suggestion.get("proposed_page_orders")
+def _reading_order_page_orders(remediation_intelligence: dict[str, Any]) -> list[dict[str, Any]]:
+    value = remediation_intelligence.get("proposed_page_orders")
     if not isinstance(value, list):
         return []
     orders: list[dict[str, Any]] = []
@@ -80,11 +79,7 @@ def _reading_order_page_orders(llm_suggestion: dict[str, Any]) -> list[dict[str,
         raw_ids = item.get("ordered_review_ids")
         if not isinstance(page, int) or not isinstance(raw_ids, list):
             continue
-        ordered_review_ids = [
-            str(entry).strip()
-            for entry in raw_ids
-            if str(entry).strip()
-        ]
+        ordered_review_ids = [str(entry).strip() for entry in raw_ids if str(entry).strip()]
         if ordered_review_ids:
             orders.append(
                 {
@@ -95,8 +90,8 @@ def _reading_order_page_orders(llm_suggestion: dict[str, Any]) -> list[dict[str,
     return orders
 
 
-def _reading_order_element_updates(llm_suggestion: dict[str, Any]) -> list[dict[str, Any]]:
-    value = llm_suggestion.get("proposed_element_updates")
+def _reading_order_element_updates(remediation_intelligence: dict[str, Any]) -> list[dict[str, Any]]:
+    value = remediation_intelligence.get("proposed_element_updates")
     if not isinstance(value, list):
         return []
     updates: list[dict[str, Any]] = []
@@ -117,8 +112,8 @@ def _reading_order_element_updates(llm_suggestion: dict[str, Any]) -> list[dict[
     return updates
 
 
-def _table_updates(llm_suggestion: dict[str, Any]) -> list[dict[str, Any]]:
-    value = llm_suggestion.get("proposed_table_updates")
+def _table_updates(remediation_intelligence: dict[str, Any]) -> list[dict[str, Any]]:
+    value = remediation_intelligence.get("proposed_table_updates")
     if not isinstance(value, list):
         return []
     updates: list[dict[str, Any]] = []
@@ -129,16 +124,24 @@ def _table_updates(llm_suggestion: dict[str, Any]) -> list[dict[str, Any]]:
         suggested_action = str(item.get("suggested_action") or "").strip()
         if not table_review_id:
             continue
-        header_rows = [
-            entry
-            for entry in item.get("header_rows", [])
-            if isinstance(entry, int) and entry >= 0
-        ] if isinstance(item.get("header_rows"), list) else []
-        row_header_columns = [
-            entry
-            for entry in item.get("row_header_columns", [])
-            if isinstance(entry, int) and entry >= 0
-        ] if isinstance(item.get("row_header_columns"), list) else []
+        header_rows = (
+            [
+                entry
+                for entry in item.get("header_rows", [])
+                if isinstance(entry, int) and entry >= 0
+            ]
+            if isinstance(item.get("header_rows"), list)
+            else []
+        )
+        row_header_columns = (
+            [
+                entry
+                for entry in item.get("row_header_columns", [])
+                if isinstance(entry, int) and entry >= 0
+            ]
+            if isinstance(item.get("row_header_columns"), list)
+            else []
+        )
         updates.append(
             {
                 "table_review_id": table_review_id,
@@ -162,20 +165,28 @@ def _structure_elements_for_page(
         if not isinstance(raw_element, dict):
             continue
         page = raw_element.get("page")
-        if isinstance(page, int) and page + 1 == page_number and isinstance(raw_element.get("review_id"), str):
+        if (
+            isinstance(page, int)
+            and page + 1 == page_number
+            and isinstance(raw_element.get("review_id"), str)
+        ):
             entries.append((index, raw_element))
     return entries
 
 
-def can_apply_reading_order_recommendation(
+def can_apply_reading_order_change(
     structure: dict[str, Any] | None,
-    llm_suggestion: dict[str, Any] | None,
+    remediation_intelligence: dict[str, Any] | None,
 ) -> bool:
-    if not structure or not isinstance(structure.get("elements"), list) or not isinstance(llm_suggestion, dict):
+    if (
+        not structure
+        or not isinstance(structure.get("elements"), list)
+        or not isinstance(remediation_intelligence, dict)
+    ):
         return False
 
-    page_orders = _reading_order_page_orders(llm_suggestion)
-    element_updates = _reading_order_element_updates(llm_suggestion)
+    page_orders = _reading_order_page_orders(remediation_intelligence)
+    element_updates = _reading_order_element_updates(remediation_intelligence)
     if not page_orders and not element_updates:
         return False
 
@@ -203,34 +214,38 @@ def can_apply_reading_order_recommendation(
     return True
 
 
-def can_accept_reading_order_recommendation(
+def can_accept_reading_order_change(
     structure: dict[str, Any] | None,
-    llm_suggestion: dict[str, Any] | None,
+    remediation_intelligence: dict[str, Any] | None,
 ) -> bool:
-    if not isinstance(llm_suggestion, dict):
+    if not isinstance(remediation_intelligence, dict):
         return False
-    action = str(llm_suggestion.get("suggested_action") or "").strip()
+    action = str(remediation_intelligence.get("suggested_action") or "").strip()
     if action in READING_ORDER_NOOP_ACTIONS:
         return True
-    return can_apply_reading_order_recommendation(structure, llm_suggestion)
+    return can_apply_reading_order_change(structure, remediation_intelligence)
 
 
-def apply_reading_order_recommendation(
+def apply_reading_order_change(
     structure: dict[str, Any] | None,
-    llm_suggestion: dict[str, Any] | None,
+    remediation_intelligence: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     editable = ensure_editable_structure(structure)
-    if not can_apply_reading_order_recommendation(editable, llm_suggestion) or editable is None:
+    if not can_apply_reading_order_change(editable, remediation_intelligence) or editable is None:
         return None
 
     next_elements = list(editable["elements"])
-    page_orders = _reading_order_page_orders(llm_suggestion or {})
-    element_updates = _reading_order_element_updates(llm_suggestion or {})
+    page_orders = _reading_order_page_orders(remediation_intelligence or {})
+    element_updates = _reading_order_element_updates(remediation_intelligence or {})
 
     for page_order in page_orders:
-        entries = _structure_elements_for_page({**editable, "elements": next_elements}, int(page_order["page"]))
+        entries = _structure_elements_for_page(
+            {**editable, "elements": next_elements}, int(page_order["page"])
+        )
         replacement_by_id = {str(element["review_id"]): element for _, element in entries}
-        replacements = [replacement_by_id.get(review_id) for review_id in page_order["ordered_review_ids"]]
+        replacements = [
+            replacement_by_id.get(review_id) for review_id in page_order["ordered_review_ids"]
+        ]
         if any(element is None for element in replacements):
             return None
         for (index, _), replacement in zip(entries, replacements, strict=True):
@@ -279,14 +294,14 @@ def apply_reading_order_recommendation(
     )
 
 
-def can_apply_table_recommendation(
+def can_apply_table_change(
     structure: dict[str, Any] | None,
-    llm_suggestion: dict[str, Any] | None,
+    remediation_intelligence: dict[str, Any] | None,
 ) -> bool:
     editable = ensure_editable_structure(structure)
-    if not editable or not isinstance(llm_suggestion, dict):
+    if not editable or not isinstance(remediation_intelligence, dict):
         return False
-    updates = _table_updates(llm_suggestion)
+    updates = _table_updates(remediation_intelligence)
     if not updates:
         return False
 
@@ -309,34 +324,40 @@ def can_apply_table_recommendation(
     return True
 
 
-def can_accept_table_recommendation(
+def can_accept_table_change(
     structure: dict[str, Any] | None,
-    llm_suggestion: dict[str, Any] | None,
+    remediation_intelligence: dict[str, Any] | None,
 ) -> bool:
-    if not isinstance(llm_suggestion, dict):
+    if not isinstance(remediation_intelligence, dict):
         return False
-    action = str(llm_suggestion.get("suggested_action") or "").strip()
+    action = str(remediation_intelligence.get("suggested_action") or "").strip()
     if action in TABLE_NOOP_ACTIONS:
         return True
-    return can_apply_table_recommendation(structure, llm_suggestion)
+    return can_apply_table_change(structure, remediation_intelligence)
 
 
-def apply_table_recommendation(
+def apply_table_change(
     structure: dict[str, Any] | None,
-    llm_suggestion: dict[str, Any] | None,
+    remediation_intelligence: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     editable = ensure_editable_structure(structure)
-    if not can_apply_table_recommendation(editable, llm_suggestion) or editable is None:
+    if not can_apply_table_change(editable, remediation_intelligence) or editable is None:
         return None
 
-    updates_by_id = {update["table_review_id"]: update for update in _table_updates(llm_suggestion or {})}
+    updates_by_id = {
+        update["table_review_id"]: update for update in _table_updates(remediation_intelligence or {})
+    }
     next_elements: list[Any] = []
     for raw_element in editable.get("elements", []):
         if not isinstance(raw_element, dict):
             next_elements.append(raw_element)
             continue
         update = updates_by_id.get(str(raw_element.get("review_id") or "").strip())
-        if not update or raw_element.get("type") != "table" or not isinstance(raw_element.get("cells"), list):
+        if (
+            not update
+            or raw_element.get("type") != "table"
+            or not isinstance(raw_element.get("cells"), list)
+        ):
             next_elements.append(raw_element)
             continue
 
@@ -371,12 +392,12 @@ def apply_table_recommendation(
 
 
 def applicable_actualtext_candidates(
-    llm_suggestion: dict[str, Any] | None,
+    remediation_intelligence: dict[str, Any] | None,
     task_metadata: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    if not isinstance(llm_suggestion, dict):
+    if not isinstance(remediation_intelligence, dict):
         return []
-    candidates = llm_suggestion.get("actualtext_candidates")
+    candidates = remediation_intelligence.get("actualtext_candidates")
     if not isinstance(candidates, list):
         return []
     targets = font_review_targets(task_metadata)
@@ -387,7 +408,11 @@ def applicable_actualtext_candidates(
         page = candidate.get("page")
         operator_index = candidate.get("operator_index")
         proposed_actualtext = str(candidate.get("proposed_actualtext") or "").strip()
-        if not isinstance(page, int) or not isinstance(operator_index, int) or not proposed_actualtext:
+        if (
+            not isinstance(page, int)
+            or not isinstance(operator_index, int)
+            or not proposed_actualtext
+        ):
             continue
         font = str(candidate.get("font") or "").strip() or None
         is_target = any(

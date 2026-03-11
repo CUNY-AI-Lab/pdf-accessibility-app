@@ -155,7 +155,7 @@ def apply_grounded_text_adjudication(
     return review_tasks, recalculate_fidelity_summary(fidelity_report, review_tasks)
 
 
-def blocking_review_task_count(review_tasks: list[dict[str, object]]) -> int:
+def blocking_task_count(review_tasks: list[dict[str, object]]) -> int:
     return sum(1 for task in review_tasks if isinstance(task, dict) and bool(task.get("blocking")))
 
 

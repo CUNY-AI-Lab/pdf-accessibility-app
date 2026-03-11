@@ -48,7 +48,7 @@ def test_generate_table_intelligence_returns_normalized_update(monkeypatch, tmp_
             },
             page_structure_fragments=[{"page": 1, "type": "paragraph", "text": "Nearby caption"}],
             llm_client=object(),
-            previous_suggestion={"summary": "Previous", "suggested_action": "manual_only"},
+            previous_intelligence={"summary": "Previous", "suggested_action": "manual_only"},
         )
     )
 
@@ -69,4 +69,4 @@ def test_generate_table_intelligence_returns_normalized_update(monkeypatch, tmp_
     assert unit.unit_id == "review-7"
     assert unit.structure_context[0]["text"] == "Nearby caption"
     assert unit.metadata["table_review_target"]["cells"][0]["text"] == "Header"
-    assert unit.metadata["previous_suggestion"] == {"summary": "Previous", "suggested_action": "manual_only"}
+    assert unit.metadata["previous_intelligence"] == {"summary": "Previous", "suggested_action": "manual_only"}

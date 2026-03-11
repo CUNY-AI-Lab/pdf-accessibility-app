@@ -3,7 +3,6 @@ import { Link } from "react-router-dom";
 import { useDeleteJob } from "../api/jobs";
 import ConfirmDialog from "./ConfirmDialog";
 import type { Job, JobStatus } from "../types";
-import { pluralize } from "../utils/format";
 import { CheckIcon } from "./Icons";
 
 const STATUS_CONFIG: Record<
@@ -22,8 +21,8 @@ const STATUS_CONFIG: Record<
     bg: "bg-info-light",
     dot: "bg-info animate-pulse-soft",
   },
-  awaiting_recommendation_review: {
-    label: "Recommendations",
+  manual_remediation: {
+    label: "Manual Remediation",
     color: "text-warning",
     bg: "bg-warning-light",
     dot: "bg-warning",
@@ -77,13 +76,7 @@ export default function JobCard({ job }: JobCardProps) {
   // Outcome summary values (computed once, not in JSX)
   const valResult = job.steps.find((s) => s.step_name === "validation")?.result;
   const isCompliant = valResult && typeof valResult.compliant === "boolean" ? valResult.compliant : null;
-  const fidelityResult = job.steps.find((s) => s.step_name === "fidelity")?.result;
-  const blockingTasks = typeof fidelityResult?.blocking_tasks === "number" ? fidelityResult.blocking_tasks : 0;
-  const advisoryTasks = typeof fidelityResult?.advisory_tasks === "number" ? fidelityResult.advisory_tasks : 0;
-  const reviewItemCount = blockingTasks + advisoryTasks;
-
-  const linkTo =
-    job.status === "awaiting_recommendation_review" ? `/jobs/${job.id}/review` : `/jobs/${job.id}`;
+  const linkTo = `/jobs/${job.id}`;
 
   const handleDelete = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -166,9 +159,9 @@ export default function JobCard({ job }: JobCardProps) {
         </p>
       )}
 
-      {job.status === "awaiting_recommendation_review" && reviewItemCount > 0 && (
+      {job.status === "manual_remediation" && (
         <p className="text-xs text-warning font-medium mb-3">
-          {reviewItemCount} {pluralize(reviewItemCount, "recommendation")} {pluralize(reviewItemCount, "is", "are")} ready
+          Manual follow-up required
         </p>
       )}
 

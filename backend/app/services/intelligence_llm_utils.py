@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import copy
 import json
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from app.models import Job
 from app.services.llm_client import LlmClient

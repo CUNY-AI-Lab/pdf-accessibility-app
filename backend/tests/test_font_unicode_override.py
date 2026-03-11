@@ -3,10 +3,9 @@ from pathlib import Path
 import pikepdf
 import pytest
 
-from tests.fixtures import TEST_SAMPLE_PDF
-
 from app.pipeline.orchestrator import _parse_tounicode_map
 from app.services.font_unicode_override import apply_unicode_override_to_context
+from tests.fixtures import TEST_SAMPLE_PDF
 
 
 def _resolve_object(value):

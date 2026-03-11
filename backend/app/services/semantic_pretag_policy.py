@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from app.services.document_intelligence import (
@@ -9,7 +11,7 @@ from app.services.document_intelligence import (
     collect_nearby_blocks,
     collect_structure_fragments,
 )
-from app.services.form_fields import field_label_quality
+from app.services.form_fields import field_label_quality, is_technical_field_name
 
 PRETAG_TABLE_ALLOWED_ACTIONS = frozenset({"confirm_current_headers", "set_table_headers"})
 PRETAG_FORM_ALLOWED_TYPES = frozenset({
@@ -20,6 +22,63 @@ PRETAG_FORM_ALLOWED_TYPES = frozenset({
     "combo_box",
     "list_box",
 })
+PRETAG_WIDGET_RATIONALIZATION_ALLOWED_TYPES = frozenset({"text"})
+PAGE_CHROME_RE = re.compile(r"^\d+\s*\|?\s*p\s*a\s*g\s*e$", re.IGNORECASE)
+
+
+def _normalize_widget_text(value: object) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _looks_like_page_chrome(value: str) -> bool:
+    text = _normalize_widget_text(value)
+    if not text:
+        return False
+    return bool(PAGE_CHROME_RE.match(text))
+
+
+def suspicious_widget_candidates(fields: list[dict[str, object]]) -> list[dict[str, object]]:
+    label_counts: Counter[str] = Counter()
+    label_pages: defaultdict[str, set[int]] = defaultdict(set)
+
+    for field in fields:
+        if str(field.get("field_type") or "").strip() not in PRETAG_WIDGET_RATIONALIZATION_ALLOWED_TYPES:
+            continue
+        accessible_name = _normalize_widget_text(field.get("accessible_name"))
+        field_name = _normalize_widget_text(field.get("field_name"))
+        label = accessible_name or field_name
+        if not label or is_technical_field_name(field_name):
+            continue
+        page = field.get("page")
+        label_counts[label] += 1
+        if isinstance(page, int) and page > 0:
+            label_pages[label].add(page)
+
+    candidates: list[dict[str, object]] = []
+    for field in fields:
+        if str(field.get("field_type") or "").strip() not in PRETAG_WIDGET_RATIONALIZATION_ALLOWED_TYPES:
+            continue
+        accessible_name = _normalize_widget_text(field.get("accessible_name"))
+        field_name = _normalize_widget_text(field.get("field_name"))
+        label = accessible_name or field_name
+        if not label or is_technical_field_name(field_name):
+            continue
+        suspicion_reasons: list[str] = []
+        if _looks_like_page_chrome(label):
+            suspicion_reasons.append("page_chrome")
+        if len(label_pages.get(label, set())) >= 2:
+            suspicion_reasons.append("repeated_across_pages")
+        if len(label) >= 28 and " " in label and not is_technical_field_name(label):
+            suspicion_reasons.append("natural_language_static_text")
+        if not suspicion_reasons:
+            continue
+        candidate = dict(field)
+        candidate["suspicion_reasons"] = suspicion_reasons
+        candidate["same_label_count"] = int(label_counts.get(label, 0))
+        candidate["same_label_pages"] = sorted(label_pages.get(label, set()))
+        candidate["looks_like_page_chrome"] = _looks_like_page_chrome(label)
+        candidates.append(candidate)
+    return candidates
 
 
 def table_page_structure_fragments(
@@ -270,6 +329,90 @@ def form_targets_for_intelligence(
     return targets
 
 
+def widget_targets_for_rationalization(
+    *,
+    working_pdf: Path,
+    structure_json: dict[str, object],
+) -> list[dict[str, object]]:
+    document = build_document_model(structure_json=structure_json, pdf_path=working_pdf)
+    raw_fields: list[dict[str, object]] = []
+    page_figure_counts: Counter[int] = Counter()
+    page_table_counts: Counter[int] = Counter()
+    elements = structure_json.get("elements")
+    if isinstance(elements, list):
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            page_raw = element.get("page")
+            if not isinstance(page_raw, int) or page_raw < 0:
+                continue
+            page_number = page_raw + 1
+            if element.get("type") == "figure":
+                page_figure_counts[page_number] += 1
+            elif element.get("type") == "table":
+                page_table_counts[page_number] += 1
+
+    for page in document.pages:
+        for field in page.fields:
+            raw_fields.append(
+                {
+                    "field_review_id": field.field_review_id,
+                    "page": page.page_number,
+                    "order": field.order,
+                    "field_type": field.field_type,
+                    "field_name": field.field_name,
+                    "accessible_name": field.accessible_name,
+                    "label_quality": field.label_quality,
+                    "value_text": field.value_text,
+                    "bbox": field.bbox.to_dict() if field.bbox else None,
+                }
+            )
+
+    candidate_by_id = {
+        str(candidate.get("field_review_id") or "").strip(): candidate
+        for candidate in suspicious_widget_candidates(raw_fields)
+        if str(candidate.get("field_review_id") or "").strip()
+    }
+    if not candidate_by_id:
+        return []
+
+    targets: list[dict[str, object]] = []
+    for page in document.pages:
+        for field in page.fields:
+            review_id = str(field.field_review_id or "").strip()
+            candidate = candidate_by_id.get(review_id)
+            if not candidate:
+                continue
+            field_bbox = field.bbox.to_dict() if field.bbox else None
+            page_figure_like_count = int(page_figure_counts.get(page.page_number, 0))
+            page_table_count = int(page_table_counts.get(page.page_number, 0))
+            suspicion_reasons = {
+                str(reason).strip()
+                for reason in candidate.get("suspicion_reasons", [])
+                if str(reason).strip()
+            }
+            if (
+                suspicion_reasons == {"natural_language_static_text"}
+                and page_figure_like_count <= 0
+                and page_table_count <= 0
+            ):
+                continue
+            targets.append(
+                {
+                    **candidate,
+                    "nearby_blocks": collect_nearby_blocks(
+                        document,
+                        page_number=page.page_number,
+                        bbox=field_bbox,
+                        limit=6,
+                    ),
+                    "page_figure_like_count": page_figure_like_count,
+                    "page_table_count": page_table_count,
+                }
+            )
+    return targets
+
+
 def should_auto_apply_form_intelligence(item: dict[str, object]) -> bool:
     if str(item.get("confidence") or "").strip() != "high":
         return False
@@ -285,3 +428,11 @@ def should_auto_apply_form_intelligence(item: dict[str, object]) -> bool:
     if current_label and label == current_label:
         return False
     return True
+
+
+def should_auto_remove_widget(item: dict[str, object]) -> bool:
+    if str(item.get("confidence") or "").strip() != "high":
+        return False
+    if str(item.get("suggested_action") or "").strip() != "remove_static_widget":
+        return False
+    return bool(str(item.get("field_review_id") or "").strip())

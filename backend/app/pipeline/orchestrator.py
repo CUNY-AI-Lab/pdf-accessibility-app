@@ -5,14 +5,12 @@ import copy
 import json
 import logging
 import re
-import shutil
+from datetime import UTC, datetime
 from functools import lru_cache
-from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
 import pikepdf
-
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,51 +24,86 @@ from app.pipeline.structure import extract_structure
 from app.pipeline.subprocess_utils import SubprocessTimeout, communicate_with_timeout
 from app.pipeline.tagger import tag_pdf
 from app.pipeline.validator import validate_pdf
+from app.services.applied_changes import add_applied_change
+from app.services.auto_structure_apply import auto_apply_structure_tasks
+from app.services.file_storage import create_job_dir, get_output_path
+from app.services.font_intelligence_auto import (
+    attempt_auto_llm_font_map as _attempt_auto_llm_font_map,
+)
+from app.services.font_intelligence_auto import (
+    fidelity_not_worse as _fidelity_not_worse,
+)
+from app.services.form_fields import apply_field_accessible_names, remove_widget_fields
 from app.services.grounded_text_apply import (
     PRETAG_GROUNDED_TEXT_TARGET_LIMIT,
+)
+from app.services.grounded_text_apply import (
     apply_grounded_text_resolutions_to_structure as _apply_grounded_text_resolutions_to_structure,
+)
+from app.services.grounded_text_apply import (
     collect_safe_grounded_text_resolutions as _collect_safe_grounded_text_resolutions,
+)
+from app.services.grounded_text_apply import (
     has_grounded_text_candidate_task as _has_grounded_text_candidate_task,
-    should_auto_apply_grounded_code_block as _should_auto_apply_grounded_code_block,
-    should_auto_apply_grounded_encoding_block as _should_auto_apply_grounded_encoding_block,
 )
-from app.services.grounded_text_review import (
+from app.services.grounded_text_intelligence import (
     adjudicate_grounded_text_candidates as _adjudicate_grounded_text_candidates,
-    apply_grounded_text_adjudication as _apply_grounded_text_adjudication,
-    blocking_review_task_count as _blocking_review_task_count,
-    recalculate_fidelity_summary as _recalculate_fidelity_summary,
-    update_grounded_text_check as _update_grounded_text_check,
 )
-from app.services.form_fields import apply_field_accessible_names
-from app.services.font_review_auto import (
-    attempt_auto_llm_font_map as _attempt_auto_llm_font_map,
-    fidelity_not_worse as _fidelity_not_worse,
+from app.services.grounded_text_intelligence import (
+    recalculate_fidelity_summary as _recalculate_fidelity_summary,
 )
 from app.services.intelligence_gemini_forms import (
     generate_form_intelligence,
     generate_form_intelligence_for_page,
 )
-from app.services.intelligence_gemini_tables import generate_table_intelligence
-from app.services.file_storage import create_job_dir, get_output_path
-from app.services.job_manager import JobManager
 from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
-from app.services.llm_client import LlmClient as _LlmClient, make_llm_client
+from app.services.intelligence_gemini_tables import generate_table_intelligence
+from app.services.intelligence_gemini_widgets import (
+    generate_widget_intelligence,
+    generate_widget_intelligence_for_page,
+)
+from app.services.job_manager import JobManager
+from app.services.llm_client import LlmClient as _LlmClient
+from app.services.llm_client import make_llm_client
 from app.services.page_intelligence import collect_grounded_text_candidates
-from app.services.applied_changes import add_applied_change
-from app.services.auto_review_apply import auto_apply_structure_review_tasks
+from app.services.review_surface import (
+    filter_user_visible_review_tasks,
+    is_user_visible_applied_change_type,
+)
 from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
 from app.services.semantic_pretag_policy import (
     apply_table_intelligence_to_element as _apply_table_intelligence_to_element,
+)
+from app.services.semantic_pretag_policy import (
     form_targets_for_intelligence as _form_targets_for_intelligence,
+)
+from app.services.semantic_pretag_policy import (
     should_auto_apply_form_intelligence as _should_auto_apply_form_intelligence,
+)
+from app.services.semantic_pretag_policy import (
     should_auto_apply_table_intelligence as _should_auto_apply_table_intelligence,
+)
+from app.services.semantic_pretag_policy import (
+    should_auto_remove_widget as _should_auto_remove_widget,
+)
+from app.services.semantic_pretag_policy import (
     should_retry_table_intelligence_aggressively as _should_retry_table_intelligence_aggressively,
+)
+from app.services.semantic_pretag_policy import (
     should_retry_table_intelligence_confirm_existing as _should_retry_table_intelligence_confirm_existing,
+)
+from app.services.semantic_pretag_policy import (
     table_page_structure_fragments as _table_page_structure_fragments,
+)
+from app.services.semantic_pretag_policy import (
     table_targets_with_cells as _table_targets_with_cells,
 )
-from app.services.toc_suggestions import enhance_toc_structure_with_llm
+from app.services.semantic_pretag_policy import (
+    widget_targets_for_rationalization as _widget_targets_for_rationalization,
+)
+from app.services.toc_intelligence import enhance_toc_structure_with_intelligence
 from app.services.validation_compare import is_better_validation as _is_better_validation
+from app.services.visual_figure_rationalization import synthesize_missing_visual_figures
 
 logger = logging.getLogger(__name__)
 
@@ -92,20 +125,22 @@ FONT_SUBSET_RE = re.compile(r"^[A-Z]{6}\+.+")
 FONT_NAME_RE = re.compile(r"[^A-Za-z0-9]+")
 HEX_STR_RE = re.compile(r"<([0-9A-Fa-f]+)>")
 MAX_TOUNICODE_BFRANGE_SPAN = 65536
-SAFE_IMPLICIT_STANDARD_BASEFONTS = frozenset({
-    "TimesRoman",
-    "TimesBold",
-    "TimesItalic",
-    "TimesBoldItalic",
-    "Helvetica",
-    "HelveticaBold",
-    "HelveticaOblique",
-    "HelveticaBoldOblique",
-    "Courier",
-    "CourierBold",
-    "CourierOblique",
-    "CourierBoldOblique",
-})
+SAFE_IMPLICIT_STANDARD_BASEFONTS = frozenset(
+    {
+        "TimesRoman",
+        "TimesBold",
+        "TimesItalic",
+        "TimesBoldItalic",
+        "Helvetica",
+        "HelveticaBold",
+        "HelveticaOblique",
+        "HelveticaBoldOblique",
+        "Courier",
+        "CourierBold",
+        "CourierOblique",
+        "CourierBoldOblique",
+    }
+)
 SYSTEM_FONT_EXTENSIONS = {".ttf", ".otf", ".ttc"}
 SYSTEM_FONT_DIRS = (
     Path("/System/Library/Fonts"),
@@ -253,17 +288,19 @@ def _build_validation_changes(
         status_by_rule[rule_id] = remediation_status
         source = after or before or {}
 
-        changes.append({
-            "rule_id": rule_id,
-            "description": source.get("description", "Unknown violation"),
-            "severity": source.get("severity", "error"),
-            "location": source.get("location"),
-            "category": source.get("category"),
-            "fix_hint": source.get("fix_hint"),
-            "baseline_count": before.get("count", 0) if before else 0,
-            "post_count": after.get("count", 0) if after else 0,
-            "remediation_status": remediation_status,
-        })
+        changes.append(
+            {
+                "rule_id": rule_id,
+                "description": source.get("description", "Unknown violation"),
+                "severity": source.get("severity", "error"),
+                "location": source.get("location"),
+                "category": source.get("category"),
+                "fix_hint": source.get("fix_hint"),
+                "baseline_count": before.get("count", 0) if before else 0,
+                "post_count": after.get("count", 0) if after else 0,
+                "remediation_status": remediation_status,
+            }
+        )
 
     return changes, status_by_rule
 
@@ -314,15 +351,9 @@ def _build_validation_payload(
         baseline_validation.violations,
         selected_validation.violations,
     )
-    needs_remediation = len(
-        [c for c in changes if c["remediation_status"] == "needs_remediation"]
-    )
-    auto_remediated = len(
-        [c for c in changes if c["remediation_status"] == "auto_remediated"]
-    )
-    manual_remediated = len(
-        [c for c in changes if c["remediation_status"] == "manual_remediated"]
-    )
+    needs_remediation = len([c for c in changes if c["remediation_status"] == "needs_remediation"])
+    auto_remediated = len([c for c in changes if c["remediation_status"] == "auto_remediated"])
+    manual_remediated = len([c for c in changes if c["remediation_status"] == "manual_remediated"])
 
     remediation_payload: dict[str, object] = {
         "needs_remediation": needs_remediation,
@@ -353,7 +384,7 @@ def _build_validation_payload(
         "profile": settings.verapdf_flavour,
         "standard": "PDF/UA",
         "validator": validator_name,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "baseline": {
             "compliant": baseline_validation.compliant,
             "validator": baseline_validator_name,
@@ -403,6 +434,16 @@ def _blocking_task_count(review_tasks: list[dict[str, object]]) -> int:
     return len([task for task in review_tasks if bool(task.get("blocking"))])
 
 
+def _prepare_user_review_surface(
+    review_tasks: list[dict[str, object]],
+    fidelity_report: dict[str, object],
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    # Fidelity and terminal status stay tied to the full pipeline backlog.
+    updated_fidelity_report = _recalculate_fidelity_summary(fidelity_report, review_tasks)
+    user_visible_review_tasks = filter_user_visible_review_tasks(review_tasks)
+    return user_visible_review_tasks, updated_fidelity_report
+
+
 def _merge_review_task_metadata(
     review_tasks: list[dict[str, object]],
     *,
@@ -438,6 +479,7 @@ def _apply_figure_reclassification(
         "removed_indexes": [],
         "removed_kinds": {},
         "pages": [],
+        "artifact_pages": [],
     }
     if not isinstance(structure_json, dict):
         audit["reason"] = "missing_structure"
@@ -471,6 +513,7 @@ def _apply_figure_reclassification(
     removed_indexes: list[int] = []
     removed_pages: set[int] = set()
     removed_kinds: dict[str, int] = {}
+    artifact_pages: set[int] = set()
     for element in elements:
         if not isinstance(element, dict):
             updated_elements.append(element)
@@ -483,6 +526,11 @@ def _apply_figure_reclassification(
                 page = element.get("page")
                 if isinstance(page, int) and page >= 0:
                     removed_pages.add(page + 1)
+                    if (
+                        resolved_kind == "artifact"
+                        and bool(element.get("synthetic_figure"))
+                    ):
+                        artifact_pages.add(page + 1)
                 removed_kinds[resolved_kind] = removed_kinds.get(resolved_kind, 0) + 1
                 continue
         updated_elements.append(element)
@@ -492,12 +540,24 @@ def _apply_figure_reclassification(
         return structure_json, audit
 
     updated["elements"] = updated_elements
+    if artifact_pages:
+        existing_ignored = updated.get("visual_meaning_ignored_pages")
+        ignored_pages: set[int] = set()
+        if isinstance(existing_ignored, list):
+            ignored_pages.update(
+                int(page)
+                for page in existing_ignored
+                if isinstance(page, int) and page > 0
+            )
+        ignored_pages.update(artifact_pages)
+        updated["visual_meaning_ignored_pages"] = sorted(ignored_pages)
     audit["applied"] = True
     audit["reason"] = "applied"
     audit["removed_count"] = len(removed_indexes)
     audit["removed_indexes"] = sorted(removed_indexes)
     audit["removed_kinds"] = removed_kinds
     audit["pages"] = sorted(removed_pages)
+    audit["artifact_pages"] = sorted(artifact_pages)
     return updated, audit
 
 
@@ -780,6 +840,179 @@ async def _apply_pretag_table_intelligence(
     return updated_structure, audit
 
 
+def _preview_job_for_pdf(job: Job, pdf_path: Path) -> Job:
+    preview_job = copy.copy(job)
+    preview_job.input_path = str(pdf_path)
+    preview_job.output_path = str(pdf_path)
+    return preview_job
+
+
+async def _apply_pretag_widget_rationalization(
+    *,
+    job: Job,
+    settings: Settings,
+    working_pdf: Path,
+    structure_json: dict[str, object],
+) -> tuple[Path, dict[str, object]]:
+    audit: dict[str, object] = {
+        "enabled": bool(settings.auto_apply_form_intelligence),
+        "attempted": False,
+        "applied": False,
+        "reason": "",
+        "candidate_count": 0,
+        "applied_count": 0,
+        "page_batch_count": 0,
+        "page_batch_resolved_count": 0,
+        "page_batch_failed_count": 0,
+        "individual_fallback_count": 0,
+        "pages": [],
+        "review_ids": [],
+    }
+    if not settings.auto_apply_form_intelligence:
+        audit["reason"] = "disabled"
+        return working_pdf, audit
+    if not working_pdf.exists():
+        audit["reason"] = "missing_pdf"
+        return working_pdf, audit
+    if not isinstance(structure_json, dict):
+        audit["reason"] = "missing_structure"
+        return working_pdf, audit
+
+    targets = _widget_targets_for_rationalization(
+        working_pdf=working_pdf,
+        structure_json=structure_json,
+    )
+    if not targets:
+        audit["reason"] = "no_candidates"
+        return working_pdf, audit
+
+    audit["attempted"] = True
+    audit["candidate_count"] = len(targets)
+    preview_job = _preview_job_for_pdf(job, working_pdf)
+    llm_client = make_llm_client(settings)
+    try:
+        semaphore = asyncio.Semaphore(max(1, settings.llm_max_concurrency))
+        targets_by_review_id = {
+            str(target.get("field_review_id") or "").strip(): target
+            for target in targets
+            if str(target.get("field_review_id") or "").strip()
+        }
+        targets_by_page: dict[int, list[dict[str, object]]] = {}
+        for target in targets:
+            page = target.get("page")
+            if not isinstance(page, int) or page <= 0:
+                continue
+            targets_by_page.setdefault(page, []).append(target)
+        audit["page_batch_count"] = len(targets_by_page)
+
+        async def _generate(target: dict[str, object]) -> dict[str, object]:
+            async with semaphore:
+                return await generate_widget_intelligence(
+                    job=preview_job,
+                    target=target,
+                    llm_client=llm_client,
+                )
+
+        async def _generate_page(
+            page_number: int, page_targets: list[dict[str, object]]
+        ) -> list[dict[str, object]]:
+            async with semaphore:
+                return await generate_widget_intelligence_for_page(
+                    job=preview_job,
+                    page_number=page_number,
+                    targets=page_targets,
+                    llm_client=llm_client,
+                )
+
+        intelligence_items: list[dict[str, object]] = []
+        page_items_by_id: dict[str, dict[str, object]] = {}
+        for page_number, page_targets in sorted(targets_by_page.items()):
+            try:
+                page_items = await _generate_page(page_number, page_targets)
+            except Exception:
+                audit["page_batch_failed_count"] = int(audit.get("page_batch_failed_count", 0)) + 1
+                continue
+            for item in page_items:
+                if not isinstance(item, dict):
+                    continue
+                review_id = str(item.get("field_review_id") or "").strip()
+                if review_id:
+                    page_items_by_id[review_id] = item
+                intelligence_items.append(item)
+
+        resolved_page_results = sum(
+            1
+            for item in page_items_by_id.values()
+            if str(item.get("suggested_action") or "").strip()
+            in {"preserve_control", "remove_static_widget"}
+        )
+        audit["page_batch_resolved_count"] = resolved_page_results
+
+        unresolved_targets = [
+            target
+            for review_id, target in targets_by_review_id.items()
+            if str(page_items_by_id.get(review_id, {}).get("suggested_action") or "").strip()
+            not in {"preserve_control", "remove_static_widget"}
+        ]
+        audit["individual_fallback_count"] = len(unresolved_targets)
+        if unresolved_targets:
+            fallback_items = await asyncio.gather(
+                *[_generate(target) for target in unresolved_targets]
+            )
+            for item in fallback_items:
+                if not isinstance(item, dict):
+                    continue
+                review_id = str(item.get("field_review_id") or "").strip()
+                if review_id:
+                    page_items_by_id[review_id] = item
+            intelligence_items = list(page_items_by_id.values())
+    except Exception as exc:
+        audit["reason"] = f"llm_failed: {exc}"
+        return working_pdf, audit
+    finally:
+        await llm_client.close()
+
+    remove_review_ids = [
+        str(item.get("field_review_id") or "").strip()
+        for item in intelligence_items
+        if isinstance(item, dict) and _should_auto_remove_widget(item)
+    ]
+    if not remove_review_ids:
+        audit["reason"] = "no_safe_resolutions"
+        return working_pdf, audit
+
+    patched_pdf = get_output_path(
+        job.id,
+        f"pretag_widget_rationalization_{job.original_filename}",
+    )
+    try:
+        applied_review_ids = remove_widget_fields(
+            input_pdf=working_pdf,
+            output_pdf=patched_pdf,
+            review_ids_to_remove=set(remove_review_ids),
+        )
+    except Exception as exc:
+        audit["reason"] = f"apply_failed: {exc}"
+        return working_pdf, audit
+    if not applied_review_ids:
+        audit["reason"] = "no_matching_fields"
+        return working_pdf, audit
+
+    applied_pages = {
+        int(target.get("page"))
+        for target in targets
+        if str(target.get("field_review_id") or "").strip() in set(applied_review_ids)
+        and isinstance(target.get("page"), int)
+        and int(target.get("page")) > 0
+    }
+    audit["applied"] = True
+    audit["applied_count"] = len(applied_review_ids)
+    audit["pages"] = sorted(applied_pages)
+    audit["review_ids"] = applied_review_ids
+    audit["reason"] = "applied"
+    return patched_pdf, audit
+
+
 async def _apply_pretag_form_intelligence(
     *,
     job: Job,
@@ -821,6 +1054,7 @@ async def _apply_pretag_form_intelligence(
 
     audit["attempted"] = True
     audit["candidate_count"] = len(targets)
+    preview_job = _preview_job_for_pdf(job, working_pdf)
     llm_client = make_llm_client(settings)
     try:
         semaphore = asyncio.Semaphore(max(1, settings.llm_max_concurrency))
@@ -841,16 +1075,18 @@ async def _apply_pretag_form_intelligence(
         async def _generate(target: dict[str, object]) -> dict[str, object]:
             async with semaphore:
                 return await generate_form_intelligence(
-                    job=job,
+                    job=preview_job,
                     target={key: value for key, value in target.items() if key != "nearby_blocks"},
                     nearby_blocks=list(target.get("nearby_blocks") or []),
                     llm_client=llm_client,
                 )
 
-        async def _generate_page(page_number: int, page_targets: list[dict[str, object]]) -> list[dict[str, object]]:
+        async def _generate_page(
+            page_number: int, page_targets: list[dict[str, object]]
+        ) -> list[dict[str, object]]:
             async with semaphore:
                 return await generate_form_intelligence_for_page(
-                    job=job,
+                    job=preview_job,
                     page_number=page_number,
                     targets=page_targets,
                     llm_client=llm_client,
@@ -872,9 +1108,7 @@ async def _apply_pretag_form_intelligence(
                     page_items_by_id[review_id] = item
                 intelligence_items.append(item)
         safe_page_results = sum(
-            1
-            for item in page_items_by_id.values()
-            if _should_auto_apply_form_intelligence(item)
+            1 for item in page_items_by_id.values() if _should_auto_apply_form_intelligence(item)
         )
         audit["page_batch_resolved_count"] = safe_page_results
 
@@ -952,10 +1186,7 @@ def _font_only_errors(violations) -> bool:
 
 
 def _has_font_errors(violations) -> bool:
-    return any(
-        v.severity == "error" and FONT_RULE_FRAGMENT in str(v.rule_id)
-        for v in violations
-    )
+    return any(v.severity == "error" and FONT_RULE_FRAGMENT in str(v.rule_id) for v in violations)
 
 
 def _inspect_pdf_features(pdf_path: Path) -> dict[str, int | bool]:
@@ -1020,17 +1251,13 @@ def _inspect_pdf_features(pdf_path: Path) -> dict[str, int | bool]:
                             if isinstance(cid_font, pikepdf.Dictionary):
                                 descriptor = _resolve_dictionary(cid_font.get("/FontDescriptor"))
                                 base_font_name = str(
-                                    cid_font.get("/BaseFont")
-                                    or font_dict.get("/BaseFont")
-                                    or ""
+                                    cid_font.get("/BaseFont") or font_dict.get("/BaseFont") or ""
                                 )
                     else:
                         descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
                         if isinstance(descriptor, pikepdf.Dictionary):
                             base_font_name = str(
-                                font_dict.get("/BaseFont")
-                                or descriptor.get("/FontName")
-                                or ""
+                                font_dict.get("/BaseFont") or descriptor.get("/FontName") or ""
                             )
 
                     if not _has_embedded_font(descriptor):
@@ -1139,12 +1366,10 @@ def _font_remediation_lanes(
     """Choose remediation lanes based on rule family and document risk profile."""
     error_rule_ids = [str(v.rule_id) for v in violations if v.severity == "error"]
     has_embed_rules = any(
-        any(marker in rule_id for marker in FONT_EMBED_RULE_MARKERS)
-        for rule_id in error_rule_ids
+        any(marker in rule_id for marker in FONT_EMBED_RULE_MARKERS) for rule_id in error_rule_ids
     )
     has_unicode_rules = any(
-        any(marker in rule_id for marker in FONT_UNICODE_RULE_MARKERS)
-        for rule_id in error_rule_ids
+        any(marker in rule_id for marker in FONT_UNICODE_RULE_MARKERS) for rule_id in error_rule_ids
     )
     has_dict_repair_rules = any(
         any(marker in rule_id for marker in FONT_DICT_REPAIR_RULE_MARKERS)
@@ -1157,7 +1382,9 @@ def _font_remediation_lanes(
         safe_candidates = int(unicode_gate.get("safe_candidate_count", 0) or 0)
         if safe_candidates <= 0:
             allow_unicode_lane = False
-            reason = str(unicode_gate.get("reason", "")).strip() or "no deterministic font candidates"
+            reason = (
+                str(unicode_gate.get("reason", "")).strip() or "no deterministic font candidates"
+            )
             skipped.append("ToUnicode repair skipped: " + reason)
 
     lanes: list[str] = []
@@ -1254,10 +1481,7 @@ def _local_embed_support_kind(font_dict, descendant_subtype=None) -> str:
         and _normalize_font_name(_base_font_name(font_dict)) in GHOSTSCRIPT_TYPE1_SUBSTITUTES
     ):
         return "type1_standard14"
-    if (
-        subtype == pikepdf.Name("/Type0")
-        and descendant_subtype == pikepdf.Name("/CIDFontType2")
-    ):
+    if subtype == pikepdf.Name("/Type0") and descendant_subtype == pikepdf.Name("/CIDFontType2"):
         return "cidfonttype2"
     return ""
 
@@ -1297,7 +1521,9 @@ def _tagging_regressions(candidate, current) -> list[str]:
         if candidate_count == 0:
             regressions.append(f"{label} dropped to zero ({current_count} -> 0)")
         elif current_count >= 5 and candidate_count < int(current_count * 0.8):
-            regressions.append(f"{label} dropped significantly ({current_count} -> {candidate_count})")
+            regressions.append(
+                f"{label} dropped significantly ({current_count} -> {candidate_count})"
+            )
 
     current_links = _count(current, "links_tagged")
     candidate_links = _count(candidate, "links_tagged")
@@ -1393,8 +1619,7 @@ def _unicode_repair_gate_from_diagnostics(
         "reason": "",
     }
     has_invalid_unicode_rules = any(
-        v.severity == "error" and "7.21.7-2" in str(v.rule_id)
-        for v in (violations or [])
+        v.severity == "error" and "7.21.7-2" in str(v.rule_id) for v in (violations or [])
     )
     has_unicode_rule_family = any(
         v.severity == "error"
@@ -1463,8 +1688,7 @@ def _unicode_repair_gate_from_diagnostics(
         examples = profile.get("blocked_examples") or []
         suffix = f" ({', '.join(examples)})" if examples else ""
         profile["reason"] = (
-            "unicode issues appear tied to simple fonts without explicit encoding"
-            + suffix
+            "unicode issues appear tied to simple fonts without explicit encoding" + suffix
         )
     else:
         profile["reason"] = "no deterministic ToUnicode candidates found"
@@ -1759,7 +1983,8 @@ def _ghostscript_type1_descriptor(
     widths_by_code = {
         _coerce_metric_int(charnum): _coerce_metric_int(width)
         for charnum, width, _ in afm._chars.values()
-        if isinstance(_coerce_metric_int(charnum, -1), int) and 0 <= _coerce_metric_int(charnum, -1) <= 255
+        if isinstance(_coerce_metric_int(charnum, -1), int)
+        and 0 <= _coerce_metric_int(charnum, -1) <= 255
     }
     weight = str(attrs.get("Weight", "") or "").lower()
     stem_v = 120 if any(token in weight for token in ("bold", "demi", "black")) else 80
@@ -1792,7 +2017,12 @@ def _local_font_program(
         font_bytes, matched_name = _system_font_program(font_name)
         if not font_bytes:
             return None, None, None, None
-        return font_bytes, matched_name, str(pikepdf.Name("/FontFile2")), {"Length1": len(font_bytes)}
+        return (
+            font_bytes,
+            matched_name,
+            str(pikepdf.Name("/FontFile2")),
+            {"Length1": len(font_bytes)},
+        )
 
     if support_kind == "type1_standard14":
         font_bytes, matched_name, lengths = _ghostscript_type1_font_program(font_name)
@@ -2372,7 +2602,11 @@ def _simple_font_unicode_map(font_dict, font_bytes: bytes | None) -> dict[int, s
         elif policy == "embedded_cff" and font_bytes:
             mapping.update(_cff_builtin_encoding_map(font_bytes))
 
-    return {code: text for code, text in mapping.items() if 0 <= code <= 0xFF and _is_valid_unicode_text(text)}
+    return {
+        code: text
+        for code, text in mapping.items()
+        if 0 <= code <= 0xFF and _is_valid_unicode_text(text)
+    }
 
 
 def _raw_text_bytes(op: str, operands) -> bytes:
@@ -2656,7 +2890,9 @@ def _inspect_font_diagnostics(
                 )
             )
 
-        def _collect_used_simple_font_codes(content_obj, resources, *, target_font_keys: set[tuple[int, int]]) -> None:
+        def _collect_used_simple_font_codes(
+            content_obj, resources, *, target_font_keys: set[tuple[int, int]]
+        ) -> None:
             if not target_font_keys:
                 return
             if resources is None:
@@ -2676,7 +2912,9 @@ def _inspect_font_diagnostics(
             if isinstance(fonts, pikepdf.Dictionary):
                 for font_obj in fonts.values():
                     font_dict = _resolve_dictionary(font_obj)
-                    font_key = _obj_key(font_dict) if isinstance(font_dict, pikepdf.Dictionary) else None
+                    font_key = (
+                        _obj_key(font_dict) if isinstance(font_dict, pikepdf.Dictionary) else None
+                    )
                     if font_key and font_key in target_font_keys:
                         target_font_in_scope = True
                         break
@@ -2731,17 +2969,21 @@ def _inspect_font_diagnostics(
                 subtype = str(font_dict.get("/Subtype") or "")
                 has_tounicode = pikepdf.Name("/ToUnicode") in font_dict
                 encoding = font_dict.get("/Encoding")
-                encoding_name = str(encoding) if encoding is not None and not isinstance(encoding, pikepdf.Dictionary) else (
-                    "dict"
-                    if isinstance(encoding, pikepdf.Dictionary)
-                    else ""
+                encoding_name = (
+                    str(encoding)
+                    if encoding is not None and not isinstance(encoding, pikepdf.Dictionary)
+                    else ("dict" if isinstance(encoding, pikepdf.Dictionary) else "")
                 )
                 font_bytes = _font_stream_bytes(descriptor)
                 auto_unicode_policy = ""
                 if subtype in ("/Type1", "/MMType1", "/TrueType"):
-                    auto_unicode_policy = _simple_font_auto_unicode_policy(font_dict, font_bytes=font_bytes)
+                    auto_unicode_policy = _simple_font_auto_unicode_policy(
+                        font_dict, font_bytes=font_bytes
+                    )
                 embedded = _has_embedded_font(descriptor)
-                local_embed_support = _local_embed_support_kind(font_dict, descendant_subtype=descendant_subtype)
+                local_embed_support = _local_embed_support_kind(
+                    font_dict, descendant_subtype=descendant_subtype
+                )
                 local_font_program_available = False
                 if not embedded and local_embed_support and base_font:
                     local_font_program_available = bool(
@@ -2756,7 +2998,9 @@ def _inspect_font_diagnostics(
                     "object_id": profile_key,
                     "base_font": base_font or "(unnamed)",
                     "subtype": subtype,
-                    "descendant_subtype": str(descendant_subtype or "") if descendant_subtype else "",
+                    "descendant_subtype": str(descendant_subtype or "")
+                    if descendant_subtype
+                    else "",
                     "embedded": embedded,
                     "has_tounicode": has_tounicode,
                     "encoding": encoding_name,
@@ -2813,8 +3057,16 @@ def _inspect_font_diagnostics(
                         cid_font = None
                         if isinstance(descendants, pikepdf.Array) and descendants:
                             cid_font = _resolve_dictionary(descendants[0])
-                        descriptor = _resolve_dictionary(cid_font.get("/FontDescriptor")) if isinstance(cid_font, pikepdf.Dictionary) else None
-                        descendant_subtype = cid_font.get("/Subtype") if isinstance(cid_font, pikepdf.Dictionary) else None
+                        descriptor = (
+                            _resolve_dictionary(cid_font.get("/FontDescriptor"))
+                            if isinstance(cid_font, pikepdf.Dictionary)
+                            else None
+                        )
+                        descendant_subtype = (
+                            cid_font.get("/Subtype")
+                            if isinstance(cid_font, pikepdf.Dictionary)
+                            else None
+                        )
                         _touch_profile(
                             font_dict,
                             descendant_subtype=descendant_subtype,
@@ -2960,7 +3212,8 @@ def _inspect_font_diagnostics(
                         current_missing_codes = {
                             code
                             for code in used_codes
-                            if code not in existing_map or not _is_valid_unicode_text(existing_map[code])
+                            if code not in existing_map
+                            or not _is_valid_unicode_text(existing_map[code])
                         }
                         generated_map = {}
                         if str(profile["auto_unicode_policy"]) != "blocked":
@@ -3012,11 +3265,19 @@ def _inspect_font_diagnostics(
             for profile in profiles
             if str(profile["subtype"]) in {"/Type1", "/MMType1", "/TrueType"}
         )
-        summary["type0_fonts"] = sum(1 for profile in profiles if str(profile["subtype"]) == "/Type0")
+        summary["type0_fonts"] = sum(
+            1 for profile in profiles if str(profile["subtype"]) == "/Type0"
+        )
         summary["embedded_fonts"] = sum(1 for profile in profiles if bool(profile["embedded"]))
-        summary["unembedded_fonts"] = sum(1 for profile in profiles if not bool(profile["embedded"]))
-        summary["fonts_with_tounicode"] = sum(1 for profile in profiles if bool(profile["has_tounicode"]))
-        summary["fonts_missing_tounicode"] = sum(1 for profile in profiles if not bool(profile["has_tounicode"]))
+        summary["unembedded_fonts"] = sum(
+            1 for profile in profiles if not bool(profile["embedded"])
+        )
+        summary["fonts_with_tounicode"] = sum(
+            1 for profile in profiles if bool(profile["has_tounicode"])
+        )
+        summary["fonts_missing_tounicode"] = sum(
+            1 for profile in profiles if not bool(profile["has_tounicode"])
+        )
         summary["fonts_with_invalid_tounicode"] = sum(
             1 for profile in profiles if int(profile["invalid_tounicode_entries"]) > 0
         )
@@ -3052,7 +3313,7 @@ def _inspect_font_diagnostics(
             for profile in profiles
             if not bool(profile["embedded"]) and not bool(profile["local_embed_support"])
         )
-        diagnostics["profiles"] = profiles[:max(0, profile_limit)]
+        diagnostics["profiles"] = profiles[: max(0, profile_limit)]
     except Exception as exc:
         diagnostics["error"] = str(exc)
 
@@ -3083,24 +3344,28 @@ def _render_tounicode_cmap(mapping: dict[int, str], code_bytes: int) -> bytes:
     ]
 
     for i in range(0, len(entries), 100):
-        chunk = entries[i:i + 100]
+        chunk = entries[i : i + 100]
         lines.append(f"{len(chunk)} beginbfchar")
         for code, value in chunk:
             dest_hex = value.encode("utf-16-be").hex().upper()
             lines.append(f"<{code:0{width}X}> <{dest_hex}>")
         lines.append("endbfchar")
 
-    lines.extend([
-        "endcmap",
-        "CMapName currentdict /CMap defineresource pop",
-        "end",
-        "end",
-        "",
-    ])
+    lines.extend(
+        [
+            "endcmap",
+            "CMapName currentdict /CMap defineresource pop",
+            "end",
+            "end",
+            "",
+        ]
+    )
     return "\n".join(lines).encode("ascii")
 
 
-def _merge_tounicode_maps(existing: dict[int, str], generated: dict[int, str]) -> tuple[dict[int, str], int]:
+def _merge_tounicode_maps(
+    existing: dict[int, str], generated: dict[int, str]
+) -> tuple[dict[int, str], int]:
     merged = {code: text for code, text in existing.items() if _is_valid_unicode_text(text)}
     overwritten = 0
     for code, text in generated.items():
@@ -3223,7 +3488,7 @@ def _repair_pdf_tounicode_sync(
         mapping: dict[int, int] = {}
         pair_count = len(raw) // 2
         for cid in range(pair_count):
-            gid = int.from_bytes(raw[cid * 2:(cid + 1) * 2], "big")
+            gid = int.from_bytes(raw[cid * 2 : (cid + 1) * 2], "big")
             mapping[cid] = gid
         return mapping, False
 
@@ -3290,7 +3555,9 @@ def _repair_pdf_tounicode_sync(
         if appearance_key:
             seen_collect_appearances.add(appearance_key)
 
-        appearance_resources = _resolve_dictionary(appearance_obj.get("/Resources")) or fallback_resources
+        appearance_resources = (
+            _resolve_dictionary(appearance_obj.get("/Resources")) or fallback_resources
+        )
         if hasattr(appearance_obj, "read_bytes"):
             _collect_used_simple_font_codes(appearance_obj, appearance_resources)
 
@@ -3374,7 +3641,9 @@ def _repair_pdf_tounicode_sync(
         if appearance_key:
             candidate_seen_appearances.add(appearance_key)
 
-        appearance_resources = _resolve_dictionary(appearance_obj.get("/Resources")) or fallback_resources
+        appearance_resources = (
+            _resolve_dictionary(appearance_obj.get("/Resources")) or fallback_resources
+        )
         _collect_zero_byte_candidates(appearance_resources)
 
         for key in ("/N", "/R", "/D"):
@@ -3440,7 +3709,9 @@ def _repair_pdf_tounicode_sync(
                         changed = True
             elif op == "Do" and operands and isinstance(xobjects, pikepdf.Dictionary):
                 xobject = _resolve_dictionary(xobjects.get(operands[0]))
-                if isinstance(xobject, pikepdf.Dictionary) and xobject.get("/Subtype") == pikepdf.Name("/Form"):
+                if isinstance(xobject, pikepdf.Dictionary) and xobject.get(
+                    "/Subtype"
+                ) == pikepdf.Name("/Form"):
                     child_resources = _resolve_dictionary(xobject.get("/Resources")) or resources
                     _sanitize_simple_font_zero_bytes(pdf, xobject, child_resources)
 
@@ -3459,7 +3730,9 @@ def _repair_pdf_tounicode_sync(
         if appearance_key:
             sanitized_appearance_streams.add(appearance_key)
 
-        appearance_resources = _resolve_dictionary(appearance_obj.get("/Resources")) or fallback_resources
+        appearance_resources = (
+            _resolve_dictionary(appearance_obj.get("/Resources")) or fallback_resources
+        )
         if hasattr(appearance_obj, "read_bytes"):
             _sanitize_simple_font_zero_bytes(pdf, appearance_obj, appearance_resources)
 
@@ -3533,9 +3806,7 @@ def _repair_pdf_tounicode_sync(
             return False, 0, 0, invalid_entries, 0, 0
 
         target_map = {
-            code: text
-            for code, text in generated.items()
-            if not used_codes or code in used_codes
+            code: text for code, text in generated.items() if not used_codes or code in used_codes
         }
         if not target_map:
             return False, 0, len(generated), invalid_entries, 0, 0
@@ -3557,7 +3828,14 @@ def _repair_pdf_tounicode_sync(
 
         cmap_bytes = _render_tounicode_cmap(target_map, 1)
         font_dict[pikepdf.Name("/ToUnicode")] = pdf.make_stream(cmap_bytes)
-        return True, len(target_map), len(target_map), invalid_entries, overwritten, stale_entries_removed
+        return (
+            True,
+            len(target_map),
+            len(target_map),
+            invalid_entries,
+            overwritten,
+            stale_entries_removed,
+        )
 
     def _walk_resources(pdf, resources) -> None:
         if not _is_pdf_mapping(resources):
@@ -3586,7 +3864,14 @@ def _repair_pdf_tounicode_sync(
                         pikepdf.Name("/MMType1"),
                         pikepdf.Name("/TrueType"),
                     ):
-                        changed, merged_count, generated_count, invalid_entries, overwritten, stale_entries_removed = _rebuild_simple_font_tounicode(
+                        (
+                            changed,
+                            merged_count,
+                            generated_count,
+                            invalid_entries,
+                            overwritten,
+                            stale_entries_removed,
+                        ) = _rebuild_simple_font_tounicode(
                             pdf,
                             type0_font,
                         )
@@ -3602,10 +3887,12 @@ def _repair_pdf_tounicode_sync(
                     if cid_font.get("/Subtype") != pikepdf.Name("/CIDFontType2"):
                         continue
 
-                    changed, merged_count, generated_count, invalid_entries, overwritten = _rebuild_type0_tounicode(
-                        pdf,
-                        type0_font,
-                        cid_font,
+                    changed, merged_count, generated_count, invalid_entries, overwritten = (
+                        _rebuild_type0_tounicode(
+                            pdf,
+                            type0_font,
+                            cid_font,
+                        )
                     )
                     stale_entries_removed = 0
                 if changed:
@@ -3677,7 +3964,9 @@ def _repair_pdf_tounicode_sync(
                         seen_fields.add(field_key)
 
                     field_resources = _resolve_dictionary(field.get("/DR"))
-                    _collect_used_simple_font_codes_from_appearance(field.get("/AP"), field_resources)
+                    _collect_used_simple_font_codes_from_appearance(
+                        field.get("/AP"), field_resources
+                    )
 
                     kids = field.get("/Kids")
                     if isinstance(kids, pikepdf.Array):
@@ -3706,7 +3995,9 @@ def _repair_pdf_tounicode_sync(
                     for field in fields:
                         field_dict = _resolve_dictionary(field)
                         if _is_pdf_mapping(field_dict):
-                            _collect_zero_byte_candidates(_resolve_dictionary(field_dict.get("/DR")))
+                            _collect_zero_byte_candidates(
+                                _resolve_dictionary(field_dict.get("/DR"))
+                            )
                             _collect_zero_byte_candidates_from_appearance(
                                 field_dict.get("/AP"),
                                 _resolve_dictionary(field_dict.get("/DR")),
@@ -3846,17 +4137,19 @@ def _embed_system_fonts_sync(
         if not descriptor_data:
             return descriptor
 
-        descriptor = pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/FontDescriptor"),
-            "/FontName": pikepdf.Name(f"/{_strip_subset_prefix(font_name)}"),
-            "/Flags": int(descriptor_data["Flags"]),
-            "/ItalicAngle": int(descriptor_data["ItalicAngle"]),
-            "/Ascent": int(descriptor_data["Ascent"]),
-            "/Descent": int(descriptor_data["Descent"]),
-            "/CapHeight": int(descriptor_data["CapHeight"]),
-            "/StemV": int(descriptor_data["StemV"]),
-            "/FontBBox": pikepdf.Array(descriptor_data["FontBBox"]),
-        })
+        descriptor = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/FontDescriptor"),
+                "/FontName": pikepdf.Name(f"/{_strip_subset_prefix(font_name)}"),
+                "/Flags": int(descriptor_data["Flags"]),
+                "/ItalicAngle": int(descriptor_data["ItalicAngle"]),
+                "/Ascent": int(descriptor_data["Ascent"]),
+                "/Descent": int(descriptor_data["Descent"]),
+                "/CapHeight": int(descriptor_data["CapHeight"]),
+                "/StemV": int(descriptor_data["StemV"]),
+                "/FontBBox": pikepdf.Array(descriptor_data["FontBBox"]),
+            }
+        )
         font_dict[pikepdf.Name("/FontDescriptor")] = descriptor
         return descriptor
 
@@ -3877,7 +4170,10 @@ def _embed_system_fonts_sync(
             and existing_first_char is not None
             and existing_last_char is not None
         ):
-            if isinstance(descriptor, pikepdf.Dictionary) and pikepdf.Name("/MissingWidth") not in descriptor:
+            if (
+                isinstance(descriptor, pikepdf.Dictionary)
+                and pikepdf.Name("/MissingWidth") not in descriptor
+            ):
                 descriptor[pikepdf.Name("/MissingWidth")] = int(
                     descriptor_data.get("MissingWidth", 0) or 0
                 )
@@ -3891,9 +4187,13 @@ def _embed_system_fonts_sync(
             font_dict[pikepdf.Name("/LastChar")] = last_char
             font_dict[pikepdf.Name("/Widths")] = pikepdf.Array(int(width) for width in widths)
         if isinstance(descriptor, pikepdf.Dictionary):
-            descriptor[pikepdf.Name("/MissingWidth")] = int(descriptor_data.get("MissingWidth", 0) or 0)
+            descriptor[pikepdf.Name("/MissingWidth")] = int(
+                descriptor_data.get("MissingWidth", 0) or 0
+            )
 
-    def _embed_descriptor_font(font_dict, descriptor, font_name: str, *, descendant_subtype=None) -> bool:
+    def _embed_descriptor_font(
+        font_dict, descriptor, font_name: str, *, descendant_subtype=None
+    ) -> bool:
         descriptor = _ensure_type1_descriptor(font_dict, descriptor, font_name)
         if not isinstance(descriptor, pikepdf.Dictionary):
             stats["fonts_unsupported"] += 1
@@ -3917,7 +4217,9 @@ def _embed_system_fonts_sync(
         descriptor[pikepdf.Name(fontfile_key)] = stream
         _apply_type1_width_metrics(font_dict, descriptor, font_name)
         if pikepdf.Name("/FontName") not in descriptor and font_name:
-            descriptor[pikepdf.Name("/FontName")] = pikepdf.Name(f"/{_strip_subset_prefix(font_name)}")
+            descriptor[pikepdf.Name("/FontName")] = pikepdf.Name(
+                f"/{_strip_subset_prefix(font_name)}"
+            )
         stats["fonts_embedded"] += 1
         stats["fonts_touched"] += 1
         logger.info(f"Embedded local font program for {font_name} using {matched_name}")
@@ -3950,7 +4252,11 @@ def _embed_system_fonts_sync(
                     descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
                     font_name = str(
                         font_dict.get("/BaseFont")
-                        or (descriptor.get("/FontName") if isinstance(descriptor, pikepdf.Dictionary) else "")
+                        or (
+                            descriptor.get("/FontName")
+                            if isinstance(descriptor, pikepdf.Dictionary)
+                            else ""
+                        )
                     )
                     _embed_descriptor_font(font_dict, descriptor, font_name)
                     continue
@@ -3959,7 +4265,11 @@ def _embed_system_fonts_sync(
                     descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
                     font_name = str(
                         font_dict.get("/BaseFont")
-                        or (descriptor.get("/FontName") if isinstance(descriptor, pikepdf.Dictionary) else "")
+                        or (
+                            descriptor.get("/FontName")
+                            if isinstance(descriptor, pikepdf.Dictionary)
+                            else ""
+                        )
                     )
                     changed = _embed_descriptor_font(font_dict, descriptor, font_name)
                     if not changed and _local_embed_support_kind(font_dict) != "type1_standard14":
@@ -4062,9 +4372,7 @@ async def _embed_system_fonts(
 
 def _ghostscript_embed_command(gs: str, input_path: Path, output_path: Path) -> tuple[str, ...]:
     always_embed = " ".join(GHOSTSCRIPT_ALWAYS_EMBED_FONTS)
-    distiller_params = (
-        f"<< /NeverEmbed [ ] /AlwaysEmbed [ {always_embed} ] >> setdistillerparams"
-    )
+    distiller_params = f"<< /NeverEmbed [ ] /AlwaysEmbed [ {always_embed} ] >> setdistillerparams"
     return (
         gs,
         "-q",
@@ -4181,7 +4489,9 @@ async def _attempt_font_lane(
                 "diagnostics_summary": embed_diagnostics.get("summary", {}),
             }
             rewritten = job_dir / "fontfix_embedded_gs.pdf"
-            ok, message = await _rewrite_pdf_with_ghostscript_embed(working_pdf, rewritten, timeout_seconds=settings.subprocess_timeout_ghostscript)
+            ok, message = await _rewrite_pdf_with_ghostscript_embed(
+                working_pdf, rewritten, timeout_seconds=settings.subprocess_timeout_ghostscript
+            )
             preprocess_message = _join_messages(preprocess_message, message)
             if not ok:
                 return {
@@ -4204,7 +4514,9 @@ async def _attempt_font_lane(
                 requires_retag = False
             else:
                 rewritten = job_dir / "fontfix_embedded_gs.pdf"
-                ok, message = await _rewrite_pdf_with_ghostscript_embed(working_pdf, rewritten, timeout_seconds=settings.subprocess_timeout_ghostscript)
+                ok, message = await _rewrite_pdf_with_ghostscript_embed(
+                    working_pdf, rewritten, timeout_seconds=settings.subprocess_timeout_ghostscript
+                )
                 preprocess_message = message
                 if not ok:
                     return {
@@ -4248,7 +4560,11 @@ async def _attempt_font_lane(
                 refreshed_structure = await extract_structure(remediation_input, refresh_dir)
                 candidate_structure_json = refreshed_structure.document_json
                 if isinstance(candidate_structure_json, dict):
-                    original_elements = structure_json.get("elements", []) if isinstance(structure_json, dict) else []
+                    original_elements = (
+                        structure_json.get("elements", [])
+                        if isinstance(structure_json, dict)
+                        else []
+                    )
                     refreshed_elements = candidate_structure_json.get("elements", [])
                     original_figures = sum(
                         1
@@ -4261,7 +4577,8 @@ async def _attempt_font_lane(
                         if isinstance(element, dict) and element.get("type") == "figure"
                     )
                     approved_alts = [
-                        entry for entry in reviewed_alts
+                        entry
+                        for entry in reviewed_alts
                         if isinstance(entry, dict) and entry.get("status") == "approved"
                     ]
                     if approved_alts and original_figures != refreshed_figures:
@@ -4305,7 +4622,9 @@ async def _attempt_font_lane(
 
     if lane in (FONT_LANE_OCR_REDO, FONT_LANE_OCR_FORCE):
         post_ocr_repaired = job_dir / f"{lane}_post_font_dicts.pdf"
-        ok, post_message, post_stats = await _repair_pdf_font_dicts(validation_target, post_ocr_repaired)
+        ok, post_message, post_stats = await _repair_pdf_font_dicts(
+            validation_target, post_ocr_repaired
+        )
         if ok:
             validation_target = post_ocr_repaired
             remediation_output = post_ocr_repaired
@@ -4313,7 +4632,9 @@ async def _attempt_font_lane(
             preprocess_message = _join_messages(preprocess_message, post_message)
 
         post_ocr_widths = job_dir / f"{lane}_post_width_sync.pdf"
-        ok, width_message, width_stats = await _sync_pdf_cid_cff_widths(validation_target, post_ocr_widths)
+        ok, width_message, width_stats = await _sync_pdf_cid_cff_widths(
+            validation_target, post_ocr_widths
+        )
         if ok:
             validation_target = post_ocr_widths
             remediation_output = post_ocr_widths
@@ -4332,7 +4653,9 @@ async def _attempt_font_lane(
         "attempted": True,
         "success": True,
         "ocr_skipped": preprocess_skipped,
-        "ocr_message": preprocess_message if lane in (FONT_LANE_OCR_REDO, FONT_LANE_OCR_FORCE) else "",
+        "ocr_message": preprocess_message
+        if lane in (FONT_LANE_OCR_REDO, FONT_LANE_OCR_FORCE)
+        else "",
         "message": preprocess_message,
         "details": preprocess_details,
         "requires_retag": requires_retag,
@@ -4353,9 +4676,7 @@ async def _update_step(
     error: str | None = None,
 ):
     """Update a job step's status in the database."""
-    stmt = select(JobStep).where(
-        JobStep.job_id == job_id, JobStep.step_name == step_name
-    )
+    stmt = select(JobStep).where(JobStep.job_id == job_id, JobStep.step_name == step_name)
     row = await db.execute(stmt)
     step = row.scalar_one_or_none()
     if step is None:
@@ -4365,9 +4686,9 @@ async def _update_step(
 
     step.status = status
     if status == "running":
-        step.started_at = datetime.now(timezone.utc)
+        step.started_at = datetime.now(UTC)
     if status in ("complete", "failed", "skipped"):
-        step.completed_at = datetime.now(timezone.utc)
+        step.completed_at = datetime.now(UTC)
     if result:
         step.result_json = json.dumps(result)
     if error:
@@ -4406,14 +4727,22 @@ async def run_pipeline(
 
             job.classification = classification.type
             job.page_count = classification.total_pages
-            await _update_step(db, job_id, "classify", "complete", result={
-                "type": classification.type,
-                "confidence": classification.confidence,
-                "pages_with_text": classification.pages_with_text,
-                "total_pages": classification.total_pages,
-            })
+            await _update_step(
+                db,
+                job_id,
+                "classify",
+                "complete",
+                result={
+                    "type": classification.type,
+                    "confidence": classification.confidence,
+                    "pages_with_text": classification.pages_with_text,
+                    "total_pages": classification.total_pages,
+                },
+            )
             job_manager.emit_progress(
-                job_id, step="classify", status="complete",
+                job_id,
+                step="classify",
+                status="complete",
                 result={"type": classification.type},
             )
 
@@ -4437,15 +4766,24 @@ async def run_pipeline(
 
                 if ocr_result.success:
                     working_pdf = ocr_result.output_path
-                    await _update_step(db, job_id, "ocr", "complete", result={
-                        "skipped": ocr_result.skipped,
-                        "message": ocr_result.message,
-                    })
+                    await _update_step(
+                        db,
+                        job_id,
+                        "ocr",
+                        "complete",
+                        result={
+                            "skipped": ocr_result.skipped,
+                            "message": ocr_result.message,
+                        },
+                    )
                     job_manager.emit_progress(job_id, step="ocr", status="complete")
                 else:
                     await _update_step(db, job_id, "ocr", "failed", error=ocr_result.message)
                     job_manager.emit_progress(
-                        job_id, step="ocr", status="failed", message=ocr_result.message,
+                        job_id,
+                        step="ocr",
+                        status="failed",
+                        message=ocr_result.message,
                     )
                     raise RuntimeError(
                         f"OCR failed for {classification.type} document: {ocr_result.message}"
@@ -4463,7 +4801,7 @@ async def run_pipeline(
             if structure.processed_pdf_path:
                 working_pdf = structure.processed_pdf_path
 
-            toc_llm_assist = {
+            toc_intelligence_assist = {
                 "attempted": False,
                 "applied": False,
                 "reason": "disabled",
@@ -4473,15 +4811,17 @@ async def run_pipeline(
             if settings.assist_toc_with_llm:
                 llm_client = make_llm_client(settings)
                 try:
-                    structure.document_json, toc_llm_assist = await enhance_toc_structure_with_llm(
+                    structure.document_json, toc_intelligence_assist = await enhance_toc_structure_with_intelligence(
                         pdf_path=working_pdf,
                         structure_json=structure.document_json,
                         original_filename=job.original_filename or input_path.name,
                         llm_client=llm_client,
                     )
                 except Exception as exc:
-                    logger.warning(f"TOC LLM assist failed for {job.original_filename}: {exc}")
-                    toc_llm_assist = {
+                    logger.warning(
+                        f"TOC intelligence assist failed for {job.original_filename}: {exc}"
+                    )
+                    toc_intelligence_assist = {
                         "attempted": True,
                         "applied": False,
                         "reason": str(exc),
@@ -4491,29 +4831,53 @@ async def run_pipeline(
                 finally:
                     await llm_client.close()
 
+            structure.document_json, structure.figures, synthetic_figure_rationalization = (
+                synthesize_missing_visual_figures(
+                    working_pdf=working_pdf,
+                    structure_json=structure.document_json,
+                    figures=structure.figures,
+                    figures_dir=job_dir / "figures",
+                )
+            )
+            structure.figures_count = len(structure.figures)
+
             elements = structure.document_json.get("elements", [])
             headings_count = sum(1 for el in elements if el.get("type") == "heading")
             tables_count = sum(1 for el in elements if el.get("type") == "table")
             toc_caption_count = sum(1 for el in elements if el.get("type") == "toc_caption")
-            toc_item_count = sum(1 for el in elements if el.get("type") in {"toc_item", "toc_item_table"})
+            toc_item_count = sum(
+                1 for el in elements if el.get("type") in {"toc_item", "toc_item_table"}
+            )
 
             job.structure_json = json.dumps(structure.document_json)
-            await _update_step(db, job_id, "structure", "complete", result={
-                "page_count": structure.page_count,
-                "headings": headings_count,
-                "tables": tables_count,
-                "figures": structure.figures_count,
-                "toc_captions": toc_caption_count,
-                "toc_items": toc_item_count,
-                "toc_llm_assist": toc_llm_assist,
-            })
+            await _update_step(
+                db,
+                job_id,
+                "structure",
+                "complete",
+                result={
+                    "page_count": structure.page_count,
+                    "headings": headings_count,
+                    "tables": tables_count,
+                    "figures": structure.figures_count,
+                    "toc_captions": toc_caption_count,
+                    "toc_items": toc_item_count,
+                    "toc_intelligence_assist": toc_intelligence_assist,
+                    "synthetic_figure_rationalization": synthetic_figure_rationalization,
+                },
+            )
             job_manager.emit_progress(
-                job_id, step="structure", status="complete",
+                job_id,
+                step="structure",
+                status="complete",
                 result={
                     "figures_found": structure.figures_count,
                     "toc_captions": toc_caption_count,
                     "toc_items": toc_item_count,
-                    "toc_llm_assist_applied": bool(toc_llm_assist.get("applied", False)),
+                    "toc_intelligence_assist_applied": bool(toc_intelligence_assist.get("applied", False)),
+                    "synthetic_figure_count": int(
+                        synthetic_figure_rationalization.get("applied_count", 0) or 0
+                    ),
                 },
             )
 
@@ -4566,7 +4930,9 @@ async def run_pipeline(
                         elif not generated_text and caption_fallback:
                             status = "approved"
                             generated_text = caption_fallback
-                        elif not generated_text or (generated_text.startswith("[") and generated_text.endswith("]")):
+                        elif not generated_text or (
+                            generated_text.startswith("[") and generated_text.endswith("]")
+                        ):
                             status = "approved"
                         else:
                             status = "approved"
@@ -4575,30 +4941,40 @@ async def run_pipeline(
                         approved_count += 1
                     elif status == "rejected":
                         rejected_count += 1
-                    db.add(AltTextEntry(
-                        job_id=job_id,
-                        figure_index=alt.figure_index,
-                        image_path=str(fig.path),
-                        generated_text=generated_text or None,
-                        status=status,
-                    ))
+                    db.add(
+                        AltTextEntry(
+                            job_id=job_id,
+                            figure_index=alt.figure_index,
+                            image_path=str(fig.path),
+                            generated_text=generated_text or None,
+                            status=status,
+                        )
+                    )
                 await db.commit()
                 figure_change_specs = figure_applied_change_specs(
                     figures=structure.figures,
                     alt_texts=alt_texts,
                 )
 
-                await _update_step(db, job_id, "alt_text", "complete", result={
-                    "count": len(alt_texts),
-                    "approved": approved_count,
-                    "rejected": rejected_count,
-                    "reviewable_changes": len(figure_change_specs),
-                    "reclassified": reclassified_count,
-                    "figure_reclassification": figure_reclassification,
-                    "auto_approve_enabled": settings.auto_approve_generated_alt_text,
-                })
+                await _update_step(
+                    db,
+                    job_id,
+                    "alt_text",
+                    "complete",
+                    result={
+                        "count": len(alt_texts),
+                        "approved": approved_count,
+                        "rejected": rejected_count,
+                        "reviewable_changes": len(figure_change_specs),
+                        "reclassified": reclassified_count,
+                        "figure_reclassification": figure_reclassification,
+                        "auto_approve_enabled": settings.auto_approve_generated_alt_text,
+                    },
+                )
                 job_manager.emit_progress(
-                    job_id, step="alt_text", status="complete",
+                    job_id,
+                    step="alt_text",
+                    status="complete",
                     result={
                         "count": len(alt_texts),
                         "approved": approved_count,
@@ -4649,7 +5025,10 @@ async def run_pipeline(
                 job.error = user_error or f"Pipeline failed at step: {current_step}"
                 await db.commit()
             job_manager.emit_progress(
-                job_id, step=current_step or "error", status="failed", message=user_error,
+                job_id,
+                step=current_step or "error",
+                status="failed",
+                message=user_error,
             )
 
 
@@ -4720,6 +5099,12 @@ async def run_tagging_and_validation(
             settings=settings,
             structure_json=structure_json,
         )
+        working_pdf, pretag_widget_rationalization = await _apply_pretag_widget_rationalization(
+            job=job,
+            settings=settings,
+            working_pdf=working_pdf,
+            structure_json=structure_json,
+        )
         working_pdf, pretag_form_intelligence = await _apply_pretag_form_intelligence(
             job=job,
             settings=settings,
@@ -4737,28 +5122,52 @@ async def run_tagging_and_validation(
         )
 
         job.output_path = str(tagging_result.output_path)
-        await _update_step(db, job_id, "tagging", "complete", result={
-            "tags_added": tagging_result.tags_added,
-            "lang_set": tagging_result.lang_set,
-            "struct_elems": tagging_result.struct_elems_created,
-            "headings_tagged": tagging_result.headings_tagged,
-            "figures_tagged": tagging_result.figures_tagged,
-            "decorative_figures_artifacted": tagging_result.decorative_figures_artifacted,
-            "tables_tagged": tagging_result.tables_tagged,
-            "lists_tagged": tagging_result.lists_tagged,
-            "links_tagged": tagging_result.links_tagged,
-            "bookmarks_added": tagging_result.bookmarks_added,
-            "title_set": tagging_result.title_set,
-            "grounded_text_auto_applied": bool(pretag_grounded_text.get("applied")),
-            "grounded_text_auto_applied_count": int(pretag_grounded_text.get("applied_count", 0) or 0),
-            "grounded_text_code_auto_applied_count": int(pretag_grounded_text.get("applied_code_text_count", 0) or 0),
-            "table_intelligence_auto_applied": bool(pretag_table_intelligence.get("applied")),
-            "table_intelligence_auto_applied_count": int(pretag_table_intelligence.get("applied_count", 0) or 0),
-            "table_intelligence_confirmed_count": int(pretag_table_intelligence.get("confirmed_count", 0) or 0),
-            "table_intelligence_set_headers_count": int(pretag_table_intelligence.get("set_headers_count", 0) or 0),
-            "form_intelligence_auto_applied": bool(pretag_form_intelligence.get("applied")),
-            "form_intelligence_auto_applied_count": int(pretag_form_intelligence.get("applied_count", 0) or 0),
-        })
+        await _update_step(
+            db,
+            job_id,
+            "tagging",
+            "complete",
+            result={
+                "tags_added": tagging_result.tags_added,
+                "lang_set": tagging_result.lang_set,
+                "struct_elems": tagging_result.struct_elems_created,
+                "headings_tagged": tagging_result.headings_tagged,
+                "figures_tagged": tagging_result.figures_tagged,
+                "decorative_figures_artifacted": tagging_result.decorative_figures_artifacted,
+                "tables_tagged": tagging_result.tables_tagged,
+                "lists_tagged": tagging_result.lists_tagged,
+                "links_tagged": tagging_result.links_tagged,
+                "bookmarks_added": tagging_result.bookmarks_added,
+                "title_set": tagging_result.title_set,
+                "grounded_text_auto_applied": bool(pretag_grounded_text.get("applied")),
+                "grounded_text_auto_applied_count": int(
+                    pretag_grounded_text.get("applied_count", 0) or 0
+                ),
+                "grounded_text_code_auto_applied_count": int(
+                    pretag_grounded_text.get("applied_code_text_count", 0) or 0
+                ),
+                "table_intelligence_auto_applied": bool(pretag_table_intelligence.get("applied")),
+                "table_intelligence_auto_applied_count": int(
+                    pretag_table_intelligence.get("applied_count", 0) or 0
+                ),
+                "table_intelligence_confirmed_count": int(
+                    pretag_table_intelligence.get("confirmed_count", 0) or 0
+                ),
+                "table_intelligence_set_headers_count": int(
+                    pretag_table_intelligence.get("set_headers_count", 0) or 0
+                ),
+                "widget_rationalization_auto_applied": bool(
+                    pretag_widget_rationalization.get("applied")
+                ),
+                "widget_rationalization_auto_applied_count": int(
+                    pretag_widget_rationalization.get("applied_count", 0) or 0
+                ),
+                "form_intelligence_auto_applied": bool(pretag_form_intelligence.get("applied")),
+                "form_intelligence_auto_applied_count": int(
+                    pretag_form_intelligence.get("applied_count", 0) or 0
+                ),
+            },
+        )
         job_manager.emit_progress(job_id, step="tagging", status="complete")
 
         # ── Step 6: Validation ──
@@ -4812,8 +5221,16 @@ async def run_tagging_and_validation(
                 for v in validation.violations
             ):
                 gate_font_diagnostics = initial_font_diagnostics
-                summary = initial_font_diagnostics.get("summary") if isinstance(initial_font_diagnostics, dict) else None
-                profiles = initial_font_diagnostics.get("profiles") if isinstance(initial_font_diagnostics, dict) else None
+                summary = (
+                    initial_font_diagnostics.get("summary")
+                    if isinstance(initial_font_diagnostics, dict)
+                    else None
+                )
+                profiles = (
+                    initial_font_diagnostics.get("profiles")
+                    if isinstance(initial_font_diagnostics, dict)
+                    else None
+                )
                 if (
                     isinstance(summary, dict)
                     and isinstance(profiles, list)
@@ -4904,7 +5321,11 @@ async def run_tagging_and_validation(
                                 best_tagging_result = candidate_tagging_result
                                 preprocessed_path = attempt.get("preprocessed_path")
                                 requires_retag = bool(attempt.get("requires_retag", True))
-                                if requires_retag and isinstance(preprocessed_path, str) and preprocessed_path:
+                                if (
+                                    requires_retag
+                                    and isinstance(preprocessed_path, str)
+                                    and preprocessed_path
+                                ):
                                     best_working_pdf = Path(preprocessed_path)
                                     fidelity_source_pdf = best_working_pdf
                                 if isinstance(attempt["output_path"], Path):
@@ -4941,7 +5362,9 @@ async def run_tagging_and_validation(
                         font_remediation["selected_lane"] = selected_lanes[-1]
                         font_remediation["selected_lanes"] = selected_lanes
                         if fidelity_source_pdf != Path(job.input_path):
-                            font_remediation["selected_preprocessed_path"] = str(fidelity_source_pdf)
+                            font_remediation["selected_preprocessed_path"] = str(
+                                fidelity_source_pdf
+                            )
                         font_remediation["applied"] = True
                 except Exception as exc:
                     logger.exception(f"Font remediation lane evaluation failed for job {job_id}")
@@ -4967,14 +5390,22 @@ async def run_tagging_and_validation(
             llm_font_map_auto=llm_font_map_auto,
         )
 
-        await _update_step(db, job_id, "validation", "complete", result={
-            "compliant": selected_validation.compliant,
-            "violations_count": len(selected_validation.violations),
-            "font_remediation_attempted": bool(font_remediation["attempted"]),
-            "font_remediation_applied": bool(font_remediation["applied"]),
-        })
+        await _update_step(
+            db,
+            job_id,
+            "validation",
+            "complete",
+            result={
+                "compliant": selected_validation.compliant,
+                "violations_count": len(selected_validation.violations),
+                "font_remediation_attempted": bool(font_remediation["attempted"]),
+                "font_remediation_applied": bool(font_remediation["applied"]),
+            },
+        )
         job_manager.emit_progress(
-            job_id, step="validation", status="complete",
+            job_id,
+            step="validation",
+            status="complete",
             result={
                 "compliant": selected_validation.compliant,
                 "font_remediation_attempted": bool(font_remediation["attempted"]),
@@ -5004,20 +5435,28 @@ async def run_tagging_and_validation(
             tagging_metrics=validation_payload["tagging"],
             classification=job.classification,
         )
-        review_tasks, fidelity_report, grounded_text_adjudication = await _adjudicate_grounded_text_candidates(
+        (
+            review_tasks,
+            fidelity_report,
+            grounded_text_adjudication,
+        ) = await _adjudicate_grounded_text_candidates(
             job=job,
             settings=settings,
             review_tasks=review_tasks,
             fidelity_report=fidelity_report,
         )
-        safe_grounded_resolutions = _collect_safe_grounded_text_resolutions(grounded_text_adjudication)
-        if safe_grounded_resolutions and _blocking_review_task_count(review_tasks) > 0:
+        safe_grounded_resolutions = _collect_safe_grounded_text_resolutions(
+            grounded_text_adjudication
+        )
+        if safe_grounded_resolutions and _blocking_task_count(review_tasks) > 0:
             retry_structure_json, retry_audit = _apply_grounded_text_resolutions_to_structure(
                 structure_json or {},
                 safe_grounded_resolutions,
             )
             if bool(retry_audit.get("applied")):
-                retry_output_path = get_output_path(job_id, f"accessible_grounded_retry_{job.original_filename}")
+                retry_output_path = get_output_path(
+                    job_id, f"accessible_grounded_retry_{job.original_filename}"
+                )
                 retry_tagging_result = await tag_pdf(
                     input_path=working_pdf,
                     output_path=retry_output_path,
@@ -5058,10 +5497,10 @@ async def run_tagging_and_validation(
                     tagging_metrics=retry_validation_payload["tagging"],
                     classification=job.classification,
                 )
-                retry_blocking_count = _blocking_review_task_count(retry_review_tasks)
+                retry_blocking_count = _blocking_task_count(retry_review_tasks)
                 if (
                     retry_validation.compliant
-                    and retry_blocking_count < _blocking_review_task_count(review_tasks)
+                    and retry_blocking_count < _blocking_task_count(review_tasks)
                     and not _has_grounded_text_candidate_task(retry_review_tasks)
                 ):
                     structure_json = retry_structure_json
@@ -5073,13 +5512,19 @@ async def run_tagging_and_validation(
                     review_tasks = retry_review_tasks
                     fidelity_report = retry_fidelity_report
                 else:
-                    retry_review_tasks, retry_fidelity_report, _ = await _adjudicate_grounded_text_candidates(
+                    (
+                        retry_review_tasks,
+                        retry_fidelity_report,
+                        _,
+                    ) = await _adjudicate_grounded_text_candidates(
                         job=job,
                         settings=settings,
                         review_tasks=retry_review_tasks,
                         fidelity_report=retry_fidelity_report,
                     )
-                    if retry_validation.compliant and _blocking_review_task_count(retry_review_tasks) < _blocking_review_task_count(review_tasks):
+                    if retry_validation.compliant and _blocking_task_count(
+                        retry_review_tasks
+                    ) < _blocking_task_count(review_tasks):
                         structure_json = retry_structure_json
                         job.structure_json = json.dumps(retry_structure_json)
                         job.output_path = str(retry_tagging_result.output_path)
@@ -5090,7 +5535,12 @@ async def run_tagging_and_validation(
                         fidelity_report = retry_fidelity_report
 
         review_task_metadata_overrides: dict[tuple[str, str], dict[str, object]] = {}
-        auto_audit, candidate_validation, candidate_output_pdf, metadata_overrides = await _attempt_auto_llm_font_map(
+        (
+            auto_audit,
+            candidate_validation,
+            candidate_output_pdf,
+            metadata_overrides,
+        ) = await _attempt_auto_llm_font_map(
             job=job,
             settings=settings,
             output_pdf=Path(job.output_path or tagging_result.output_path),
@@ -5110,7 +5560,11 @@ async def run_tagging_and_validation(
         )
 
         if structure_json and _blocking_task_count(review_tasks) > 0:
-            suggested_review_tasks, auto_structure_json, applied_specs = await auto_apply_structure_review_tasks(
+            (
+                suggested_review_tasks,
+                auto_structure_json,
+                applied_specs,
+            ) = await auto_apply_structure_tasks(
                 job=job,
                 settings=settings,
                 review_tasks=review_tasks,
@@ -5118,7 +5572,9 @@ async def run_tagging_and_validation(
             )
             review_tasks = suggested_review_tasks
             if applied_specs and auto_structure_json != structure_json:
-                auto_output_path = get_output_path(job_id, f"accessible_auto_review_{job.original_filename}")
+                auto_output_path = get_output_path(
+                    job_id, f"accessible_auto_review_{job.original_filename}"
+                )
                 auto_tagging_result = await tag_pdf(
                     input_path=working_pdf,
                     output_path=auto_output_path,
@@ -5159,16 +5615,19 @@ async def run_tagging_and_validation(
                     tagging_metrics=auto_validation_payload["tagging"],
                     classification=job.classification,
                 )
-                auto_review_tasks, auto_fidelity_report, _ = await _adjudicate_grounded_text_candidates(
+                (
+                    auto_review_tasks,
+                    auto_fidelity_report,
+                    _,
+                ) = await _adjudicate_grounded_text_candidates(
                     job=job,
                     settings=settings,
                     review_tasks=auto_review_tasks,
                     fidelity_report=auto_fidelity_report,
                 )
-                if (
-                    auto_validation.compliant
-                    and _blocking_task_count(auto_review_tasks) < _blocking_task_count(review_tasks)
-                ):
+                if auto_validation.compliant and _blocking_task_count(
+                    auto_review_tasks
+                ) < _blocking_task_count(review_tasks):
                     structure_json = auto_structure_json
                     job.structure_json = json.dumps(auto_structure_json)
                     job.output_path = str(auto_tagging_result.output_path)
@@ -5225,7 +5684,38 @@ async def run_tagging_and_validation(
                     llm_font_map_auto=llm_font_map_auto,
                 )
 
-        validation_payload["fidelity"] = fidelity_report
+        final_fidelity_report, final_review_tasks = assess_fidelity(
+            input_pdf=Path(job.input_path),
+            output_pdf=Path(job.output_path or tagging_result.output_path),
+            comparison_source_pdf=fidelity_source_pdf,
+            structure_json=structure_json or {},
+            alt_entries=[
+                {
+                    "figure_index": entry.figure_index,
+                    "generated_text": entry.generated_text,
+                    "edited_text": entry.edited_text,
+                    "status": entry.status,
+                }
+                for entry in reviewed_alt_entries
+            ],
+            validation_report=validation_payload,
+            raw_validation_report=selected_validation.raw_report,
+            tagging_metrics=validation_payload["tagging"],
+            classification=job.classification,
+        )
+        (
+            final_review_tasks,
+            final_fidelity_report,
+            _,
+        ) = await _adjudicate_grounded_text_candidates(
+            job=job,
+            settings=settings,
+            review_tasks=final_review_tasks,
+            fidelity_report=final_fidelity_report,
+        )
+        review_tasks = final_review_tasks
+        fidelity_report = final_fidelity_report
+
         if review_task_metadata_overrides:
             for key, metadata in review_task_metadata_overrides.items():
                 review_tasks = _merge_review_task_metadata(
@@ -5234,6 +5724,11 @@ async def run_tagging_and_validation(
                     source=key[1],
                     metadata=metadata,
                 )
+        user_visible_review_tasks, fidelity_report = _prepare_user_review_surface(
+            review_tasks,
+            fidelity_report,
+        )
+        validation_payload["fidelity"] = fidelity_report
         job.validation_json = json.dumps(validation_payload)
         job.fidelity_json = json.dumps(fidelity_report)
 
@@ -5247,10 +5742,18 @@ async def run_tagging_and_validation(
         reviewed_alt_by_index = {entry.figure_index: entry for entry in reviewed_alt_entries}
         for change_spec in auto_applied_change_specs:
             task_type = str(change_spec.get("task_type") or "review_change")
-            metadata = change_spec.get("metadata") if isinstance(change_spec.get("metadata"), dict) else {}
-            before = change_spec.get("before") if isinstance(change_spec.get("before"), dict) else {}
+            metadata = (
+                change_spec.get("metadata") if isinstance(change_spec.get("metadata"), dict) else {}
+            )
+            before = (
+                change_spec.get("before") if isinstance(change_spec.get("before"), dict) else {}
+            )
             after = change_spec.get("after") if isinstance(change_spec.get("after"), dict) else {}
-            undo_payload = change_spec.get("undo_payload") if isinstance(change_spec.get("undo_payload"), dict) else {}
+            undo_payload = (
+                change_spec.get("undo_payload")
+                if isinstance(change_spec.get("undo_payload"), dict)
+                else {}
+            )
             if task_type == "figure_semantics":
                 figure_index_raw = metadata.get("figure_index", undo_payload.get("figure_index"))
                 try:
@@ -5278,37 +5781,46 @@ async def run_tagging_and_validation(
                 db=db,
                 job=job,
                 change_type=task_type,
-                title=str(change_spec.get("title") or "Applied recommendation"),
-                detail=str(change_spec.get("detail") or "The model applied a semantic recommendation."),
+                title=str(change_spec.get("title") or "Applied change"),
+                detail=str(change_spec.get("detail") or "The app applied a semantic change."),
                 importance=str(change_spec.get("importance") or "high"),
-                reviewable=True,
+                reviewable=bool(change_spec.get("reviewable", True))
+                and is_user_visible_applied_change_type(task_type),
                 metadata=metadata,
                 before=before,
                 after=after,
                 undo_payload=undo_payload,
             )
-        for task in review_tasks:
+        for task in user_visible_review_tasks:
             metadata = task.get("metadata", {})
             if not isinstance(metadata, dict):
                 metadata = {}
-            db.add(ReviewTask(
-                job_id=job_id,
-                task_type=str(task.get("task_type") or "review_task"),
-                title=str(task.get("title") or "Recommendation review required"),
-                detail=str(task.get("detail") or ""),
-                severity=str(task.get("severity") or "medium"),
-                blocking=bool(task.get("blocking", True)),
-                status=str(task.get("status") or "pending_review"),
-                source=str(task.get("source") or "fidelity"),
-                metadata_json=json.dumps(metadata),
-            ))
+            db.add(
+                ReviewTask(
+                    job_id=job_id,
+                    task_type=str(task.get("task_type") or "review_task"),
+                    title=str(task.get("title") or "Follow-up review required"),
+                    detail=str(task.get("detail") or ""),
+                    severity=str(task.get("severity") or "medium"),
+                    blocking=bool(task.get("blocking", True)),
+                    status=str(task.get("status") or "pending_review"),
+                    source=str(task.get("source") or "fidelity"),
+                    metadata_json=json.dumps(metadata),
+                )
+            )
 
         blocking_task_count = _blocking_task_count(review_tasks)
-        await _update_step(db, job_id, "fidelity", "complete", result={
-            "passed": bool(fidelity_report.get("passed", False)),
-            "blocking_tasks": blocking_task_count,
-            "advisory_tasks": len(review_tasks) - blocking_task_count,
-        })
+        await _update_step(
+            db,
+            job_id,
+            "fidelity",
+            "complete",
+            result={
+                "passed": bool(fidelity_report.get("passed", False)),
+                "blocking_tasks": blocking_task_count,
+                "advisory_tasks": len(review_tasks) - blocking_task_count,
+            },
+        )
         job_manager.emit_progress(
             job_id,
             step="fidelity",
@@ -5324,7 +5836,7 @@ async def run_tagging_and_validation(
         final_status = (
             "complete"
             if selected_validation.compliant and bool(fidelity_report.get("passed", False))
-            else "awaiting_recommendation_review"
+            else "manual_remediation"
         )
         job.status = final_status
         await db.commit()
@@ -5341,5 +5853,8 @@ async def run_tagging_and_validation(
             job.error = user_error or "Tagging/validation failed"
             await db.commit()
         job_manager.emit_progress(
-            job_id, step="error", status="failed", message=user_error,
+            job_id,
+            step="error",
+            status="failed",
+            message=user_error,
         )

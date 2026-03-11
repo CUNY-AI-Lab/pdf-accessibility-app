@@ -5,7 +5,11 @@ from typing import Any
 
 from app.models import Job
 from app.services.intelligence_gemini import confidence_label, confidence_score
-from app.services.intelligence_llm_utils import context_json_part, page_preview_parts, request_llm_json
+from app.services.intelligence_llm_utils import (
+    context_json_part,
+    page_preview_parts,
+    request_llm_json,
+)
 from app.services.llm_client import LlmClient
 from app.services.pdf_preview import render_bbox_preview_png_data_url
 from app.services.semantic_units import SemanticDecision, SemanticUnit
@@ -25,8 +29,8 @@ Rules:
 - Only decide for the provided unit_id and unit_type.
 - Preserve visible meaning. Do not invent document content that is not supported by the image and local evidence.
 - Use the page image, local crop, native_text_candidate, ocr_text_candidate, nearby_context, structure_context, and metadata together.
-- When semantic_unit.metadata.reviewer_feedback is present, treat it as a human correction of a previous recommendation. Use it as high-value context, but only follow it when it still matches the visible evidence and accessibility goal.
-- When semantic_unit.metadata.previous_suggestion is present, treat it as the prior recommendation for this same local unit. Revise it minimally when it still matches the visible evidence, and diverge from it explicitly when the visible evidence or reviewer feedback requires a different interpretation.
+- When semantic_unit.metadata.reviewer_feedback is present, treat it as a human correction of previous intelligence output. Use it as high-value context, but only follow it when it still matches the visible evidence and accessibility goal.
+- When semantic_unit.metadata.previous_intelligence is present, treat it as the prior intelligence output for this same local unit. Revise it minimally when it still matches the visible evidence, and diverge from it explicitly when the visible evidence or reviewer feedback requires a different interpretation.
 - Prefer one of the provided text candidates when it clearly matches the visible content.
 - Use chosen_source="llm_inferred" only when neither provided candidate is good enough and the visible content is still locally clear.
 - Prefer precision over recall.
@@ -246,14 +250,19 @@ async def adjudicate_semantic_unit(
 ) -> SemanticDecision:
     page_images: list[dict[str, Any]] = []
     unit_images: list[dict[str, Any]] = []
-    extra_pages = unit.metadata.get("extra_page_numbers") if isinstance(unit.metadata, dict) else None
+    extra_pages = (
+        unit.metadata.get("extra_page_numbers") if isinstance(unit.metadata, dict) else None
+    )
     page_numbers = [unit.page]
     if isinstance(extra_pages, list):
-        page_numbers.extend(page_number for page_number in extra_pages if isinstance(page_number, int))
+        page_numbers.extend(
+            page_number for page_number in extra_pages if isinstance(page_number, int)
+        )
     page_images = page_preview_parts(job, page_numbers)
     try:
         if job is not None and unit.bbox:
             from app.services.intelligence_llm_utils import job_pdf_path
+
             pdf_path = job_pdf_path(job)
             try:
                 preview_url = render_bbox_preview_png_data_url(pdf_path, unit.page, unit.bbox)
@@ -264,7 +273,9 @@ async def adjudicate_semantic_unit(
     except Exception:
         pass
 
-    extra_image_urls = unit.metadata.get("extra_image_data_urls") if isinstance(unit.metadata, dict) else None
+    extra_image_urls = (
+        unit.metadata.get("extra_image_data_urls") if isinstance(unit.metadata, dict) else None
+    )
     if isinstance(extra_image_urls, list):
         for url in extra_image_urls:
             if isinstance(url, str) and url.strip():
@@ -313,7 +324,8 @@ async def adjudicate_semantic_unit(
         summary=str(parsed.get("summary") or "").strip(),
         confidence=confidence_label(parsed.get("confidence")),
         confidence_score=confidence_score(parsed.get("confidence")),
-        suggested_action=str(parsed.get("suggested_action") or "manual_only").strip() or "manual_only",
+        suggested_action=str(parsed.get("suggested_action") or "manual_only").strip()
+        or "manual_only",
         reason=str(parsed.get("reason") or "").strip(),
         chosen_source=str(parsed.get("chosen_source") or "").strip() or None,
         resolved_text=str(parsed.get("resolved_text") or "").strip() or None,
@@ -339,7 +351,5 @@ async def adjudicate_semantic_units(
 ) -> list[SemanticDecision]:
     decisions: list[SemanticDecision] = []
     for unit in units:
-        decisions.append(
-            await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)
-        )
+        decisions.append(await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client))
     return decisions

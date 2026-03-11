@@ -19,9 +19,9 @@ def confidence_score(value: Any) -> float:
     return 0.5
 
 
-def normalize_reading_order_suggestion(suggestion: dict[str, Any]) -> dict[str, Any]:
+def normalize_reading_order_intelligence(intelligence: dict[str, Any]) -> dict[str, Any]:
     page_orders: list[dict[str, Any]] = []
-    raw_page_orders = suggestion.get("proposed_page_orders")
+    raw_page_orders = intelligence.get("proposed_page_orders")
     if isinstance(raw_page_orders, list):
         for raw_order in raw_page_orders:
             if not isinstance(raw_order, dict):
@@ -46,7 +46,7 @@ def normalize_reading_order_suggestion(suggestion: dict[str, Any]) -> dict[str, 
             )
 
     element_updates: list[dict[str, Any]] = []
-    raw_element_updates = suggestion.get("proposed_element_updates")
+    raw_element_updates = intelligence.get("proposed_element_updates")
     if isinstance(raw_element_updates, list):
         for raw_update in raw_element_updates:
             if not isinstance(raw_update, dict):
@@ -67,7 +67,7 @@ def normalize_reading_order_suggestion(suggestion: dict[str, Any]) -> dict[str, 
             element_updates.append(normalized_update)
 
     readable_text_hints: list[dict[str, Any]] = []
-    raw_hints = suggestion.get("readable_text_hints")
+    raw_hints = intelligence.get("readable_text_hints")
     if isinstance(raw_hints, list):
         for raw_hint in raw_hints:
             if not isinstance(raw_hint, dict):
@@ -94,16 +94,16 @@ def normalize_reading_order_suggestion(suggestion: dict[str, Any]) -> dict[str, 
 
     return {
         "task_type": "reading_order",
-        "confidence": confidence_score(suggestion.get("confidence")),
+        "confidence": confidence_score(intelligence.get("confidence")),
         "proposed_page_orders": page_orders,
         "proposed_element_updates": element_updates,
         "readable_text_hints": readable_text_hints,
     }
 
 
-def normalize_table_suggestion(suggestion: dict[str, Any]) -> dict[str, Any]:
+def normalize_table_intelligence(intelligence: dict[str, Any]) -> dict[str, Any]:
     table_updates: list[dict[str, Any]] = []
-    raw_updates = suggestion.get("proposed_table_updates")
+    raw_updates = intelligence.get("proposed_table_updates")
     if isinstance(raw_updates, list):
         for raw_update in raw_updates:
             if not isinstance(raw_update, dict):
@@ -134,6 +134,6 @@ def normalize_table_suggestion(suggestion: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "task_type": "table_semantics",
-        "confidence": confidence_score(suggestion.get("confidence")),
+        "confidence": confidence_score(intelligence.get("confidence")),
         "proposed_table_updates": table_updates,
     }

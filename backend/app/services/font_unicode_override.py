@@ -10,7 +10,6 @@ from app.services.font_actualtext import (
     _resolve_text_showing_instruction,
 )
 
-
 TEXT_SHOWING_OPERATORS = {"Tj", "TJ", "'", '"'}
 SIMPLE_FONT_SUBTYPES = {
     pikepdf.Name("/Type1"),
@@ -26,19 +25,25 @@ def _base_font_name(font_dict) -> str:
 
 
 def _is_valid_unicode_text(text: str) -> bool:
-    from app.pipeline.orchestrator import _is_valid_unicode_text as _orchestrator_is_valid_unicode_text
+    from app.pipeline.orchestrator import (
+        _is_valid_unicode_text as _orchestrator_is_valid_unicode_text,
+    )
 
     return _orchestrator_is_valid_unicode_text(text)
 
 
 def _parse_tounicode_map_details(stream_obj):
-    from app.pipeline.orchestrator import _parse_tounicode_map_details as _orchestrator_parse_tounicode_map_details
+    from app.pipeline.orchestrator import (
+        _parse_tounicode_map_details as _orchestrator_parse_tounicode_map_details,
+    )
 
     return _orchestrator_parse_tounicode_map_details(stream_obj)
 
 
 def _render_tounicode_cmap(mapping: dict[int, str], code_bytes: int) -> bytes:
-    from app.pipeline.orchestrator import _render_tounicode_cmap as _orchestrator_render_tounicode_cmap
+    from app.pipeline.orchestrator import (
+        _render_tounicode_cmap as _orchestrator_render_tounicode_cmap,
+    )
 
     return _orchestrator_render_tounicode_cmap(mapping, code_bytes)
 

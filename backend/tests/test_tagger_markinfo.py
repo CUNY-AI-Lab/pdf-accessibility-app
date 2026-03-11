@@ -3,9 +3,8 @@ from pathlib import Path
 import pikepdf
 import pytest
 
-from tests.fixtures import TEST_SAMPLE_PDF
-
 from app.pipeline.tagger import ContentRegion, _emit_tagged_region, tag_pdf
+from tests.fixtures import TEST_SAMPLE_PDF
 
 
 @pytest.mark.asyncio

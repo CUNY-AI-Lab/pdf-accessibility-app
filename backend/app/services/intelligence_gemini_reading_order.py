@@ -4,7 +4,11 @@ from typing import Any
 
 from app.models import Job
 from app.services.intelligence_gemini import confidence_label, confidence_score
-from app.services.intelligence_llm_utils import context_json_part, page_preview_parts, request_llm_json
+from app.services.intelligence_llm_utils import (
+    context_json_part,
+    page_preview_parts,
+    request_llm_json,
+)
 from app.services.llm_client import LlmClient
 
 READING_ORDER_INTELLIGENCE_PROMPT = """You are a PDF accessibility reading-order assistant.
@@ -38,7 +42,7 @@ Respond with strict JSON only using this schema:
 
 Rules:
 - Use only the provided review_id values from page_blocks.
-- When reviewer_feedback is present, treat it as a human correction of the previous recommendation. Follow it when it matches the visible page evidence and accessibility goal.
+- When reviewer_feedback is present, treat it as a human correction of the previous intelligence output. Follow it when it matches the visible page evidence and accessibility goal.
 - If you provide ordered_review_ids, include every page block exactly once.
 - Use `artifact_headers_footers` only for repeated running heads, page numbers, or purely decorative side material.
 - Use `reorder_review` when the main issue is block order or block role.
@@ -50,12 +54,18 @@ Rules:
 """
 
 
-def _normalize_reading_order_intelligence(parsed: dict[str, Any], *, page_number: int) -> dict[str, Any]:
-    ordered_review_ids = [
-        str(review_id).strip()
-        for review_id in parsed.get("ordered_review_ids", [])
-        if str(review_id).strip()
-    ] if isinstance(parsed.get("ordered_review_ids"), list) else []
+def _normalize_reading_order_intelligence(
+    parsed: dict[str, Any], *, page_number: int
+) -> dict[str, Any]:
+    ordered_review_ids = (
+        [
+            str(review_id).strip()
+            for review_id in parsed.get("ordered_review_ids", [])
+            if str(review_id).strip()
+        ]
+        if isinstance(parsed.get("ordered_review_ids"), list)
+        else []
+    )
 
     element_updates: list[dict[str, Any]] = []
     raw_updates = parsed.get("element_updates")
@@ -81,7 +91,8 @@ def _normalize_reading_order_intelligence(parsed: dict[str, Any], *, page_number
         "summary": str(parsed.get("summary") or "").strip(),
         "confidence": confidence_label(parsed.get("confidence")),
         "confidence_score": confidence_score(parsed.get("confidence")),
-        "suggested_action": str(parsed.get("suggested_action") or "manual_only").strip() or "manual_only",
+        "suggested_action": str(parsed.get("suggested_action") or "manual_only").strip()
+        or "manual_only",
         "reason": str(parsed.get("reason") or "").strip(),
         "page": page_number,
         "ordered_review_ids": ordered_review_ids,
@@ -98,7 +109,7 @@ async def generate_reading_order_intelligence(
     page_text_intelligence_blocks: list[dict[str, Any]],
     llm_client: LlmClient,
     reviewer_feedback: str | None = None,
-    previous_suggestion: dict[str, Any] | None = None,
+    previous_intelligence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "job_filename": job.original_filename,
@@ -111,14 +122,13 @@ async def generate_reading_order_intelligence(
         "page_structure_fragments": page_structure_fragments,
         "page_text_intelligence_blocks": page_text_intelligence_blocks,
         "reviewer_feedback": reviewer_feedback or "",
-        "previous_suggestion": previous_suggestion or {},
+        "previous_intelligence": previous_intelligence or {},
     }
     content = [
         {
             "type": "text",
             "text": (
-                f"{READING_ORDER_INTELLIGENCE_PROMPT}\n\n"
-                "Image order: one full-page preview only."
+                f"{READING_ORDER_INTELLIGENCE_PROMPT}\n\nImage order: one full-page preview only."
             ),
         },
         *page_preview_parts(job, [page_number]),

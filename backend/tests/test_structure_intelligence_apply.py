@@ -1,13 +1,13 @@
-from app.services.recommendation_apply import (
+from app.services.structure_intelligence_apply import (
     applicable_actualtext_candidates,
-    apply_reading_order_recommendation,
-    apply_table_recommendation,
-    can_accept_reading_order_recommendation,
-    can_accept_table_recommendation,
+    apply_reading_order_change,
+    apply_table_change,
+    can_accept_reading_order_change,
+    can_accept_table_change,
 )
 
 
-def test_apply_reading_order_recommendation_reorders_and_retypes():
+def test_apply_reading_order_change_reorders_and_retypes():
     structure = {
         "elements": [
             {"page": 0, "type": "paragraph", "text": "first", "review_id": "review-0"},
@@ -16,10 +16,12 @@ def test_apply_reading_order_recommendation_reorders_and_retypes():
     }
     suggestion = {
         "proposed_page_orders": [{"page": 1, "ordered_review_ids": ["review-1", "review-0"]}],
-        "proposed_element_updates": [{"review_id": "review-0", "new_type": "heading", "new_level": 2}],
+        "proposed_element_updates": [
+            {"review_id": "review-0", "new_type": "heading", "new_level": 2}
+        ],
     }
 
-    applied = apply_reading_order_recommendation(structure, suggestion)
+    applied = apply_reading_order_change(structure, suggestion)
 
     assert applied is not None
     assert [element["text"] for element in applied["elements"]] == ["second", "first"]
@@ -28,7 +30,7 @@ def test_apply_reading_order_recommendation_reorders_and_retypes():
     assert "review_id" not in applied["elements"][0]
 
 
-def test_apply_table_recommendation_sets_header_flags():
+def test_apply_table_change_sets_header_flags():
     structure = {
         "elements": [
             {
@@ -54,7 +56,7 @@ def test_apply_table_recommendation_sets_header_flags():
         ]
     }
 
-    applied = apply_table_recommendation(structure, suggestion)
+    applied = apply_table_change(structure, suggestion)
 
     assert applied is not None
     cells = applied["elements"][0]["cells"]
@@ -63,18 +65,24 @@ def test_apply_table_recommendation_sets_header_flags():
     assert cells[2]["is_header"] is False
 
 
-def test_can_accept_reading_order_recommendation_allows_confirm_current_order():
-    assert can_accept_reading_order_recommendation(
-        {"elements": []},
-        {"suggested_action": "confirm_current_order"},
-    ) is True
+def test_can_accept_reading_order_change_allows_confirm_current_order():
+    assert (
+        can_accept_reading_order_change(
+            {"elements": []},
+            {"suggested_action": "confirm_current_order"},
+        )
+        is True
+    )
 
 
-def test_can_accept_table_recommendation_allows_confirm_current_headers():
-    assert can_accept_table_recommendation(
-        {"elements": []},
-        {"suggested_action": "confirm_current_headers"},
-    ) is True
+def test_can_accept_table_change_allows_confirm_current_headers():
+    assert (
+        can_accept_table_change(
+            {"elements": []},
+            {"suggested_action": "confirm_current_headers"},
+        )
+        is True
+    )
 
 
 def test_applicable_actualtext_candidates_filters_to_flagged_targets():

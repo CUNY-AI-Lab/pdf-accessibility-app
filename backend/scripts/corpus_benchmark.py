@@ -21,19 +21,18 @@ import pikepdf
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.api.review import apply_review_recommendation, keep_applied_change
+from app.api.review import keep_applied_change
 from app.config import get_settings
 from app.models import AppliedChange, Base, Job, JobStep, ReviewTask
 from app.pipeline.classify import classify_pdf
 from app.pipeline.ocr import run_ocr
-from app.pipeline.orchestrator import run_pipeline, run_tagging_and_validation
+from app.pipeline.orchestrator import run_pipeline
 from app.pipeline.structure import extract_structure
 from app.pipeline.tagger import tag_pdf
 from app.pipeline.validator import validate_pdf
 from app.services.file_storage import cleanup_job_files
 from app.services.job_manager import JobManager
 from app.services.llm_client import track_llm_usage
-
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 OUTPUT_ROOT = ROOT_DIR / "data" / "benchmarks"
@@ -221,10 +220,7 @@ def _font_only_errors(validation) -> bool:
 
 
 def _has_font_errors(validation) -> bool:
-    return any(
-        v.severity == "error" and "-7.21." in str(v.rule_id)
-        for v in validation.violations
-    )
+    return any(v.severity == "error" and "-7.21." in str(v.rule_id) for v in validation.violations)
 
 
 def _ocr_lane_skip_reasons(
@@ -256,8 +252,7 @@ def _font_remediation_lanes(
 ) -> list[str]:
     error_rule_ids = [str(v.rule_id) for v in validation.violations if v.severity == "error"]
     has_unicode_rules = any(
-        any(marker in rule_id for marker in FONT_UNICODE_RULE_MARKERS)
-        for rule_id in error_rule_ids
+        any(marker in rule_id for marker in FONT_UNICODE_RULE_MARKERS) for rule_id in error_rule_ids
     )
     has_dict_repair_rules = any(
         any(marker in rule_id for marker in FONT_DICT_REPAIR_RULE_MARKERS)
@@ -322,7 +317,9 @@ def _tagging_regressions(candidate, current) -> list[str]:
         if candidate_count == 0:
             regressions.append(f"{label} dropped to zero ({current_count} -> 0)")
         elif current_count >= 5 and candidate_count < int(current_count * 0.8):
-            regressions.append(f"{label} dropped significantly ({current_count} -> {candidate_count})")
+            regressions.append(
+                f"{label} dropped significantly ({current_count} -> {candidate_count})"
+            )
 
     current_links = _count(current, "links_tagged")
     candidate_links = _count(candidate, "links_tagged")
@@ -598,19 +595,21 @@ def _render_tounicode_cmap(mapping: dict[int, str], code_bytes: int) -> bytes:
         "endcodespacerange",
     ]
     for i in range(0, len(entries), 100):
-        chunk = entries[i:i + 100]
+        chunk = entries[i : i + 100]
         lines.append(f"{len(chunk)} beginbfchar")
         for code, value in chunk:
             dest_hex = value.encode("utf-16-be").hex().upper()
             lines.append(f"<{code:0{width}X}> <{dest_hex}>")
         lines.append("endbfchar")
-    lines.extend([
-        "endcmap",
-        "CMapName currentdict /CMap defineresource pop",
-        "end",
-        "end",
-        "",
-    ])
+    lines.extend(
+        [
+            "endcmap",
+            "CMapName currentdict /CMap defineresource pop",
+            "end",
+            "end",
+            "",
+        ]
+    )
     return "\n".join(lines).encode("ascii")
 
 
@@ -726,10 +725,12 @@ def _repair_pdf_tounicode(
         mapping: dict[int, int] = {}
         pair_count = len(raw) // 2
         for cid in range(pair_count):
-            mapping[cid] = int.from_bytes(raw[cid * 2:(cid + 1) * 2], "big")
+            mapping[cid] = int.from_bytes(raw[cid * 2 : (cid + 1) * 2], "big")
         return mapping, False
 
-    def _merge_tounicode_maps(existing: dict[int, str], generated: dict[int, str]) -> dict[int, str]:
+    def _merge_tounicode_maps(
+        existing: dict[int, str], generated: dict[int, str]
+    ) -> dict[int, str]:
         merged = {code: text for code, text in existing.items() if _is_valid_unicode_text(text)}
         for code, text in generated.items():
             if not _is_valid_unicode_text(text):
@@ -811,7 +812,9 @@ def _repair_pdf_tounicode(
                 if cid_font.get("/Subtype") != pikepdf.Name("/CIDFontType2"):
                     continue
 
-                changed, merged_count, generated_count = _rebuild_type0_tounicode(pdf, type0_font, cid_font)
+                changed, merged_count, generated_count = _rebuild_type0_tounicode(
+                    pdf, type0_font, cid_font
+                )
                 if changed:
                     stats["fonts_touched"] += 1
                     stats["maps_rebuilt"] += 1
@@ -965,8 +968,7 @@ def _build_rule_backlog(workflow_db_path: Path) -> list[dict]:
                 "total_errors": entry["total_errors"],
                 "documents_affected": len(doc_items),
                 "documents": [
-                    {"filename": filename, "errors": errors}
-                    for filename, errors in doc_items
+                    {"filename": filename, "errors": errors} for filename, errors in doc_items
                 ],
             }
         )
@@ -1031,8 +1033,7 @@ def _build_review_backlog(workflow_db_path: Path) -> list[dict]:
                 "documents_affected": len(doc_items),
                 "occurrences": sum(count for _, count in doc_items),
                 "documents": [
-                    {"filename": filename, "occurrences": count}
-                    for filename, count in doc_items
+                    {"filename": filename, "occurrences": count} for filename, count in doc_items
                 ],
             }
         )
@@ -1075,47 +1076,23 @@ async def _finalize_review_if_needed(
                 return
             if job.status == "processing":
                 pass
-            elif job.status != "awaiting_recommendation_review":
+            elif job.status not in {"complete", "manual_remediation"}:
                 return
-            else:
-                change_result = await db.execute(
-                    select(AppliedChange)
-                    .where(
-                        AppliedChange.job_id == job_id,
-                        AppliedChange.review_status == "pending_review",
-                        AppliedChange.reviewable.is_(True),
-                    )
-                    .order_by(AppliedChange.created_at.asc())
+            change_result = await db.execute(
+                select(AppliedChange)
+                .where(
+                    AppliedChange.job_id == job_id,
+                    AppliedChange.review_status == "pending_review",
+                    AppliedChange.reviewable.is_(True),
                 )
-                pending_changes = change_result.scalars().all()
-                if pending_changes:
-                    for change in pending_changes:
-                        await keep_applied_change(job_id=job_id, change_id=change.id, db=db)
-                    continue
-
-                task_result = await db.execute(
-                    select(ReviewTask)
-                    .where(
-                        ReviewTask.job_id == job_id,
-                        ReviewTask.status == "pending_review",
-                        ReviewTask.blocking.is_(True),
-                    )
-                    .order_by(ReviewTask.created_at.asc())
-                )
-                blocking_tasks = task_result.scalars().all()
-                if not blocking_tasks:
-                    validation_json = _parse_json(job.validation_json)
-                    fidelity_json = _parse_json(job.fidelity_json)
-                    if bool(validation_json.get("compliant", False)) and bool(fidelity_json.get("passed", False)):
-                        job.status = "complete"
-                        await db.commit()
-                    return
-
-                await apply_review_recommendation(
-                    job_id=job_id,
-                    task_id=blocking_tasks[0].id,
-                    db=db,
-                )
+                .order_by(AppliedChange.created_at.asc())
+            )
+            pending_changes = change_result.scalars().all()
+            if pending_changes:
+                for change in pending_changes:
+                    await keep_applied_change(job_id=job_id, change_id=change.id, db=db)
+                continue
+            return
 
         await asyncio.sleep(0.1)
 
@@ -1234,15 +1211,25 @@ async def benchmark_one_workflow(
             elements = structure_json.get("elements")
             if isinstance(elements, list):
                 elements_total = len(elements)
-                elements_headings = sum(1 for e in elements if isinstance(e, dict) and e.get("type") == "heading")
-                elements_figures = sum(1 for e in elements if isinstance(e, dict) and e.get("type") == "figure")
-                elements_tables = sum(1 for e in elements if isinstance(e, dict) and e.get("type") == "table")
-                elements_list_items = sum(1 for e in elements if isinstance(e, dict) and e.get("type") == "list_item")
+                elements_headings = sum(
+                    1 for e in elements if isinstance(e, dict) and e.get("type") == "heading"
+                )
+                elements_figures = sum(
+                    1 for e in elements if isinstance(e, dict) and e.get("type") == "figure"
+                )
+                elements_tables = sum(
+                    1 for e in elements if isinstance(e, dict) and e.get("type") == "table"
+                )
+                elements_list_items = sum(
+                    1 for e in elements if isinstance(e, dict) and e.get("type") == "list_item"
+                )
                 elements_toc_captions = sum(
                     1 for e in elements if isinstance(e, dict) and e.get("type") == "toc_caption"
                 )
                 elements_toc_items = sum(
-                    1 for e in elements if isinstance(e, dict) and e.get("type") in {"toc_item", "toc_item_table"}
+                    1
+                    for e in elements
+                    if isinstance(e, dict) and e.get("type") in {"toc_item", "toc_item_table"}
                 )
 
             steps_result = await db.execute(select(JobStep).where(JobStep.job_id == job_id))
@@ -1259,7 +1246,11 @@ async def benchmark_one_workflow(
             tagging_secs = _step_duration_secs(tagging_step)
             validation_secs = _step_duration_secs(validation_step)
 
-            structure_metrics = _parse_json(structure_step.result_json) if structure_step and structure_step.result_json else {}
+            structure_metrics = (
+                _parse_json(structure_step.result_json)
+                if structure_step and structure_step.result_json
+                else {}
+            )
             if isinstance(structure_metrics, dict):
                 toc_assist = structure_metrics.get("toc_llm_assist", {})
                 if isinstance(toc_assist, dict):
@@ -1310,7 +1301,9 @@ async def benchmark_one_workflow(
             remediation_metrics = validation_json.get("remediation", {})
             if isinstance(remediation_metrics, dict):
                 validation_errors_reduced = int(remediation_metrics.get("errors_reduced", 0) or 0)
-                validation_warnings_reduced = int(remediation_metrics.get("warnings_reduced", 0) or 0)
+                validation_warnings_reduced = int(
+                    remediation_metrics.get("warnings_reduced", 0) or 0
+                )
                 font_metrics = remediation_metrics.get("font_remediation", {})
                 if isinstance(font_metrics, dict):
                     font_lane_attempted = bool(font_metrics.get("attempted", False))
@@ -1318,7 +1311,9 @@ async def benchmark_one_workflow(
                     font_lane_first_errors = int(font_metrics.get("first_pass_errors", 0) or 0)
                     font_lane_first_warnings = int(font_metrics.get("first_pass_warnings", 0) or 0)
                     font_lane_second_errors = int(font_metrics.get("second_pass_errors", 0) or 0)
-                    font_lane_second_warnings = int(font_metrics.get("second_pass_warnings", 0) or 0)
+                    font_lane_second_warnings = int(
+                        font_metrics.get("second_pass_warnings", 0) or 0
+                    )
 
             review_tasks_result = await db.execute(
                 select(ReviewTask).where(ReviewTask.job_id == job_id)
@@ -1344,7 +1339,7 @@ async def benchmark_one_workflow(
                 shutil.copy2(output_path, dest)
 
             if not validation_json and not error:
-                if job.status == "awaiting_recommendation_review":
+                if job.status == "manual_remediation":
                     blocking_pending = sum(
                         1
                         for task in review_tasks
@@ -1361,14 +1356,15 @@ async def benchmark_one_workflow(
                     if blocking_pending or pending_change_count:
                         pending_parts: list[str] = []
                         if pending_change_count:
-                            pending_parts.append(f"{pending_change_count} applied change recommendation(s)")
+                            pending_parts.append(
+                                f"{pending_change_count} applied change review item(s)"
+                            )
                         if blocking_pending:
-                            pending_parts.append(f"{blocking_pending} blocking recommendation question(s)")
-                        error = "Recommendation review required: " + " and ".join(pending_parts) + " still pending"
+                            pending_parts.append(f"{blocking_pending} blocking review item(s)")
+                        error = "Review still pending: " + " and ".join(pending_parts)
                     else:
                         error = (
-                            "Workflow finished in recommendation review without validation "
-                            "or pending recommendations"
+                            "Workflow finished in review without validation or pending review items"
                         )
                 else:
                     error = f"Workflow finished with status={job.status} but no validation payload"
@@ -1605,7 +1601,9 @@ async def benchmark_one(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
                     remediation_input = repaired
                 elif lane == FONT_LANE_EMBED:
                     rewritten = run_dir / f"{pdf_path.stem}_fontfix_embedded.pdf"
-                    rewritten_ok = await _rewrite_pdf_with_ghostscript_embed(tag_input_path, rewritten)
+                    rewritten_ok = await _rewrite_pdf_with_ghostscript_embed(
+                        tag_input_path, rewritten
+                    )
                     if not rewritten_ok:
                         continue
                     remediation_input = rewritten
@@ -1638,7 +1636,10 @@ async def benchmark_one(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
                     flavour=settings.verapdf_flavour,
                 )
                 regressions = _tagging_regressions(lane_tagging, selected_tagging)
-                if _is_better_validation(candidate_validation, selected_validation) and not regressions:
+                if (
+                    _is_better_validation(candidate_validation, selected_validation)
+                    and not regressions
+                ):
                     selected_validation = candidate_validation
                     selected_tagging = lane_tagging
                     tags_total = lane_tagging.tags_added
@@ -1667,7 +1668,7 @@ async def benchmark_one(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
             if selected_validation.raw_report.get("report")
             else selected_validation.raw_report.get("validator", "unknown")
         )
-        final_status = "complete" if compliant else "awaiting_recommendation_review"
+        final_status = "complete" if compliant else "manual_remediation"
         fidelity_passed = compliant
     except Exception as exc:
         error = re.sub(r"\s+", " ", str(exc)).strip()
@@ -1766,11 +1767,7 @@ def write_outputs(output_dir: Path, rows: list[DocMetrics], mode: str) -> None:
     compliant = [r for r in completed if r.compliant]
     fidelity_passed = [r for r in completed if r.fidelity_passed]
     release_ready = [r for r in completed if r.final_status == "complete"]
-    awaiting_recommendation_review = [
-        r
-        for r in completed
-        if r.final_status == "awaiting_recommendation_review" and r.compliant
-    ]
+    manual_remediation = [r for r in completed if r.final_status == "manual_remediation"]
     non_compliant = [r for r in completed if not r.compliant]
     font_attempted = [r for r in completed if r.font_lane_attempted]
     font_applied = [r for r in completed if r.font_lane_applied]
@@ -1817,12 +1814,13 @@ def write_outputs(output_dir: Path, rows: list[DocMetrics], mode: str) -> None:
         f.write(f"- Successful runs: {len(completed)}\n")
         f.write(f"- Failed runs: {len(failed)}\n")
         f.write(f"- Compliant outputs: {len(compliant)} / {len(completed) if completed else 0}\n")
-        f.write(f"- Fidelity-passed outputs: {len(fidelity_passed)} / {len(completed) if completed else 0}\n")
-        f.write(f"- Release-ready outputs: {len(release_ready)} / {len(completed) if completed else 0}\n")
         f.write(
-            "- Compliant but recommendation review required: "
-            f"{len(awaiting_recommendation_review)}\n"
+            f"- Fidelity-passed outputs: {len(fidelity_passed)} / {len(completed) if completed else 0}\n"
         )
+        f.write(
+            f"- Release-ready outputs: {len(release_ready)} / {len(completed) if completed else 0}\n"
+        )
+        f.write(f"- Manual remediation required: {len(manual_remediation)}\n")
         f.write(f"- Non-compliant outputs: {len(non_compliant)}\n")
         f.write(
             f"- Validation errors before/after: {baseline_errors} -> {remediated_errors} "
@@ -1881,8 +1879,7 @@ def write_outputs(output_dir: Path, rows: list[DocMetrics], mode: str) -> None:
         if rule_backlog:
             for entry in rule_backlog[:10]:
                 top_docs = ", ".join(
-                    f"{doc['filename']} ({doc['errors']})"
-                    for doc in entry["documents"][:3]
+                    f"{doc['filename']} ({doc['errors']})" for doc in entry["documents"][:3]
                 )
                 f.write(
                     f"- {entry['rule_id']}: {entry['total_errors']} errors across "
@@ -1897,8 +1894,7 @@ def write_outputs(output_dir: Path, rows: list[DocMetrics], mode: str) -> None:
         if review_backlog:
             for entry in review_backlog[:10]:
                 top_docs = ", ".join(
-                    f"{doc['filename']} ({doc['occurrences']})"
-                    for doc in entry["documents"][:3]
+                    f"{doc['filename']} ({doc['occurrences']})" for doc in entry["documents"][:3]
                 )
                 f.write(
                     f"- {entry['task_type']} [{entry['source']}] "

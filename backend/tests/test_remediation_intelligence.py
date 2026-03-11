@@ -5,16 +5,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.services import review_suggestions
+from app.services import remediation_intelligence
 from app.services.intelligence_llm_utils import extract_json_object, job_pdf_path
-from app.services.review_suggestions import (
+from app.services.remediation_intelligence import (
     _font_task_payload,
     _page_blocks_for_review,
     _suspicious_reading_blocks,
     _table_targets_for_review,
-    generate_review_suggestion,
-    select_auto_font_review_resolution,
-    select_auto_font_map_override,
+    generate_remediation_intelligence,
+    select_auto_font_override,
+    select_auto_font_resolution,
 )
 
 
@@ -93,12 +93,12 @@ def test_job_pdf_path_falls_back_to_input_when_output_missing(tmp_path):
 
 def test_font_task_payload_uses_review_targets_and_page_structure_context(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "render_page_jpeg_data_url",
         lambda pdf_path, page_number: f"data:image/jpeg;base64,page-{page_number}",
     )
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "render_target_preview_png_data_url",
         lambda pdf_path, context_path: f"data:image/png;base64,target-{hash(context_path) % 10}",
     )
@@ -108,8 +108,16 @@ def test_font_task_payload_uses_review_targets_and_page_structure_context(monkey
             tmp_path,
             structure={
                 "elements": [
-                    {"type": "list_item", "page": 1, "text": "Arrow marker precedes this list entry in the source."},
-                    {"type": "paragraph", "page": 1, "text": "The same marker repeats before multiple entries."},
+                    {
+                        "type": "list_item",
+                        "page": 1,
+                        "text": "Arrow marker precedes this list entry in the source.",
+                    },
+                    {
+                        "type": "paragraph",
+                        "page": 1,
+                        "text": "The same marker repeats before multiple entries.",
+                    },
                 ]
             },
         ),
@@ -144,7 +152,7 @@ def test_font_task_payload_uses_review_targets_and_page_structure_context(monkey
 
 def test_font_task_payload_includes_reviewer_feedback_context(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "render_page_jpeg_data_url",
         lambda pdf_path, page_number: f"data:image/jpeg;base64,page-{page_number}",
     )
@@ -155,8 +163,8 @@ def test_font_task_payload_includes_reviewer_feedback_context(monkeypatch, tmp_p
             "font_text_fidelity",
             metadata={
                 "pages_to_check": [1],
-                "llm_suggestion": {
-                    "summary": "Previous recommendation",
+                "remediation_intelligence": {
+                    "summary": "Previous suggestion",
                     "suggested_action": "manual_only",
                     "reason": "Previous reason",
                 },
@@ -166,8 +174,9 @@ def test_font_task_payload_includes_reviewer_feedback_context(monkeypatch, tmp_p
     )
 
     assert '"reviewer_feedback": "This is a bullet marker, not a decorative glyph."' in prompt_text
-    assert '"previous_suggestion": {' in prompt_text
+    assert '"previous_intelligence": {' in prompt_text
     assert '"suggested_action": "manual_only"' in prompt_text
+
 
 def test_page_blocks_for_review_collects_structure_fragments(tmp_path):
     page_blocks = _page_blocks_for_review(
@@ -182,7 +191,11 @@ def test_page_blocks_for_review_collects_structure_fragments(tmp_path):
                         "text": "D a t a  B o o k",
                         "bbox": {"l": 72, "t": 700, "r": 250, "b": 660},
                     },
-                    {"type": "paragraph", "page": 1, "text": "A sidebar note appears before the main content."},
+                    {
+                        "type": "paragraph",
+                        "page": 1,
+                        "text": "A sidebar note appears before the main content.",
+                    },
                 ]
             },
         ),
@@ -198,7 +211,7 @@ def test_page_blocks_for_review_collects_structure_fragments(tmp_path):
 
 def test_suspicious_reading_blocks_collects_grounding(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "extract_ocr_text_from_bbox",
         lambda pdf_path, page_number, bbox: "Data Book",
     )
@@ -215,7 +228,11 @@ def test_suspicious_reading_blocks_collects_grounding(monkeypatch, tmp_path):
                         "text": "D a t a  B o o k",
                         "bbox": {"l": 72, "t": 700, "r": 250, "b": 660},
                     },
-                    {"type": "paragraph", "page": 1, "text": "A sidebar note appears before the main content."},
+                    {
+                        "type": "paragraph",
+                        "page": 1,
+                        "text": "A sidebar note appears before the main content.",
+                    },
                 ]
             },
         ),
@@ -231,12 +248,13 @@ def test_suspicious_reading_blocks_collects_grounding(monkeypatch, tmp_path):
     assert suspicious_blocks[0]["next_text"] == ""
 
 
-def test_generate_review_suggestion_supports_reading_order(monkeypatch, tmp_path):
+def test_generate_remediation_intelligence_supports_reading_order(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "extract_ocr_text_from_bbox",
         lambda pdf_path, page_number, bbox: "Data Book",
     )
+
     async def _fake_page_intelligence(**kwargs):
         return {
             "task_type": "page_text_intelligence",
@@ -259,7 +277,11 @@ def test_generate_review_suggestion_supports_reading_order(monkeypatch, tmp_path
                 }
             ],
         }
-    monkeypatch.setattr(review_suggestions, "generate_suspicious_text_intelligence", _fake_page_intelligence)
+
+    monkeypatch.setattr(
+        remediation_intelligence, "generate_suspicious_text_intelligence", _fake_page_intelligence
+    )
+
     async def _fake_reading_order_intelligence(**kwargs):
         return {
             "task_type": "reading_order_intelligence",
@@ -272,12 +294,15 @@ def test_generate_review_suggestion_supports_reading_order(monkeypatch, tmp_path
             "ordered_review_ids": ["review-0", "review-1"],
             "element_updates": [],
         }
-    monkeypatch.setattr(review_suggestions, "generate_reading_order_intelligence", _fake_reading_order_intelligence)
+
+    monkeypatch.setattr(
+        remediation_intelligence, "generate_reading_order_intelligence", _fake_reading_order_intelligence
+    )
 
     fake_llm = _FakeLlmClient({})
 
     suggestion = asyncio.run(
-        generate_review_suggestion(
+        generate_remediation_intelligence(
             job=_job(
                 tmp_path,
                 structure={
@@ -299,18 +324,20 @@ def test_generate_review_suggestion_supports_reading_order(monkeypatch, tmp_path
     assert suggestion["readable_text_hints"][0]["readable_text_hint"] == "Data Book"
     assert suggestion["readable_text_hints"][0]["ocr_text_candidate"] == "Data Book"
     assert suggestion["readable_text_hints"][0]["chosen_source"] == "ocr"
-    assert suggestion["document_overlay"]["provenance"] == "gemini_review_suggestion"
+    assert suggestion["document_overlay"]["provenance"] == "gemini_remediation_intelligence"
     assert suggestion["document_overlay"]["pages"][0]["page_number"] == 1
     assert suggestion["model"] == "google/gemini-3-flash-preview"
     assert fake_llm.calls == []
 
 
-def test_generate_review_suggestion_passes_reviewer_feedback_to_reading_order(monkeypatch, tmp_path):
+def test_generate_remediation_intelligence_passes_reviewer_feedback_to_reading_order(
+    monkeypatch, tmp_path
+):
     captured: dict[str, object] = {}
 
     async def _fake_page_intelligence(**kwargs):
         captured["page_feedback"] = kwargs.get("reviewer_feedback")
-        captured["page_previous_suggestions"] = kwargs.get("previous_suggestions")
+        captured["page_previous_intelligence"] = kwargs.get("previous_intelligence")
         return {
             "task_type": "page_text_intelligence",
             "summary": "",
@@ -321,7 +348,7 @@ def test_generate_review_suggestion_passes_reviewer_feedback_to_reading_order(mo
 
     async def _fake_reading_order_intelligence(**kwargs):
         captured["order_feedback"] = kwargs.get("reviewer_feedback")
-        captured["order_previous_suggestion"] = kwargs.get("previous_suggestion")
+        captured["order_previous_intelligence"] = kwargs.get("previous_intelligence")
         return {
             "task_type": "reading_order_intelligence",
             "summary": "Current order is acceptable.",
@@ -334,17 +361,24 @@ def test_generate_review_suggestion_passes_reviewer_feedback_to_reading_order(mo
             "element_updates": [],
         }
 
-    monkeypatch.setattr(review_suggestions, "generate_suspicious_text_intelligence", _fake_page_intelligence)
-    monkeypatch.setattr(review_suggestions, "generate_reading_order_intelligence", _fake_reading_order_intelligence)
+    monkeypatch.setattr(
+        remediation_intelligence, "generate_suspicious_text_intelligence", _fake_page_intelligence
+    )
+    monkeypatch.setattr(
+        remediation_intelligence, "generate_reading_order_intelligence", _fake_reading_order_intelligence
+    )
 
     suggestion = asyncio.run(
-        generate_review_suggestion(
-            job=_job(tmp_path, structure={"elements": [{"type": "paragraph", "page": 0, "text": "Hello"}]}),
+        generate_remediation_intelligence(
+            job=_job(
+                tmp_path,
+                structure={"elements": [{"type": "paragraph", "page": 0, "text": "Hello"}]},
+            ),
             task=_task(
                 "reading_order",
                 metadata={
-                    "llm_suggestion": {
-                        "summary": "Previous recommendation",
+                    "remediation_intelligence": {
+                        "summary": "Previous suggestion",
                         "suggested_action": "reorder_review",
                         "reason": "Previous reason",
                         "page_text_intelligence": {
@@ -378,7 +412,7 @@ def test_generate_review_suggestion_passes_reviewer_feedback_to_reading_order(mo
 
     assert captured["page_feedback"] == "The sidebar should stay in the main flow."
     assert captured["order_feedback"] == "The sidebar should stay in the main flow."
-    assert captured["page_previous_suggestions"] == {
+    assert captured["page_previous_intelligence"] == {
         (1, "review-0"): {
             "summary": "Previous text hint",
             "suggested_action": "set_resolved_text",
@@ -386,7 +420,7 @@ def test_generate_review_suggestion_passes_reviewer_feedback_to_reading_order(mo
             "resolved_text": "Hello",
         }
     }
-    assert captured["order_previous_suggestion"] == {
+    assert captured["order_previous_intelligence"] == {
         "summary": "Previous page order",
         "suggested_action": "reorder_review",
         "reason": "Old ordering",
@@ -397,7 +431,7 @@ def test_generate_review_suggestion_passes_reviewer_feedback_to_reading_order(mo
 
 
 def test_aggregate_table_intelligence_preserves_reclassification():
-    aggregated = review_suggestions._aggregate_table_intelligence(
+    aggregated = remediation_intelligence._aggregate_table_intelligence(
         [
             {
                 "summary": "This is an org chart, not a data table.",
@@ -420,9 +454,9 @@ def test_aggregate_table_intelligence_preserves_reclassification():
     assert aggregated["proposed_table_updates"][0]["resolved_kind"] == "org_chart"
 
 
-def test_generate_review_suggestion_keeps_font_actualtext_candidates(monkeypatch, tmp_path):
+def test_generate_remediation_intelligence_keeps_font_actualtext_candidates(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "render_page_jpeg_data_url",
         lambda pdf_path, page_number: f"data:image/jpeg;base64,page-{page_number}",
     )
@@ -457,7 +491,7 @@ def test_generate_review_suggestion_keeps_font_actualtext_candidates(monkeypatch
     )
 
     suggestion = asyncio.run(
-        generate_review_suggestion(
+        generate_remediation_intelligence(
             job=_job(tmp_path),
             task=_task(
                 "font_text_fidelity",
@@ -479,6 +513,7 @@ def test_generate_review_suggestion_keeps_font_actualtext_candidates(monkeypatch
     assert candidates[0]["operator_index"] == 132
     assert candidates[0]["proposed_actualtext"] == "bullet"
     assert fake_llm.calls[0]["kwargs"]["temperature"] == 0
+
 
 def test_table_targets_for_review_collects_table_targets(tmp_path):
     job = _job(
@@ -516,7 +551,7 @@ def test_table_targets_for_review_collects_table_targets(tmp_path):
     assert target["text_excerpt"] == "Enrollment by program and semester"
 
 
-def test_generate_review_suggestion_supports_table_semantics(monkeypatch, tmp_path):
+def test_generate_remediation_intelligence_supports_table_semantics(monkeypatch, tmp_path):
     async def _fake_table_intelligence(**kwargs):
         target = kwargs["target"]
         if target["table_review_id"] == "review-0":
@@ -544,12 +579,13 @@ def test_generate_review_suggestion_supports_table_semantics(monkeypatch, tmp_pa
             "header_rows": [],
             "row_header_columns": [],
         }
-    monkeypatch.setattr(review_suggestions, "generate_table_intelligence", _fake_table_intelligence)
+
+    monkeypatch.setattr(remediation_intelligence, "generate_table_intelligence", _fake_table_intelligence)
 
     fake_llm = _FakeLlmClient({"summary": "unused"})
 
     suggestion = asyncio.run(
-        generate_review_suggestion(
+        generate_remediation_intelligence(
             job=_job(
                 tmp_path,
                 structure={
@@ -606,18 +642,18 @@ def test_generate_review_suggestion_supports_table_semantics(monkeypatch, tmp_pa
     assert suggestion["confidence"] == "medium"
     assert len(suggestion["proposed_table_updates"]) == 1
     assert len(suggestion["table_intelligence"]) == 2
-    assert suggestion["document_overlay"]["provenance"] == "gemini_review_suggestion"
+    assert suggestion["document_overlay"]["provenance"] == "gemini_remediation_intelligence"
     assert suggestion["document_overlay"]["pages"][0]["page_number"] == 1
-    assert "recommendation" in suggestion["summary"].lower()
+    assert "reviewed" in suggestion["summary"].lower()
     assert fake_llm.calls == []
 
 
-def test_generate_review_suggestion_rejects_unsupported_task(tmp_path):
+def test_generate_remediation_intelligence_rejects_unsupported_task(tmp_path):
     fake_llm = _FakeLlmClient({"summary": "n/a"})
 
     with pytest.raises(ValueError):
         asyncio.run(
-            generate_review_suggestion(
+            generate_remediation_intelligence(
                 job=_job(tmp_path),
                 task=_task("annotation_description"),
                 llm_client=fake_llm,
@@ -625,9 +661,9 @@ def test_generate_review_suggestion_rejects_unsupported_task(tmp_path):
         )
 
 
-def test_select_auto_font_map_override_accepts_high_confidence_single_glyph(monkeypatch, tmp_path):
+def test_select_auto_font_override_accepts_high_confidence_single_glyph(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "inspect_context_font_target",
         lambda pdf_path, context_path: {
             "font_code": 1,
@@ -637,7 +673,7 @@ def test_select_auto_font_map_override_accepts_high_confidence_single_glyph(monk
         },
     )
 
-    selected = select_auto_font_map_override(
+    selected = select_auto_font_override(
         job=_job(tmp_path),
         task=_task(
             "font_text_fidelity",
@@ -659,7 +695,7 @@ def test_select_auto_font_map_override_accepts_high_confidence_single_glyph(monk
                 ],
             },
         ),
-        suggestion={
+        intelligence={
             "task_type": "font_text_fidelity",
             "confidence": "high",
             "suggested_action": "font_map_candidate",
@@ -693,9 +729,11 @@ def test_select_auto_font_map_override_accepts_high_confidence_single_glyph(monk
     }
 
 
-def test_select_auto_font_map_override_rejects_divergent_or_low_confidence_candidates(monkeypatch, tmp_path):
+def test_select_auto_font_override_rejects_divergent_or_low_confidence_candidates(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "inspect_context_font_target",
         lambda pdf_path, context_path: {
             "font_code": 1,
@@ -720,10 +758,10 @@ def test_select_auto_font_map_override_rejects_divergent_or_low_confidence_candi
         },
     )
 
-    low_confidence = select_auto_font_map_override(
+    low_confidence = select_auto_font_override(
         job=_job(tmp_path),
         task=task,
-        suggestion={
+        intelligence={
             "task_type": "font_text_fidelity",
             "confidence": "medium",
             "suggested_action": "font_map_candidate",
@@ -740,7 +778,7 @@ def test_select_auto_font_map_override_rejects_divergent_or_low_confidence_candi
     )
     assert low_confidence is None
 
-    divergent = select_auto_font_map_override(
+    divergent = select_auto_font_override(
         job=_job(tmp_path),
         task=_task(
             "font_text_fidelity",
@@ -762,7 +800,7 @@ def test_select_auto_font_map_override_rejects_divergent_or_low_confidence_candi
                 ],
             },
         ),
-        suggestion={
+        intelligence={
             "task_type": "font_text_fidelity",
             "confidence": "high",
             "suggested_action": "font_map_candidate",
@@ -787,9 +825,11 @@ def test_select_auto_font_map_override_rejects_divergent_or_low_confidence_candi
     assert divergent is None
 
 
-def test_select_auto_font_map_override_accepts_actualtext_action_when_candidates_are_safe(monkeypatch, tmp_path):
+def test_select_auto_font_override_accepts_actualtext_action_when_candidates_are_safe(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "inspect_context_font_target",
         lambda pdf_path, context_path: {
             "font_code": 1,
@@ -799,7 +839,7 @@ def test_select_auto_font_map_override_accepts_actualtext_action_when_candidates
         },
     )
 
-    selected = select_auto_font_map_override(
+    selected = select_auto_font_override(
         job=_job(tmp_path),
         task=_task(
             "font_text_fidelity",
@@ -815,7 +855,7 @@ def test_select_auto_font_map_override_accepts_actualtext_action_when_candidates
                 ],
             },
         ),
-        suggestion={
+        intelligence={
             "task_type": "font_text_fidelity",
             "confidence": "high",
             "suggested_action": "actualtext_candidate",
@@ -849,9 +889,9 @@ def test_select_auto_font_map_override_accepts_actualtext_action_when_candidates
     }
 
 
-def test_select_auto_font_map_override_rejects_decorative_actualtext_action(monkeypatch, tmp_path):
+def test_select_auto_font_override_rejects_decorative_actualtext_action(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "inspect_context_font_target",
         lambda pdf_path, context_path: {
             "font_code": 1,
@@ -861,7 +901,7 @@ def test_select_auto_font_map_override_rejects_decorative_actualtext_action(monk
         },
     )
 
-    selected = select_auto_font_map_override(
+    selected = select_auto_font_override(
         job=_job(tmp_path),
         task=_task(
             "font_text_fidelity",
@@ -877,7 +917,7 @@ def test_select_auto_font_map_override_rejects_decorative_actualtext_action(monk
                 ],
             },
         ),
-        suggestion={
+        intelligence={
             "task_type": "font_text_fidelity",
             "confidence": "high",
             "suggested_action": "actualtext_candidate",
@@ -903,9 +943,11 @@ def test_select_auto_font_map_override_rejects_decorative_actualtext_action(monk
     assert selected is None
 
 
-def test_select_auto_font_review_resolution_accepts_decorative_artifact_action(monkeypatch, tmp_path):
+def test_select_auto_font_resolution_accepts_decorative_artifact_action(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "inspect_context_font_target",
         lambda pdf_path, context_path: {
             "font_code": 1,
@@ -915,7 +957,7 @@ def test_select_auto_font_review_resolution_accepts_decorative_artifact_action(m
         },
     )
 
-    selected = select_auto_font_review_resolution(
+    selected = select_auto_font_resolution(
         job=_job(tmp_path),
         task=_task(
             "font_text_fidelity",
@@ -937,7 +979,7 @@ def test_select_auto_font_review_resolution_accepts_decorative_artifact_action(m
                 ],
             },
         ),
-        suggestion={
+        intelligence={
             "task_type": "font_text_fidelity",
             "confidence": "high",
             "suggested_action": "artifact_if_decorative",
@@ -986,11 +1028,11 @@ def test_select_auto_font_review_resolution_accepts_decorative_artifact_action(m
     }
 
 
-def test_select_auto_font_review_resolution_accepts_decorative_artifact_without_actualtext_candidates(
+def test_select_auto_font_resolution_accepts_decorative_artifact_without_actualtext_candidates(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "inspect_context_font_target",
         lambda pdf_path, context_path: {
             "font_code": 1,
@@ -1000,7 +1042,7 @@ def test_select_auto_font_review_resolution_accepts_decorative_artifact_without_
         },
     )
 
-    selected = select_auto_font_review_resolution(
+    selected = select_auto_font_resolution(
         job=_job(tmp_path),
         task=_task(
             "font_text_fidelity",
@@ -1016,7 +1058,7 @@ def test_select_auto_font_review_resolution_accepts_decorative_artifact_without_
                 ],
             },
         ),
-        suggestion={
+        intelligence={
             "task_type": "font_text_fidelity",
             "confidence": "high",
             "suggested_action": "artifact_if_decorative",
@@ -1044,11 +1086,11 @@ def test_select_auto_font_review_resolution_accepts_decorative_artifact_without_
     }
 
 
-def test_select_auto_font_review_resolution_ignores_low_confidence_actualtext_candidates_for_artifact(
+def test_select_auto_font_resolution_ignores_low_confidence_actualtext_candidates_for_artifact(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "inspect_context_font_target",
         lambda pdf_path, context_path: {
             "font_code": 1,
@@ -1058,7 +1100,7 @@ def test_select_auto_font_review_resolution_ignores_low_confidence_actualtext_ca
         },
     )
 
-    selected = select_auto_font_review_resolution(
+    selected = select_auto_font_resolution(
         job=_job(tmp_path),
         task=_task(
             "font_text_fidelity",
@@ -1080,7 +1122,7 @@ def test_select_auto_font_review_resolution_ignores_low_confidence_actualtext_ca
                 ],
             },
         ),
-        suggestion={
+        intelligence={
             "task_type": "font_text_fidelity",
             "confidence": "high",
             "suggested_action": "artifact_if_decorative",
@@ -1120,11 +1162,11 @@ def test_select_auto_font_review_resolution_ignores_low_confidence_actualtext_ca
     assert selected["unicode_text"] == ""
 
 
-def test_select_auto_font_review_resolution_uses_visible_hint_for_artifact_fallback(
+def test_select_auto_font_resolution_uses_visible_hint_for_artifact_fallback(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(
-        review_suggestions,
+        remediation_intelligence,
         "inspect_context_font_target",
         lambda pdf_path, context_path: {
             "font_code": 1,
@@ -1134,7 +1176,7 @@ def test_select_auto_font_review_resolution_uses_visible_hint_for_artifact_fallb
         },
     )
 
-    selected = select_auto_font_review_resolution(
+    selected = select_auto_font_resolution(
         job=_job(tmp_path),
         task=_task(
             "font_text_fidelity",
@@ -1150,7 +1192,7 @@ def test_select_auto_font_review_resolution_uses_visible_hint_for_artifact_fallb
                 ],
             },
         ),
-        suggestion={
+        intelligence={
             "task_type": "font_text_fidelity",
             "confidence": "high",
             "suggested_action": "artifact_if_decorative",

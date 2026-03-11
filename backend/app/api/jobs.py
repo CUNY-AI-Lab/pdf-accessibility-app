@@ -172,7 +172,7 @@ async def job_progress_sse(
                     if event_data is _DONE:
                         return
                     yield {"event": "progress", "data": event_data}
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     yield {"event": "ping", "data": "keepalive"}
         except asyncio.CancelledError:
             pass
