@@ -1497,7 +1497,7 @@ def _emit_tagged_region(
         mcid = builder.add_code(page_index, page_ref, lang=elem_lang)
         tag = "Code"
     elif elem_type == "formula":
-        alt = accessible_text
+        alt = _formula_alt_text(actual_text or accessible_text)
         if isinstance(alt, str):
             alt = alt.strip()
         mcid = builder.add_formula(page_index, page_ref, alt_text=alt or None)
@@ -1538,6 +1538,190 @@ def _element_accessible_text(elem: dict) -> str:
 def _element_actual_text(elem: dict) -> str | None:
     actual_text = _element_accessible_text(elem)
     return actual_text or None
+
+
+FORMULA_GREEK_WORDS = {
+    "Α": "alpha",
+    "α": "alpha",
+    "Β": "beta",
+    "β": "beta",
+    "Γ": "gamma",
+    "γ": "gamma",
+    "Δ": "delta",
+    "δ": "delta",
+    "Ε": "epsilon",
+    "ε": "epsilon",
+    "Ζ": "zeta",
+    "ζ": "zeta",
+    "Η": "eta",
+    "η": "eta",
+    "Θ": "theta",
+    "θ": "theta",
+    "Ι": "iota",
+    "ι": "iota",
+    "Κ": "kappa",
+    "κ": "kappa",
+    "Λ": "lambda",
+    "λ": "lambda",
+    "Μ": "mu",
+    "μ": "mu",
+    "Ν": "nu",
+    "ν": "nu",
+    "Ξ": "xi",
+    "ξ": "xi",
+    "Ο": "omicron",
+    "ο": "omicron",
+    "Π": "pi",
+    "π": "pi",
+    "Ρ": "rho",
+    "ρ": "rho",
+    "Σ": "sigma",
+    "σ": "sigma",
+    "ς": "sigma",
+    "Τ": "tau",
+    "τ": "tau",
+    "Υ": "upsilon",
+    "υ": "upsilon",
+    "Φ": "phi",
+    "φ": "phi",
+    "Χ": "chi",
+    "χ": "chi",
+    "Ψ": "psi",
+    "ψ": "psi",
+    "Ω": "omega",
+    "ω": "omega",
+}
+FORMULA_SYMBOL_WORDS = {
+    "=": "equals",
+    "+": "plus",
+    "±": "plus or minus",
+    "×": "times",
+    "·": "times",
+    "∙": "times",
+    "÷": "divided by",
+    "/": "over",
+    "≈": "approximately",
+    "≠": "not equal to",
+    "≤": "less than or equal to",
+    "≥": "greater than or equal to",
+    "<": "less than",
+    ">": "greater than",
+    "∑": "sum",
+    "∫": "integral",
+    "√": "square root",
+    "∞": "infinity",
+    "∂": "partial",
+    "∇": "nabla",
+    "→": "maps to",
+    "←": "from",
+    "↔": "if and only if",
+    "⇒": "implies",
+    "⇔": "if and only if",
+}
+FORMULA_SUPERSCRIPTS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾", "0123456789+-=()")
+FORMULA_SUBSCRIPTS = str.maketrans("₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎", "0123456789+-=()")
+FORMULA_MULTI_LETTER_WORDS = {
+    "sin",
+    "cos",
+    "tan",
+    "cot",
+    "sec",
+    "csc",
+    "log",
+    "ln",
+    "exp",
+    "lim",
+    "max",
+    "min",
+    "sup",
+    "inf",
+    "det",
+    "mod",
+    "gcd",
+    "lcm",
+    "sub",
+    "sum",
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "zeta",
+    "eta",
+    "theta",
+    "iota",
+    "kappa",
+    "lambda",
+    "mu",
+    "nu",
+    "xi",
+    "omicron",
+    "pi",
+    "rho",
+    "sigma",
+    "tau",
+    "upsilon",
+    "phi",
+    "chi",
+    "psi",
+    "omega",
+}
+
+
+def _spoken_formula_exponent(value: str) -> str:
+    compact = value.strip()
+    if compact == "2":
+        return "squared"
+    if compact == "3":
+        return "cubed"
+    return f"to the power of {compact}"
+
+
+def _split_formula_symbol_runs(text: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if token.lower() in FORMULA_MULTI_LETTER_WORDS:
+            return token
+        return " ".join(token)
+
+    return re.sub(r"\b[A-Za-z]{2,3}\b", repl, text)
+
+
+def _formula_alt_text(text: str | None) -> str:
+    spoken = str(text or "").strip()
+    if not spoken:
+        return ""
+
+    for symbol, word in FORMULA_GREEK_WORDS.items():
+        spoken = spoken.replace(symbol, f" {word} ")
+
+    spoken = re.sub(
+        r"([A-Za-z0-9\)])\s*\^\s*\{?([A-Za-z0-9+\-]+)\}?",
+        lambda match: f"{match.group(1)} {_spoken_formula_exponent(match.group(2))}",
+        spoken,
+    )
+    spoken = re.sub(
+        r"([A-Za-z0-9\)])([⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾]+)",
+        lambda match: f"{match.group(1)} {_spoken_formula_exponent(match.group(2).translate(FORMULA_SUPERSCRIPTS))}",
+        spoken,
+    )
+    spoken = re.sub(
+        r"([A-Za-z0-9\)])\s*_\s*\{?([A-Za-z0-9+\-]+)\}?",
+        lambda match: f"{match.group(1)} sub {match.group(2)}",
+        spoken,
+    )
+    spoken = re.sub(
+        r"([A-Za-z0-9\)])([₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎]+)",
+        lambda match: f"{match.group(1)} sub {match.group(2).translate(FORMULA_SUBSCRIPTS)}",
+        spoken,
+    )
+
+    for symbol, word in FORMULA_SYMBOL_WORDS.items():
+        spoken = spoken.replace(symbol, f" {word} ")
+
+    spoken = spoken.replace("{", " ").replace("}", " ")
+    spoken = _split_formula_symbol_runs(spoken)
+    return re.sub(r"\s+", " ", spoken).strip()
 
 
 def _make_bdc(

@@ -1,6 +1,11 @@
 from types import SimpleNamespace
 
-from app.pipeline.structure import _extract_bbox, _normalize_docling_elements, _normalize_lang_tag
+from app.pipeline.structure import (
+    _extract_bbox,
+    _looks_like_formula_text,
+    _normalize_docling_elements,
+    _normalize_lang_tag,
+)
 
 
 def test_normalize_docling_elements_maps_footnotes_to_note_elements():
@@ -154,6 +159,34 @@ def test_normalize_docling_elements_marks_toc_tables_and_heading_entries():
     assert elements[2]["text"] == "2 Installation 6"
     assert elements[3]["text"] == "PDFlib GmbH ........ 7"
     assert elements[0]["toc_group_ref"] == elements[1]["toc_group_ref"] == elements[2]["toc_group_ref"] == elements[3]["toc_group_ref"]
+
+
+def test_looks_like_formula_text_detects_short_equation_blocks():
+    assert _looks_like_formula_text("E = mc^2") is True
+    assert _looks_like_formula_text("f(x) = x^2 + 1") is True
+
+
+def test_looks_like_formula_text_rejects_prose_with_embedded_math():
+    assert _looks_like_formula_text(
+        "Distributions differed significantly (χ²(2, N = 663) = 13.30, p = .0013)."
+    ) is False
+
+
+def test_normalize_docling_elements_reclassifies_formula_like_paragraphs():
+    doc_dict = {
+        "body": {"children": [{"$ref": "#/texts/0"}]},
+        "texts": [
+            {
+                "label": "paragraph",
+                "text": "f(x) = x^2 + 1",
+                "prov": [{"page_no": 1, "bbox": {"l": 10, "b": 20, "r": 100, "t": 40}}],
+            }
+        ],
+    }
+
+    elements = _normalize_docling_elements(doc_dict)
+
+    assert elements[0]["type"] == "formula"
 
 
 def test_normalize_docling_elements_splits_toc_table_rows_into_separate_items():

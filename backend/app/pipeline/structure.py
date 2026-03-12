@@ -112,6 +112,36 @@ TOC_TRAILING_PAGE_RE = re.compile(
     r"(?:\.{2,}|\s{2,}|\t+)?\s*(?:\d+|[ivxlcdm]+)\s*$",
     re.IGNORECASE,
 )
+FORMULA_SHORT_TEXT_LIMIT = 160
+FORMULA_LONG_WORD_RE = re.compile(r"\b[A-Za-z]{4,}\b")
+FORMULA_SENTENCE_PUNCTUATION_RE = re.compile(r"[!?]|(?<!\d)\.(?!\d)|\.(?=\s|$)")
+FORMULA_OPERATOR_RE = re.compile(r"[=±×÷≈≠≤≥∑∫√^_]|(?<!\w)/(?!/)")
+FORMULA_SUPERSUB_RE = re.compile(r"[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎]")
+FORMULA_GREEK_RE = re.compile(r"[Α-Ωα-ωϐ-ϖ]")
+FORMULA_FUNCTION_RE = re.compile(
+    r"\b(?:sin|cos|tan|cot|sec|csc|log|ln|exp|lim|max|min|sup|inf|det|mod|gcd|lcm)\s*\(",
+    re.IGNORECASE,
+)
+FORMULA_EQUATION_RE = re.compile(r"\S\s*=\s*\S")
+FORMULA_SHORT_SYMBOL_RE = re.compile(r"\b[A-Za-zΑ-Ωα-ω]\d*\b")
+FORMULA_ALLOWED_LONG_WORDS = {
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "zeta",
+    "eta",
+    "theta",
+    "iota",
+    "kappa",
+    "lambda",
+    "integral",
+    "summation",
+    "square",
+    "root",
+    "limit",
+}
 
 
 @dataclass
@@ -219,6 +249,42 @@ def _extract_bbox(prov: list[dict]) -> dict | None:
     }
 
 
+def _looks_like_formula_text(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized or len(normalized) > FORMULA_SHORT_TEXT_LIMIT:
+        return False
+
+    long_words = [
+        word.lower()
+        for word in FORMULA_LONG_WORD_RE.findall(normalized)
+        if word.lower() not in FORMULA_ALLOWED_LONG_WORDS
+    ]
+    if len(long_words) >= 2:
+        return False
+
+    if FORMULA_SENTENCE_PUNCTUATION_RE.search(normalized) and long_words:
+        return False
+
+    operator_count = len(FORMULA_OPERATOR_RE.findall(normalized))
+    has_supsub = bool(FORMULA_SUPERSUB_RE.search(normalized))
+    has_greek = bool(FORMULA_GREEK_RE.search(normalized))
+    has_function = bool(FORMULA_FUNCTION_RE.search(normalized))
+    has_equation = bool(FORMULA_EQUATION_RE.search(normalized))
+    short_symbol_count = len(FORMULA_SHORT_SYMBOL_RE.findall(normalized))
+
+    if has_equation and (operator_count >= 1 or has_supsub or has_function or has_greek):
+        return True
+    if operator_count >= 2 and (short_symbol_count >= 2 or has_supsub or has_function or has_greek):
+        return True
+    if has_supsub and (short_symbol_count >= 1 or operator_count >= 1):
+        return True
+    if has_function and operator_count >= 1:
+        return True
+    if has_greek and operator_count >= 1 and not long_words:
+        return True
+    return False
+
+
 def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
     """Convert Docling's rich document model into a flat elements array for the tagger.
 
@@ -279,8 +345,9 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
 
         elif label in ("text", "paragraph", "caption", "reference"):
             if text.strip():
+                element_type = "formula" if _looks_like_formula_text(text) else "paragraph"
                 elem_dict = {
-                    "type": "paragraph",
+                    "type": element_type,
                     "text": text,
                     "page": page,
                     "bbox": bbox,

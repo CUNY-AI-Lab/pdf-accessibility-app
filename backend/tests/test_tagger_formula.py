@@ -4,6 +4,7 @@ from app.pipeline.tagger import (
     ContentRegion,
     StructTreeBuilder,
     _emit_tagged_region,
+    _formula_alt_text,
 )
 
 
@@ -41,11 +42,16 @@ def test_formula_regions_emit_formula_tag_with_alt_text():
     assert len(new_instructions) == 2
     assert str(new_instructions[0].operator) == "BDC"
     assert new_instructions[0].operands[0] == pikepdf.Name("/Formula")
+    assert str(new_instructions[0].operands[1]["/ActualText"]) == "E = mc^2"
     assert str(new_instructions[1].operator) == "EMC"
 
     formula_elem = builder.doc_elem["/K"][0]
     assert formula_elem.get("/S") == pikepdf.Name("/Formula")
-    assert str(formula_elem.get("/Alt")) == "E = mc^2"
+    assert str(formula_elem.get("/Alt")) == "E equals m c squared"
+
+
+def test_formula_alt_text_speaks_subscripts_superscripts_and_symbols():
+    assert _formula_alt_text("x_2 + y²") == "x sub 2 plus y squared"
 
 
 def test_note_regions_emit_note_tag_with_unique_id():
