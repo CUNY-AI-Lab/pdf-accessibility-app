@@ -223,6 +223,33 @@ Endpoints:
 - frontend: <http://127.0.0.1:5173>
 - backend: <http://127.0.0.1:8001>
 
+## Docker
+
+The repo now includes a simple single-container deployment:
+
+- one image with `Ghostscript`, `OCRmyPDF`, `Tesseract`, `Poppler`, `QPDF`, Java, and `veraPDF`
+- the frontend is built into the image and served by FastAPI alongside the API
+- persistent job storage in a Docker volume
+
+Start it with:
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+Then open:
+
+- app: <http://127.0.0.1:8080>
+
+Notes:
+
+- `docker compose` reads LLM settings from the root `.env`.
+- The backend persists uploads, processing artifacts, outputs, and SQLite data in the `pdf_accessibility_data` volume.
+- If `8080` is already in use, set `APP_PORT` in `.env` before starting the stack.
+- The bundled image includes `tesseract-ocr-eng`. If you need other OCR languages, extend [Dockerfile](/Users/stephenzweibel/Apps/pdf-accessibility-app/Dockerfile) with the matching `tesseract-ocr-<lang>` packages.
+- For local Vite development against a non-default backend, set `VITE_DEV_PROXY_TARGET`.
+
 ## Tests
 
 ```bash

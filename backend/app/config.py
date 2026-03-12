@@ -71,6 +71,14 @@ class Settings(BaseSettings):
     # Job lifecycle
     job_ttl_hours: int = 24
 
+    # CORS
+    cors_allow_origins: str = (
+        "http://localhost:5173,"
+        "http://127.0.0.1:5173,"
+        "http://localhost:8080,"
+        "http://127.0.0.1:8080"
+    )
+
     # LLM retry
     llm_max_retries: int = 3
     llm_retry_backoff_base: float = 2.0

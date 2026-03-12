@@ -1,0 +1,26 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////app/data/pdf_accessibility.db
+      UPLOAD_DIR: /app/data/uploads
+      PROCESSING_DIR: /app/data/processing
+      OUTPUT_DIR: /app/data/output
+    volumes:
+      - pdf_accessibility_data:/app/data
+    ports:
+      - "${APP_PORT:-8080}:8001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  pdf_accessibility_data:

@@ -2,14 +2,16 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 
 from app.api.health import router as health_router
 from app.api.router import api_router
-from app.config import get_settings
+from app.config import BASE_DIR, get_settings
 from app.database import get_session_maker, init_db
 from app.models import Job
 from app.services.file_storage import cleanup_job_files, ensure_dirs
@@ -17,6 +19,37 @@ from app.services.job_manager import get_job_manager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _frontend_dist(frontend_dist_dir: Path | None = None) -> Path | None:
+    dist_dir = (frontend_dist_dir or (BASE_DIR / "frontend" / "dist")).resolve()
+    if not (dist_dir / "index.html").is_file():
+        return None
+    return dist_dir
+
+
+def _resolve_frontend_file(frontend_dist_dir: Path, requested_path: str) -> Path | None:
+    if not requested_path:
+        return None
+
+    candidate = (frontend_dist_dir / requested_path.lstrip("/")).resolve()
+    try:
+        candidate.relative_to(frontend_dist_dir)
+    except ValueError:
+        return None
+
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def _cors_origins() -> list[str]:
+    settings = get_settings()
+    return [
+        origin
+        for origin in (item.strip() for item in settings.cors_allow_origins.split(","))
+        if origin
+    ]
 
 
 async def _periodic_cleanup():
@@ -66,43 +99,69 @@ async def _periodic_cleanup():
             logger.exception("Periodic cleanup failed, will retry next cycle")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Starting PDF Accessibility app...")
-    ensure_dirs()
-    await init_db()
-    logger.info("Database initialized")
+def _register_frontend_routes(app: FastAPI, frontend_dist_dir: Path) -> None:
+    index_path = frontend_dist_dir / "index.html"
 
-    cleanup_task = asyncio.create_task(_periodic_cleanup(), name="periodic-cleanup")
+    @app.get("/", include_in_schema=False)
+    async def frontend_index():
+        return FileResponse(index_path)
 
-    yield
-
-    logger.info("Shutting down...")
-    cleanup_task.cancel()
-    try:
-        await cleanup_task
-    except asyncio.CancelledError:
-        pass
-
-    job_manager = get_job_manager()
-    await job_manager.shutdown()
-    logger.info("Shutdown complete")
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def frontend_app(full_path: str):
+        asset_path = _resolve_frontend_file(frontend_dist_dir, full_path)
+        if asset_path is not None:
+            return FileResponse(asset_path)
+        if full_path and (full_path.startswith("assets/") or Path(full_path).suffix):
+            raise HTTPException(status_code=404)
+        return FileResponse(index_path)
 
 
-app = FastAPI(
-    title="PDF Accessibility",
-    description="PDF accessibility remediation pipeline",
-    version="0.1.0",
-    lifespan=lifespan,
-)
+def create_app(frontend_dist_dir: Path | None = None) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        logger.info("Starting PDF Accessibility app...")
+        ensure_dirs()
+        await init_db()
+        logger.info("Database initialized")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+        cleanup_task = asyncio.create_task(_periodic_cleanup(), name="periodic-cleanup")
 
-app.include_router(health_router)
-app.include_router(api_router)
+        yield
+
+        logger.info("Shutting down...")
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+
+        job_manager = get_job_manager()
+        await job_manager.shutdown()
+        logger.info("Shutdown complete")
+
+    app = FastAPI(
+        title="PDF Accessibility",
+        description="PDF accessibility remediation pipeline",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins(),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    app.include_router(health_router)
+    app.include_router(api_router)
+
+    dist_dir = _frontend_dist(frontend_dist_dir)
+    if dist_dir is not None:
+        _register_frontend_routes(app, dist_dir)
+
+    return app
+
+
+app = create_app()
