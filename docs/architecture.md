@@ -1,6 +1,6 @@
 # Architecture
 
-Updated: 2026-03-09
+Updated: 2026-03-12
 
 This app has two distinct layers:
 
@@ -8,6 +8,12 @@ This app has two distinct layers:
 2. deterministic PDF writing and release gating
 
 That split is deliberate. Gemini is used where meaning is hard. The PDF writer stays deterministic.
+
+The visible product model is also split cleanly:
+
+1. release-ready output
+2. manual remediation when trustworthiness is not high enough
+3. optional advanced review only for human-legible visible output
 
 ## Runtime flow
 
@@ -26,15 +32,13 @@ flowchart TD
     G --> G5["nearby context"]
     F --> H["Gemini structured outputs via OpenRouter"]
     H --> I["Resolved semantic decisions"]
-    I --> J["Deterministic tagger/remediator"]
-    J --> K["veraPDF"]
-    J --> L["Fidelity"]
-    K --> M{"Compliant"}
-    L --> N{"Faithful"}
-    M --> O{"Review clear"}
-    N --> O
-    O -->|Yes| P["Release-ready PDF"]
-    O -->|No| Q["Review tasks"]
+    I --> J["Pretag rationalization\n(widgets, figures, structure)"]
+    J --> K["Deterministic tagger/remediator"]
+    K --> L["veraPDF + fidelity gate"]
+    L --> M{"Release-ready"}
+    M -->|Yes| N["Release-ready PDF"]
+    M -->|No| O["Manual remediation"]
+    N --> P["Optional visible review surface"]
 ```
 
 ## Semantic units
@@ -76,6 +80,7 @@ Gemini is not allowed to write PDF objects directly.
 
 The deterministic layer is responsible for:
 
+- pretag rationalization of suspicious widgets and under-described visual figures
 - PDF/UA tag tree construction
 - `/ActualText`
 - form `/TU`
@@ -131,13 +136,14 @@ A document is release-ready only when all three are true:
 
 1. `veraPDF` says compliant
 2. fidelity says faithful enough
-3. there are no blocking review tasks
+3. the run ends `complete`, not `manual_remediation`
 
-That is stricter than validator pass alone.
+Optional visible review items do not block release. Hidden structural blockers still do.
 
 ## Known limits
 
-- complex tables still require human review in some cases
+- complex tables still require stronger extraction or manual remediation in some cases
 - visual WCAG issues such as contrast are not yet a first-class audit layer
-- math and rich media remain partial
-- semantic review still depends on good local page/crop evidence
+- math support is conservative formula tagging plus speakable formula text, not rich equation semantics
+- rich media remains partial
+- semantic adjudication still depends on good local page/crop evidence

@@ -1,10 +1,12 @@
 # PDF Accessibility App
 
-CUNY AI Lab's PDF remediation app turns uploaded PDFs into accessible output PDFs with a strict release gate:
+CUNY AI Lab's PDF remediation app turns uploaded PDFs into accessible output PDFs. The app is execution-first: it performs remediation automatically, exposes optional advanced review only for human-legible output, and sends non-trustworthy runs to manual remediation.
+
+The release gate is strict:
 
 - PDF/UA-1 compliance via `veraPDF`
 - fidelity checks for text, reading order, tables, forms, links, and figures
-- human review only where semantics still need judgment
+- manual remediation when unresolved blocking conditions remain
 
 The current design is Gemini-first for hard semantic decisions, but deterministic for PDF mutation.
 
@@ -19,7 +21,7 @@ The runtime pipeline is:
 5. `tag` - write the accessible PDF deterministically with `pikepdf`
 6. `validate` - run `veraPDF` against PDF/UA-1
 7. `fidelity` - decide whether the output is faithful enough for release
-8. `review` - create targeted review tasks only for unresolved semantics
+8. `publish result` - persist optional visible follow-up items and applied changes for advanced review while keeping structural blockers internal
 
 ## Architecture
 
@@ -37,17 +39,12 @@ flowchart LR
     D --> H
     H --> I["Gemini structured outputs via OpenRouter"]
     I --> J["Resolved document model"]
-    J --> K["Deterministic PDF writer\n(tags, ActualText, tables, forms, TOC)"]
-    K --> L["veraPDF"]
-    K --> M["Fidelity checks"]
-    L --> N{"Compliant?"}
-    M --> O{"Faithful enough?"}
-    N -->|Yes| P{"Review clear?"}
-    O -->|Yes| P
-    N -->|No| Q["Blocking review tasks"]
-    O -->|No| Q
-    P -->|Yes| R["Release-ready PDF"]
-    P -->|No| Q
+    J --> K["Pretag rationalization + deterministic PDF writer\n(tags, ActualText, tables, forms, TOC)"]
+    K --> L["veraPDF + fidelity gate"]
+    L --> M{"Release-ready?"}
+    M -->|Yes| N["Release-ready PDF"]
+    M -->|No| O["Manual remediation"]
+    N --> P["Optional advanced review\n(visible changes and checks only)"]
 ```
 
 More detail: [docs/architecture.md](docs/architecture.md)
@@ -61,9 +58,9 @@ Artifact: [backend/data/benchmarks/corpus_20260308_202258/corpus_report.md](back
 - `25 / 25` successful outputs complete, compliant, and fidelity-passed
 - `2` remaining failures are damaged input PDFs
 
-### Representative CUNY-like corpus
+### Representative non-huge corpus
 
-Artifact: [backend/data/benchmarks/corpus_20260309_134955/corpus_report.md](backend/data/benchmarks/corpus_20260309_134955/corpus_report.md)
+Artifact: [backend/data/benchmarks/corpus_20260311_121723/corpus_report.md](backend/data/benchmarks/corpus_20260311_121723/corpus_report.md)
 
 Corpus mix:
 - faculty/admin guides
@@ -72,12 +69,14 @@ Corpus mix:
 - scans
 
 Results:
-- `10 / 10` complete
-- `10 / 10` compliant
-- `10 / 10` fidelity-passed
-- average OpenRouter cost per PDF: `$0.275192`
-- median OpenRouter cost per PDF: `$0.134327`
-- average cost per page: `$0.025163`
+- `7 / 7` complete
+- `7 / 7` compliant
+- `7 / 7` fidelity-passed
+- `7 / 7` release-ready
+- `0` manual remediation
+- average OpenRouter cost per PDF: `$0.025602`
+- median OpenRouter cost per PDF: `$0.013667`
+- average runtime per PDF: `76.45s`
 
 ### Official form set (stress suite)
 
@@ -101,7 +100,9 @@ The app does not rely on one extractor.
   - suspicious text blocks
   - complex tables
   - form labels
+  - suspicious widgets and static form lookalikes
   - figures vs non-figures
+  - charts, screenshots, and other dominant visual regions
   - TOC groups
   - complex reading-order pages
 - deterministic code writes the final PDF objects
@@ -118,15 +119,17 @@ That split matters:
 - link and annotation tagging
 - TOC generation
 - form labeling
-- table risk detection and review targeting
+- table risk detection and release gating
+- widget rationalization before tagging
 - figure reclassification when a "figure" is really a table or form region
+- optional visible follow-up for figure changes, alt text, and annotation/link checks
 - OpenRouter structured outputs with prompt caching, retries, and cost tracking
 
 ## What Is Still Partial
 
 - complex table semantics beyond header-row and row-header modeling
 - visual accessibility audits such as color contrast and color-only meaning
-- rich media and math semantics
+- rich media and advanced math semantics beyond conservative formula detection
 - some PDF/UA rule families still remain `partial` or `unproven` in the coverage matrix even though the current corpora pass cleanly
 
 See:
@@ -190,7 +193,7 @@ LLM_BASE_URL=https://openrouter.ai/api/v1
 LLM_API_KEY=...
 LLM_MODEL=google/gemini-3-flash-preview
 LLM_MAX_CONCURRENCY=4
-LLM_RETRY_MAX_BACKOFF_SECONDS=30
+LLM_RETRY_MAX_BACKOFF_SECONDS=60
 OCR_LANGUAGE=eng
 VERAPDF_PATH=verapdf
 GHOSTSCRIPT_PATH=gs
@@ -257,6 +260,7 @@ cd /Users/stephenzweibel/Apps/pdf-accessibility-app/backend
 PYTHONPATH=. uv run pytest tests -q
 
 cd /Users/stephenzweibel/Apps/pdf-accessibility-app/frontend
+bun run lint
 bun run build
 ```
 

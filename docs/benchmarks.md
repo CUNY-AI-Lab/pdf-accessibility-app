@@ -1,6 +1,6 @@
 # Benchmarks And Cost
 
-Updated: 2026-03-09
+Updated: 2026-03-12
 
 This page tracks the benchmark sets that are most useful for the current product decisions.
 
@@ -10,7 +10,9 @@ A document is counted as release-ready only if it is:
 
 1. compliant
 2. fidelity-passed
-3. free of blocking review tasks
+3. finalized as `complete`, not `manual_remediation`
+
+Optional visible review items are advisory only.
 
 ## Exact curated corpus
 
@@ -21,15 +23,11 @@ Artifact: [backend/data/benchmarks/corpus_20260308_202258/corpus_report.md](../b
 
 This is the main regression corpus for the current pipeline.
 
-## Representative CUNY-like corpus
-
-Baseline before semantic batching/caching:
-- [backend/data/benchmarks/corpus_20260309_131555/corpus_report.md](../backend/data/benchmarks/corpus_20260309_131555/corpus_report.md)
-- [backend/data/benchmarks/corpus_20260309_131555/corpus_summary.json](../backend/data/benchmarks/corpus_20260309_131555/corpus_summary.json)
+## Representative non-huge corpus
 
 Current measured run:
-- [backend/data/benchmarks/corpus_20260309_134955/corpus_report.md](../backend/data/benchmarks/corpus_20260309_134955/corpus_report.md)
-- [backend/data/benchmarks/corpus_20260309_134955/corpus_summary.json](../backend/data/benchmarks/corpus_20260309_134955/corpus_summary.json)
+- [backend/data/benchmarks/corpus_20260311_121723/corpus_report.md](../backend/data/benchmarks/corpus_20260311_121723/corpus_report.md)
+- [backend/data/benchmarks/corpus_20260311_121723/corpus_summary.json](../backend/data/benchmarks/corpus_20260311_121723/corpus_summary.json)
 
 Corpus mix:
 - articles and readings
@@ -38,9 +36,11 @@ Corpus mix:
 - scanned office documents
 
 Current result:
-- `10 / 10` complete
-- `10 / 10` compliant
-- `10 / 10` fidelity-passed
+- `7 / 7` complete
+- `7 / 7` compliant
+- `7 / 7` fidelity-passed
+- `7 / 7` release-ready
+- `0` manual remediation
 
 ### Cost summary
 
@@ -48,28 +48,17 @@ Measured from OpenRouter `usage.cost`, not a hand-built pricing estimate.
 
 | Metric | Value |
 |---|---:|
-| Total cost | `$2.751915` |
-| Average cost / PDF | `$0.275192` |
-| Median cost / PDF | `$0.134327` |
-| Average cost / page | `$0.025163` |
-| Average runtime / PDF | `81.28s` |
-| Median runtime / PDF | `49.99s` |
-
-### Cost range examples
-
-| PDF | Cost |
-|---|---:|
-| `AI-Assisted Programming - Spring 2026 Syllabus.pdf` | `$0.000000` |
-| `CUNY_Libraries_AI_Discovery_Guide (1).pdf` | `$0.055204` |
-| `Code4Lib BePress Article.pdf` | `$0.095892` |
-| `Bucinca-2021-cognitive-forcing-functions.pdf` | `$0.223823` |
-| `1-s2.0-S0360131524002380-main.pdf` | `$0.604448` |
-| `filer-user-guide-january-2025.pdf` | `$1.234529` |
+| Total cost | `$0.179212` |
+| Average cost / PDF | `$0.025602` |
+| Median cost / PDF | `$0.013667` |
+| Average cost / page | `$0.003144` |
+| Average runtime / PDF | `76.45s` |
+| Median runtime / PDF | `54.91s` |
 
 Interpretation:
-- many ordinary CUNY documents are under `$0.10`
-- harder academic/admin documents often land in the `$0.20 - $0.60` range
-- the current outliers are figure-heavy or semantics-heavy guides
+- this is the current release-sanity corpus after the execution-first review cleanup
+- ordinary non-huge CUNY documents are now often only a few cents each on this representative set
+- the remaining cost outliers are still figure-heavy or semantics-heavy guides
 
 ## Official form set (stress suite)
 

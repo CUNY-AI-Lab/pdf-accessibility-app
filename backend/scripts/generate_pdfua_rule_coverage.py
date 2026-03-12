@@ -5,6 +5,7 @@ import csv
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter
+from datetime import date
 from pathlib import Path
 
 PROFILE_URL = "https://raw.githubusercontent.com/veraPDF/veraPDF-validation-profiles/integration/PDF_UA/PDFUA-1.xml"
@@ -22,7 +23,7 @@ STATUS_LABELS = {
 }
 EVIDENCE_TEXT = (
     "Exact curated corpus: backend/data/benchmarks/corpus_20260308_202258/corpus_report.md; "
-    "representative CUNY-like corpus: backend/data/benchmarks/corpus_20260309_134955/corpus_report.md; "
+    "representative non-huge corpus: backend/data/benchmarks/corpus_20260311_121723/corpus_report.md; "
     "official form set: backend/data/benchmarks/corpus_20260309_123540/corpus_report.md; "
     "scanned OCR fixture sweep: backend/data/benchmarks/scanned_fixture_corpus_20260307_rerun/workflow.sqlite3"
 )
@@ -211,12 +212,12 @@ def classify(rule_id: str, tags: str, description: str) -> tuple[str, str, str]:
         return (
             'covered',
             'The app tags links, widgets, and generic annotations, sets Tabs/S, adds annotation descriptions where needed, and prunes incidental TrapNet/PrinterMark annotations from output pages.',
-            'backend/app/pipeline/tagger.py, backend/app/api/review.py',
+            'backend/app/pipeline/tagger.py, backend/app/pipeline/fidelity.py',
         )
     if rule_id in ANNOT_PARTIAL_RULES:
         return (
             'partial',
-            'The app partially covers this annotation/media family: form widgets are structurally tagged, and media clip data dictionaries now get syntax-critical CT/Alt backfills, but richer semantics still need dedicated review and modeling.',
+            'The app partially covers this annotation/media family: form widgets are structurally tagged, and media clip data dictionaries now get syntax-critical CT/Alt backfills, but richer semantics still need dedicated modeling or manual remediation.',
             'backend/app/pipeline/tagger.py, backend/app/pipeline/fidelity.py',
         )
     if rule_id in ANNOT_GAP_RULES:
@@ -234,14 +235,14 @@ def classify(rule_id: str, tags: str, description: str) -> tuple[str, str, str]:
     if rule_id == '7.20-2':
         return (
             'partial',
-            'The pipeline traverses Form XObjects in several remediation and review paths, but full structure incorporation of all Form XObject content is not yet proven across all inputs.',
+            'The pipeline traverses Form XObjects in several remediation and rationalization paths, but full structure incorporation of all Form XObject content is not yet proven across all inputs.',
             'backend/app/pipeline/orchestrator.py, backend/app/services/font_actualtext.py',
         )
     if rule_id in FONT_COVERED_RULES:
         return (
             'covered',
-            'The app has explicit automatic and review-assisted remediation lanes for the dominant PDF/UA font mapping and embedding failures, with passing corpus evidence.',
-            'backend/app/pipeline/orchestrator.py, backend/app/api/review.py',
+            'The app has explicit automatic remediation lanes and validator/fidelity backstops for the dominant PDF/UA font mapping and embedding failures, with passing corpus evidence.',
+            'backend/app/pipeline/orchestrator.py, backend/app/pipeline/fidelity.py',
         )
     if rule_id in FONT_PARTIAL_RULES:
         return (
@@ -275,7 +276,7 @@ def write_outputs(rows: list[dict[str, str]]) -> None:
         'description', 'rationale', 'implementation_paths', 'evidence',
     ]
     with CSV_PATH.open('w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator='\n')
         writer.writeheader()
         writer.writerows(rows)
 
@@ -292,7 +293,7 @@ def write_outputs(rows: list[dict[str, str]]) -> None:
 
     with MD_PATH.open('w', encoding='utf-8') as f:
         f.write('# PDF/UA-1 Rule Coverage Matrix\n\n')
-        f.write('Updated: 2026-03-09\n\n')
+        f.write(f'Updated: {date.today().isoformat()}\n\n')
         f.write('Source rule set: veraPDF PDF/UA-1 validation profile (`106` rules).\n\n')
         f.write('Status legend:\n')
         f.write('- `Covered`: explicit implementation path plus current benchmark evidence.\n')

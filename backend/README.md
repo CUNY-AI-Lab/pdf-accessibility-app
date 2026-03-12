@@ -6,6 +6,7 @@ The backend is a FastAPI application that owns:
 - semantic adjudication and grounding
 - PDF writing
 - validation and fidelity checks
+- user-visible review surface selection
 - benchmark generation
 
 ## Key directories
@@ -120,5 +121,5 @@ PYTHONPATH=. uv run python scripts/generate_pdfua_rule_coverage.py
 ## Current evidence
 
 - exact curated corpus: [../backend/data/benchmarks/corpus_20260308_202258/corpus_report.md](../backend/data/benchmarks/corpus_20260308_202258/corpus_report.md)
-- representative CUNY-like corpus: [../backend/data/benchmarks/corpus_20260309_134955/corpus_report.md](../backend/data/benchmarks/corpus_20260309_134955/corpus_report.md)
+- representative non-huge corpus: [../backend/data/benchmarks/corpus_20260311_121723/corpus_report.md](../backend/data/benchmarks/corpus_20260311_121723/corpus_report.md)
 - official form set: [../backend/data/benchmarks/corpus_20260309_123540/corpus_report.md](../backend/data/benchmarks/corpus_20260309_123540/corpus_report.md)

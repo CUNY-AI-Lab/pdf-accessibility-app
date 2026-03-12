@@ -1,13 +1,13 @@
 # Accessibility Coverage
 
-Updated: 2026-03-09
+Updated: 2026-03-12
 
 This document describes what the app currently covers, what is still partial, and what remains outside the product today.
 
 The important distinction is:
 
 - `compliant` means the output passes `veraPDF` for PDF/UA-1
-- `accessible enough to release` means compliant, fidelity-passed, and free of blocking review tasks
+- `accessible enough to release` means compliant, fidelity-passed, and not forced into `manual_remediation` by unresolved blocking conditions
 
 ## Strong Coverage
 
@@ -30,7 +30,7 @@ Primary implementation:
 
 ### Font remediation and text accessibility
 
-The app has real automatic and review-assisted font repair paths.
+The app has real automatic and LLM-guided font repair paths.
 
 Covered areas include:
 - embedding missing fonts
@@ -69,7 +69,7 @@ The app now has real form-label support.
 Covered today:
 - widget tagging
 - `/TU` writing for risky fields
-- grouped field review targeting
+- grouped field detection and label generation
 - high-confidence Gemini-assisted label generation
 
 Evidence:
@@ -102,18 +102,18 @@ What is strong:
 What is still partial:
 - grouped headers beyond simple header band modeling
 - logical splitting of visually dense statistical tables
-- full accessibility confidence on large multi-level tables
+- full accessibility confidence on large multi-level tables, which can still force manual remediation on hard cases
 
 ### Reading order on complex layouts
 
 What is strong:
-- page/block-level review
-- Gemini reading-order proposals
-- deterministic apply path through the structure editor
+- page/block-level semantic adjudication
+- Gemini reading-order decisions on hard pages
+- deterministic structure apply paths before tagging
 
 What is still partial:
 - multi-column pages with dense sidebars or callouts
-- page-zoning UX is still more engineering-oriented than remediator-oriented
+- some dense layouts still depend on upstream extraction quality and fidelity backstops
 
 ### Figure semantics
 
@@ -121,15 +121,15 @@ What is strong:
 - figure vs non-figure reclassification
 - decorative vs meaningful decisions
 - caption-backed alt text
-- real review gating for unresolved figures
+- optional visible checks for generated descriptions when extra confidence is useful
 
 What is still partial:
-- substantive uncaptioned charts and diagrams still need review more often than we would like
+- substantive uncaptioned charts and diagrams still need stronger summaries or manual remediation more often than we would like
 - figure-heavy guides remain a cost outlier class
 
 ### Math and formula semantics
 
-The app can tag formulas and preserve some formula text, but does not yet provide a rich math semantics stack.
+The app can conservatively detect formulas, tag them as `/Formula`, preserve raw formula text, and generate speakable formula alt text, but it does not yet provide a rich math semantics stack.
 
 ### Link quality
 
@@ -166,15 +166,15 @@ A document is release-ready only if all are true:
 
 1. `veraPDF` says compliant
 2. fidelity says faithful enough
-3. no blocking review tasks remain
+3. the run ends `complete`, not `manual_remediation`
 
-That is stricter than validator pass alone.
+Optional visible review items do not block release. That is stricter than validator pass alone because hidden structural blockers still force manual remediation.
 
 ## Current Evidence Snapshot
 
 - exact curated corpus: [backend/data/benchmarks/corpus_20260308_202258/corpus_report.md](backend/data/benchmarks/corpus_20260308_202258/corpus_report.md)
   - `25 / 25` successful outputs release-ready
-- representative CUNY-like corpus: [backend/data/benchmarks/corpus_20260309_134955/corpus_report.md](backend/data/benchmarks/corpus_20260309_134955/corpus_report.md)
-  - `10 / 10` release-ready
+- representative non-huge corpus: [backend/data/benchmarks/corpus_20260311_121723/corpus_report.md](backend/data/benchmarks/corpus_20260311_121723/corpus_report.md)
+  - `7 / 7` release-ready
 - official form set: [backend/data/benchmarks/corpus_20260309_123540/corpus_report.md](backend/data/benchmarks/corpus_20260309_123540/corpus_report.md)
   - `7 / 7` release-ready

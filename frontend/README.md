@@ -4,8 +4,8 @@ The frontend is a React + TypeScript application that exposes:
 
 - upload and job tracking
 - outcome and validation reporting
-- review workflows for unresolved semantics
-- structure editing for reading order and table/header adjustments
+- optional advanced review for visible changes and checks
+- manual remediation reporting when a run stops short of a trustworthy output
 
 ## Main pages
 
@@ -17,23 +17,26 @@ The frontend is a React + TypeScript application that exposes:
 ## Important components
 
 - [src/components/OutcomeHero.tsx](src/components/OutcomeHero.tsx)
+- [src/components/RemediationSummary.tsx](src/components/RemediationSummary.tsx)
 - [src/components/ValidationReport.tsx](src/components/ValidationReport.tsx)
+- [src/components/AppliedChangeCard.tsx](src/components/AppliedChangeCard.tsx)
 - [src/components/ReviewTaskCard.tsx](src/components/ReviewTaskCard.tsx)
-- [src/components/StructureEditor.tsx](src/components/StructureEditor.tsx)
-- [src/components/FontTargetPanel.tsx](src/components/FontTargetPanel.tsx)
+- [src/components/PipelineProgress.tsx](src/components/PipelineProgress.tsx)
 
 ## UI model
 
 The UI is organized around three questions:
 
-1. is the PDF release-ready?
+1. did the run finish `complete`, `manual_remediation`, or `failed`?
 2. what did the app change automatically?
-3. what still requires review?
+3. do I want to spot-check any visible items?
 
 That is why the frontend separates:
 - outcome summary
 - technical report
-- targeted review tasks
+- optional visible follow-up
+
+The frontend intentionally does not surface PDF-structural mechanics. Reading order internals, table header indexing, font repair, widget cleanup, and similar pipeline decisions stay system-owned and off-screen.
 
 ## Development
 
@@ -53,14 +56,12 @@ bun run build
 
 The frontend expects the backend at `http://127.0.0.1:8001` during local development.
 
-## Current review capabilities
+## Current review surface
 
 The UI supports:
-- reading-order editing
-- table-by-table review cards
-- alt-text review
-- form semantics review tasks
-- font-text review context
-- Gemini-backed review suggestions with deterministic apply paths
+- figure semantics applied changes with `keep`, `undo`, and `revise`
+- optional visible checks for generated alt text
+- optional visible checks for annotation and link descriptions
+- manual-remediation pages with current-PDF and report downloads
 
-The frontend is intentionally not the source of truth for remediation logic. It renders review context and sends constrained edits back to the backend.
+The frontend is intentionally not the source of truth for remediation logic. It renders output state and optional review context while the backend owns remediation, trust gating, and persistence.
