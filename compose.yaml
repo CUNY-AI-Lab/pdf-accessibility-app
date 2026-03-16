@@ -12,15 +12,12 @@ services:
       OUTPUT_DIR: /app/data/output
     volumes:
       - pdf_accessibility_data:/app/data
+      - pdf_accessibility_cache:/home/app/.cache
     ports:
       - "${APP_PORT:-8080}:8001"
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
+    stop_grace_period: 1m
     restart: unless-stopped
 
 volumes:
   pdf_accessibility_data:
+  pdf_accessibility_cache:

@@ -228,28 +228,46 @@ Endpoints:
 
 ## Docker
 
-The repo now includes a simple single-container deployment:
+The repo includes a single-container deployment that is ready to ship:
 
 - one image with `Ghostscript`, `OCRmyPDF`, `Tesseract`, `Poppler`, `QPDF`, Java, and `veraPDF`
 - the frontend is built into the image and served by FastAPI alongside the API
-- persistent job storage in a Docker volume
+- the container runs as a non-root user behind `tini`
+- health checks are baked into the image
+- persistent job data and runtime caches use Docker volumes
 
 Start it with:
 
 ```bash
 cp .env.example .env
-docker compose up --build
+docker compose up -d --build
 ```
 
 Then open:
 
 - app: <http://127.0.0.1:8080>
 
+You can also run the image directly:
+
+```bash
+docker build -t pdf-accessibility-app .
+docker run -d \
+  --name pdf-accessibility-app \
+  --env-file .env \
+  -p 8080:8001 \
+  -v pdf_accessibility_data:/app/data \
+  -v pdf_accessibility_cache:/home/app/.cache \
+  pdf-accessibility-app
+```
+
 Notes:
 
 - `docker compose` reads LLM settings from the root `.env`.
+- Set a real remote `LLM_API_KEY` in `.env` before deployment, or disable strict validation for a local LLM endpoint.
 - The backend persists uploads, processing artifacts, outputs, and SQLite data in the `pdf_accessibility_data` volume.
+- Runtime caches live in `pdf_accessibility_cache`, which avoids redownloading model assets into the container filesystem.
 - If `8080` is already in use, set `APP_PORT` in `.env` before starting the stack.
+- Container health is exposed at <http://127.0.0.1:8080/health>.
 - The bundled image includes `tesseract-ocr-eng`. If you need other OCR languages, extend [Dockerfile](/Users/stephenzweibel/Apps/pdf-accessibility-app/Dockerfile) with the matching `tesseract-ocr-<lang>` packages.
 - For local Vite development against a non-default backend, set `VITE_DEV_PROXY_TARGET`.
 

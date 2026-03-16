@@ -102,11 +102,11 @@ async def _periodic_cleanup():
 def _register_frontend_routes(app: FastAPI, frontend_dist_dir: Path) -> None:
     index_path = frontend_dist_dir / "index.html"
 
-    @app.get("/", include_in_schema=False)
+    @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def frontend_index():
         return FileResponse(index_path)
 
-    @app.get("/{full_path:path}", include_in_schema=False)
+    @app.api_route("/{full_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
     async def frontend_app(full_path: str):
         asset_path = _resolve_frontend_file(frontend_dist_dir, full_path)
         if asset_path is not None:

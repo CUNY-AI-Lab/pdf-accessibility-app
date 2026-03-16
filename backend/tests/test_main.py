@@ -34,6 +34,9 @@ def test_create_app_serves_built_frontend(tmp_path, monkeypatch):
         assert root_response.status_code == 200
         assert "div id='root'" in root_response.text
 
+        root_head_response = client.head("/")
+        assert root_head_response.status_code == 200
+
         asset_response = client.get("/assets/app.js")
         assert asset_response.status_code == 200
         assert asset_response.text == "console.log('ok');"
