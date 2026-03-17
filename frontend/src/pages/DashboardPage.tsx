@@ -9,7 +9,7 @@ const FILTERS: { label: string; value: string | undefined }[] = [
   { label: "All", value: undefined },
   { label: "Queued", value: "queued" },
   { label: "Processing", value: "processing" },
-  { label: "Manual Remediation", value: "manual_remediation" },
+  { label: "Needs Fixes", value: "manual_remediation" },
   { label: "Complete", value: "complete" },
   { label: "Failed", value: "failed" },
 ];
@@ -25,7 +25,7 @@ export default function DashboardPage() {
         <div>
           <h1 className="text-3xl text-ink tracking-tight">Dashboard</h1>
           <p className="text-sm text-ink-muted mt-1">
-            {data?.total ?? 0} {pluralize(data?.total ?? 0, "document")} processed
+            {data?.total ?? 0} {pluralize(data?.total ?? 0, "document")}
           </p>
         </div>
         <Link

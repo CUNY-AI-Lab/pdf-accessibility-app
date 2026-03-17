@@ -8,6 +8,7 @@ import PipelineProgress from "../components/PipelineProgress";
 import RemediationSummary from "../components/RemediationSummary";
 import ValidationReport from "../components/ValidationReport";
 import { useJobProgress } from "../hooks/useJobProgress";
+import { formatBytes } from "../utils/format";
 import { asNumber } from "../utils/typeGuards";
 
 export default function JobDetailPage() {
@@ -125,9 +126,7 @@ export default function JobDetailPage() {
         </h1>
         <div className="flex items-center gap-3 text-sm text-ink-muted">
           {job.file_size_bytes && (
-            <span>
-              {(job.file_size_bytes / (1024 * 1024)).toFixed(1)} MB
-            </span>
+            <span>{formatBytes(job.file_size_bytes)}</span>
           )}
           {job.classification && (
             <>
@@ -171,8 +170,8 @@ export default function JobDetailPage() {
                 Detailed report unavailable
               </h3>
               <p className="text-sm text-ink-muted">
-                We could not load the full validation details right now. The terminal job status
-                above still reflects the app&apos;s final release decision.
+                Could not load the full validation details right now. The job status
+                above still reflects the final outcome.
               </p>
             </div>
           )}
@@ -180,23 +179,10 @@ export default function JobDetailPage() {
           {reviewContextStatus === "unavailable" && (
             <div className="rounded-xl border border-warning/30 bg-warning-light/20 p-5">
               <h3 className="font-display text-lg text-ink mb-1">
-                Visible review details unavailable
+                Review details unavailable
               </h3>
               <p className="text-sm text-ink-muted">
-                We could not load the limited in-app QA details right now. Reload the page if
-                you want to inspect figure decisions or visible checks.
-              </p>
-            </div>
-          )}
-
-          {job.status === "complete" && reviewContextStatus === "ready" && reviewItemCount === 0 && (
-            <div className="rounded-xl border border-info/25 bg-info-light/20 p-5">
-              <h3 className="font-display text-lg text-ink mb-1">
-                Optional external QA
-              </h3>
-              <p className="text-sm text-ink-muted">
-                This PDF passed release checks. Download it and, if needed, spot-check it with a
-                screen reader, PAC, or Acrobat instead of relying on the limited in-app QA surface.
+                Could not load review details right now. Reload the page to try again.
               </p>
             </div>
           )}

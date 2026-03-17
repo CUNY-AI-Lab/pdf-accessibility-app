@@ -1,14 +1,11 @@
 import type { ReviewTask } from "../types";
 import { pagePreviewUrl, previewPagesForTask } from "../pages/reviewHelpers";
+import { pluralize } from "../utils/format";
 import PreviewImage from "./PreviewImage";
 
 interface ReviewTaskCardProps {
   jobId: string;
   task: ReviewTask;
-}
-
-function pluralize(count: number, singular: string, plural = `${singular}s`): string {
-  return count === 1 ? singular : plural;
 }
 
 function metadataNumber(task: ReviewTask, key: string): number {
@@ -114,11 +111,6 @@ export default function ReviewTaskCard({ jobId, task }: ReviewTaskCardProps) {
         </div>
       )}
 
-      <div className="mt-4 rounded-lg border border-ink/8 bg-white/70 px-3 py-3">
-        <p className="text-sm text-ink">
-          This is an optional advanced check if you want extra confidence in the current output.
-        </p>
-      </div>
     </div>
   );
 }

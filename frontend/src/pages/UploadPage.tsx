@@ -1,8 +1,19 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useCreateJobs } from "../api/jobs";
+import { formatBytes } from "../utils/format";
 import FileDropzone from "../components/FileDropzone";
 import { ArrowRightIcon, XIcon } from "../components/Icons";
+
+const PIPELINE_STEPS = [
+  { icon: "M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2", label: "Classify", desc: "Detect document type" },
+  { icon: "M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z", label: "OCR", desc: "Extract text from scans" },
+  { icon: "M3 3h18v18H3zM3 9h18M9 3v18", label: "Structure", desc: "Analyze layout" },
+  { icon: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z", label: "Alt Text", desc: "Describe images" },
+  { icon: "M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z", label: "Tag", desc: "Add PDF/UA tags" },
+  { icon: "M9 12l2 2 4-4m6 2a9 9 0 1 1-18 0 9 9 0 0 1 18 0z", label: "Validate", desc: "Check compliance" },
+  { icon: "M4 6h16M4 12h10M4 18h7", label: "Fidelity", desc: "Verify output quality" },
+];
 
 export default function UploadPage() {
   const navigate = useNavigate();
@@ -78,7 +89,7 @@ export default function UploadPage() {
                       {file.name}
                     </p>
                     <p className="text-xs text-ink-muted">
-                      {(file.size / (1024 * 1024)).toFixed(1)} MB
+                      {formatBytes(file.size)}
                     </p>
                   </div>
                 </div>
@@ -132,49 +143,41 @@ export default function UploadPage() {
             )}
           </div>
         )}
+      </div>
 
-        {/* What to expect */}
-        <div className="mt-14 mb-10 text-center">
+      {/* Pipeline overview — full width */}
+      <div className="mt-16 mb-4">
+        <div className="text-center mb-8">
           <h2 className="text-lg font-display text-ink mb-2">
             What to expect
           </h2>
           <p className="text-sm text-ink-muted leading-relaxed max-w-md mx-auto">
-            Processing typically takes 1&ndash;3 minutes depending on document
-            length. You'll get an accessible PDF with proper structure tags,
-            alt text for images, and a compliance report.
+            Processing typically takes 1&ndash;3 minutes. You'll get an accessible
+            PDF with proper structure tags, alt text for images, and a compliance report.
           </p>
         </div>
 
-        {/* Pipeline overview */}
-        <h3 className="text-sm font-semibold text-ink-muted text-center mb-4 tracking-wide uppercase">
-          Our 7-step process
-        </h3>
-        <div className="grid grid-cols-2 md:grid-cols-3 gap-4 stagger">
-          {[
-            { icon: "M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2", label: "Classify", desc: "Detect document type" },
-            { icon: "M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z", label: "OCR", desc: "Extract text from scans" },
-            { icon: "M3 3h18v18H3zM3 9h18M9 3v18", label: "Structure", desc: "Analyze layout" },
-            { icon: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z", label: "Alt Text", desc: "Describe images" },
-            { icon: "M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z", label: "Tag", desc: "Add PDF/UA tags" },
-            { icon: "M9 12l2 2 4-4m6 2a9 9 0 1 1-18 0 9 9 0 0 1 18 0z", label: "Validate", desc: "Check compliance" },
-            { icon: "M4 6h16M4 12h10M4 18h7", label: "Fidelity", desc: "Check output quality" },
-          ].map((step) => (
-            <div
-              key={step.label}
-              className="
-                px-4 py-4 rounded-xl bg-cream border border-ink/5
-                text-center
-              "
-            >
-              <div className="w-9 h-9 rounded-xl bg-paper-warm text-ink-muted mx-auto mb-2 flex items-center justify-center">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                  <path d={step.icon} />
-                </svg>
+        {/* Horizontal pipeline as connected steps */}
+        <div className="rounded-xl border border-ink/6 bg-cream p-5">
+          <div className="flex flex-wrap justify-center gap-3">
+            {PIPELINE_STEPS.map((step, i) => (
+              <div
+                key={step.label}
+                className="rounded-lg bg-paper-warm/50 px-4 py-4 text-center flex flex-col items-center gap-2 animate-fade-in min-w-[7rem] flex-1 max-w-[10rem]"
+                style={{ animationDelay: `${i * 60}ms` }}
+              >
+                <div className="w-9 h-9 rounded-xl bg-paper-warm text-ink-muted flex items-center justify-center">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d={step.icon} />
+                  </svg>
+                </div>
+                <div>
+                  <p className="text-sm font-semibold text-ink leading-tight">{step.label}</p>
+                  <p className="text-xs text-ink-muted mt-0.5">{step.desc}</p>
+                </div>
               </div>
-              <p className="text-sm font-semibold text-ink">{step.label}</p>
-              <p className="text-xs text-ink-muted mt-0.5">{step.desc}</p>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
       </div>
     </div>

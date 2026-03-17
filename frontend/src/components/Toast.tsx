@@ -7,13 +7,13 @@ export default function Toast() {
 
   return (
     <div
-      className="fixed bottom-4 right-4 z-50 flex max-w-sm items-start gap-3 rounded-lg bg-red-600 px-4 py-3 text-white shadow-lg animate-slide-up"
+      className="fixed bottom-4 right-4 z-50 flex max-w-sm items-start gap-3 rounded-xl bg-error px-4 py-3 text-white shadow-lifted animate-slide-up"
       role="alert"
     >
       <p className="flex-1 text-sm">{toast.message}</p>
       <button
         onClick={dismissToast}
-        className="shrink-0 rounded p-0.5 text-red-100 hover:bg-red-700 hover:text-white"
+        className="shrink-0 rounded p-0.5 text-white/70 hover:bg-white/15 hover:text-white"
         aria-label="Dismiss"
       >
         <svg

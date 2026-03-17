@@ -14,7 +14,7 @@ import ReviewTaskCard from "../components/ReviewTaskCard";
 import type { AppliedChange } from "../types";
 
 function actionSubject(change: AppliedChange): string {
-  return change.change_type === "figure_semantics" ? "figure decision" : "change";
+  return change.change_type === "figure_semantics" ? "image description" : "change";
 }
 
 export default function ReviewPage() {
@@ -101,7 +101,7 @@ export default function ReviewPage() {
           ? error
           : new Error(
               change.change_type === "figure_semantics"
-                ? "Failed to retry this figure decision"
+                ? "Failed to retry this image description"
                 : `Failed to revise this ${actionSubject(change)}`,
             ),
       );
@@ -145,7 +145,7 @@ export default function ReviewPage() {
       <div className="text-center py-20">
         <h2 className="text-xl font-display text-ink mb-2">Review not ready</h2>
         <p className="text-sm text-ink-muted mb-6">
-          In-app review is only available after processing reaches a terminal state.
+          Review is available once processing completes.
         </p>
         <Link
           to={`/jobs/${id}`}
@@ -170,7 +170,7 @@ export default function ReviewPage() {
       <div className="flex items-end justify-between mb-8">
         <div>
           <h1 className="text-2xl md:text-3xl text-ink tracking-tight mb-1">
-            {isManualRemediation ? "Inspect QA Context" : "Inspect QA Details"}
+            Review
           </h1>
           <p className="text-sm text-ink-muted">
             {job?.original_filename}
@@ -178,35 +178,27 @@ export default function ReviewPage() {
         </div>
       </div>
 
-      <div className="mb-8 rounded-xl border border-ink/6 bg-cream p-5">
-        <p className="text-sm text-ink-muted">
-          {reviewContextError
-            ? "We could not load the limited in-app QA context right now. Download links below still reflect the current output."
-            : isManualRemediation
-            ? "This run stopped short of a trustworthy accessible output. The in-app surface only shows figure decisions and a few visible QA checks from the current PDF. It does not expose or resolve the full blocker set."
-            : hasReviewItems
-              ? "This PDF already passed release checks. This page only exposes figure decisions the app already made and a few visible QA checks."
-              : "This PDF already passed release checks. This page is only useful if you want to inspect the limited in-app QA details."}
-        </p>
-      </div>
-
-      {reviewContextError && (
+      {reviewContextError ? (
         <div className="mb-8 rounded-xl border border-warning/30 bg-warning-light/20 p-5">
-          <h2 className="text-lg text-ink mb-1">Visible review details unavailable</h2>
           <p className="text-sm text-ink-muted">
-            Reload the page if you want to inspect figure decisions or visible QA checks. The job status and
-            download links remain accurate.
+            Could not load review details. Download links still reflect the current output.
           </p>
         </div>
-      )}
+      ) : isManualRemediation ? (
+        <div className="mb-8 rounded-xl border border-warning/30 bg-warning-light/20 p-5">
+          <p className="text-sm text-ink-muted">
+            This PDF needs manual fixes. You can review image descriptions and optional checks below, but some issues require tools outside the app.
+          </p>
+        </div>
+      ) : null}
 
       {isManualRemediation && (
         <div className="mb-8 rounded-xl border border-warning/30 bg-warning-light/30 p-6">
           <h2 className="text-2xl text-ink tracking-tight mb-2">
-            Manual remediation required
+            Needs manual fixes
           </h2>
           <p className="text-sm text-ink-muted">
-            The app could not finish a trustworthy accessible output automatically. Use the validation report and current PDF for manual follow-up outside the app.
+            Some issues could not be fixed automatically. Download the report and current PDF to continue in an external tool.
           </p>
           <div className="mt-4 flex flex-wrap items-center gap-4">
             <a
@@ -231,12 +223,10 @@ export default function ReviewPage() {
         <section className="space-y-4 mb-8">
           <div className="rounded-xl border border-accent/20 bg-accent-glow/20 p-5">
             <h2 className="text-lg text-ink mb-1">
-              {isManualRemediation ? "Figure decisions in the current PDF" : "Figure decisions already applied"}
+              Image descriptions
             </h2>
             <p className="text-sm text-ink-muted">
-              {isManualRemediation
-                ? "These are figure-specific decisions the app already made. They may help you inspect what happened, but they will not resolve non-figure blockers elsewhere in the document."
-                : "These are figure-specific decisions already written into the current PDF. Keep one if it looks right, undo it to remove that figure decision and rerun processing, or retry that figure with more guidance."}
+              Review image descriptions the app generated. Keep, undo, or revise each one.
             </p>
           </div>
           {pendingAppliedChanges.map((change) => (
@@ -258,11 +248,9 @@ export default function ReviewPage() {
       {openReviewTasks.length > 0 && (
         <section className="space-y-4 mb-8">
           <div className="rounded-xl border border-ink/6 bg-cream p-5">
-            <h2 className="text-lg text-ink mb-1">Optional visible checks</h2>
+            <h2 className="text-lg text-ink mb-1">Additional checks</h2>
             <p className="text-sm text-ink-muted">
-              {isManualRemediation
-                ? "These are the only visible QA checks the app exposes in-app. They may help you inspect the current output, but they do not replace manual remediation."
-                : "These are the only extra visible QA checks the app exposes in-app today."}
+              Optional checks for extra confidence in the output.
             </p>
           </div>
           <div className="space-y-4">
@@ -278,12 +266,12 @@ export default function ReviewPage() {
       )}
 
       {!hasReviewItems && !isManualRemediation && !reviewContextError && (
-        <div className="rounded-xl border border-info/25 bg-info-light/20 p-6">
+        <div className="rounded-xl border border-success/25 bg-success-light/20 p-6">
           <h2 className="text-2xl text-ink tracking-tight mb-2">
-            External QA only
+            Nothing to review
           </h2>
           <p className="text-sm text-ink-muted">
-            This PDF already passed release checks. Download the file and, if needed, test it with a screen reader, PAC, or Acrobat.
+            This PDF passed all checks. For extra assurance, test with a screen reader or PAC.
           </p>
           <a
             href={`/api/jobs/${id}/download/report`}

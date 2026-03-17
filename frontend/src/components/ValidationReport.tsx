@@ -162,7 +162,7 @@ export default function ValidationReport({ report }: ValidationReportProps) {
       {(fidelityPassed !== null || fidelityChecks.length > 0) && (
         <div className="rounded-xl border border-ink/6 bg-cream p-4">
           <h4 className="text-sm font-semibold text-ink mb-3">
-            Fidelity Gate
+            Quality Check
           </h4>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
             <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
@@ -172,15 +172,15 @@ export default function ValidationReport({ report }: ValidationReportProps) {
                   ? "n/a"
                   : fidelityPassed
                     ? "Passed"
-                    : "Manual remediation required"}
+                    : "Needs manual fixes"}
               </p>
             </div>
             <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
-              <p className="text-ink-muted text-xs">Blocking Tasks</p>
+              <p className="text-ink-muted text-xs">Required Fixes</p>
               <p className="text-ink mt-0.5">{blockingTasks ?? "n/a"}</p>
             </div>
             <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
-              <p className="text-ink-muted text-xs">Advisory Tasks</p>
+              <p className="text-ink-muted text-xs">Suggestions</p>
               <p className="text-ink mt-0.5">{advisoryTasks ?? "n/a"}</p>
             </div>
           </div>
@@ -240,7 +240,7 @@ export default function ValidationReport({ report }: ValidationReportProps) {
         <div className="rounded-xl border border-ink/6 bg-cream overflow-hidden">
           <div className="px-4 py-3 border-b border-ink/6 bg-paper-warm/50">
             <h4 className="text-sm font-semibold text-ink">
-              Remediation Lifecycle
+              Issue History
             </h4>
           </div>
           <div className="divide-y divide-ink/5">

@@ -30,27 +30,9 @@ export default function AppliedChangeCard({
     low: "bg-info-light text-info",
   } as const;
 
-  const keepLabel = keeping
-    ? isFigureDecision
-      ? "Keeping Figure Decision..."
-      : "Keeping..."
-    : isFigureDecision
-      ? "Keep Figure Decision"
-      : "Keep";
-  const undoLabel = undoing
-    ? isFigureDecision
-      ? "Undoing Figure Decision..."
-      : "Undoing..."
-    : isFigureDecision
-      ? "Undo Figure Decision"
-      : "Undo";
-  const retryLabel = revising
-    ? isFigureDecision
-      ? "Retrying Figure Decision..."
-      : "Revising..."
-    : isFigureDecision
-      ? "Retry Figure Decision"
-      : "Revise";
+  const keepLabel = keeping ? "Keeping..." : "Keep";
+  const undoLabel = undoing ? "Undoing..." : "Undo";
+  const retryLabel = revising ? "Retrying..." : "Retry";
 
   return (
     <div className="rounded-xl border border-ink/6 bg-cream p-5">
@@ -60,7 +42,7 @@ export default function AppliedChangeCard({
           <p className="mt-1 text-sm text-ink-light">{change.detail}</p>
         </div>
         <span className={`rounded-full px-2 py-1 text-[11px] font-medium ${severityClasses[change.importance]}`}>
-          {isFigureDecision ? "Figure QA" : "Review"}
+          {isFigureDecision ? "Image QA" : "Review"}
         </span>
       </div>
 
@@ -91,7 +73,7 @@ export default function AppliedChangeCard({
 
       <div className="mt-4 rounded-lg border border-ink/8 bg-white/70 p-3">
         <label className="block text-xs font-medium uppercase tracking-wide text-ink-muted mb-2">
-          {isFigureDecision ? "Retry Figure Decision" : "Revise"}
+          Retry with feedback
         </label>
         <textarea
           value={feedback}
@@ -100,13 +82,13 @@ export default function AppliedChangeCard({
           className="w-full rounded-lg border border-ink/10 bg-white px-3 py-2 text-sm text-ink placeholder:text-ink-muted/70"
           placeholder={
             isFigureDecision
-              ? "Describe how this figure should be handled. The app will retry this figure decision and rerun tagging and validation."
+              ? "Describe how this image should be handled. The app will regenerate the description and rerun tagging and validation."
               : "Explain what should change and the app will retry this edit."
           }
         />
         {isFigureDecision && (
           <p className="mt-2 text-xs text-ink-muted">
-            This only changes this figure decision. It does not address non-figure blockers elsewhere in the PDF.
+            This only changes this image's description. Other issues elsewhere in the PDF are not affected.
           </p>
         )}
         <div className="mt-3 flex justify-end">

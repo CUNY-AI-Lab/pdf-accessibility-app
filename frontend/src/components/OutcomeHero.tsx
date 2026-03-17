@@ -17,23 +17,22 @@ interface OutcomeHeroProps {
   error?: string;
 }
 
-function inspectSummary(appliedChangeCount: number, reviewTaskCount: number): string | null {
+function reviewSummary(appliedChangeCount: number, reviewTaskCount: number): string | null {
   if (appliedChangeCount > 0 && reviewTaskCount > 0) {
-    return `${appliedChangeCount} figure ${pluralize(appliedChangeCount, "decision")} the app already applied and ${reviewTaskCount} visible ${pluralize(reviewTaskCount, "check")}`;
+    return `${appliedChangeCount} image ${pluralize(appliedChangeCount, "description")} and ${reviewTaskCount} additional ${pluralize(reviewTaskCount, "check")}`;
   }
   if (appliedChangeCount > 0) {
-    return `${appliedChangeCount} figure ${pluralize(appliedChangeCount, "decision")} the app already applied`;
+    return `${appliedChangeCount} image ${pluralize(appliedChangeCount, "description")}`;
   }
   if (reviewTaskCount > 0) {
-    return `${reviewTaskCount} visible ${pluralize(reviewTaskCount, "check")}`;
+    return `${reviewTaskCount} additional ${pluralize(reviewTaskCount, "check")}`;
   }
   return null;
 }
 
-function inspectButtonLabel(appliedChangeCount: number, reviewTaskCount: number): string {
-  if (appliedChangeCount > 0 && reviewTaskCount > 0) return "Inspect QA Details";
-  if (appliedChangeCount > 0) return "Inspect Figure Decisions";
-  return "Inspect Visible Checks";
+function reviewButtonLabel(appliedChangeCount: number, reviewTaskCount: number): string {
+  if (appliedChangeCount > 0) return "Review Image Descriptions";
+  return "Review Checks";
 }
 
 export default function OutcomeHero({
@@ -46,8 +45,8 @@ export default function OutcomeHero({
   reviewContextStatus = "ready",
   error,
 }: OutcomeHeroProps) {
-  const summary = inspectSummary(appliedChangeCount, reviewTaskCount);
-  const inspectLabel = inspectButtonLabel(appliedChangeCount, reviewTaskCount);
+  const summary = reviewSummary(appliedChangeCount, reviewTaskCount);
+  const reviewLabel = reviewButtonLabel(appliedChangeCount, reviewTaskCount);
 
   if (status === "failed") {
     return (
@@ -82,12 +81,10 @@ export default function OutcomeHero({
             </h2>
             <p className="text-sm text-ink-muted leading-relaxed">
               {reviewContextStatus === "loading"
-                ? "This output passed the app's release checks. Optional figure-decision and visible-check details are still loading."
-                : reviewContextStatus === "unavailable"
-                  ? "This output passed the app's release checks. Figure-decision and visible-check details are unavailable right now."
-                  : summary
-                ? `This output passed the app's release checks. You can optionally inspect ${summary}.`
-                : "This output passed the app's release checks and is ready for assistive technologies."}
+                ? "All compliance checks passed. Review details are still loading."
+                : summary
+                ? `All compliance checks passed. You can optionally review ${summary}.`
+                : "All compliance checks passed and your PDF is ready for assistive technologies."}
             </p>
             <div className="flex flex-wrap items-center gap-3 mt-4">
               <DownloadButton jobId={jobId} filename={filename} type="pdf" />
@@ -96,12 +93,13 @@ export default function OutcomeHero({
                   to={`/jobs/${jobId}/review`}
                   className="
                     inline-flex items-center gap-2 px-5 py-3 rounded-xl
-                    bg-accent text-white font-medium text-sm
-                    hover:bg-accent/90 shadow-sm hover:shadow-md
+                    border border-ink/10 bg-white text-ink font-medium text-sm
+                    hover:border-ink/20 hover:bg-paper-warm
+                    shadow-sm hover:shadow-card
                     transition-all duration-200 no-underline
                   "
                 >
-                  {inspectLabel}
+                  {reviewLabel}
                   <ArrowRightIcon size={14} />
                 </Link>
               )}
@@ -119,7 +117,7 @@ export default function OutcomeHero({
     );
   }
 
-  // Non-compliant output that still needs manual remediation
+  // Needs manual fixes
   return (
     <div className="rounded-2xl border-2 border-warning/25 bg-warning-light/20 p-6 animate-slide-up">
       <div className="flex items-start gap-4">
@@ -128,20 +126,13 @@ export default function OutcomeHero({
         </div>
         <div className="flex-1">
           <h2 className="font-display text-xl text-ink mb-1">
-            Manual remediation required
+            Needs manual fixes
           </h2>
           <p className="text-sm text-ink-muted leading-relaxed">
             {blockingIssueCount && blockingIssueCount > 0
-              ? `${blockingIssueCount} ${pluralize(blockingIssueCount, "issue")} still block a trustworthy accessible output.`
-              : "Automated remediation stopped short of a trustworthy accessible output."}
-            {" "}
-            {reviewContextStatus === "loading"
-              ? "Optional figure-decision and visible-check details are still loading."
-              : reviewContextStatus === "unavailable"
-                ? "Figure-decision and visible-check details are unavailable right now, but manual follow-up is still required outside the app."
-              : summary
-              ? `You can inspect ${summary} in the current PDF for context, but you will still need manual follow-up outside the app.`
-              : "Use the current PDF and report for manual follow-up outside the app."}
+              ? `${blockingIssueCount} ${pluralize(blockingIssueCount, "issue")} could not be fixed automatically.`
+              : "Some issues could not be fixed automatically."}
+            {" "}Download the current PDF and report to continue remediation in Acrobat or another tool.
           </p>
           <div className="flex flex-wrap items-center gap-3 mt-4">
             <DownloadButton jobId={jobId} filename={filename} type="pdf" />
@@ -150,12 +141,13 @@ export default function OutcomeHero({
                 to={`/jobs/${jobId}/review`}
                 className="
                   inline-flex items-center gap-2 px-5 py-3 rounded-xl
-                  bg-accent text-white font-medium text-sm
-                  hover:bg-accent/90 shadow-sm hover:shadow-md
+                  border border-ink/10 bg-white text-ink font-medium text-sm
+                  hover:border-ink/20 hover:bg-paper-warm
+                  shadow-sm hover:shadow-card
                   transition-all duration-200 no-underline
                 "
               >
-                {inspectLabel}
+                {reviewLabel}
                 <ArrowRightIcon size={14} />
               </Link>
             )}
