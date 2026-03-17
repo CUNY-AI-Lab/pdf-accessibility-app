@@ -20,7 +20,12 @@ export function useJobs(status?: string) {
       apiFetch<{ jobs: Job[]; total: number }>(
         `/jobs${status ? `?status=${status}` : ""}`,
       ),
-    refetchInterval: 5000,
+    refetchInterval: (query) => {
+      const data = query.state.data as { jobs: Job[]; total: number } | undefined;
+      return data?.jobs.some((job) => job.status === "queued" || job.status === "processing")
+        ? 5000
+        : 30000;
+    },
   });
 }
 
@@ -28,7 +33,11 @@ export function useJob(id: string) {
   return useQuery({
     queryKey: ["jobs", id],
     queryFn: () => apiFetch<Job>(`/jobs/${id}`),
-    refetchInterval: 3000,
+    refetchInterval: (query) => {
+      const job = query.state.data as Job | undefined;
+      if (!job) return false;
+      return job.status === "queued" || job.status === "processing" ? 3000 : false;
+    },
   });
 }
 
@@ -56,12 +65,7 @@ export function useKeepAppliedChange(jobId: string) {
         `/jobs/${jobId}/applied-changes/${changeId}/keep`,
         { method: "POST" },
       ),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "applied-changes"] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
-    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
   });
 }
 
@@ -73,12 +77,7 @@ export function useUndoAppliedChange(jobId: string) {
         `/jobs/${jobId}/applied-changes/${changeId}/undo`,
         { method: "POST" },
       ),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "applied-changes"] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
-    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
   });
 }
 
@@ -93,12 +92,7 @@ export function useReviseAppliedChange(jobId: string) {
           body: JSON.stringify({ feedback }),
         },
       ),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "applied-changes"] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "review-tasks"] });
-      queryClient.invalidateQueries({ queryKey: ["jobs", jobId, "validation"] });
-    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
   });
 }
 

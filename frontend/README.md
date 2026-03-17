@@ -38,6 +38,15 @@ That is why the frontend separates:
 
 The frontend intentionally does not surface PDF-structural mechanics. Reading order internals, table header indexing, font repair, widget cleanup, and similar pipeline decisions stay system-owned and off-screen.
 
+## Session Behavior
+
+The frontend does not implement login, account management, or browser-side PDF persistence.
+
+- the backend assigns an anonymous HTTP-only browser session cookie
+- the dashboard and job pages only show jobs created by that browser session
+- clearing cookies or switching browser profiles means the user loses access to in-flight and completed jobs from the old session
+- backend TTL cleanup deletes old jobs and files even if the browser still has a valid cookie
+
 ## Development
 
 Run the dev server:
@@ -59,7 +68,7 @@ The frontend expects the backend at `http://127.0.0.1:8001` during local develop
 ## Current review surface
 
 The UI supports:
-- figure semantics applied changes with `keep`, `undo`, and `revise`
+- figure-semantics QA controls to keep a decision, undo a decision, or retry a figure decision
 - optional visible checks for generated alt text
 - optional visible checks for annotation and link descriptions
 - manual-remediation pages with current-PDF and report downloads

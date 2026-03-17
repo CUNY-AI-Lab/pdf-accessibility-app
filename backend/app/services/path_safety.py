@@ -31,4 +31,8 @@ def validate_path_within_allowed_roots(candidate: Path) -> Path:
 
 def safe_filename(original_filename: str) -> str:
     """Strip directory components from a user-supplied filename."""
-    return Path(original_filename).name
+    normalized = str(original_filename or "").replace("\\", "/")
+    name = Path(normalized).name.strip()
+    if name in {"", ".", ".."}:
+        return "document.pdf"
+    return name

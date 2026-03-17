@@ -22,11 +22,13 @@ class Job(Base):
     __table_args__ = (
         Index("idx_jobs_status", "status"),
         Index("idx_jobs_created_at", "created_at"),
+        Index("idx_jobs_owner_session_hash", "owner_session_hash"),
     )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
     filename: Mapped[str] = mapped_column(String, nullable=False)
     original_filename: Mapped[str] = mapped_column(String, nullable=False)
+    owner_session_hash: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
     classification: Mapped[str | None] = mapped_column(String, nullable=True)
     input_path: Mapped[str] = mapped_column(String, nullable=False)

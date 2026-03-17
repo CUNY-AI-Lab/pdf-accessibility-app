@@ -63,6 +63,7 @@ from app.services.intelligence_gemini_widgets import (
     generate_widget_intelligence_for_page,
 )
 from app.services.job_manager import JobManager
+from app.services.job_state import clear_terminal_artifacts
 from app.services.llm_client import LlmClient as _LlmClient
 from app.services.llm_client import make_llm_client
 from app.services.page_intelligence import collect_grounded_text_candidates
@@ -5851,6 +5852,7 @@ async def run_tagging_and_validation(
         if job:
             job.status = "failed"
             job.error = user_error or "Tagging/validation failed"
+            clear_terminal_artifacts(job)
             await db.commit()
         job_manager.emit_progress(
             job_id,

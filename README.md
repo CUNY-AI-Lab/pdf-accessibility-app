@@ -21,7 +21,7 @@ The runtime pipeline is:
 5. `tag` - write the accessible PDF deterministically with `pikepdf`
 6. `validate` - run `veraPDF` against PDF/UA-1
 7. `fidelity` - decide whether the output is faithful enough for release
-8. `publish result` - persist optional visible follow-up items and applied changes for advanced review while keeping structural blockers internal
+8. `publish result` - persist optional visible QA details for advanced inspection, limited to figure decisions and a few visible checks, while keeping structural blockers internal
 
 ## Architecture
 
@@ -44,10 +44,28 @@ flowchart LR
     L --> M{"Release-ready?"}
     M -->|Yes| N["Release-ready PDF"]
     M -->|No| O["Manual remediation"]
-    N --> P["Optional advanced review\n(visible changes and checks only)"]
+    N --> P["Optional advanced review\n(figure decisions and visible checks only)"]
 ```
 
 More detail: [docs/architecture.md](docs/architecture.md)
+
+## Session Model And Retention
+
+The app does not use logins or accounts.
+
+- each browser gets an anonymous HTTP-only session cookie
+- every uploaded PDF job is bound to that browser session on the backend
+- the dashboard and all job, download, preview, and review APIs only return jobs owned by the current browser session
+- uploaded PDFs, processing artifacts, and output files expire after `JOB_TTL_HOURS`, which defaults to `12`
+
+Practical implications:
+
+- a user can close the tab and come back later from the same browser profile
+- a different browser or a cleared-cookie profile will not be able to see existing jobs
+- the app is intentionally ephemeral; old jobs age out even if the user never deletes them manually
+
+This isolation applies to the app's own API and stored job state. Semantic
+adjudication still uses the configured LLM provider described below.
 
 ## Current Evidence
 
@@ -200,7 +218,13 @@ GHOSTSCRIPT_PATH=gs
 TESSERACT_PATH=tesseract
 PDFTOPPM_PATH=pdftoppm
 BINARY_SEARCH_DIRS=/usr/bin,/usr/local/bin
+JOB_TTL_HOURS=12
+ANONYMOUS_SESSION_COOKIE_NAME=anon_session
+ANONYMOUS_SESSION_COOKIE_MAX_AGE_HOURS=720
+ANONYMOUS_SESSION_COOKIE_SECURE=false
 ```
+
+For HTTPS deployments, set `ANONYMOUS_SESSION_COOKIE_SECURE=true`.
 
 Binary resolution order:
 1. explicit setting or env var (`*_PATH`)
@@ -234,7 +258,7 @@ The repo includes a single-container deployment that is ready to ship:
 - the frontend is built into the image and served by FastAPI alongside the API
 - the container runs as a non-root user behind `tini`
 - health checks are baked into the image
-- persistent job data and runtime caches use Docker volumes
+- persistent job data and runtime caches use Docker volumes, but expired jobs are still purged by the app's TTL cleanup
 
 Start it with:
 

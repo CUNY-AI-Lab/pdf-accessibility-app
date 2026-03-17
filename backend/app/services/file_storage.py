@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi import HTTPException, UploadFile
 
 from app.config import get_settings
+from app.services.path_safety import safe_filename
 
 
 def ensure_dirs():
@@ -22,7 +23,7 @@ async def save_upload(file: UploadFile) -> tuple[str, Path, int]:
     settings = get_settings()
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
 
-    ext = Path(file.filename or "upload.pdf").suffix
+    ext = Path(safe_filename(file.filename or "upload.pdf")).suffix
     stored_name = f"{uuid.uuid4()}{ext}"
     dest = settings.upload_dir / stored_name
 
@@ -48,6 +49,13 @@ async def save_upload(file: UploadFile) -> tuple[str, Path, int]:
                 )
             f.write(chunk)
 
+    if first_chunk:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail="File is empty",
+        )
+
     return stored_name, dest, size
 
 
@@ -63,7 +71,7 @@ def get_output_path(job_id: str, filename: str) -> Path:
     settings = get_settings()
     output_dir = settings.output_dir / job_id
     output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir / filename
+    return output_dir / safe_filename(filename)
 
 
 def cleanup_job_files(job_id: str, input_path: str | None = None):

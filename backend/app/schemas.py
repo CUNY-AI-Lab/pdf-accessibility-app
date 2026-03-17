@@ -22,6 +22,7 @@ class JobResponse(BaseModel):
     page_count: int | None = None
     file_size_bytes: int | None = None
     error: str | None = None
+    validation_compliant: bool | None = None
     created_at: datetime
     updated_at: datetime
     steps: list[JobStepResponse] = Field(default_factory=list)

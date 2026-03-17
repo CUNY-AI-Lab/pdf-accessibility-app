@@ -16,19 +16,52 @@ export default function JobDetailPage() {
   const { data: job, isLoading, error } = useJob(id!);
   const deleteJob = useDeleteJob();
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const isActive = job?.status === "processing" || job?.status === "queued";
-  const hasOptionalReview = job?.status === "complete";
-  const { steps } = useJobProgress(id!, isActive);
+  const canInspectOutput = job?.status === "complete" || job?.status === "manual_remediation";
+  const { steps } = useJobProgress(id!, isActive, job?.steps);
   const hasFinalOutput = job?.status === "complete" || job?.status === "manual_remediation";
-  const { data: validationReport } = useValidation(id!, hasFinalOutput);
-  const { data: reviewTasks } = useReviewTasks(id!, hasOptionalReview);
-  const { data: appliedChanges } = useAppliedChanges(id!, hasOptionalReview);
+  const {
+    data: validationReport,
+    error: validationError,
+  } = useValidation(id!, hasFinalOutput);
+  const {
+    data: reviewTasks,
+    error: reviewTasksError,
+    isLoading: reviewTasksLoading,
+  } = useReviewTasks(id!, canInspectOutput);
+  const {
+    data: appliedChanges,
+    error: appliedChangesError,
+    isLoading: appliedChangesLoading,
+  } = useAppliedChanges(id!, canInspectOutput);
   const openReviewTasks = reviewTasks?.filter((task) => task.status === "pending_review") ?? [];
   const pendingAppliedChanges = appliedChanges?.filter((change) => change.review_status === "pending_review") ?? [];
   const followUpCount = openReviewTasks.length;
   const appliedChangeCount = pendingAppliedChanges.length;
   const reviewItemCount = followUpCount + appliedChangeCount;
   const [showDetails, setShowDetails] = useState(false);
+  const reviewContextLoading =
+    canInspectOutput && (reviewTasksLoading || appliedChangesLoading);
+  const reviewContextError = reviewTasksError || appliedChangesError;
+  const reviewContextStatus =
+    !canInspectOutput
+      ? "ready"
+      : reviewContextLoading
+        ? "loading"
+        : reviewContextError
+          ? "unavailable"
+          : "ready";
+  const fidelity =
+    validationReport?.fidelity && typeof validationReport.fidelity === "object"
+      ? (validationReport.fidelity as Record<string, unknown>)
+      : {};
+  const fidelitySummary =
+    fidelity.summary && typeof fidelity.summary === "object"
+      ? (fidelity.summary as Record<string, unknown>)
+      : {};
+  const blockingIssueCount =
+    asNumber(fidelitySummary.blocking_tasks) ?? validationReport?.violations.length ?? null;
 
   // Use SSE steps when actively processing, otherwise use API data
   const displaySteps = isActive ? steps : job?.steps ?? [];
@@ -126,18 +159,44 @@ export default function JobDetailPage() {
             jobId={job.id}
             filename={job.original_filename}
             status={job.status as "complete" | "manual_remediation" | "failed"}
-            compliant={validationReport?.compliant}
-            pendingCount={job.status === "complete" ? reviewItemCount : (validationReport?.violations.length ?? 0)}
+            appliedChangeCount={appliedChangeCount}
+            reviewTaskCount={followUpCount}
+            blockingIssueCount={job.status === "manual_remediation" ? blockingIssueCount : null}
+            reviewContextStatus={reviewContextStatus}
           />
 
-          {job.status === "complete" && reviewItemCount === 0 && (
+          {validationError && (
+            <div className="rounded-xl border border-warning/30 bg-warning-light/20 p-5">
+              <h3 className="font-display text-lg text-ink mb-1">
+                Detailed report unavailable
+              </h3>
+              <p className="text-sm text-ink-muted">
+                We could not load the full validation details right now. The terminal job status
+                above still reflects the app&apos;s final release decision.
+              </p>
+            </div>
+          )}
+
+          {reviewContextStatus === "unavailable" && (
+            <div className="rounded-xl border border-warning/30 bg-warning-light/20 p-5">
+              <h3 className="font-display text-lg text-ink mb-1">
+                Visible review details unavailable
+              </h3>
+              <p className="text-sm text-ink-muted">
+                We could not load the limited in-app QA details right now. Reload the page if
+                you want to inspect figure decisions or visible checks.
+              </p>
+            </div>
+          )}
+
+          {job.status === "complete" && reviewContextStatus === "ready" && reviewItemCount === 0 && (
             <div className="rounded-xl border border-info/25 bg-info-light/20 p-5">
               <h3 className="font-display text-lg text-ink mb-1">
                 Optional external QA
               </h3>
               <p className="text-sm text-ink-muted">
                 This PDF passed release checks. Download it and, if needed, spot-check it with a
-                screen reader, PAC, or Acrobat instead of using the in-app review workflow.
+                screen reader, PAC, or Acrobat instead of relying on the limited in-app QA surface.
               </p>
             </div>
           )}
@@ -235,13 +294,16 @@ export default function JobDetailPage() {
             jobId={job.id}
             filename={job.original_filename}
             status="failed"
-            compliant={false}
-            pendingCount={0}
+            appliedChangeCount={0}
+            reviewTaskCount={0}
             error={job.error}
           />
           <button
             type="button"
-            onClick={() => setShowConfirmDialog(true)}
+            onClick={() => {
+              setDeleteError(null);
+              setShowConfirmDialog(true);
+            }}
             className="
               px-4 py-2 rounded-lg text-sm font-medium
               bg-paper-warm text-ink-muted
@@ -256,13 +318,26 @@ export default function JobDetailPage() {
             message="Delete this failed job? This action cannot be undone."
             confirmLabel="Delete"
             cancelLabel="Cancel"
+            confirmPending={deleteJob.isPending}
+            errorMessage={deleteError}
             onConfirm={() => {
-              setShowConfirmDialog(false);
+              setDeleteError(null);
               deleteJob.mutate(job.id, {
-                onSuccess: () => navigate("/dashboard"),
+                onSuccess: () => {
+                  setShowConfirmDialog(false);
+                  navigate("/dashboard");
+                },
+                onError: (error) => {
+                  setDeleteError(
+                    error instanceof Error ? error.message : "Failed to delete this job. Please try again.",
+                  );
+                },
               });
             }}
-            onCancel={() => setShowConfirmDialog(false)}
+            onCancel={() => {
+              if (deleteJob.isPending) return;
+              setShowConfirmDialog(false);
+            }}
           />
         </div>
       )}

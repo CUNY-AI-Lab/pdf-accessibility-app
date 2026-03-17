@@ -147,7 +147,7 @@ export default function UploadPage() {
 
         {/* Pipeline overview */}
         <h3 className="text-sm font-semibold text-ink-muted text-center mb-4 tracking-wide uppercase">
-          Our 6-step process
+          Our 7-step process
         </h3>
         <div className="grid grid-cols-2 md:grid-cols-3 gap-4 stagger">
           {[
@@ -157,6 +157,7 @@ export default function UploadPage() {
             { icon: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z", label: "Alt Text", desc: "Describe images" },
             { icon: "M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z", label: "Tag", desc: "Add PDF/UA tags" },
             { icon: "M9 12l2 2 4-4m6 2a9 9 0 1 1-18 0 9 9 0 0 1 18 0z", label: "Validate", desc: "Check compliance" },
+            { icon: "M4 6h16M4 12h10M4 18h7", label: "Fidelity", desc: "Check output quality" },
           ].map((step) => (
             <div
               key={step.label}

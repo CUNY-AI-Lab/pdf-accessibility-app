@@ -1,8 +1,9 @@
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -15,6 +16,7 @@ from app.schemas import (
     AppliedChangeResponse,
     ReviewFeedbackRequest,
 )
+from app.services.anonymous_sessions import AnonymousSession, get_anonymous_session
 from app.services.applied_changes import (
     add_applied_change,
     change_to_response_payload,
@@ -23,11 +25,27 @@ from app.services.applied_changes import (
 )
 from app.services.intelligence_gemini_figures import generate_figure_intelligence
 from app.services.job_manager import get_job_manager
+from app.services.job_state import (
+    ACTIVE_JOB_STATUSES,
+    clear_terminal_artifacts,
+    reset_rerun_steps,
+)
 from app.services.llm_client import make_llm_client
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/jobs/{job_id}", tags=["review"])
+
+_REVIEW_ACTION_STALE_DETAIL = (
+    "This figure decision is no longer pending review. Refresh to see the latest job state."
+)
+_REVIEW_ACTION_IN_PROGRESS_DETAIL = (
+    "Accessibility processing is already running for this PDF. Refresh to see the latest status."
+)
+_REVIEW_SURFACE_UNAVAILABLE_DETAIL = (
+    "In-app review is only available after the app reaches a complete or manual-remediation output."
+)
+_REVIEWABLE_JOB_STATUSES = frozenset({"complete", "manual_remediation"})
 
 
 def _parse_json(raw: str | None) -> dict:
@@ -37,9 +55,15 @@ def _parse_json(raw: str | None) -> dict:
 async def _load_job(
     *,
     job_id: str,
+    session_hash: str,
     db: AsyncSession,
 ) -> Job:
-    job_result = await db.execute(select(Job).where(Job.id == job_id))
+    job_result = await db.execute(
+        select(Job).where(
+            Job.id == job_id,
+            Job.owner_session_hash == session_hash,
+        )
+    )
     job = job_result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -64,6 +88,21 @@ async def _load_applied_change(
     return change
 
 
+def _ensure_change_is_pending_review(change: AppliedChange) -> None:
+    if change.review_status != "pending_review":
+        raise HTTPException(status_code=409, detail=_REVIEW_ACTION_STALE_DETAIL)
+
+
+def _ensure_job_is_not_processing(job: Job) -> None:
+    if job.status in ACTIVE_JOB_STATUSES or get_job_manager().is_running(job.id):
+        raise HTTPException(status_code=409, detail=_REVIEW_ACTION_IN_PROGRESS_DETAIL)
+
+
+def _ensure_job_supports_in_app_review(job: Job) -> None:
+    if job.status not in _REVIEWABLE_JOB_STATUSES:
+        raise HTTPException(status_code=409, detail=_REVIEW_SURFACE_UNAVAILABLE_DETAIL)
+
+
 def _applied_change_to_response(change: AppliedChange) -> AppliedChangeResponse:
     return AppliedChangeResponse(**change_to_response_payload(change))
 
@@ -73,12 +112,40 @@ async def _restart_tagging_with_current_state(
     job: Job,
     db: AsyncSession,
 ) -> None:
+    _ensure_job_supports_in_app_review(job)
+
+    job_manager = get_job_manager()
+    if job_manager.is_running(job.id):
+        raise HTTPException(status_code=409, detail=_REVIEW_ACTION_IN_PROGRESS_DETAIL)
+
+    active_statuses = tuple(ACTIVE_JOB_STATUSES)
+    claim_result = await db.execute(
+        update(Job)
+        .where(
+            Job.id == job.id,
+            ~Job.status.in_(active_statuses),
+        )
+        .values(
+            status="processing",
+            error=None,
+            output_path=None,
+            validation_json=None,
+            fidelity_json=None,
+            updated_at=datetime.now(UTC),
+        )
+    )
+    if claim_result.rowcount != 1:
+        raise HTTPException(status_code=409, detail=_REVIEW_ACTION_IN_PROGRESS_DETAIL)
+
     job.status = "processing"
+    job.error = None
+    clear_terminal_artifacts(job)
+
+    await reset_rerun_steps(db, job.id)
     await db.commit()
 
     settings = get_settings()
     session_maker = get_session_maker()
-    job_manager = get_job_manager()
 
     async def _resume(jid, sm, s, jm):
         async with sm() as resume_db:
@@ -253,7 +320,7 @@ async def _apply_revised_figure_change(
     await _restart_tagging_with_current_state(job=job, db=db)
     return AppliedChangeActionResponse(
         status="reopened",
-        message="Revised the figure change and restarted accessibility processing.",
+        message="Retried the figure decision and restarted accessibility processing.",
         job_status="processing",
     )
 
@@ -309,7 +376,7 @@ async def _undo_applied_change(
         await _restart_tagging_with_current_state(job=job, db=db)
         return AppliedChangeActionResponse(
             status="undone",
-            message="Undid the applied figure change and restarted accessibility processing.",
+            message="Undid the applied figure decision and restarted accessibility processing.",
             job_status="processing",
         )
     raise HTTPException(status_code=400, detail="This change cannot be undone.")
@@ -319,8 +386,10 @@ async def _undo_applied_change(
 async def list_applied_changes(
     job_id: str,
     db: AsyncSession = Depends(get_db),
+    session: AnonymousSession = Depends(get_anonymous_session),
 ):
-    job = await _load_job(job_id=job_id, db=db)
+    job = await _load_job(job_id=job_id, session_hash=session.session_hash, db=db)
+    _ensure_job_supports_in_app_review(job)
     changes = await list_pending_reviewable_changes(db=db, job_id=job.id)
     return [_applied_change_to_response(change) for change in changes]
 
@@ -330,14 +399,19 @@ async def keep_applied_change(
     job_id: str,
     change_id: int,
     db: AsyncSession = Depends(get_db),
+    session: AnonymousSession = Depends(get_anonymous_session),
 ):
-    job = await _load_job(job_id=job_id, db=db)
+    job = await _load_job(job_id=job_id, session_hash=session.session_hash, db=db)
+    _ensure_job_supports_in_app_review(job)
     change = await _load_applied_change(job_id=job_id, change_id=change_id, db=db)
+    _ensure_change_is_pending_review(change)
+    _ensure_job_is_not_processing(job)
     change.review_status = "kept"
+    job.updated_at = datetime.now(UTC)
     await db.commit()
     return AppliedChangeActionResponse(
         status="kept",
-        message="Kept this applied change.",
+        message="Kept this figure decision.",
         job_status=str(job.status),
     )
 
@@ -347,9 +421,13 @@ async def undo_applied_change(
     job_id: str,
     change_id: int,
     db: AsyncSession = Depends(get_db),
+    session: AnonymousSession = Depends(get_anonymous_session),
 ):
-    job = await _load_job(job_id=job_id, db=db)
+    job = await _load_job(job_id=job_id, session_hash=session.session_hash, db=db)
+    _ensure_job_supports_in_app_review(job)
     change = await _load_applied_change(job_id=job_id, change_id=change_id, db=db)
+    _ensure_change_is_pending_review(change)
+    _ensure_job_is_not_processing(job)
     return await _undo_applied_change(job=job, change=change, db=db)
 
 
@@ -359,9 +437,13 @@ async def revise_applied_change(
     change_id: int,
     request: ReviewFeedbackRequest | None = None,
     db: AsyncSession = Depends(get_db),
+    session: AnonymousSession = Depends(get_anonymous_session),
 ):
-    job = await _load_job(job_id=job_id, db=db)
+    job = await _load_job(job_id=job_id, session_hash=session.session_hash, db=db)
+    _ensure_job_supports_in_app_review(job)
     change = await _load_applied_change(job_id=job_id, change_id=change_id, db=db)
+    _ensure_change_is_pending_review(change)
+    _ensure_job_is_not_processing(job)
     if change.change_type != "figure_semantics":
         raise HTTPException(
             status_code=400,

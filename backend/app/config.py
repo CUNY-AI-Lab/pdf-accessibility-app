@@ -69,7 +69,12 @@ class Settings(BaseSettings):
     max_upload_size_bytes: int = 500 * 1024 * 1024  # 500 MB
 
     # Job lifecycle
-    job_ttl_hours: int = 24
+    job_ttl_hours: int = 12
+
+    # Anonymous browser session
+    anonymous_session_cookie_name: str = "anon_session"
+    anonymous_session_cookie_max_age_hours: int = 24 * 30
+    anonymous_session_cookie_secure: bool = False
 
     # CORS
     cors_allow_origins: str = (

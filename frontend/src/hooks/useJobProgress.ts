@@ -16,10 +16,29 @@ function createInitialSteps(): PipelineStep[] {
   return INITIAL_STEPS.map((step) => ({ ...step }));
 }
 
+function mergeStepsWithInitialState(steps?: PipelineStep[]): PipelineStep[] {
+  const provided = new Map((steps ?? []).map((step) => [step.step_name, step]));
+  return INITIAL_STEPS.map((step) => ({
+    ...step,
+    ...provided.get(step.step_name),
+  }));
+}
+
+function hasMeaningfulStepState(steps?: PipelineStep[]): boolean {
+  return (steps ?? []).some(
+    (step) =>
+      step.status !== "pending" ||
+      step.started_at !== undefined ||
+      step.completed_at !== undefined ||
+      step.error !== undefined ||
+      step.result !== undefined,
+  );
+}
+
 const MAX_RETRIES = 8;
 const MAX_BACKOFF_MS = 30_000;
 
-export function useJobProgress(jobId: string, active = true) {
+export function useJobProgress(jobId: string, active = true, initialSteps?: PipelineStep[]) {
   const [stepsByJob, setStepsByJob] = useState<Record<string, PipelineStep[]>>(
     {},
   );
@@ -29,16 +48,33 @@ export function useJobProgress(jobId: string, active = true) {
   const retryCountRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const seededSteps = useMemo(
+    () => mergeStepsWithInitialState(initialSteps),
+    [initialSteps],
+  );
+  const seededStepsAreMeaningful = useMemo(
+    () => hasMeaningfulStepState(seededSteps),
+    [seededSteps],
+  );
   const steps = useMemo(
-    () => stepsByJob[jobId] ?? createInitialSteps(),
-    [jobId, stepsByJob],
+    () => {
+      const current = stepsByJob[jobId];
+      if (!current) {
+        return seededSteps;
+      }
+      if (!hasMeaningfulStepState(current) && seededStepsAreMeaningful) {
+        return seededSteps;
+      }
+      return current;
+    },
+    [jobId, seededSteps, seededStepsAreMeaningful, stepsByJob],
   );
 
   const updateStep = useCallback((event: ProgressEvent) => {
     if (event.step === "review" || event.step === "error") return;
 
     setStepsByJob((prev) => {
-      const currentSteps = prev[jobId] ?? createInitialSteps();
+      const currentSteps = prev[jobId] ?? seededSteps ?? createInitialSteps();
       const nextSteps = currentSteps.map((s) =>
         s.step_name === (event.step as StepName)
           ? {
@@ -60,7 +96,7 @@ export function useJobProgress(jobId: string, active = true) {
         [jobId]: nextSteps,
       };
     });
-  }, [jobId]);
+  }, [jobId, seededSteps]);
 
   const connect = useEffectEvent(() => {
     const openConnection = () => {

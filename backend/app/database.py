@@ -49,6 +49,8 @@ def _ensure_schema(sync_conn, review_tasks_table, applied_changes_table) -> None
         columns = {column["name"] for column in inspector.get_columns("jobs")}
         if "fidelity_json" not in columns:
             sync_conn.execute(text("ALTER TABLE jobs ADD COLUMN fidelity_json TEXT"))
+        if "owner_session_hash" not in columns:
+            sync_conn.execute(text("ALTER TABLE jobs ADD COLUMN owner_session_hash TEXT"))
 
     if "review_tasks" not in table_names:
         review_tasks_table.create(bind=sync_conn, checkfirst=True)
@@ -59,6 +61,11 @@ def _ensure_schema(sync_conn, review_tasks_table, applied_changes_table) -> None
     sync_conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status)"))
     sync_conn.execute(
         text("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs (created_at)")
+    )
+    sync_conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_owner_session_hash ON jobs (owner_session_hash)"
+        )
     )
     sync_conn.execute(
         text("CREATE INDEX IF NOT EXISTS idx_job_steps_job_id ON job_steps (job_id)")

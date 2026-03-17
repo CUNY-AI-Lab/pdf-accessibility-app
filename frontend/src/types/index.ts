@@ -39,6 +39,7 @@ export interface Job {
   page_count?: number;
   file_size_bytes?: number;
   error?: string;
+  validation_compliant?: boolean | null;
   created_at: string;
   updated_at: string;
   steps: PipelineStep[];

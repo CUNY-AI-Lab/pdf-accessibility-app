@@ -95,6 +95,16 @@ cd /Users/stephenzweibel/Apps/pdf-accessibility-app/backend
 uv run uvicorn app.main:app --reload --port 8001
 ```
 
+The backend scopes jobs to an anonymous browser session using an HTTP-only cookie.
+There is no login flow, but job APIs only return documents created by the current
+browser session. Uploaded files and job state expire after `JOB_TTL_HOURS`
+(`12` by default).
+This protects jobs inside the app's API surface; semantic LLM calls still go to
+the configured provider.
+
+For HTTPS deployments, set `ANONYMOUS_SESSION_COOKIE_SECURE=true` so the cookie
+is only sent over secure transport.
+
 ## Tests
 
 ```bash

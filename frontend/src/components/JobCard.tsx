@@ -68,19 +68,19 @@ export default function JobCard({ job }: JobCardProps) {
   const config = STATUS_CONFIG[job.status];
   const deleteJob = useDeleteJob();
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const completedSteps = job.steps.filter(
     (s) => s.status === "complete" || s.status === "skipped",
   ).length;
   const progress = job.steps.length > 0 ? (completedSteps / job.steps.length) * 100 : 0;
 
-  // Outcome summary values (computed once, not in JSX)
-  const valResult = job.steps.find((s) => s.step_name === "validation")?.result;
-  const isCompliant = valResult && typeof valResult.compliant === "boolean" ? valResult.compliant : null;
+  const isCompliant = job.validation_compliant ?? null;
   const linkTo = `/jobs/${job.id}`;
 
   const handleDelete = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    setDeleteError(null);
     setShowConfirmDialog(true);
   };
 
@@ -172,6 +172,12 @@ export default function JobCard({ job }: JobCardProps) {
         </p>
       )}
 
+      {deleteError && (
+        <p className="text-xs text-error bg-error-light rounded-lg px-3 py-2 mb-3">
+          {deleteError}
+        </p>
+      )}
+
       {/* Footer */}
       <div className="flex items-center justify-between">
         <span className="text-xs text-ink-muted">
@@ -203,11 +209,25 @@ export default function JobCard({ job }: JobCardProps) {
         message={`Delete "${job.original_filename}"? This action cannot be undone.`}
         confirmLabel="Delete"
         cancelLabel="Cancel"
+        confirmPending={deleteJob.isPending}
+        errorMessage={deleteError}
         onConfirm={() => {
-          setShowConfirmDialog(false);
-          deleteJob.mutate(job.id);
+          setDeleteError(null);
+          deleteJob.mutate(job.id, {
+            onSuccess: () => {
+              setShowConfirmDialog(false);
+            },
+            onError: (error) => {
+              setDeleteError(
+                error instanceof Error ? error.message : "Failed to delete this job. Please try again.",
+              );
+            },
+          });
         }}
-        onCancel={() => setShowConfirmDialog(false)}
+        onCancel={() => {
+          if (deleteJob.isPending) return;
+          setShowConfirmDialog(false);
+        }}
       />
     </Link>
   );

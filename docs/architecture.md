@@ -1,6 +1,6 @@
 # Architecture
 
-Updated: 2026-03-12
+Updated: 2026-03-16
 
 This app has two distinct layers:
 
@@ -40,6 +40,19 @@ flowchart TD
     M -->|No| O["Manual remediation"]
     N --> P["Optional visible review surface"]
 ```
+
+## Session boundary
+
+The product uses anonymous browser sessions instead of user accounts.
+
+- FastAPI middleware assigns an HTTP-only cookie to each browser
+- every job row is owned by a hash of that session token
+- list, detail, download, preview, SSE progress, and review routes are all scoped to the current browser session
+- jobs and their files are ephemeral and expire after `JOB_TTL_HOURS`, which defaults to `12`
+
+This keeps the app login-free while preventing one browser session from seeing another session's PDFs through the product API.
+It does not change the fact that semantic adjudication still uses the configured
+external LLM provider.
 
 ## Semantic units
 
