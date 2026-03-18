@@ -51,6 +51,34 @@ async def list_pending_reviewable_changes(
     return list(result.scalars().all())
 
 
+async def list_figure_changes(
+    *,
+    db: AsyncSession,
+    job_id: str,
+) -> list[AppliedChange]:
+    """Return the latest applied change per figure, including auto-kept ones."""
+    all_result = await db.execute(
+        select(AppliedChange)
+        .where(
+            AppliedChange.job_id == job_id,
+            AppliedChange.change_type == "figure_semantics",
+        )
+        .order_by(AppliedChange.created_at.desc())
+    )
+    all_changes = list(all_result.scalars().all())
+    # Keep only the most recent change per figure_index
+    seen: set[int] = set()
+    latest: list[AppliedChange] = []
+    for change in all_changes:
+        metadata = parse_json_dict(change.metadata_json)
+        fig_idx = metadata.get("figure_index")
+        if fig_idx is not None and fig_idx not in seen:
+            seen.add(fig_idx)
+            latest.append(change)
+    latest.sort(key=lambda c: c.created_at)
+    return latest
+
+
 async def add_applied_change(
     *,
     db: AsyncSession,

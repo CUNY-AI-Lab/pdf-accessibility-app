@@ -68,8 +68,6 @@ def figure_applied_change_specs(
     for result in alt_texts:
         if result.status == "reclassified":
             continue
-        if not result.reviewable:
-            continue
         figure = figure_by_index.get(result.figure_index)
         if figure is None:
             continue
@@ -102,7 +100,7 @@ def figure_applied_change_specs(
                 "title": title,
                 "detail": detail,
                 "importance": result.importance,
-                "reviewable": True,
+                "reviewable": result.reviewable,
                 "metadata": metadata,
                 "before": {
                     "generated_text": None,

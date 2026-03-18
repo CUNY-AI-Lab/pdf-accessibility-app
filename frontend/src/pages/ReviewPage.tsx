@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   useAppliedChanges,
   useEditAppliedChange,
+  useFigureChanges,
   useJob,
   useKeepAppliedChange,
   useReviseAppliedChange,
@@ -37,6 +38,11 @@ export default function ReviewPage() {
     isLoading: appliedChangesLoading,
     error: appliedChangesError,
   } = useAppliedChanges(id!, canInspectOutput);
+  const {
+    data: figureChanges,
+    isLoading: figureChangesLoading,
+    error: figureChangesError,
+  } = useFigureChanges(id!, canInspectOutput);
   const keepAppliedChange = useKeepAppliedChange(id!);
   const undoAppliedChange = useUndoAppliedChange(id!);
   const reviseAppliedChange = useReviseAppliedChange(id!);
@@ -49,11 +55,13 @@ export default function ReviewPage() {
   const [changeActionErrorId, setChangeActionErrorId] = useState<number | null>(null);
   const [changeActionError, setChangeActionError] = useState<Error | null>(null);
 
-  const isLoading = jobLoading || (canInspectOutput && (tasksLoading || appliedChangesLoading));
+  const isLoading = jobLoading || (canInspectOutput && (tasksLoading || appliedChangesLoading || figureChangesLoading));
   const isManualRemediation = job?.status === "manual_remediation";
-  const reviewContextError = reviewTasksError || appliedChangesError;
+  const reviewContextError = reviewTasksError || appliedChangesError || figureChangesError;
   const openReviewTasks = reviewTasks?.filter((task) => task.status === "pending_review") ?? [];
   const pendingAppliedChanges = appliedChanges?.filter((change) => change.review_status === "pending_review") ?? [];
+  const pendingIds = new Set(pendingAppliedChanges.map((c) => c.id));
+  const keptFigureChanges = figureChanges?.filter((c) => !pendingIds.has(c.id) && c.review_status === "kept") ?? [];
   const hasReviewItems = pendingAppliedChanges.length > 0 || openReviewTasks.length > 0;
 
   const handleKeepAppliedChange = async (change: AppliedChange) => {
@@ -253,6 +261,35 @@ export default function ReviewPage() {
             </p>
           </div>
           {pendingAppliedChanges.map((change) => (
+            <AppliedChangeCard
+              key={change.id}
+              jobId={id!}
+              change={change}
+              onKeep={handleKeepAppliedChange}
+              onUndo={handleUndoAppliedChange}
+              onRevise={handleReviseAppliedChange}
+              onEdit={handleEditAppliedChange}
+              keeping={keepingChangeId === change.id}
+              undoing={undoingChangeId === change.id}
+              revising={revisingChangeId === change.id}
+              editing={editingChangeId === change.id}
+              actionError={changeActionErrorId === change.id ? changeActionError : null}
+            />
+          ))}
+        </section>
+      )}
+
+      {keptFigureChanges.length > 0 && (
+        <section className="space-y-4 mb-8">
+          <div className="rounded-xl border border-ink/6 bg-cream p-5">
+            <h2 className="text-lg text-ink mb-1">
+              Image descriptions
+            </h2>
+            <p className="text-sm text-ink-muted">
+              Review and edit the alt text applied to each figure.
+            </p>
+          </div>
+          {keptFigureChanges.map((change) => (
             <AppliedChangeCard
               key={change.id}
               jobId={id!}

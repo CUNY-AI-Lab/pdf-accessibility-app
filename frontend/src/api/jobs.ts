@@ -57,6 +57,14 @@ export function useAppliedChanges(jobId: string, enabled = true) {
   });
 }
 
+export function useFigureChanges(jobId: string, enabled = true) {
+  return useQuery({
+    queryKey: ["jobs", jobId, "figure-changes"],
+    queryFn: () => apiFetch<AppliedChange[]>(`/jobs/${jobId}/figure-changes`),
+    enabled,
+  });
+}
+
 export function useKeepAppliedChange(jobId: string) {
   const queryClient = useQueryClient();
   return useMutation({

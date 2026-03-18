@@ -22,6 +22,7 @@ from app.services.anonymous_sessions import AnonymousSession, get_anonymous_sess
 from app.services.applied_changes import (
     add_applied_change,
     change_to_response_payload,
+    list_figure_changes,
     list_pending_reviewable_changes,
     parse_json_dict,
 )
@@ -396,6 +397,19 @@ async def list_applied_changes(
     return [_applied_change_to_response(change) for change in changes]
 
 
+@router.get("/figure-changes", response_model=list[AppliedChangeResponse])
+async def list_all_figure_changes(
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+    session: AnonymousSession = Depends(get_anonymous_session),
+):
+    """Return all figure changes including auto-kept ones, for review/editing."""
+    job = await _load_job(job_id=job_id, session_hash=session.session_hash, db=db)
+    _ensure_job_supports_in_app_review(job)
+    changes = await list_figure_changes(db=db, job_id=job.id)
+    return [_applied_change_to_response(change) for change in changes]
+
+
 @router.post("/applied-changes/{change_id}/keep", response_model=AppliedChangeActionResponse)
 async def keep_applied_change(
     job_id: str,
@@ -471,7 +485,8 @@ async def edit_applied_change(
     job = await _load_job(job_id=job_id, session_hash=session.session_hash, db=db)
     _ensure_job_supports_in_app_review(job)
     change = await _load_applied_change(job_id=job_id, change_id=change_id, db=db)
-    _ensure_change_is_pending_review(change)
+    if change.review_status not in ("pending_review", "kept"):
+        raise HTTPException(status_code=409, detail=_REVIEW_ACTION_STALE_DETAIL)
     _ensure_job_is_not_processing(job)
     if change.change_type != "figure_semantics":
         raise HTTPException(
