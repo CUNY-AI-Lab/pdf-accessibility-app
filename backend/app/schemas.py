@@ -66,6 +66,10 @@ class ReviewFeedbackRequest(BaseModel):
     feedback: str | None = None
 
 
+class ReviewEditRequest(BaseModel):
+    text: str
+
+
 class AppliedChangeActionResponse(BaseModel):
     status: str
     message: str

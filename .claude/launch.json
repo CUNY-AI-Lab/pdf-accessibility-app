@@ -2,6 +2,13 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "backend",
+      "runtimeExecutable": "/Users/stephenzweibel/.local/bin/uv",
+      "runtimeArgs": ["run", "uvicorn", "app.main:app", "--reload", "--port", "8001"],
+      "port": 8001,
+      "cwd": "backend"
+    },
+    {
       "name": "frontend",
       "runtimeExecutable": "/Users/stephenzweibel/.bun/bin/bun",
       "runtimeArgs": ["run", "dev"],

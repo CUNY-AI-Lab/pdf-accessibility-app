@@ -96,6 +96,21 @@ export function useReviseAppliedChange(jobId: string) {
   });
 }
 
+export function useEditAppliedChange(jobId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ changeId, text }: { changeId: number; text: string }) =>
+      apiFetch<{ status: string; message: string; job_status: string }>(
+        `/jobs/${jobId}/applied-changes/${changeId}/edit`,
+        {
+          method: "POST",
+          body: JSON.stringify({ text }),
+        },
+      ),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+  });
+}
+
 export function useValidation(jobId: string, enabled = true) {
   return useQuery({
     queryKey: ["jobs", jobId, "validation"],

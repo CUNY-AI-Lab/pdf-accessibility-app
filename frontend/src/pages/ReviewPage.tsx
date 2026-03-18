@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   useAppliedChanges,
+  useEditAppliedChange,
   useJob,
   useKeepAppliedChange,
   useReviseAppliedChange,
@@ -39,10 +40,12 @@ export default function ReviewPage() {
   const keepAppliedChange = useKeepAppliedChange(id!);
   const undoAppliedChange = useUndoAppliedChange(id!);
   const reviseAppliedChange = useReviseAppliedChange(id!);
+  const editAppliedChange = useEditAppliedChange(id!);
 
   const [keepingChangeId, setKeepingChangeId] = useState<number | null>(null);
   const [undoingChangeId, setUndoingChangeId] = useState<number | null>(null);
   const [revisingChangeId, setRevisingChangeId] = useState<number | null>(null);
+  const [editingChangeId, setEditingChangeId] = useState<number | null>(null);
   const [changeActionErrorId, setChangeActionErrorId] = useState<number | null>(null);
   const [changeActionError, setChangeActionError] = useState<Error | null>(null);
 
@@ -107,6 +110,26 @@ export default function ReviewPage() {
       );
     } finally {
       setRevisingChangeId(null);
+    }
+  };
+
+  const handleEditAppliedChange = async (change: AppliedChange, text: string) => {
+    setChangeActionErrorId(null);
+    setChangeActionError(null);
+    setEditingChangeId(change.id);
+    try {
+      const result = await editAppliedChange.mutateAsync({ changeId: change.id, text });
+      if (result.job_status === "processing" || result.job_status === "failed") {
+        navigate(`/jobs/${id}`);
+      }
+    } catch (error) {
+      setChangeActionErrorId(change.id);
+      setChangeActionError(
+        error instanceof Error ? error : new Error("Failed to save the edited description"),
+      );
+      throw error; // Re-throw so AppliedChangeCard keeps the edit form open
+    } finally {
+      setEditingChangeId(null);
     }
   };
 
@@ -232,13 +255,16 @@ export default function ReviewPage() {
           {pendingAppliedChanges.map((change) => (
             <AppliedChangeCard
               key={change.id}
+              jobId={id!}
               change={change}
               onKeep={handleKeepAppliedChange}
               onUndo={handleUndoAppliedChange}
               onRevise={handleReviseAppliedChange}
+              onEdit={handleEditAppliedChange}
               keeping={keepingChangeId === change.id}
               undoing={undoingChangeId === change.id}
               revising={revisingChangeId === change.id}
+              editing={editingChangeId === change.id}
               actionError={changeActionErrorId === change.id ? changeActionError : null}
             />
           ))}

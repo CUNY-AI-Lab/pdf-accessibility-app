@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +15,7 @@ from app.pipeline.structure import FigureInfo
 from app.schemas import (
     AppliedChangeActionResponse,
     AppliedChangeResponse,
+    ReviewEditRequest,
     ReviewFeedbackRequest,
 )
 from app.services.anonymous_sessions import AnonymousSession, get_anonymous_session
@@ -455,3 +457,98 @@ async def revise_applied_change(
         db=db,
         reviewer_feedback=(request.feedback.strip() if request and request.feedback else None),
     )
+
+
+@router.post("/applied-changes/{change_id}/edit", response_model=AppliedChangeActionResponse)
+async def edit_applied_change(
+    job_id: str,
+    change_id: int,
+    request: ReviewEditRequest,
+    db: AsyncSession = Depends(get_db),
+    session: AnonymousSession = Depends(get_anonymous_session),
+):
+    """Directly edit the alt text for a figure decision."""
+    job = await _load_job(job_id=job_id, session_hash=session.session_hash, db=db)
+    _ensure_job_supports_in_app_review(job)
+    change = await _load_applied_change(job_id=job_id, change_id=change_id, db=db)
+    _ensure_change_is_pending_review(change)
+    _ensure_job_is_not_processing(job)
+    if change.change_type != "figure_semantics":
+        raise HTTPException(
+            status_code=400,
+            detail="This change type cannot be edited in the app.",
+        )
+
+    entry, metadata = await _load_figure_change_context(job=job, change=change, db=db)
+    edited_text = request.text.strip()
+    if not edited_text:
+        raise HTTPException(status_code=400, detail="Alt text cannot be empty.")
+
+    previous_state = {
+        "generated_text": entry.generated_text,
+        "edited_text": entry.edited_text,
+        "status": entry.status,
+    }
+
+    entry.edited_text = edited_text
+    entry.status = "approved"
+
+    change.review_status = "undone"
+    await add_applied_change(
+        db=db,
+        job=job,
+        change_type="figure_semantics",
+        title=f"Updated figure {entry.figure_index + 1}",
+        detail="Manually edited figure description.",
+        importance=str(change.importance or "medium"),
+        reviewable=True,
+        metadata={
+            **metadata,
+            "figure_index": entry.figure_index,
+        },
+        before=previous_state,
+        after={
+            "generated_text": entry.generated_text,
+            "edited_text": entry.edited_text,
+            "status": entry.status,
+        },
+        undo_payload={
+            "kind": "alt_text_entry",
+            "entry_id": entry.id,
+            "figure_index": entry.figure_index,
+            **previous_state,
+        },
+    )
+    await _restart_tagging_with_current_state(job=job, db=db)
+    return AppliedChangeActionResponse(
+        status="edited",
+        message="Saved the edited figure description and restarted accessibility processing.",
+        job_status="processing",
+    )
+
+
+@router.get("/figures/{figure_index}/image")
+async def get_figure_image(
+    job_id: str,
+    figure_index: int,
+    db: AsyncSession = Depends(get_db),
+    session: AnonymousSession = Depends(get_anonymous_session),
+):
+    """Serve the extracted figure image for review."""
+    await _load_job(job_id=job_id, session_hash=session.session_hash, db=db)
+    result = await db.execute(
+        select(AltTextEntry).where(
+            AltTextEntry.job_id == job_id,
+            AltTextEntry.figure_index == figure_index,
+        )
+    )
+    entry = result.scalar_one_or_none()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Figure not found")
+    image_path = Path(entry.image_path)
+    if not image_path.exists():
+        raise HTTPException(status_code=404, detail="Figure image file not found")
+    suffix = image_path.suffix.lower()
+    media_types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
+    media_type = media_types.get(suffix, "image/png")
+    return FileResponse(image_path, media_type=media_type)
