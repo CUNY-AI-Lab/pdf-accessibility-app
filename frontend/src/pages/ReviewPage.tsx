@@ -58,10 +58,12 @@ export default function ReviewPage() {
   const isLoading = jobLoading || (canInspectOutput && (tasksLoading || appliedChangesLoading || figureChangesLoading));
   const isManualRemediation = job?.status === "manual_remediation";
   const reviewContextError = reviewTasksError || appliedChangesError || figureChangesError;
-  const openReviewTasks = reviewTasks?.filter((task) => task.status === "pending_review") ?? [];
   const pendingAppliedChanges = appliedChanges?.filter((change) => change.review_status === "pending_review") ?? [];
   const pendingIds = new Set(pendingAppliedChanges.map((c) => c.id));
   const keptFigureChanges = figureChanges?.filter((c) => !pendingIds.has(c.id) && c.review_status === "kept") ?? [];
+  const hasFigureCards = pendingAppliedChanges.some((c) => c.change_type === "figure_semantics") || keptFigureChanges.length > 0;
+  const openReviewTasks = (reviewTasks?.filter((task) => task.status === "pending_review") ?? [])
+    .filter((task) => !(task.task_type === "alt_text" && hasFigureCards));
   const hasReviewItems = pendingAppliedChanges.length > 0 || openReviewTasks.length > 0;
 
   const handleKeepAppliedChange = async (change: AppliedChange) => {
