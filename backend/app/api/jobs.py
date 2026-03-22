@@ -3,7 +3,7 @@ import json
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only, selectinload
@@ -11,7 +11,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from app.config import get_settings
 from app.database import get_db, get_session_maker
-from app.models import Job, JobStep
+from app.models import AltTextEntry, Job, JobStep, ReviewTask
 from app.pipeline.orchestrator import run_pipeline
 from app.schemas import JobCreateResponse, JobListResponse, JobResponse, JobStepResponse
 from app.services.anonymous_sessions import AnonymousSession, get_anonymous_session
@@ -21,6 +21,7 @@ from app.services.job_state import (
     CLEANUP_INTERRUPTED_ERROR,
     mark_job_failed,
 )
+from app.services.html_report import render_batch_html_report
 from app.services.path_safety import safe_filename
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -225,6 +226,74 @@ async def list_jobs(
     return JobListResponse(
         jobs=[job_to_response(j, include_step_results=False) for j in jobs],
         total=len(jobs),
+    )
+
+
+_BATCH_REPORT_STATUSES = frozenset({"complete", "manual_remediation"})
+_NO_STORE_HEADERS = {
+    "Cache-Control": "private, no-store",
+    "Pragma": "no-cache",
+    "Expires": "0",
+    "Vary": "Cookie",
+}
+
+
+@router.get("/download/batch-report.html")
+async def download_batch_report(
+    db: AsyncSession = Depends(get_db),
+    session: AnonymousSession = Depends(get_anonymous_session),
+):
+    """Download a combined HTML report for all completed jobs in this session."""
+    result = await db.execute(
+        select(Job)
+        .where(
+            Job.owner_session_hash == session.session_hash,
+            Job.status.in_(_BATCH_REPORT_STATUSES),
+        )
+        .order_by(Job.created_at.desc())
+    )
+    jobs = result.scalars().all()
+
+    if not jobs:
+        raise HTTPException(status_code=404, detail="No completed jobs to report on")
+
+    job_reports: list[dict] = []
+    for job in jobs:
+        if not job.validation_json:
+            continue
+        validation = json.loads(job.validation_json)
+        alt_texts = (
+            await db.execute(
+                select(AltTextEntry)
+                .where(AltTextEntry.job_id == job.id)
+                .order_by(AltTextEntry.figure_index)
+            )
+        ).scalars().all()
+        review_tasks = (
+            await db.execute(
+                select(ReviewTask)
+                .where(ReviewTask.job_id == job.id)
+                .order_by(ReviewTask.blocking.desc(), ReviewTask.created_at.asc())
+            )
+        ).scalars().all()
+        job_reports.append({
+            "job": job,
+            "validation": validation,
+            "alt_texts": list(alt_texts),
+            "review_tasks": list(review_tasks),
+        })
+
+    if not job_reports:
+        raise HTTPException(status_code=404, detail="No completed jobs with reports")
+
+    html_content = render_batch_html_report(job_reports)
+    return Response(
+        content=html_content,
+        media_type="text/html",
+        headers={
+            **_NO_STORE_HEADERS,
+            "Content-Disposition": 'attachment; filename="batch_accessibility_report.html"',
+        },
     )
 
 

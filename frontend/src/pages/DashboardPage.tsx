@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
+import { apiUrl } from "../api/client";
 import { useJobs } from "../api/jobs";
 import JobCard from "../components/JobCard";
 import { pluralize } from "../utils/format";
@@ -18,6 +19,10 @@ export default function DashboardPage() {
   const [filter, setFilter] = useState<string | undefined>(undefined);
   const { data, isLoading, error } = useJobs(filter);
 
+  const hasCompletedJobs = data?.jobs.some(
+    (j) => j.status === "complete" || j.status === "manual_remediation",
+  );
+
   return (
     <div className="animate-fade-in">
       {/* Header */}
@@ -28,21 +33,43 @@ export default function DashboardPage() {
             {data?.total ?? 0} {pluralize(data?.total ?? 0, "document")}
           </p>
         </div>
-        <Link
-          to="/"
-          className="
-            inline-flex items-center gap-2 px-4 py-2.5 rounded-xl
-            bg-accent text-white text-sm font-medium
-            hover:bg-accent/90 shadow-sm hover:shadow-md
-            transition-all duration-200 no-underline
-          "
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <line x1="12" y1="5" x2="12" y2="19" />
-            <line x1="5" y1="12" x2="19" y2="12" />
-          </svg>
-          Upload
-        </Link>
+        <div className="flex items-center gap-3">
+          {hasCompletedJobs && (
+            <a
+              href={apiUrl("/jobs/download/batch-report.html")}
+              download="batch_accessibility_report.html"
+              className="
+                inline-flex items-center gap-2 px-4 py-2.5 rounded-xl
+                border border-ink/10 bg-white text-ink text-sm font-medium
+                hover:border-ink/20 hover:bg-paper-warm
+                shadow-sm hover:shadow-card
+                transition-all duration-200 no-underline
+              "
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              Download All Reports
+            </a>
+          )}
+          <Link
+            to="/"
+            className="
+              inline-flex items-center gap-2 px-4 py-2.5 rounded-xl
+              bg-accent text-white text-sm font-medium
+              hover:bg-accent/90 shadow-sm hover:shadow-md
+              transition-all duration-200 no-underline
+            "
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+            Upload
+          </Link>
+        </div>
       </div>
 
       {/* Filters */}

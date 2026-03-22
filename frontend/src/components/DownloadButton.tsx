@@ -14,14 +14,15 @@ export default function DownloadButton({
   const href =
     type === "pdf"
       ? apiUrl(`/jobs/${jobId}/download`)
-      : apiUrl(`/jobs/${jobId}/download/report`);
+      : apiUrl(`/jobs/${jobId}/download/report.html`);
 
   const label = type === "pdf" ? "Download Accessible PDF" : "Download Report";
+  const stem = filename.replace(/\.pdf$/i, "");
 
   return (
     <a
       href={href}
-      download={type === "pdf" ? `accessible_${filename}` : `report_${filename}.json`}
+      download={type === "pdf" ? `accessible_${filename}` : `report_${stem}.html`}
       className="
         inline-flex items-center gap-2.5 px-5 py-3 rounded-xl
         bg-accent text-white font-medium text-sm

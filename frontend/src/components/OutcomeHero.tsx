@@ -105,8 +105,8 @@ export default function OutcomeHero({
                 </Link>
               )}
               <a
-                href={apiUrl(`/jobs/${jobId}/download/report`)}
-                download={`report_${filename}.json`}
+                href={apiUrl(`/jobs/${jobId}/download/report.html`)}
+                download={`report_${filename.replace(/\.pdf$/i, "")}.html`}
                 className="text-sm text-ink-muted hover:text-accent transition-colors no-underline"
               >
                 Download report
@@ -153,8 +153,8 @@ export default function OutcomeHero({
               </Link>
             )}
             <a
-              href={apiUrl(`/jobs/${jobId}/download/report`)}
-              download={`report_${filename}.json`}
+              href={apiUrl(`/jobs/${jobId}/download/report.html`)}
+              download={`report_${filename.replace(/\.pdf$/i, "")}.html`}
               className="text-sm text-ink-muted hover:text-accent transition-colors no-underline"
             >
               Download report

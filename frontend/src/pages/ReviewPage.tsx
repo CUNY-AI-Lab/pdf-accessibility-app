@@ -259,8 +259,8 @@ export default function ReviewPage() {
                 Download Accessible PDF
               </a>
               <a
-                href={apiUrl(`/jobs/${id}/download/report`)}
-                download={job ? `report_${job.original_filename}.json` : undefined}
+                href={apiUrl(`/jobs/${id}/download/report.html`)}
+                download={job ? `report_${job.original_filename.replace(/\.pdf$/i, "")}.html` : undefined}
                 className="text-sm text-accent font-medium no-underline hover:underline"
               >
                 Download report
@@ -290,8 +290,8 @@ export default function ReviewPage() {
               Download Accessible PDF
             </a>
             <a
-              href={apiUrl(`/jobs/${id}/download/report`)}
-              download={job ? `report_${job.original_filename}.json` : undefined}
+              href={apiUrl(`/jobs/${id}/download/report.html`)}
+              download={job ? `report_${job.original_filename.replace(/\.pdf$/i, "")}.html` : undefined}
               className="text-sm text-accent font-medium no-underline hover:underline"
             >
               Download report
@@ -387,8 +387,8 @@ export default function ReviewPage() {
             This PDF passed all checks. For extra assurance, test with a screen reader or PAC.
           </p>
           <a
-            href={apiUrl(`/jobs/${id}/download/report`)}
-            download={job ? `report_${job.original_filename}.json` : undefined}
+            href={apiUrl(`/jobs/${id}/download/report.html`)}
+            download={job ? `report_${job.original_filename.replace(/\.pdf$/i, "")}.html` : undefined}
             className="inline-flex mt-4 text-sm text-accent font-medium no-underline hover:underline"
           >
             Download report

@@ -10,9 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db
-from app.models import Job, ReviewTask
+from app.models import AltTextEntry, Job, ReviewTask
 from app.schemas import ReviewTaskResponse, ValidationReportResponse
 from app.services.anonymous_sessions import AnonymousSession, get_anonymous_session
+from app.services.html_report import render_html_report
 from app.services.path_safety import safe_filename, validate_path_within_allowed_roots
 from app.services.pdf_preview import render_page_png_bytes
 from app.services.review_surface import is_user_visible_review_task_type
@@ -163,3 +164,41 @@ async def download_report(
     for header_name, header_value in _NO_STORE_HEADERS.items():
         response.headers[header_name] = header_value
     return ValidationReportResponse.model_validate_json(job.validation_json)
+
+
+@router.get("/download/report.html")
+async def download_html_report(
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+    session: AnonymousSession = Depends(get_anonymous_session),
+):
+    job = await _load_owned_job(job_id=job_id, session_hash=session.session_hash, db=db)
+    if job.status not in _OUTPUT_READY_STATUSES or not job.validation_json:
+        raise HTTPException(status_code=404, detail="Validation report not yet available")
+
+    validation = json.loads(job.validation_json)
+    alt_texts = (
+        await db.execute(
+            select(AltTextEntry)
+            .where(AltTextEntry.job_id == job_id)
+            .order_by(AltTextEntry.figure_index)
+        )
+    ).scalars().all()
+    review_tasks = (
+        await db.execute(
+            select(ReviewTask)
+            .where(ReviewTask.job_id == job_id)
+            .order_by(ReviewTask.blocking.desc(), ReviewTask.created_at.asc())
+        )
+    ).scalars().all()
+
+    html_content = render_html_report(job, validation, list(alt_texts), list(review_tasks))
+    filename = safe_filename(job.original_filename).rsplit(".", 1)[0]
+    return Response(
+        content=html_content,
+        media_type="text/html",
+        headers={
+            **_NO_STORE_HEADERS,
+            "Content-Disposition": f'attachment; filename="report_{filename}.html"',
+        },
+    )
