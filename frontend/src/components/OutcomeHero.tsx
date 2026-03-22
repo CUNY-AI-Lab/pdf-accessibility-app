@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import { apiUrl } from "../api/client";
 import type { JobStatus } from "../types";
 import { pluralize } from "../utils/format";
 import DownloadButton from "./DownloadButton";
@@ -30,7 +31,7 @@ function reviewSummary(appliedChangeCount: number, reviewTaskCount: number): str
   return null;
 }
 
-function reviewButtonLabel(appliedChangeCount: number, reviewTaskCount: number): string {
+function reviewButtonLabel(appliedChangeCount: number): string {
   if (appliedChangeCount > 0) return "Review Image Descriptions";
   return "Review Checks";
 }
@@ -46,7 +47,7 @@ export default function OutcomeHero({
   error,
 }: OutcomeHeroProps) {
   const summary = reviewSummary(appliedChangeCount, reviewTaskCount);
-  const reviewLabel = reviewButtonLabel(appliedChangeCount, reviewTaskCount);
+  const reviewLabel = reviewButtonLabel(appliedChangeCount);
 
   if (status === "failed") {
     return (
@@ -104,7 +105,7 @@ export default function OutcomeHero({
                 </Link>
               )}
               <a
-                href={`/api/jobs/${jobId}/download/report`}
+                href={apiUrl(`/jobs/${jobId}/download/report`)}
                 download={`report_${filename}.json`}
                 className="text-sm text-ink-muted hover:text-accent transition-colors no-underline"
               >
@@ -152,7 +153,7 @@ export default function OutcomeHero({
               </Link>
             )}
             <a
-              href={`/api/jobs/${jobId}/download/report`}
+              href={apiUrl(`/jobs/${jobId}/download/report`)}
               download={`report_${filename}.json`}
               className="text-sm text-ink-muted hover:text-accent transition-colors no-underline"
             >

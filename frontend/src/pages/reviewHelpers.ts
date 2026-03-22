@@ -1,3 +1,4 @@
+import { apiUrl } from "../api/client";
 import type { ReviewTask } from "../types";
 
 function metadataPageList(task: ReviewTask, key: string): number[] {
@@ -22,7 +23,7 @@ function pagesFromEntries(task: ReviewTask, key: string): number[] {
 }
 
 export function pagePreviewUrl(jobId: string, pageNumber: number): string {
-  return `/api/jobs/${jobId}/pages/${pageNumber}/preview`;
+  return apiUrl(`/jobs/${jobId}/pages/${pageNumber}/preview`);
 }
 
 export function previewPagesForTask(task: ReviewTask): number[] {

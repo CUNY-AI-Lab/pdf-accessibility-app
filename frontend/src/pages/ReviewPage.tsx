@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { apiUrl } from "../api/client";
 import {
   useAppliedChanges,
   useEditAppliedChange,
@@ -235,14 +236,14 @@ export default function ReviewPage() {
           </p>
           <div className="mt-4 flex flex-wrap items-center gap-4">
             <a
-              href={`/api/jobs/${id}/download/report`}
+              href={apiUrl(`/jobs/${id}/download/report`)}
               download={job ? `report_${job.original_filename}.json` : undefined}
               className="text-sm text-accent font-medium no-underline hover:underline"
             >
               Download report
             </a>
             <a
-              href={`/api/jobs/${id}/download`}
+              href={apiUrl(`/jobs/${id}/download`)}
               download={job ? `accessible_${job.original_filename}` : undefined}
               className="text-sm text-accent font-medium no-underline hover:underline"
             >
@@ -339,7 +340,7 @@ export default function ReviewPage() {
             This PDF passed all checks. For extra assurance, test with a screen reader or PAC.
           </p>
           <a
-            href={`/api/jobs/${id}/download/report`}
+            href={apiUrl(`/jobs/${id}/download/report`)}
             download={job ? `report_${job.original_filename}.json` : undefined}
             className="inline-flex mt-4 text-sm text-accent font-medium no-underline hover:underline"
           >

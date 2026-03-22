@@ -1,4 +1,23 @@
-const BASE_URL = "/api";
+function normalizeBasePath(basePath: string): string {
+  if (!basePath || basePath === "/") {
+    return "";
+  }
+  return basePath.endsWith("/") ? basePath.slice(0, -1) : basePath;
+}
+
+function joinPath(basePath: string, path: string): string {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return `${basePath}${normalizedPath}`;
+}
+
+const APP_BASE_PATH = normalizeBasePath(import.meta.env.BASE_URL);
+
+export const ROUTER_BASENAME = APP_BASE_PATH || undefined;
+export const BASE_URL = joinPath(APP_BASE_PATH, "/api");
+
+export function apiUrl(path: string): string {
+  return joinPath(BASE_URL, path);
+}
 
 export class ApiError extends Error {
   status: number;
@@ -16,7 +35,7 @@ export async function apiFetch<T>(
   path: string,
   options?: RequestInit,
 ): Promise<T> {
-  const url = `${BASE_URL}${path}`;
+  const url = apiUrl(path);
   const response = await fetch(url, {
     ...options,
     headers: {

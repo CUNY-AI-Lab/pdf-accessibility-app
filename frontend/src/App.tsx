@@ -1,4 +1,5 @@
 import { BrowserRouter, Link, Route, Routes } from "react-router-dom";
+import { ROUTER_BASENAME } from "./api/client";
 import ErrorBoundary from "./components/ErrorBoundary";
 import Layout from "./components/Layout";
 import DashboardPage from "./pages/DashboardPage";
@@ -24,7 +25,7 @@ function NotFound() {
 export default function App() {
   return (
     <ErrorBoundary>
-      <BrowserRouter>
+      <BrowserRouter basename={ROUTER_BASENAME}>
         <Routes>
           <Route element={<Layout />}>
             <Route path="/" element={<UploadPage />} />

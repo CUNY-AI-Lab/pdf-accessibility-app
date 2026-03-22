@@ -1,5 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
+import { apiUrl } from "../api/client";
 import type { PipelineStep, ProgressEvent, StepName } from "../types";
 
 const INITIAL_STEPS: PipelineStep[] = [
@@ -105,7 +106,7 @@ export function useJobProgress(jobId: string, active = true, initialSteps?: Pipe
         sourceRef.current = null;
       }
 
-      const source = new EventSource(`/api/jobs/${jobId}/progress`);
+      const source = new EventSource(apiUrl(`/jobs/${jobId}/progress`));
       sourceRef.current = source;
 
       source.onopen = () => {

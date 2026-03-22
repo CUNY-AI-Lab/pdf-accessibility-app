@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        VITE_APP_BASE_PATH: ${VITE_APP_BASE_PATH:-/}
     env_file:
       - .env
     environment:

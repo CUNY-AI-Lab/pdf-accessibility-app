@@ -40,7 +40,6 @@ export default function JobDetailPage() {
   const pendingAppliedChanges = appliedChanges?.filter((change) => change.review_status === "pending_review") ?? [];
   const followUpCount = openReviewTasks.length;
   const appliedChangeCount = pendingAppliedChanges.length;
-  const reviewItemCount = followUpCount + appliedChangeCount;
   const [showDetails, setShowDetails] = useState(false);
   const reviewContextLoading =
     canInspectOutput && (reviewTasksLoading || appliedChangesLoading);

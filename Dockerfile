@@ -1,5 +1,8 @@
 FROM oven/bun:1.2.21 AS frontend-build
 
+ARG VITE_APP_BASE_PATH=/
+ENV VITE_APP_BASE_PATH=${VITE_APP_BASE_PATH}
+
 WORKDIR /app/frontend
 
 COPY frontend/package.json frontend/bun.lock ./

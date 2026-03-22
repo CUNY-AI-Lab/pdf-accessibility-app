@@ -1,3 +1,5 @@
+import { apiUrl } from "../api/client";
+
 interface DownloadButtonProps {
   jobId: string;
   filename: string;
@@ -11,8 +13,8 @@ export default function DownloadButton({
 }: DownloadButtonProps) {
   const href =
     type === "pdf"
-      ? `/api/jobs/${jobId}/download`
-      : `/api/jobs/${jobId}/download/report`;
+      ? apiUrl(`/jobs/${jobId}/download`)
+      : apiUrl(`/jobs/${jobId}/download/report`);
 
   const label = type === "pdf" ? "Download Accessible PDF" : "Download Report";
 

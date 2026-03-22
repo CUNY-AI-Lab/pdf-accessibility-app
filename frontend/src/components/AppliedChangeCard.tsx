@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { apiUrl } from "../api/client";
 import type { AppliedChange } from "../types";
 
 interface AppliedChangeCardProps {
@@ -95,7 +96,7 @@ export default function AppliedChangeCard({
       {isFigureDecision && figureIndex !== null && (
         <div className="mt-4">
           <img
-            src={`/api/jobs/${jobId}/figures/${figureIndex}/image`}
+            src={apiUrl(`/jobs/${jobId}/figures/${figureIndex}/image`)}
             alt={`Figure ${figureIndex + 1}`}
             className="max-h-48 rounded-lg border border-ink/8 bg-white object-contain"
             onError={(e) => {
