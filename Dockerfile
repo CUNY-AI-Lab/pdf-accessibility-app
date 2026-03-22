@@ -95,7 +95,7 @@ download_models(
     progress=False,
 )
 RapidOcrModel.download_models(
-    backend="onnxruntime",
+    backend="torch",
     local_dir=artifacts / RapidOcrModel._model_repo_folder,
     force=False,
     progress=False,

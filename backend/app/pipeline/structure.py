@@ -824,7 +824,10 @@ async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
 
     def _convert():
         from docling.datamodel.base_models import InputFormat
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.datamodel.pipeline_options import (
+            PdfPipelineOptions,
+            RapidOcrOptions,
+        )
         from docling.document_converter import DocumentConverter, PdfFormatOption
 
         def _convert_one(path: Path):
@@ -833,6 +836,7 @@ async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
                 images_scale=2.0,
                 do_picture_classification=True,
                 do_table_structure=True,
+                ocr_options=RapidOcrOptions(backend="torch"),
             )
             converter = DocumentConverter(
                 format_options={

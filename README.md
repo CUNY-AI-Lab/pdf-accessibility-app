@@ -290,7 +290,7 @@ Notes:
 - Set a real remote `LLM_API_KEY` in `.env` before deployment, or disable strict validation for a local LLM endpoint.
 - The backend persists uploads, processing artifacts, outputs, and SQLite data in the `pdf_accessibility_data` volume.
 - Runtime caches live in `pdf_accessibility_cache`, which avoids redownloading transient assets into the container filesystem.
-- The image preloads the Docling models this app uses into `/home/app/artifacts/docling`, so the normal OCR/layout/table/picture-classifier path does not need first-run downloads.
+- The image preloads the Docling models this app uses into `/home/app/artifacts/docling`, including the RapidOCR torch artifacts used by the PDF pipeline, so the normal OCR/layout/table/picture-classifier path does not need first-run downloads.
 - Docling debug output is redirected to `/app/data/debug`, which keeps optional debug writes off the read-only app/venv paths.
 - If `8080` is already in use, set `APP_PORT` in `.env` before starting the stack.
 - For subpath deployments, set `VITE_APP_BASE_PATH` in `.env` before building, for example `VITE_APP_BASE_PATH=/pdf-accessibility/`.
