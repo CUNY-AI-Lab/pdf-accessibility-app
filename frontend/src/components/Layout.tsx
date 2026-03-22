@@ -15,7 +15,7 @@ export default function Layout() {
         <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
           <Link to="/" className="flex items-center gap-3 no-underline group shrink-0">
             <img
-              src="/cuny-ai-lab-logo.png"
+              src={`${import.meta.env.BASE_URL}cuny-ai-lab-logo.png`}
               alt="CUNY AI Lab"
               className="h-7 w-auto transition-opacity duration-200 group-hover:opacity-80"
             />
