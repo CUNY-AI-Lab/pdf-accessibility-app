@@ -6,6 +6,7 @@ downloaded at runtime, which dramatically reduces cold start time.
 
 from pathlib import Path
 
+from docling.models.stages.ocr.rapid_ocr_model import RapidOcrModel
 from docling.utils.model_downloader import download_models
 
 # Use the default cache directory inside the container
@@ -30,4 +31,14 @@ download_models(
     progress=True,
 )
 
-print(f"Preloaded Docling artifacts into {artifacts}")
+# RapidOCR models are downloaded separately — Docling's download_models
+# doesn't handle them. Without this, the worker fails at runtime when
+# processing mixed/scanned PDFs.
+RapidOcrModel.download_models(
+    backend="torch",
+    local_dir=artifacts / RapidOcrModel._model_repo_folder,
+    force=False,
+    progress=True,
+)
+
+print(f"Preloaded Docling artifacts (including RapidOCR) into {artifacts}")
