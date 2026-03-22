@@ -47,7 +47,6 @@ export default function AppliedChangeCard({
   const altText = getAltText(change);
   const decorative = isDecorative(change);
   const anyBusy = keeping || undoing || revising || editing;
-  const isAlreadyKept = change.review_status === "kept";
   const isPending = change.review_status === "pending_review";
 
   const severityClasses = {
