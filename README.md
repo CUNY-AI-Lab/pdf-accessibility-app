@@ -289,7 +289,9 @@ Notes:
 - `docker compose` reads LLM settings from the root `.env`.
 - Set a real remote `LLM_API_KEY` in `.env` before deployment, or disable strict validation for a local LLM endpoint.
 - The backend persists uploads, processing artifacts, outputs, and SQLite data in the `pdf_accessibility_data` volume.
-- Runtime caches live in `pdf_accessibility_cache`, which avoids redownloading model assets into the container filesystem.
+- Runtime caches live in `pdf_accessibility_cache`, which avoids redownloading transient assets into the container filesystem.
+- The image preloads the Docling models this app uses into `/home/app/artifacts/docling`, so the normal OCR/layout/table/picture-classifier path does not need first-run downloads.
+- Docling debug output is redirected to `/app/data/debug`, which keeps optional debug writes off the read-only app/venv paths.
 - If `8080` is already in use, set `APP_PORT` in `.env` before starting the stack.
 - For subpath deployments, set `VITE_APP_BASE_PATH` in `.env` before building, for example `VITE_APP_BASE_PATH=/pdf-accessibility/`.
 - Container health is exposed at <http://127.0.0.1:8080/health>.
