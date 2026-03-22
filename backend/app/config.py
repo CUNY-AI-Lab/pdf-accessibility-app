@@ -90,6 +90,11 @@ class Settings(BaseSettings):
     llm_retry_max_backoff_seconds: float = 60.0
     llm_max_concurrency: int = 4
 
+    # RunPod serverless (Docling structure extraction)
+    runpod_endpoint_id: str = ""
+    runpod_api_key: str = ""
+    runpod_timeout: int = 300  # 5 min — allows for cold starts
+
     # Dev
     debug: bool = False
 

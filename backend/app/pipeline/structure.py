@@ -819,105 +819,229 @@ def _repair_pdf_with_ghostscript(
     return output_path.exists() and output_path.stat().st_size > 0
 
 
-async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
-    """Extract document structure using Docling."""
+async def _convert_via_runpod(
+    pdf_path: Path,
+    job_dir: Path,
+    endpoint_id: str,
+    api_key: str,
+    timeout: int,
+) -> tuple[dict, list[FigureInfo]]:
+    """Send PDF to RunPod serverless Docling endpoint and return (doc_dict, figures).
 
-    def _convert():
-        from docling.datamodel.base_models import InputFormat
-        from docling.datamodel.pipeline_options import (
-            PdfPipelineOptions,
-            RapidOcrOptions,
+    The RunPod worker returns the same Docling export_to_dict() output as the
+    local converter, plus base64-encoded figure images.
+    """
+    import base64
+    import time
+
+    import httpx
+
+    pdf_b64 = base64.b64encode(pdf_path.read_bytes()).decode()
+    url = f"https://api.runpod.ai/v2/{endpoint_id}/run"
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+        # Submit job
+        resp = await client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"input": {"pdf_base64": pdf_b64, "filename": pdf_path.name}},
         )
-        from docling.document_converter import DocumentConverter, PdfFormatOption
+        resp.raise_for_status()
+        job_id = resp.json()["id"]
+        logger.info("RunPod job submitted: %s", job_id)
 
-        def _convert_one(path: Path):
-            pipeline_options = PdfPipelineOptions(
-                generate_picture_images=True,
-                images_scale=2.0,
-                do_picture_classification=True,
-                do_table_structure=True,
-                ocr_options=RapidOcrOptions(backend="torch"),
-            )
-            converter = DocumentConverter(
-                format_options={
-                    InputFormat.PDF: PdfFormatOption(
-                        pipeline_options=pipeline_options,
-                    ),
-                }
-            )
-            return converter.convert(str(path))
-
-        source_pdf = pdf_path
-        processed_pdf_path = source_pdf
-        repaired_pdf = job_dir / "repaired_input.pdf"
-        try:
-            conv_result = _convert_one(source_pdf)
-        except Exception:
-            if _repair_pdf_with_ghostscript(source_pdf, repaired_pdf):
-                logger.warning(
-                    "Docling failed on %s; retrying structure extraction with Ghostscript-repaired file",
-                    source_pdf.name,
+        # Poll for completion
+        status_url = f"https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}"
+        start = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - start
+            if elapsed > timeout:
+                raise TimeoutError(
+                    f"RunPod job {job_id} did not complete within {timeout}s"
                 )
-                conv_result = _convert_one(repaired_pdf)
-                processed_pdf_path = repaired_pdf
-            else:
-                raise
+            await asyncio.sleep(min(5, max(1, 5 - elapsed / 60)))
+            status_resp = await client.get(
+                status_url,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            status_resp.raise_for_status()
+            data = status_resp.json()
+            status = data.get("status")
+            if status == "COMPLETED":
+                logger.info(
+                    "RunPod job %s completed (delay=%sms, exec=%sms)",
+                    job_id,
+                    data.get("delayTime"),
+                    data.get("executionTime"),
+                )
+                break
+            if status == "FAILED":
+                raise RuntimeError(
+                    f"RunPod job {job_id} failed: {data.get('error', 'unknown')}"
+                )
 
-        doc = conv_result.document
-        doc_dict = doc.export_to_dict()
+    output = data["output"]  # type: ignore[possibly-undefined]  # always set via break on COMPLETED
+    doc_dict = output["document"]
 
-        # Extract and save figure images
-        figures = []
-        figures_dir = job_dir / "figures"
-        figures_dir.mkdir(exist_ok=True)
+    # Reconstruct figure images from base64
+    figures = []
+    figures_dir = job_dir / "figures"
+    figures_dir.mkdir(exist_ok=True)
 
-        dict_pictures = doc_dict.get("pictures", [])
+    dict_pictures = doc_dict.get("pictures", [])
 
-        for i, element in enumerate(doc.pictures if hasattr(doc, 'pictures') else []):
-            try:
-                img = element.get_image(conv_result)
-                if img:
-                    fig_path = figures_dir / f"figure_{i}.png"
-                    img.save(str(fig_path), "PNG")
-                    caption = None
-                    if i < len(dict_pictures):
-                        caption = _get_caption_text(dict_pictures[i], doc_dict)
-                    figures.append(FigureInfo(
-                        index=i,
-                        path=fig_path,
-                        caption=caption,
-                        page=(element.prov[0].page_no - 1) if element.prov else None,
-                        bbox=_extract_bbox(element.prov) if getattr(element, "prov", None) else None,
-                    ))
-            except Exception as e:
-                logger.warning(f"Failed to extract figure {i}: {e}")
+    for fig_data in output.get("figures", []):
+        i = fig_data["index"]
+        img_b64 = fig_data.get("image_base64")
+        if not img_b64:
+            continue
+        fig_path = figures_dir / f"figure_{i}.png"
+        fig_path.write_bytes(base64.b64decode(img_b64))
 
-        # Normalize into elements array and infer heading levels
-        elements = _normalize_docling_elements(doc_dict)
-        _infer_heading_levels(elements)
-        title = _extract_title_from_docling(doc_dict, elements)
+        caption = None
+        if i < len(dict_pictures):
+            caption = _get_caption_text(dict_pictures[i], doc_dict)
 
-        page_count = len(doc_dict.get("pages", {}))
-        figures_count = len(figures)
-        headings_count = sum(1 for el in elements if el["type"] == "heading")
-        tables_count = sum(1 for el in elements if el["type"] == "table")
+        page = fig_data.get("page")
 
-        structure = {
-            "source": str(pdf_path.name),
-            "page_count": page_count,
-            "title": title,
-            "elements": elements,
-            "figures_count": figures_count,
-        }
+        # Extract bbox from the dict_pictures provenance data
+        bbox = None
+        if i < len(dict_pictures):
+            prov = dict_pictures[i].get("prov", [])
+            bbox = _extract_bbox(prov)
 
-        return StructureResult(
-            document_json=structure,
-            figures=figures,
-            processed_pdf_path=processed_pdf_path,
-            page_count=page_count,
-            headings_count=headings_count,
-            tables_count=tables_count,
-            figures_count=figures_count,
+        figures.append(FigureInfo(
+            index=i,
+            path=fig_path,
+            caption=caption,
+            page=page,
+            bbox=bbox,
+        ))
+
+    return doc_dict, figures
+
+
+async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
+    """Extract document structure using Docling.
+
+    When RUNPOD_ENDPOINT_ID and RUNPOD_API_KEY are set, the conversion is
+    offloaded to a RunPod serverless GPU worker. Otherwise Docling runs locally.
+    """
+    settings = get_settings()
+    use_runpod = bool(settings.runpod_endpoint_id and settings.runpod_api_key)
+
+    if use_runpod:
+        logger.info("Using RunPod serverless endpoint for structure extraction")
+        doc_dict, figures = await _convert_via_runpod(
+            pdf_path,
+            job_dir,
+            settings.runpod_endpoint_id,
+            settings.runpod_api_key,
+            settings.runpod_timeout,
         )
+        processed_pdf_path = pdf_path
+    else:
+        def _convert():
+            from docling.datamodel.base_models import InputFormat
+            from docling.datamodel.pipeline_options import (
+                PdfPipelineOptions,
+                RapidOcrOptions,
+            )
+            from docling.document_converter import DocumentConverter, PdfFormatOption
 
-    return await asyncio.to_thread(_convert)
+            def _convert_one(path: Path):
+                pipeline_options = PdfPipelineOptions(
+                    generate_picture_images=True,
+                    images_scale=2.0,
+                    do_picture_classification=True,
+                    do_table_structure=True,
+                    ocr_options=RapidOcrOptions(backend="torch"),
+                )
+                converter = DocumentConverter(
+                    format_options={
+                        InputFormat.PDF: PdfFormatOption(
+                            pipeline_options=pipeline_options,
+                        ),
+                    }
+                )
+                return converter.convert(str(path))
+
+            source_pdf = pdf_path
+            result_processed_pdf_path = source_pdf
+            repaired_pdf = job_dir / "repaired_input.pdf"
+            try:
+                conv_result = _convert_one(source_pdf)
+            except Exception:
+                if _repair_pdf_with_ghostscript(source_pdf, repaired_pdf):
+                    logger.warning(
+                        "Docling failed on %s; retrying structure extraction with Ghostscript-repaired file",
+                        source_pdf.name,
+                    )
+                    conv_result = _convert_one(repaired_pdf)
+                    result_processed_pdf_path = repaired_pdf
+                else:
+                    raise
+
+            doc = conv_result.document
+            doc_dict = doc.export_to_dict()
+
+            # Extract and save figure images
+            figures = []
+            figures_dir = job_dir / "figures"
+            figures_dir.mkdir(exist_ok=True)
+
+            dict_pictures = doc_dict.get("pictures", [])
+
+            for i, element in enumerate(doc.pictures if hasattr(doc, 'pictures') else []):
+                try:
+                    img = element.get_image(conv_result)
+                    if img:
+                        fig_path = figures_dir / f"figure_{i}.png"
+                        img.save(str(fig_path), "PNG")
+                        caption = None
+                        if i < len(dict_pictures):
+                            caption = _get_caption_text(dict_pictures[i], doc_dict)
+                        figures.append(FigureInfo(
+                            index=i,
+                            path=fig_path,
+                            caption=caption,
+                            page=(element.prov[0].page_no - 1) if element.prov else None,
+                            bbox=_extract_bbox(element.prov) if getattr(element, "prov", None) else None,
+                        ))
+                except Exception as e:
+                    logger.warning(f"Failed to extract figure {i}: {e}")
+
+            return doc_dict, figures, result_processed_pdf_path
+
+        doc_dict, figures, processed_pdf_path = await asyncio.to_thread(_convert)
+
+    # Normalize into elements array and infer heading levels
+    elements = _normalize_docling_elements(doc_dict)
+    _infer_heading_levels(elements)
+    title = _extract_title_from_docling(doc_dict, elements)
+
+    page_count = len(doc_dict.get("pages", {}))
+    figures_count = len(figures)
+    headings_count = sum(1 for el in elements if el["type"] == "heading")
+    tables_count = sum(1 for el in elements if el["type"] == "table")
+
+    structure = {
+        "source": str(pdf_path.name),
+        "page_count": page_count,
+        "title": title,
+        "elements": elements,
+        "figures_count": figures_count,
+    }
+
+    return StructureResult(
+        document_json=structure,
+        figures=figures,
+        processed_pdf_path=processed_pdf_path,
+        page_count=page_count,
+        headings_count=headings_count,
+        tables_count=tables_count,
+        figures_count=figures_count,
+    )
