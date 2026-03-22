@@ -44,6 +44,23 @@ Frontend proxies `/api` and `/health` to `http://localhost:8001` via Vite config
 5. Tag (pikepdf PDF/UA)
 6. Validate (veraPDF)
 
+## Fidelity Check
+Post-remediation quality gate in `backend/app/pipeline/fidelity.py`. Runs after
+tagging/validation to detect content issues the validator can't catch.
+
+Key checks: text drift, reading order, table coverage, form labels, font fidelity.
+
+**Text drift** uses classification-aware comparison:
+- **Digital PDFs**: strict symmetric similarity via `SequenceMatcher` (threshold 0.82)
+- **Mixed/Scanned PDFs**: asymmetric metrics via `rapidfuzz` — measures *containment*
+  (is original text preserved in output?) and *preservation* (were original characters
+  corrupted?) rather than penalizing OCR-added text. This avoids false positives when
+  OCR legitimately expands the text layer.
+
+Blocking fidelity tasks surface on the review page via `FidelityIssueCard` with
+task-type-specific metadata (similarity scores, page numbers, table counts, etc.).
+Task types are registered in `backend/app/services/review_surface.py`.
+
 ## RunPod Serverless (Docling)
 Structure extraction can be offloaded to a RunPod serverless GPU endpoint to
 avoid running Docling's ML models locally. Set `RUNPOD_ENDPOINT_ID` and

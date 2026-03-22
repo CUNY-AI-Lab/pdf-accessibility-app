@@ -35,7 +35,7 @@ export function previewPagesForTask(task: ReviewTask): number[] {
     }
   }
 
-  for (const key of ["poor_links", "broken_links"]) {
+  for (const key of ["poor_links", "broken_links", "table_review_targets", "targets", "field_review_targets"]) {
     for (const page of pagesFromEntries(task, key)) {
       if (page > 0) {
         pages.add(page);

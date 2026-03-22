@@ -12,9 +12,18 @@ import {
   useUndoAppliedChange,
 } from "../api/jobs";
 import AppliedChangeCard from "../components/AppliedChangeCard";
+import FidelityIssueCard from "../components/FidelityIssueCard";
 import { ChevronLeftIcon } from "../components/Icons";
 import ReviewTaskCard from "../components/ReviewTaskCard";
 import type { AppliedChange } from "../types";
+
+const FIDELITY_TASK_TYPES = new Set([
+  "content_fidelity",
+  "reading_order",
+  "table_semantics",
+  "form_semantics",
+  "font_text_fidelity",
+]);
 
 function actionSubject(change: AppliedChange): string {
   return change.change_type === "figure_semantics" ? "image description" : "change";
@@ -63,9 +72,18 @@ export default function ReviewPage() {
   const pendingIds = new Set(pendingAppliedChanges.map((c) => c.id));
   const keptFigureChanges = figureChanges?.filter((c) => !pendingIds.has(c.id) && c.review_status === "kept") ?? [];
   const hasFigureCards = pendingAppliedChanges.some((c) => c.change_type === "figure_semantics") || keptFigureChanges.length > 0;
-  const openReviewTasks = (reviewTasks?.filter((task) => task.status === "pending_review") ?? [])
+  const allOpenTasks = reviewTasks?.filter((task) => task.status === "pending_review") ?? [];
+  const blockingFidelityTasks = allOpenTasks.filter(
+    (task) => task.blocking && FIDELITY_TASK_TYPES.has(task.task_type),
+  );
+  const nonBlockingFidelityTasks = allOpenTasks.filter(
+    (task) => !task.blocking && FIDELITY_TASK_TYPES.has(task.task_type),
+  );
+  const optionalReviewTasks = allOpenTasks
+    .filter((task) => !FIDELITY_TASK_TYPES.has(task.task_type))
     .filter((task) => !(task.task_type === "alt_text" && hasFigureCards));
-  const hasReviewItems = pendingAppliedChanges.length > 0 || openReviewTasks.length > 0;
+  const additionalCheckTasks = [...nonBlockingFidelityTasks, ...optionalReviewTasks];
+  const hasReviewItems = pendingAppliedChanges.length > 0 || allOpenTasks.length > 0;
 
   const handleKeepAppliedChange = async (change: AppliedChange) => {
     setChangeActionErrorId(null);
@@ -212,23 +230,52 @@ export default function ReviewPage() {
         </div>
       </div>
 
-      {reviewContextError ? (
+      {reviewContextError && (
         <div className="mb-8 rounded-xl border border-warning/30 bg-warning-light/20 p-5">
           <p className="text-sm text-ink-muted">
             Could not load review details. Download links still reflect the current output.
           </p>
         </div>
-      ) : isManualRemediation ? (
-        <div className="mb-8 rounded-xl border border-warning/30 bg-warning-light/20 p-5">
-          <p className="text-sm text-ink-muted">
-            This PDF needs manual fixes. You can review image descriptions and optional checks below, but some issues require tools outside the app.
-          </p>
-        </div>
-      ) : null}
+      )}
 
-      {isManualRemediation && (
+      {blockingFidelityTasks.length > 0 && (
+        <section className="space-y-4 mb-8">
+          <div className="rounded-xl border border-error/20 bg-error-light/10 p-6">
+            <h2 className="text-lg text-ink mb-1">
+              Issues requiring external tools
+            </h2>
+            <p className="text-sm text-ink-muted">
+              {blockingFidelityTasks.length === 1
+                ? "1 issue was detected that cannot be fixed within this app."
+                : `${blockingFidelityTasks.length} issues were detected that cannot be fixed within this app.`}
+              {" "}Use a tool like Adobe Acrobat Pro to address {blockingFidelityTasks.length === 1 ? "it" : "them"}.
+            </p>
+            <div className="mt-4 flex flex-wrap items-center gap-4">
+              <a
+                href={apiUrl(`/jobs/${id}/download`)}
+                download={job ? `accessible_${job.original_filename}` : undefined}
+                className="inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white no-underline hover:bg-accent/90"
+              >
+                Download Accessible PDF
+              </a>
+              <a
+                href={apiUrl(`/jobs/${id}/download/report`)}
+                download={job ? `report_${job.original_filename}.json` : undefined}
+                className="text-sm text-accent font-medium no-underline hover:underline"
+              >
+                Download report
+              </a>
+            </div>
+          </div>
+          {blockingFidelityTasks.map((task) => (
+            <FidelityIssueCard key={task.id} jobId={id!} task={task} />
+          ))}
+        </section>
+      )}
+
+      {isManualRemediation && blockingFidelityTasks.length === 0 && (
         <div className="mb-8 rounded-xl border border-warning/30 bg-warning-light/30 p-6">
-          <h2 className="text-2xl text-ink tracking-tight mb-2">
+          <h2 className="text-lg text-ink mb-1">
             Needs manual fixes
           </h2>
           <p className="text-sm text-ink-muted">
@@ -236,18 +283,18 @@ export default function ReviewPage() {
           </p>
           <div className="mt-4 flex flex-wrap items-center gap-4">
             <a
+              href={apiUrl(`/jobs/${id}/download`)}
+              download={job ? `accessible_${job.original_filename}` : undefined}
+              className="inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white no-underline hover:bg-accent/90"
+            >
+              Download Accessible PDF
+            </a>
+            <a
               href={apiUrl(`/jobs/${id}/download/report`)}
               download={job ? `report_${job.original_filename}.json` : undefined}
               className="text-sm text-accent font-medium no-underline hover:underline"
             >
               Download report
-            </a>
-            <a
-              href={apiUrl(`/jobs/${id}/download`)}
-              download={job ? `accessible_${job.original_filename}` : undefined}
-              className="text-sm text-accent font-medium no-underline hover:underline"
-            >
-              Download current PDF
             </a>
           </div>
         </div>
@@ -311,7 +358,7 @@ export default function ReviewPage() {
         </section>
       )}
 
-      {openReviewTasks.length > 0 && (
+      {additionalCheckTasks.length > 0 && (
         <section className="space-y-4 mb-8">
           <div className="rounded-xl border border-ink/6 bg-cream p-5">
             <h2 className="text-lg text-ink mb-1">Additional checks</h2>
@@ -320,13 +367,13 @@ export default function ReviewPage() {
             </p>
           </div>
           <div className="space-y-4">
-            {openReviewTasks.map((task) => (
-              <ReviewTaskCard
-                key={task.id}
-                jobId={id!}
-                task={task}
-              />
-            ))}
+            {additionalCheckTasks.map((task) =>
+              FIDELITY_TASK_TYPES.has(task.task_type) ? (
+                <FidelityIssueCard key={task.id} jobId={id!} task={task} />
+              ) : (
+                <ReviewTaskCard key={task.id} jobId={id!} task={task} />
+              ),
+            )}
           </div>
         </section>
       )}

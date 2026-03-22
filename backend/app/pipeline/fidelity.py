@@ -13,6 +13,8 @@ from typing import Any
 
 import pikepdf
 from pdfminer.high_level import extract_text
+from rapidfuzz.distance import Levenshtein
+from rapidfuzz.fuzz import partial_ratio
 from PIL import Image
 
 from app.services.form_fields import extract_widget_fields
@@ -68,6 +70,10 @@ SCANNED_TEXT_MIN_CHARS = 40
 OCR_VISUAL_SAMPLE_MAX_PAGES = 3
 OCR_VISUAL_NONWHITE_THRESHOLD = 245
 OCR_VISUAL_MIN_INK_RATIO = 0.001
+OCR_CONTAINMENT_FAIL = 85
+OCR_CONTAINMENT_WARN = 92
+OCR_PRESERVATION_FAIL = 0.90
+OCR_PRESERVATION_WARN = 0.95
 STRUCTURE_FRAGMENT_LIMIT = 24
 STRUCTURE_FRAGMENT_MIN_LEN = 18
 NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
@@ -108,6 +114,26 @@ def _strip_subset_prefix(value: str | None) -> str:
     if FONT_SUBSET_RE.match(raw):
         return raw.split("+", 1)[1]
     return raw
+
+
+def _compute_preservation(source: str, output: str) -> float:
+    """Compute how well the source text is preserved in the output.
+
+    Uses Levenshtein opcodes to decompose edits into insert/replace/delete.
+    Only replacements and deletions count against the score — insertions
+    (OCR adding new text) are expected and not penalized.
+
+    Returns a score from 0.0 to 1.0 where 1.0 means perfect preservation.
+    """
+    if not source:
+        return 1.0
+    opcodes = Levenshtein.opcodes(source, output)
+    damaged_chars = sum(
+        src_end - src_start
+        for tag, src_start, src_end, _, _ in opcodes
+        if tag in ("replace", "delete")
+    )
+    return 1.0 - (damaged_chars / len(source))
 
 
 def _extract_pdf_text_sample(path: Path) -> str:
@@ -1081,70 +1107,155 @@ def assess_fidelity(
                         "original_length_ratio": round(original_length_ratio, 4),
                     },
                 )
-        if similarity < 0.82 or length_ratio < 0.7 or length_ratio > 1.45:
-            status = "fail"
-            add_task(
-                "review:content_fidelity",
-                task_type="content_fidelity",
-                title="Verify extracted text fidelity",
-                detail=(
-                    "The remediated PDF text differs substantially from the source text sample. "
-                    "Check for OCR drift, Unicode remaps, or missing content."
-                ),
-                severity="high",
-                blocking=True,
-                metadata={
-                    "similarity": round(similarity, 4),
-                    "length_ratio": round(length_ratio, 4),
-                },
-            )
-        elif similarity < 0.9 or length_ratio < 0.85 or length_ratio > 1.2:
-            status = "warning"
-            add_task(
-                "review:content_fidelity",
-                task_type="content_fidelity",
-                title="Spot-check extracted text fidelity",
-                detail=(
-                    "The remediated PDF text sample differs moderately from the source. "
-                    "A manual spot-check is recommended."
-                ),
-                severity="medium",
-                blocking=False,
-                metadata={
-                    "similarity": round(similarity, 4),
-                    "length_ratio": round(length_ratio, 4),
-                },
-            )
-        checks.append(
-            {
-                "check": "text_drift",
-                "status": status,
-                "message": (
-                    "Compared the final PDF against the source used for the final tagging pass."
-                    if using_alternate_source
-                    else "Compared source and remediated text samples."
-                ),
-                "metrics": {
-                    "similarity": round(similarity, 4),
-                    "length_ratio": round(length_ratio, 4),
-                    "source_chars": len(source_text),
-                    "output_chars": len(output_text),
-                    "comparison_source": "retag_input"
-                    if using_alternate_source
-                    else "original_input",
-                    **(
-                        {"original_similarity": round(original_similarity, 4)}
-                        if original_similarity is not None
-                        else {}
+
+        is_ocr_document = classification in ("scanned", "mixed")
+
+        if is_ocr_document:
+            # For scanned/mixed PDFs, use asymmetric metrics: OCR legitimately
+            # adds text from images, so we measure whether the *original* text
+            # is preserved (containment + preservation) rather than whether the
+            # texts match symmetrically.
+            containment = partial_ratio(source_text, output_text)
+            preservation = _compute_preservation(source_text, output_text)
+
+            if containment < OCR_CONTAINMENT_FAIL or preservation < OCR_PRESERVATION_FAIL or length_ratio < 0.7:
+                status = "fail"
+                add_task(
+                    "review:content_fidelity",
+                    task_type="content_fidelity",
+                    title="Verify extracted text fidelity",
+                    detail=(
+                        "The original text may not be fully preserved in the remediated PDF. "
+                        "Check for corrupted or missing text in pages that had an existing text layer."
                     ),
-                    **(
-                        {"original_length_ratio": round(original_length_ratio, 4)}
-                        if original_length_ratio is not None
-                        else {}
+                    severity="high",
+                    blocking=True,
+                    metadata={
+                        "similarity": round(similarity, 4),
+                        "length_ratio": round(length_ratio, 4),
+                        "containment": round(containment, 1),
+                        "preservation": round(preservation, 4),
+                    },
+                )
+            elif containment < OCR_CONTAINMENT_WARN or preservation < OCR_PRESERVATION_WARN:
+                status = "warning"
+                add_task(
+                    "review:content_fidelity",
+                    task_type="content_fidelity",
+                    title="Spot-check extracted text fidelity",
+                    detail=(
+                        "Minor differences detected between source and remediated text. "
+                        "A manual spot-check of pages with existing text is recommended."
                     ),
-                },
-            }
-        )
+                    severity="medium",
+                    blocking=False,
+                    metadata={
+                        "similarity": round(similarity, 4),
+                        "length_ratio": round(length_ratio, 4),
+                        "containment": round(containment, 1),
+                        "preservation": round(preservation, 4),
+                    },
+                )
+
+            checks.append(
+                {
+                    "check": "text_drift",
+                    "status": status,
+                    "message": (
+                        f"OCR document ({classification}): measured text containment and preservation "
+                        f"instead of symmetric similarity."
+                    ),
+                    "metrics": {
+                        "similarity": round(similarity, 4),
+                        "length_ratio": round(length_ratio, 4),
+                        "containment": round(containment, 1),
+                        "preservation": round(preservation, 4),
+                        "source_chars": len(source_text),
+                        "output_chars": len(output_text),
+                        "comparison_source": "retag_input"
+                        if using_alternate_source
+                        else "original_input",
+                        **(
+                            {"original_similarity": round(original_similarity, 4)}
+                            if original_similarity is not None
+                            else {}
+                        ),
+                        **(
+                            {"original_length_ratio": round(original_length_ratio, 4)}
+                            if original_length_ratio is not None
+                            else {}
+                        ),
+                    },
+                }
+            )
+        else:
+            # Digital PDFs: use strict symmetric similarity thresholds.
+            # The text layer should be preserved with minimal drift.
+            if similarity < 0.82 or length_ratio < 0.7 or length_ratio > 1.45:
+                status = "fail"
+                add_task(
+                    "review:content_fidelity",
+                    task_type="content_fidelity",
+                    title="Verify extracted text fidelity",
+                    detail=(
+                        "The remediated PDF text differs substantially from the source text sample. "
+                        "Check for OCR drift, Unicode remaps, or missing content."
+                    ),
+                    severity="high",
+                    blocking=True,
+                    metadata={
+                        "similarity": round(similarity, 4),
+                        "length_ratio": round(length_ratio, 4),
+                    },
+                )
+            elif similarity < 0.9 or length_ratio < 0.85 or length_ratio > 1.2:
+                status = "warning"
+                add_task(
+                    "review:content_fidelity",
+                    task_type="content_fidelity",
+                    title="Spot-check extracted text fidelity",
+                    detail=(
+                        "The remediated PDF text sample differs moderately from the source. "
+                        "A manual spot-check is recommended."
+                    ),
+                    severity="medium",
+                    blocking=False,
+                    metadata={
+                        "similarity": round(similarity, 4),
+                        "length_ratio": round(length_ratio, 4),
+                    },
+                )
+
+            checks.append(
+                {
+                    "check": "text_drift",
+                    "status": status,
+                    "message": (
+                        "Compared the final PDF against the source used for the final tagging pass."
+                        if using_alternate_source
+                        else "Compared source and remediated text samples."
+                    ),
+                    "metrics": {
+                        "similarity": round(similarity, 4),
+                        "length_ratio": round(length_ratio, 4),
+                        "source_chars": len(source_text),
+                        "output_chars": len(output_text),
+                        "comparison_source": "retag_input"
+                        if using_alternate_source
+                        else "original_input",
+                        **(
+                            {"original_similarity": round(original_similarity, 4)}
+                            if original_similarity is not None
+                            else {}
+                        ),
+                        **(
+                            {"original_length_ratio": round(original_length_ratio, 4)}
+                            if original_length_ratio is not None
+                            else {}
+                        ),
+                    },
+                }
+            )
     else:
         checks.append(
             {

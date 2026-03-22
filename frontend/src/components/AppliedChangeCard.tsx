@@ -47,6 +47,8 @@ export default function AppliedChangeCard({
   const altText = getAltText(change);
   const decorative = isDecorative(change);
   const anyBusy = keeping || undoing || revising || editing;
+  const isAlreadyKept = change.review_status === "kept";
+  const isPending = change.review_status === "pending_review";
 
   const severityClasses = {
     high: "bg-error-light text-error",
@@ -172,53 +174,57 @@ export default function AppliedChangeCard({
         </details>
       )}
 
-      <div className="mt-4 flex flex-wrap gap-2">
-        <button
-          type="button"
-          onClick={() => onKeep(change)}
-          disabled={anyBusy}
-          className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
-        >
-          {keepLabel}
-        </button>
-        <button
-          type="button"
-          onClick={() => onUndo(change)}
-          disabled={anyBusy}
-          className="rounded-lg border border-ink/10 bg-white px-4 py-2 text-sm font-medium text-ink disabled:opacity-50"
-        >
-          {undoLabel}
-        </button>
-      </div>
-
-      <details className="mt-4">
-        <summary className="cursor-pointer text-xs font-medium text-ink-muted hover:text-ink">
-          Retry with AI feedback
-        </summary>
-        <div className="mt-2 rounded-lg border border-ink/8 bg-white/70 p-3">
-          <textarea
-            value={feedback}
-            onChange={(event) => setFeedback(event.target.value)}
-            rows={3}
-            className="w-full rounded-lg border border-ink/10 bg-white px-3 py-2 text-sm text-ink placeholder:text-ink-muted/70"
-            placeholder={
-              isFigureDecision
-                ? "Describe how this image should be handled. The app will regenerate the description and rerun tagging and validation."
-                : "Explain what should change and the app will retry this edit."
-            }
-          />
-          <div className="mt-3 flex justify-end">
-            <button
-              type="button"
-              onClick={() => onRevise(change, feedback)}
-              disabled={!feedback.trim() || anyBusy}
-              className="rounded-lg border border-accent/20 bg-accent/10 px-4 py-2 text-sm font-medium text-accent disabled:opacity-50"
-            >
-              {retryLabel}
-            </button>
-          </div>
+      {isPending && (
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => onKeep(change)}
+            disabled={anyBusy}
+            className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+          >
+            {keepLabel}
+          </button>
+          <button
+            type="button"
+            onClick={() => onUndo(change)}
+            disabled={anyBusy}
+            className="rounded-lg border border-ink/10 bg-white px-4 py-2 text-sm font-medium text-ink disabled:opacity-50"
+          >
+            {undoLabel}
+          </button>
         </div>
-      </details>
+      )}
+
+      {isPending && (
+        <details className="mt-4">
+          <summary className="cursor-pointer text-xs font-medium text-ink-muted hover:text-ink">
+            Retry with AI feedback
+          </summary>
+          <div className="mt-2 rounded-lg border border-ink/8 bg-white/70 p-3">
+            <textarea
+              value={feedback}
+              onChange={(event) => setFeedback(event.target.value)}
+              rows={3}
+              className="w-full rounded-lg border border-ink/10 bg-white px-3 py-2 text-sm text-ink placeholder:text-ink-muted/70"
+              placeholder={
+                isFigureDecision
+                  ? "Describe how this image should be handled. The app will regenerate the description and rerun tagging and validation."
+                  : "Explain what should change and the app will retry this edit."
+              }
+            />
+            <div className="mt-3 flex justify-end">
+              <button
+                type="button"
+                onClick={() => onRevise(change, feedback)}
+                disabled={!feedback.trim() || anyBusy}
+                className="rounded-lg border border-accent/20 bg-accent/10 px-4 py-2 text-sm font-medium text-accent disabled:opacity-50"
+              >
+                {retryLabel}
+              </button>
+            </div>
+          </div>
+        </details>
+      )}
 
       {actionError && (
         <div className="mt-3 rounded-lg border border-error/25 bg-error-light/40 px-3 py-2 text-sm text-error">
