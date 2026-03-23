@@ -90,10 +90,11 @@ class Settings(BaseSettings):
     llm_retry_max_backoff_seconds: float = 60.0
     llm_max_concurrency: int = 4
 
-    # RunPod serverless (Docling structure extraction)
-    runpod_endpoint_id: str = ""
-    runpod_api_key: str = ""
-    runpod_timeout: int = 300  # 5 min — allows for cold starts
+    # Docling-serve persistent server (preferred — zero cold start)
+    docling_serve_url: str = ""
+    docling_serve_timeout: int = 300  # 5 min
+    docling_serve_ocr_engine: str = "rapidocr"
+
 
     # Dev
     debug: bool = False

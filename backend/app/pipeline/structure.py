@@ -819,107 +819,159 @@ def _repair_pdf_with_ghostscript(
     return output_path.exists() and output_path.stat().st_size > 0
 
 
-async def _convert_via_runpod(
+async def _convert_via_docling_serve(
     pdf_path: Path,
     job_dir: Path,
-    endpoint_id: str,
-    api_key: str,
+    base_url: str,
     timeout: int,
+    ocr_engine: str = "rapidocr",
 ) -> tuple[dict, list[FigureInfo]]:
-    """Send PDF to RunPod serverless Docling endpoint and return (doc_dict, figures).
+    """Send PDF to a docling-serve instance and return (doc_dict, figures).
 
-    The RunPod worker returns the same Docling export_to_dict() output as the
-    local converter, plus base64-encoded figure images.
+    Uses the async conversion endpoint with polling.  The response contains
+    the same Docling ``export_to_dict()`` structure as the local converter.
+    Figure images are cropped from embedded page renders using bbox data.
     """
     import base64
+    import io
     import time
 
     import httpx
 
-    pdf_b64 = base64.b64encode(pdf_path.read_bytes()).decode()
-    url = f"https://api.runpod.ai/v2/{endpoint_id}/run"
+    base_url = base_url.rstrip("/")
+    submit_url = f"{base_url}/v1/convert/file/async"
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-        # Submit job
-        resp = await client.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={"input": {"pdf_base64": pdf_b64, "filename": pdf_path.name}},
-        )
+        with open(pdf_path, "rb") as f:
+            resp = await client.post(
+                submit_url,
+                files={"files": (pdf_path.name, f, "application/pdf")},
+                data={
+                    "to_formats": "json",
+                    "image_export_mode": "embedded",
+                    "include_images": "true",
+                    "ocr_engine": ocr_engine,
+                    "do_table_structure": "true",
+                    "do_picture_classification": "true",
+                    "images_scale": "2.0",
+                },
+            )
         resp.raise_for_status()
-        job_id = resp.json()["id"]
-        logger.info("RunPod job submitted: %s", job_id)
+        task_id = resp.json()["task_id"]
+        logger.info("docling-serve task submitted: %s", task_id)
 
         # Poll for completion
-        status_url = f"https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}"
+        poll_url = f"{base_url}/v1/status/poll/{task_id}"
         start = time.monotonic()
         while True:
             elapsed = time.monotonic() - start
             if elapsed > timeout:
                 raise TimeoutError(
-                    f"RunPod job {job_id} did not complete within {timeout}s"
+                    f"docling-serve task {task_id} did not complete within {timeout}s"
                 )
-            await asyncio.sleep(min(5, max(1, 5 - elapsed / 60)))
-            status_resp = await client.get(
-                status_url,
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            status_resp.raise_for_status()
-            data = status_resp.json()
-            status = data.get("status")
-            if status == "COMPLETED":
+            await asyncio.sleep(2)
+            poll_resp = await client.get(poll_url)
+            poll_resp.raise_for_status()
+            poll_data = poll_resp.json()
+            status = poll_data.get("task_status")
+            if status == "success":
                 logger.info(
-                    "RunPod job %s completed (delay=%sms, exec=%sms)",
-                    job_id,
-                    data.get("delayTime"),
-                    data.get("executionTime"),
+                    "docling-serve task %s completed in %.1fs",
+                    task_id,
+                    time.monotonic() - start,
                 )
                 break
-            if status == "FAILED":
+            if status == "failure":
                 raise RuntimeError(
-                    f"RunPod job {job_id} failed: {data.get('error', 'unknown')}"
+                    f"docling-serve task {task_id} failed: "
+                    f"{poll_data.get('error_message', 'unknown')}"
                 )
 
-    output = data["output"]  # type: ignore[possibly-undefined]  # always set via break on COMPLETED
-    doc_dict = output["document"]
+        # Fetch result
+        result_resp = await client.get(f"{base_url}/v1/result/{task_id}")
+        result_resp.raise_for_status()
+        result_data = result_resp.json()
 
-    # Reconstruct figure images from base64
-    figures = []
+    doc_dict = result_data["document"]["json_content"]
+    processing_time = result_data.get("processing_time")
+    if processing_time is not None:
+        logger.info("docling-serve processing_time=%.1fs", processing_time)
+
+    # Extract figure images by cropping from embedded page renders
+    figures: list[FigureInfo] = []
     figures_dir = job_dir / "figures"
     figures_dir.mkdir(exist_ok=True)
 
     dict_pictures = doc_dict.get("pictures", [])
+    pages_dict = doc_dict.get("pages", {})
 
-    for fig_data in output.get("figures", []):
-        i = fig_data["index"]
-        img_b64 = fig_data.get("image_base64")
-        if not img_b64:
+    # Build page image cache: page_no -> PIL Image
+    page_images: dict[int, "Image.Image"] = {}  # type: ignore[name-defined]
+
+    for i, pic in enumerate(dict_pictures):
+        prov = pic.get("prov", [])
+        if not prov:
             continue
+        page_no = prov[0].get("page_no")
+        bbox_data = prov[0].get("bbox")
+        if page_no is None or not bbox_data:
+            continue
+
+        caption = _get_caption_text(pic, doc_dict)
+        bbox = _extract_bbox(prov)
+
+        # Try to crop figure from page image
         fig_path = figures_dir / f"figure_{i}.png"
-        fig_path.write_bytes(base64.b64decode(img_b64))
+        if page_no not in page_images:
+            page_key = str(page_no)
+            page_info = pages_dict.get(page_key, {})
+            page_img_data = page_info.get("image", {})
+            uri = page_img_data.get("uri", "") if isinstance(page_img_data, dict) else ""
+            if uri.startswith("data:image/"):
+                try:
+                    from PIL import Image as PILImage
 
-        caption = None
-        if i < len(dict_pictures):
-            caption = _get_caption_text(dict_pictures[i], doc_dict)
+                    # Strip data URI prefix
+                    b64_str = uri.split(",", 1)[1]
+                    img_bytes = base64.b64decode(b64_str)
+                    page_images[page_no] = PILImage.open(io.BytesIO(img_bytes))
+                except Exception as exc:
+                    logger.warning("Failed to decode page %d image: %s", page_no, exc)
 
-        page = fig_data.get("page")
+        page_img = page_images.get(page_no)
+        if page_img is not None and bbox_data:
+            try:
+                page_size = pages_dict.get(str(page_no), {}).get("size", {})
+                pdf_w = page_size.get("width", 612)
+                pdf_h = page_size.get("height", 792)
+                img_w, img_h = page_img.size
 
-        # Extract bbox from the dict_pictures provenance data
-        bbox = None
-        if i < len(dict_pictures):
-            prov = dict_pictures[i].get("prov", [])
-            bbox = _extract_bbox(prov)
+                # Convert bbox from bottom-left PDF coords to top-left pixel coords
+                scale_x = img_w / pdf_w
+                scale_y = img_h / pdf_h
+                crop_l = bbox_data.get("l", 0) * scale_x
+                crop_r = bbox_data.get("r", 0) * scale_x
+                crop_t = (pdf_h - bbox_data.get("t", 0)) * scale_y
+                crop_b = (pdf_h - bbox_data.get("b", 0)) * scale_y
 
-        figures.append(FigureInfo(
-            index=i,
-            path=fig_path,
-            caption=caption,
-            page=page,
-            bbox=bbox,
-        ))
+                cropped = page_img.crop((
+                    int(crop_l), int(crop_t), int(crop_r), int(crop_b),
+                ))
+                cropped.save(str(fig_path), "PNG")
+            except Exception as exc:
+                logger.warning("Failed to crop figure %d: %s", i, exc)
+                fig_path = None  # type: ignore[assignment]
+        else:
+            fig_path = None  # type: ignore[assignment]
+
+        if fig_path and fig_path.exists():
+            figures.append(FigureInfo(
+                index=i,
+                path=fig_path,
+                caption=caption,
+                page=page_no - 1,  # Convert to 0-based
+                bbox=bbox,
+            ))
 
     return doc_dict, figures
 
@@ -927,20 +979,19 @@ async def _convert_via_runpod(
 async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
     """Extract document structure using Docling.
 
-    When RUNPOD_ENDPOINT_ID and RUNPOD_API_KEY are set, the conversion is
-    offloaded to a RunPod serverless GPU worker. Otherwise Docling runs locally.
+    Priority: docling-serve → local Docling.
     """
     settings = get_settings()
-    use_runpod = bool(settings.runpod_endpoint_id and settings.runpod_api_key)
+    use_docling_serve = bool(settings.docling_serve_url)
 
-    if use_runpod:
-        logger.info("Using RunPod serverless endpoint for structure extraction")
-        doc_dict, figures = await _convert_via_runpod(
+    if use_docling_serve:
+        logger.info("Using docling-serve at %s for structure extraction", settings.docling_serve_url)
+        doc_dict, figures = await _convert_via_docling_serve(
             pdf_path,
             job_dir,
-            settings.runpod_endpoint_id,
-            settings.runpod_api_key,
-            settings.runpod_timeout,
+            settings.docling_serve_url,
+            settings.docling_serve_timeout,
+            settings.docling_serve_ocr_engine,
         )
         processed_pdf_path = pdf_path
     else:

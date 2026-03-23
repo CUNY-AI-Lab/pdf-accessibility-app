@@ -3,7 +3,8 @@
 ## Project Structure
 - `backend/` — FastAPI (Python 3.12, managed with `uv`)
 - `frontend/` — React + Vite + TypeScript (managed with `bun`)
-- `runpod-worker/` — RunPod serverless worker for Docling GPU inference
+- `modal-worker/` — Modal serverless worker (deprecated, kept for reference)
+- `runpod-worker/` — RunPod serverless worker (deprecated, kept for reference)
 - `data/` — Runtime storage (git-ignored): uploads, processing, output, SQLite DB
 
 ## Development
@@ -39,7 +40,7 @@ Frontend proxies `/api` and `/health` to `http://localhost:8001` via Vite config
 ## Pipeline Steps
 1. Classify (scanned vs digital)
 2. OCR (OCRmyPDF)
-3. Structure (Docling — local or RunPod serverless GPU)
+3. Structure (Docling — docling-serve or local fallback)
 4. Alt Text (Vision LLM via OpenAI-compatible API)
 5. Tag (pikepdf PDF/UA)
 6. Validate (veraPDF)
@@ -61,13 +62,14 @@ Blocking fidelity tasks surface on the review page via `FidelityIssueCard` with
 task-type-specific metadata (similarity scores, page numbers, table counts, etc.).
 Task types are registered in `backend/app/services/review_surface.py`.
 
-## RunPod Serverless (Docling)
-Structure extraction can be offloaded to a RunPod serverless GPU endpoint to
-avoid running Docling's ML models locally. Set `RUNPOD_ENDPOINT_ID` and
-`RUNPOD_API_KEY` in `.env` to enable; omit them to fall back to local Docling.
+## docling-serve (Structure Extraction)
+Persistent Docling HTTP server on the Mac Studio, reachable via Tailscale
+node sharing. Zero cold start, ~1.3s for a 7-page PDF with RapidOCR.
 
-- Worker source: `runpod-worker/` (handler, Dockerfile, model preloading)
-- Docker image: `srzweibel/docling-runpod:latest` on Docker Hub
-- Endpoint ID: `qyxpemva03ammg`
-- Cold start: ~19s (FlashBoot cached), warm: sub-second
-- Rebuild: `docker build --platform linux/amd64 -t srzweibel/docling-runpod:latest runpod-worker/ && docker push srzweibel/docling-runpod:latest`
+- Server: `DOCLING_DEVICE=mps docling-serve run --host 0.0.0.0 --port 5001`
+- Tailscale IP: `100.108.110.78` (shared from personal tailnet to CUNY tailnet)
+- Production config: `DOCLING_SERVE_URL=http://100.108.110.78:5001` in `.env`
+- Local dev: use `DOCLING_SERVE_URL=http://localhost:5001` when running on Mac Studio
+- OCR engine: RapidOCR (set via `DOCLING_SERVE_OCR_ENGINE`)
+- API: async — POST `/v1/convert/file/async`, poll `/v1/status/poll/{id}`, GET `/v1/result/{id}`
+- Falls back to local Docling if `DOCLING_SERVE_URL` is not set
