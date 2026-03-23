@@ -92,6 +92,7 @@ class Settings(BaseSettings):
 
     # Docling-serve persistent server (preferred — zero cold start)
     docling_serve_url: str = ""
+    docling_serve_token: str = ""  # Bearer token for auth proxy
     docling_serve_timeout: int = 300  # 5 min
     docling_serve_ocr_engine: str = "rapidocr"
 

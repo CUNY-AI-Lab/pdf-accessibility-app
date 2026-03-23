@@ -825,6 +825,7 @@ async def _convert_via_docling_serve(
     base_url: str,
     timeout: int,
     ocr_engine: str = "rapidocr",
+    token: str = "",
 ) -> tuple[dict, list[FigureInfo]]:
     """Send PDF to a docling-serve instance and return (doc_dict, figures).
 
@@ -841,10 +842,13 @@ async def _convert_via_docling_serve(
     base_url = base_url.rstrip("/")
     submit_url = f"{base_url}/v1/convert/file/async"
 
+    auth_headers = {"Authorization": f"Bearer {token}"} if token else {}
+
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
         with open(pdf_path, "rb") as f:
             resp = await client.post(
                 submit_url,
+                headers=auth_headers,
                 files={"files": (pdf_path.name, f, "application/pdf")},
                 data={
                     "to_formats": "json",
@@ -870,7 +874,7 @@ async def _convert_via_docling_serve(
                     f"docling-serve task {task_id} did not complete within {timeout}s"
                 )
             await asyncio.sleep(2)
-            poll_resp = await client.get(poll_url)
+            poll_resp = await client.get(poll_url, headers=auth_headers)
             poll_resp.raise_for_status()
             poll_data = poll_resp.json()
             status = poll_data.get("task_status")
@@ -888,7 +892,9 @@ async def _convert_via_docling_serve(
                 )
 
         # Fetch result
-        result_resp = await client.get(f"{base_url}/v1/result/{task_id}")
+        result_resp = await client.get(
+            f"{base_url}/v1/result/{task_id}", headers=auth_headers
+        )
         result_resp.raise_for_status()
         result_data = result_resp.json()
 
@@ -992,6 +998,7 @@ async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
             settings.docling_serve_url,
             settings.docling_serve_timeout,
             settings.docling_serve_ocr_engine,
+            settings.docling_serve_token,
         )
         processed_pdf_path = pdf_path
     else:
