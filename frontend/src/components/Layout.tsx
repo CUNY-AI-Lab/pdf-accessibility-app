@@ -10,6 +10,11 @@ const navLinkClass = ({ isActive }: { isActive: boolean }) =>
 export default function Layout() {
   return (
     <div className="min-h-screen flex flex-col">
+      {/* Beta banner */}
+      <div className="bg-amber-100 text-amber-900 text-center text-sm py-1.5 px-4 font-medium">
+        This tool is currently in beta. Results may vary — please review output carefully.
+      </div>
+
       {/* Header */}
       <header className="border-b border-ink/8 bg-cream/80 backdrop-blur-sm sticky top-0 z-50">
         <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
