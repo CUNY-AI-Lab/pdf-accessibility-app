@@ -52,14 +52,14 @@ The frontend does not implement login, account management, or browser-side PDF p
 Run the dev server:
 
 ```bash
-cd /Users/stephenzweibel/Apps/pdf-accessibility-app/frontend
+cd frontend
 bun dev
 ```
 
 Build production assets:
 
 ```bash
-cd /Users/stephenzweibel/Apps/pdf-accessibility-app/frontend
+cd frontend
 bun run build
 ```
 

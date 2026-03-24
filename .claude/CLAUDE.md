@@ -3,8 +3,6 @@
 ## Project Structure
 - `backend/` — FastAPI (Python 3.12, managed with `uv`)
 - `frontend/` — React + Vite + TypeScript (managed with `bun`)
-- `modal-worker/` — Modal serverless worker (deprecated, kept for reference)
-- `runpod-worker/` — RunPod serverless worker (deprecated, kept for reference)
 - `data/` — Runtime storage (git-ignored): uploads, processing, output, SQLite DB
 
 ## Development

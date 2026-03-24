@@ -1,2 +1,0 @@
-runpod
-docling>=2.70.0

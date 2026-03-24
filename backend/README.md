@@ -91,7 +91,7 @@ Resolution order is:
 Run the API:
 
 ```bash
-cd /Users/stephenzweibel/Apps/pdf-accessibility-app/backend
+cd backend
 uv run uvicorn app.main:app --reload --port 8001
 ```
 
@@ -108,7 +108,7 @@ is only sent over secure transport.
 ## Tests
 
 ```bash
-cd /Users/stephenzweibel/Apps/pdf-accessibility-app/backend
+cd backend
 PYTHONPATH=. uv run pytest tests -q
 ```
 
@@ -117,14 +117,14 @@ PYTHONPATH=. uv run pytest tests -q
 Representative corpus:
 
 ```bash
-cd /Users/stephenzweibel/Apps/pdf-accessibility-app/backend
+cd backend
 PYTHONPATH=. uv run python scripts/corpus_benchmark.py --exclude-wac
 ```
 
 PDF/UA coverage matrix:
 
 ```bash
-cd /Users/stephenzweibel/Apps/pdf-accessibility-app/backend
+cd backend
 PYTHONPATH=. uv run python scripts/generate_pdfua_rule_coverage.py
 ```
 
