@@ -16,7 +16,6 @@ dependencies = [
     "sse-starlette>=2.2.0",
     "Pillow>=11.0.0",
     "ocrmypdf>=16.7.0",
-    "docling>=2.70.0",
     "docling-parse>=5.5.0",
     "fonttools>=4.0.0",
     "ftfy>=6.3.1",
@@ -28,6 +27,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+local-docling = [
+    "docling>=2.70.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",

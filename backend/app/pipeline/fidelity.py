@@ -13,9 +13,9 @@ from typing import Any
 
 import pikepdf
 from pdfminer.high_level import extract_text
+from PIL import Image
 from rapidfuzz.distance import Levenshtein
 from rapidfuzz.fuzz import partial_ratio
-from PIL import Image
 
 from app.services.form_fields import extract_widget_fields
 from app.services.page_intelligence import (
@@ -30,6 +30,8 @@ from app.services.semantic_pretag_policy import (
 from app.services.visual_figure_rationalization import (
     collect_missing_visual_figure_targets as _collect_missing_visual_figure_targets,
 )
+
+logger = logging.getLogger(__name__)
 
 FONT_RULE_FRAGMENT = "-7.21."
 
@@ -616,7 +618,7 @@ def _check_link_text_quality(output_pdf: Path) -> list[dict[str, Any]]:
                     except Exception:
                         continue
     except Exception:
-        pass
+        logger.warning("Failed to check link quality in output PDF", exc_info=True)
     return poor_links
 
 
@@ -701,7 +703,7 @@ def _check_internal_link_destinations(output_pdf: Path) -> list[dict[str, Any]]:
                     except Exception:
                         continue
     except Exception:
-        pass
+        logger.warning("Failed to check internal link destinations in output PDF", exc_info=True)
     return broken
 
 

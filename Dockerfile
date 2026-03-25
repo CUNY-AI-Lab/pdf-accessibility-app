@@ -13,6 +13,10 @@ RUN bun run build
 
 FROM python:3.12-slim-bookworm
 
+# Set to "true" to include local Docling (adds ~2 GB for torch + models).
+# Not needed when DOCLING_SERVE_URL points to a remote docling-serve instance.
+ARG WITH_LOCAL_DOCLING=false
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -20,6 +24,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app/backend
 
+# Base system packages (always needed)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
@@ -29,8 +34,6 @@ RUN apt-get update \
         fonts-dejavu-core \
         fonts-liberation \
         ghostscript \
-        libgl1 \
-        libglib2.0-0 \
         libspatialindex-dev \
         poppler-utils \
         qpdf \
@@ -42,6 +45,13 @@ RUN apt-get update \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
+# Extra system packages for local Docling (OpenCV needs libgl1 + libglib2.0)
+RUN if [ "$WITH_LOCAL_DOCLING" = "true" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 RUN pip install --no-cache-dir uv
 RUN groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --create-home --home-dir /home/app app
@@ -50,11 +60,18 @@ RUN mkdir -p \
         /app/data/processing \
         /app/data/output \
         /app/data/debug \
-        /home/app/.cache/docling \
-        /home/app/.cache/huggingface \
-        /home/app/.cache/torch \
-        /home/app/artifacts/docling \
+        /home/app/.cache \
     && chown -R app:app /app/data /home/app
+
+# Extra cache dirs for local Docling models
+RUN if [ "$WITH_LOCAL_DOCLING" = "true" ]; then \
+        mkdir -p \
+            /home/app/.cache/docling \
+            /home/app/.cache/huggingface \
+            /home/app/.cache/torch \
+            /home/app/artifacts/docling \
+        && chown -R app:app /home/app; \
+    fi
 
 COPY backend/verapdf-auto-install.xml /tmp/verapdf-auto-install.xml
 RUN wget -q -O /tmp/verapdf-installer.zip https://software.verapdf.org/releases/verapdf-installer.zip \
@@ -63,12 +80,23 @@ RUN wget -q -O /tmp/verapdf-installer.zip https://software.verapdf.org/releases/
     && ln -sf /opt/verapdf/verapdf /usr/local/bin/verapdf \
     && rm -rf /tmp/verapdf-installer /tmp/verapdf-installer.zip /tmp/verapdf-auto-install.xml
 
+# Install Python dependencies.
+# Default: core deps only (no torch/docling).
+# WITH_LOCAL_DOCLING=true: also installs docling + torch + models.
 COPY backend/pyproject.toml backend/uv.lock backend/README.md ./
-RUN UV_CACHE_DIR=/tmp/uv-cache uv sync --frozen --no-dev --no-install-project \
-    && rapidocr_models_dir="$(find /app/backend/.venv/lib -type d -path '*/site-packages/rapidocr/models' -print -quit)" \
-    && test -n "$rapidocr_models_dir" \
-    && chown -R app:app "$rapidocr_models_dir" \
-    && rm -rf /tmp/uv-cache
+RUN if [ "$WITH_LOCAL_DOCLING" = "true" ]; then \
+        UV_CACHE_DIR=/tmp/uv-cache uv sync --frozen --no-dev --no-install-project --extra local-docling \
+        && rapidocr_models_dir="$(find /app/backend/.venv/lib -type d -path '*/site-packages/rapidocr/models' -print -quit)" \
+        && test -n "$rapidocr_models_dir" \
+        && chown -R app:app "$rapidocr_models_dir" \
+        && rm -rf /tmp/uv-cache; \
+    else \
+        UV_CACHE_DIR=/tmp/uv-cache uv sync --frozen --no-dev --no-install-project \
+        && rm -rf /tmp/uv-cache; \
+    fi
+
+# Pre-download Docling models into the image (only for local Docling builds).
+# The script is written unconditionally (cheap) but only executed when needed.
 RUN cat > /tmp/preload_docling_models.py <<'PY'
 from pathlib import Path
 import os
@@ -102,7 +130,10 @@ RapidOcrModel.download_models(
 )
 print(f"Preloaded Docling artifacts into {artifacts}")
 PY
-RUN su app -s /bin/sh -c 'HOME=/home/app XDG_CACHE_HOME=/home/app/.cache HF_HOME=/home/app/.cache/huggingface TORCH_HOME=/home/app/.cache/torch DOCLING_CACHE_DIR=/home/app/.cache/docling DOCLING_ARTIFACTS_PATH=/home/app/artifacts/docling /app/backend/.venv/bin/python /tmp/preload_docling_models.py' \
+
+RUN if [ "$WITH_LOCAL_DOCLING" = "true" ]; then \
+        su app -s /bin/sh -c 'HOME=/home/app XDG_CACHE_HOME=/home/app/.cache HF_HOME=/home/app/.cache/huggingface TORCH_HOME=/home/app/.cache/torch DOCLING_CACHE_DIR=/home/app/.cache/docling DOCLING_ARTIFACTS_PATH=/home/app/artifacts/docling /app/backend/.venv/bin/python /tmp/preload_docling_models.py'; \
+    fi \
     && rm -f /tmp/preload_docling_models.py
 
 COPY backend/app /app/backend/app

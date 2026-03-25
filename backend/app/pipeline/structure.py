@@ -844,7 +844,9 @@ async def _convert_via_docling_serve(
 
     auth_headers = {"Authorization": f"Bearer {token}"} if token else {}
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+    # Per-request timeout: generous but bounded; total timeout enforced by the polling loop
+    per_request_timeout = httpx.Timeout(min(timeout, 120.0), connect=30.0)
+    async with httpx.AsyncClient(timeout=per_request_timeout) as client:
         with open(pdf_path, "rb") as f:
             resp = await client.post(
                 submit_url,
@@ -979,6 +981,11 @@ async def _convert_via_docling_serve(
                 bbox=bbox,
             ))
 
+    # Close PIL images to free memory
+    for img in page_images.values():
+        img.close()
+    page_images.clear()
+
     return doc_dict, figures
 
 
@@ -1003,12 +1010,19 @@ async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
         processed_pdf_path = pdf_path
     else:
         def _convert():
-            from docling.datamodel.base_models import InputFormat
-            from docling.datamodel.pipeline_options import (
-                PdfPipelineOptions,
-                RapidOcrOptions,
-            )
-            from docling.document_converter import DocumentConverter, PdfFormatOption
+            try:
+                from docling.datamodel.base_models import InputFormat
+                from docling.datamodel.pipeline_options import (
+                    PdfPipelineOptions,
+                    RapidOcrOptions,
+                )
+                from docling.document_converter import DocumentConverter, PdfFormatOption
+            except ImportError:
+                raise RuntimeError(
+                    "Local Docling is not installed. Either set DOCLING_SERVE_URL to use "
+                    "a remote docling-serve instance, or install with: "
+                    "uv sync --extra local-docling"
+                )
 
             def _convert_one(path: Path):
                 pipeline_options = PdfPipelineOptions(

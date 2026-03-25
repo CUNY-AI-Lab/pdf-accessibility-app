@@ -85,8 +85,15 @@ def cleanup_job_files(job_id: str, input_path: str | None = None):
     out_dir = settings.output_dir / job_id
     if out_dir.exists():
         shutil.rmtree(out_dir)
-    # Remove uploaded file
+    # Remove uploaded file (validate it's within upload_dir)
     if input_path:
-        p = Path(input_path)
-        if p.exists():
+        p = Path(input_path).resolve()
+        upload_root = str(settings.upload_dir.resolve()) + "/"
+        if not str(p).startswith(upload_root):
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Refusing to delete input_path outside upload_dir: %s", input_path
+            )
+        elif p.exists():
             p.unlink()

@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Coroutine
 from typing import Any
 
@@ -11,13 +11,16 @@ logger = logging.getLogger(__name__)
 _DONE = object()
 
 
+_MAX_COMPLETED_JOBS = 500
+
+
 class JobManager:
     """Manages background pipeline tasks and SSE progress broadcasting."""
 
     def __init__(self):
         self._tasks: dict[str, asyncio.Task] = {}
         self._progress_channels: dict[str, list[asyncio.Queue]] = defaultdict(list)
-        self._completed_jobs: set[str] = set()
+        self._completed_jobs: OrderedDict[str, None] = OrderedDict()
 
     async def submit_job(
         self, job_id: str, coro: Coroutine[Any, Any, Any]
@@ -34,14 +37,17 @@ class JobManager:
         except Exception:
             coro.close()
             raise
-        self._completed_jobs.discard(job_id)
+        self._completed_jobs.pop(job_id, None)
         self._tasks[job_id] = task
         task.add_done_callback(lambda t: self._on_task_done(job_id, t))
         return task
 
     def _on_task_done(self, job_id: str, task: asyncio.Task):
         self._tasks.pop(job_id, None)
-        self._completed_jobs.add(job_id)
+        self._completed_jobs[job_id] = None
+        # Prevent unbounded growth — evict oldest entries (FIFO)
+        while len(self._completed_jobs) > _MAX_COMPLETED_JOBS:
+            self._completed_jobs.popitem(last=False)
         try:
             if not task.cancelled():
                 exception = task.exception()
@@ -59,6 +65,9 @@ class JobManager:
                 queue.put_nowait(_DONE)
             except asyncio.QueueFull:
                 pass
+        # Clean up empty channels to prevent dict growth
+        if job_id in self._progress_channels and not self._progress_channels[job_id]:
+            del self._progress_channels[job_id]
 
     def emit_progress(self, job_id: str, **event_data):
         event = json.dumps(event_data)

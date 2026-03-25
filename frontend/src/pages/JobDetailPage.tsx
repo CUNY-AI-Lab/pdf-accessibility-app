@@ -61,7 +61,7 @@ export default function JobDetailPage() {
       ? (fidelity.summary as Record<string, unknown>)
       : {};
   const blockingIssueCount =
-    asNumber(fidelitySummary.blocking_tasks) ?? validationReport?.violations.length ?? null;
+    asNumber(fidelitySummary.blocking_tasks) ?? null;
 
   // Use SSE steps when actively processing, otherwise use API data
   const displaySteps = isActive ? steps : job?.steps ?? [];

@@ -31,9 +31,11 @@ def _page_has_text(page: pikepdf.Page) -> bool:
             raw = b"".join(c.read_bytes() for c in contents)
         else:
             raw = contents.read_bytes()
-        # Look for text-showing operators
-        text_ops = [b"Tj", b"TJ", b"'", b'"']
-        return any(op in raw for op in text_ops)
+        # Look for text-showing operators (Tj, TJ are reliable; ' and " need
+        # boundary context to avoid false positives from string data)
+        import re
+
+        return bool(re.search(rb"(?:Tj|TJ)\b", raw))
     except Exception:
         return False
 

@@ -88,3 +88,14 @@ def _ensure_schema(sync_conn, review_tasks_table, applied_changes_table) -> None
             "CREATE INDEX IF NOT EXISTS idx_applied_changes_review_status ON applied_changes (review_status)"
         )
     )
+    # Unique constraints for data integrity
+    sync_conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_steps_job_step ON job_steps (job_id, step_name)"
+        )
+    )
+    sync_conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_alt_texts_job_figure ON alt_texts (job_id, figure_index)"
+        )
+    )

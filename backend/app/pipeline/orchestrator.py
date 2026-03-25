@@ -5010,8 +5010,9 @@ async def run_pipeline(
         except Exception as e:
             logger.exception(f"Pipeline failed for job {job_id}")
             await db.rollback()
-            # Sanitize error: strip server paths
-            user_error = re.sub(r"/\S*", "", str(e)).strip(": ")
+            # Sanitize error: strip filesystem paths (multi-segment, e.g. /home/user/...)
+            # but preserve single-segment PDF names like /Font, /Subtype
+            user_error = re.sub(r"/(?:[^\s/]+/)+[^\s]*", "", str(e)).strip(": ")
             if current_step:
                 await _update_step(
                     db,
@@ -5052,7 +5053,10 @@ async def run_tagging_and_validation(
         ocred_path = settings.processing_dir / job_id / "ocred.pdf"
         working_pdf = ocred_path if ocred_path.exists() else Path(job.input_path)
     if structure_json is None:
-        structure_json = json.loads(job.structure_json) if job.structure_json else {}
+        if job.structure_json:
+            structure_json = json.loads(job.structure_json)  # let JSONDecodeError propagate — fail the job
+        else:
+            structure_json = {}
 
     try:
         job.status = "processing"
@@ -5417,7 +5421,8 @@ async def run_tagging_and_validation(
         await _update_step(db, job_id, "fidelity", "running")
         job_manager.emit_progress(job_id, step="fidelity", status="running")
 
-        fidelity_report, review_tasks = assess_fidelity(
+        fidelity_report, review_tasks = await asyncio.to_thread(
+            assess_fidelity,
             input_pdf=Path(job.input_path),
             output_pdf=Path(job.output_path or tagging_result.output_path),
             comparison_source_pdf=fidelity_source_pdf,
@@ -5479,7 +5484,8 @@ async def run_tagging_and_validation(
                     tagging_result=retry_tagging_result,
                     llm_font_map_auto=llm_font_map_auto,
                 )
-                retry_fidelity_report, retry_review_tasks = assess_fidelity(
+                retry_fidelity_report, retry_review_tasks = await asyncio.to_thread(
+                    assess_fidelity,
                     input_pdf=Path(job.input_path),
                     output_pdf=retry_tagging_result.output_path,
                     comparison_source_pdf=fidelity_source_pdf,
@@ -5597,7 +5603,8 @@ async def run_tagging_and_validation(
                     tagging_result=auto_tagging_result,
                     llm_font_map_auto=llm_font_map_auto,
                 )
-                auto_fidelity_report, auto_review_tasks = assess_fidelity(
+                auto_fidelity_report, auto_review_tasks = await asyncio.to_thread(
+                    assess_fidelity,
                     input_pdf=Path(job.input_path),
                     output_pdf=auto_tagging_result.output_path,
                     comparison_source_pdf=fidelity_source_pdf,
@@ -5648,7 +5655,8 @@ async def run_tagging_and_validation(
                 tagging_result=selected_tagging_result,
                 llm_font_map_auto=llm_font_map_auto,
             )
-            candidate_fidelity_report, candidate_review_tasks = assess_fidelity(
+            candidate_fidelity_report, candidate_review_tasks = await asyncio.to_thread(
+                assess_fidelity,
                 input_pdf=Path(job.input_path),
                 output_pdf=candidate_output_pdf,
                 comparison_source_pdf=fidelity_source_pdf,
@@ -5685,7 +5693,8 @@ async def run_tagging_and_validation(
                     llm_font_map_auto=llm_font_map_auto,
                 )
 
-        final_fidelity_report, final_review_tasks = assess_fidelity(
+        final_fidelity_report, final_review_tasks = await asyncio.to_thread(
+            assess_fidelity,
             input_pdf=Path(job.input_path),
             output_pdf=Path(job.output_path or tagging_result.output_path),
             comparison_source_pdf=fidelity_source_pdf,

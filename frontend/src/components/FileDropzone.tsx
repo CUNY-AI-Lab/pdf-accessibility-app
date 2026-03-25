@@ -17,7 +17,14 @@ export default function FileDropzone({ onFiles, disabled }: FileDropzoneProps) {
   const handleDragLeave = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    setIsDragging(false);
+    // Only set isDragging false when actually leaving the dropzone,
+    // not when moving over child elements
+    if (
+      e.currentTarget instanceof Node &&
+      !e.currentTarget.contains(e.relatedTarget as Node)
+    ) {
+      setIsDragging(false);
+    }
   }, []);
 
   const handleDrop = useCallback(

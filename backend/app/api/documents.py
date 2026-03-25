@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from io import BytesIO
@@ -29,6 +30,19 @@ _NO_STORE_HEADERS = {
 }
 _OUTPUT_READY_STATUSES = frozenset({"complete", "manual_remediation"})
 _OUTPUT_INSPECTION_UNAVAILABLE_DETAIL = "Current output is not available for inspection"
+
+
+def _safe_json_loads(raw: str) -> dict:
+    """Parse JSON, returning an error-indicating dict on decode errors.
+
+    Metadata is supplementary display info on task cards — a corrupt entry
+    should not block the entire review task list from loading.
+    """
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        logger.error("Corrupt metadata_json in review task (BUG — investigate): %.200s", raw)
+        return {"_error": "corrupt metadata"}
 
 
 def _job_pdf_path(job: Job) -> Path:
@@ -86,7 +100,7 @@ async def list_review_tasks(
             blocking=bool(task.blocking),
             status=task.status,
             source=task.source,
-            metadata=json.loads(task.metadata_json) if task.metadata_json else {},
+            metadata=_safe_json_loads(task.metadata_json) if task.metadata_json else {},
         )
         for task in tasks
         if is_user_visible_review_task_type(task.task_type)
@@ -110,7 +124,8 @@ async def get_page_preview(
         raise HTTPException(status_code=404, detail="Page number exceeds document length")
 
     try:
-        preview_bytes = render_page_png_bytes(
+        preview_bytes = await asyncio.to_thread(
+            render_page_png_bytes,
             _job_pdf_path(job),
             page_number,
             timeout=get_settings().subprocess_timeout_preview,
@@ -176,7 +191,10 @@ async def download_html_report(
     if job.status not in _OUTPUT_READY_STATUSES or not job.validation_json:
         raise HTTPException(status_code=404, detail="Validation report not yet available")
 
-    validation = json.loads(job.validation_json)
+    try:
+        validation = json.loads(job.validation_json)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Malformed validation data")
     alt_texts = (
         await db.execute(
             select(AltTextEntry)

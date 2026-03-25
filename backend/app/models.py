@@ -1,7 +1,17 @@
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -64,6 +74,7 @@ class JobStep(Base):
     __tablename__ = "job_steps"
     __table_args__ = (
         Index("idx_job_steps_job_id", "job_id"),
+        UniqueConstraint("job_id", "step_name", name="uq_job_steps_job_step"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -84,6 +95,7 @@ class AltTextEntry(Base):
     __tablename__ = "alt_texts"
     __table_args__ = (
         Index("idx_alt_texts_job_id", "job_id"),
+        UniqueConstraint("job_id", "figure_index", name="uq_alt_texts_job_figure"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

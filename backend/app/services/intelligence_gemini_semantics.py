@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from app.models import Job
@@ -13,6 +14,8 @@ from app.services.intelligence_llm_utils import (
 from app.services.llm_client import LlmClient
 from app.services.pdf_preview import render_bbox_preview_png_data_url
 from app.services.semantic_units import SemanticDecision, SemanticUnit
+
+logger = logging.getLogger(__name__)
 
 SEMANTIC_ADJUDICATION_PROMPT = """You are a PDF accessibility semantic adjudication assistant.
 
@@ -271,7 +274,7 @@ async def adjudicate_semantic_unit(
             if preview_url:
                 unit_images.append({"type": "image_url", "image_url": {"url": preview_url}})
     except Exception:
-        pass
+        logger.debug("Failed to render bbox preview for semantic unit adjudication", exc_info=True)
 
     extra_image_urls = (
         unit.metadata.get("extra_image_data_urls") if isinstance(unit.metadata, dict) else None

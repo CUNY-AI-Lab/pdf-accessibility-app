@@ -2,24 +2,35 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 from app.models import Job
 from app.services.llm_client import LlmClient
+from app.services.path_safety import validate_path_within_allowed_roots
 from app.services.pdf_preview import render_page_jpeg_data_url
+
+logger = logging.getLogger(__name__)
 
 
 def job_pdf_path(job: Job) -> Path:
+    from fastapi import HTTPException
+
     candidates = []
     if getattr(job, "output_path", None):
         candidates.append(Path(str(job.output_path)))
     if getattr(job, "input_path", None):
         candidates.append(Path(str(job.input_path)))
     for pdf_path in candidates:
-        if pdf_path.exists():
-            return pdf_path
+        try:
+            validated = validate_path_within_allowed_roots(pdf_path)
+        except HTTPException:
+            logger.warning("PDF path outside allowed roots: %s", pdf_path)
+            continue
+        if validated.exists():
+            return validated
     preferred = candidates[0] if candidates else None
     raise RuntimeError(f"PDF file not found for page intelligence: {preferred}")
 
@@ -37,6 +48,7 @@ def page_preview_parts(job: Job | Any | None, page_numbers: Iterable[int]) -> li
     try:
         pdf_path = job_pdf_path(job)
     except Exception:
+        logger.warning("Could not resolve PDF path for page previews (job %s)", getattr(job, "id", "?"))
         return []
 
     parts: list[dict[str, Any]] = []
@@ -53,6 +65,7 @@ def page_preview_parts(job: Job | Any | None, page_numbers: Iterable[int]) -> li
                 }
             )
         except Exception:
+            logger.debug("Failed to render page %d preview for intelligence", page_number)
             continue
     return parts
 
@@ -124,6 +137,7 @@ async def request_llm_json(
                 temperature=0,
             )
         except Exception:
+            logger.debug("Structured json_schema LLM call failed, falling back to json_object")
             response = None
     if response is None:
         try:

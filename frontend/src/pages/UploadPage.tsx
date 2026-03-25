@@ -21,7 +21,11 @@ export default function UploadPage() {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
 
   const handleFiles = (files: File[]) => {
-    setSelectedFiles((prev) => [...prev, ...files]);
+    setSelectedFiles((prev) => {
+      const existingKeys = new Set(prev.map((f) => `${f.name}:${f.size}`));
+      const newFiles = files.filter((f) => !existingKeys.has(`${f.name}:${f.size}`));
+      return newFiles.length > 0 ? [...prev, ...newFiles] : prev;
+    });
   };
 
   const handleUpload = async () => {

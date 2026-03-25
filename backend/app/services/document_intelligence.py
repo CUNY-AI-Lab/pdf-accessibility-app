@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,8 @@ from app.services.document_intelligence_models import (
     TableModel,
 )
 from app.services.form_fields import extract_widget_fields
+
+logger = logging.getLogger(__name__)
 
 LEGACY_PROVENANCE = "legacy_structure"
 
@@ -214,7 +217,7 @@ def build_document_model(
                     )
                 )
         except Exception:
-            pass
+            logger.warning("Failed to extract widget fields for document intelligence", exc_info=True)
 
     pages = [pages_by_number[page_number] for page_number in sorted(pages_by_number)]
     for page in pages:

@@ -34,6 +34,7 @@ from app.services.job_state import (
     reset_rerun_steps,
 )
 from app.services.llm_client import make_llm_client
+from app.services.path_safety import validate_path_within_allowed_roots
 
 logger = logging.getLogger(__name__)
 
@@ -159,10 +160,16 @@ async def _restart_tagging_with_current_state(
                 jm,
             )
 
-    await job_manager.submit_job(
-        job.id,
-        _resume(job.id, session_maker, settings, job_manager),
-    )
+    try:
+        await job_manager.submit_job(
+            job.id,
+            _resume(job.id, session_maker, settings, job_manager),
+        )
+    except Exception:
+        # Rollback the "processing" status so the job isn't stuck
+        job.status = "manual_remediation"
+        await db.commit()
+        raise
 
 
 async def _load_figure_change_context(
@@ -219,7 +226,7 @@ def _figure_info_from_change_metadata(
     entry: AltTextEntry,
     metadata: dict,
 ) -> FigureInfo:
-    image_path = Path(entry.image_path)
+    image_path = validate_path_within_allowed_roots(Path(entry.image_path))
     if not image_path.exists():
         raise HTTPException(status_code=404, detail="Figure image file not found")
     page_raw = metadata.get("page")
@@ -560,7 +567,7 @@ async def get_figure_image(
     entry = result.scalar_one_or_none()
     if not entry:
         raise HTTPException(status_code=404, detail="Figure not found")
-    image_path = Path(entry.image_path)
+    image_path = validate_path_within_allowed_roots(Path(entry.image_path))
     if not image_path.exists():
         raise HTTPException(status_code=404, detail="Figure image file not found")
     suffix = image_path.suffix.lower()

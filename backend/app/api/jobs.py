@@ -16,12 +16,12 @@ from app.pipeline.orchestrator import run_pipeline
 from app.schemas import JobCreateResponse, JobListResponse, JobResponse, JobStepResponse
 from app.services.anonymous_sessions import AnonymousSession, get_anonymous_session
 from app.services.file_storage import cleanup_job_files, save_upload
+from app.services.html_report import render_batch_html_report
 from app.services.job_manager import _DONE, JobManager, get_job_manager
 from app.services.job_state import (
     CLEANUP_INTERRUPTED_ERROR,
     mark_job_failed,
 )
-from app.services.html_report import render_batch_html_report
 from app.services.path_safety import safe_filename
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -261,7 +261,11 @@ async def download_batch_report(
     for job in jobs:
         if not job.validation_json:
             continue
-        validation = json.loads(job.validation_json)
+        try:
+            validation = json.loads(job.validation_json)
+        except json.JSONDecodeError:
+            logger.error("Skipping job %s in batch report: corrupt validation_json (BUG)", job.id)
+            continue
         alt_texts = (
             await db.execute(
                 select(AltTextEntry)
