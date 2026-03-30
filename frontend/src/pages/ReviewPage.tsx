@@ -7,6 +7,7 @@ import {
   useFigureChanges,
   useJob,
   useKeepAppliedChange,
+  useResolveReviewTask,
   useReviseAppliedChange,
   useReviewTasks,
   useUndoAppliedChange,
@@ -57,8 +58,10 @@ export default function ReviewPage() {
   const undoAppliedChange = useUndoAppliedChange(id!);
   const reviseAppliedChange = useReviseAppliedChange(id!);
   const editAppliedChange = useEditAppliedChange(id!);
+  const resolveReviewTask = useResolveReviewTask(id!);
 
   const [keepingChangeId, setKeepingChangeId] = useState<number | null>(null);
+  const [resolvingTaskId, setResolvingTaskId] = useState<number | null>(null);
   const [undoingChangeId, setUndoingChangeId] = useState<number | null>(null);
   const [revisingChangeId, setRevisingChangeId] = useState<number | null>(null);
   const [editingChangeId, setEditingChangeId] = useState<number | null>(null);
@@ -162,6 +165,17 @@ export default function ReviewPage() {
     }
   };
 
+  const handleResolveTask = async (taskId: number) => {
+    setResolvingTaskId(taskId);
+    try {
+      await resolveReviewTask.mutateAsync({ taskId });
+    } catch {
+      // error handled by mutation state
+    } finally {
+      setResolvingTaskId(null);
+    }
+  };
+
   if (isLoading) {
     return (
       <div className="max-w-3xl mx-auto animate-pulse-soft">
@@ -242,13 +256,13 @@ export default function ReviewPage() {
         <section className="space-y-4 mb-8">
           <div className="rounded-xl border border-error/20 bg-error-light/10 p-6">
             <h2 className="text-lg text-ink mb-1">
-              Issues requiring external tools
+              Issues to review
             </h2>
             <p className="text-sm text-ink-muted">
               {blockingFidelityTasks.length === 1
-                ? "1 issue was detected that cannot be fixed within this app."
-                : `${blockingFidelityTasks.length} issues were detected that cannot be fixed within this app.`}
-              {" "}Use a tool like Adobe Acrobat Pro to address {blockingFidelityTasks.length === 1 ? "it" : "them"}.
+                ? "1 issue needs your attention."
+                : `${blockingFidelityTasks.length} issues need your attention.`}
+              {" "}Review each one below and either resolve it or fix it in an external tool like Adobe Acrobat Pro.
             </p>
             <div className="mt-4 flex flex-wrap items-center gap-4">
               <a
@@ -268,7 +282,13 @@ export default function ReviewPage() {
             </div>
           </div>
           {blockingFidelityTasks.map((task) => (
-            <FidelityIssueCard key={task.id} jobId={id!} task={task} />
+            <FidelityIssueCard
+              key={task.id}
+              jobId={id!}
+              task={task}
+              onResolve={handleResolveTask}
+              resolving={resolvingTaskId === task.id}
+            />
           ))}
         </section>
       )}
@@ -369,7 +389,13 @@ export default function ReviewPage() {
           <div className="space-y-4">
             {additionalCheckTasks.map((task) =>
               FIDELITY_TASK_TYPES.has(task.task_type) ? (
-                <FidelityIssueCard key={task.id} jobId={id!} task={task} />
+                <FidelityIssueCard
+                  key={task.id}
+                  jobId={id!}
+                  task={task}
+                  onResolve={handleResolveTask}
+                  resolving={resolvingTaskId === task.id}
+                />
               ) : (
                 <ReviewTaskCard key={task.id} jobId={id!} task={task} />
               ),

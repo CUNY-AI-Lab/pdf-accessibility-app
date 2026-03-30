@@ -9,7 +9,7 @@ Upload a PDF and the app automatically remediates it through a multi-step pipeli
 ### Pipeline
 
 1. **Classify** — Determine whether the PDF is digital, mixed, or scanned
-2. **OCR** — Add searchable text to scanned pages ([OCRmyPDF](https://ocrmypdf.readthedocs.io/))
+2. **OCR** — Add searchable text to scanned pages ([OCRmyPDF](https://ocrmypdf.readthedocs.io/)) with automatic language detection
 3. **Structure** — Extract document structure via [Docling](https://github.com/docling-project/docling), with LLM-assisted TOC enhancement
 4. **Alt Text** — Generate alt text for figures and reclassify misidentified elements using a vision LLM
 5. **Tag** — Resolve ambiguous semantics (tables, forms, reading order, grounded text) via LLM, then write PDF/UA structure tags deterministically with [pikepdf](https://github.com/pikepdf/pikepdf)
@@ -56,6 +56,7 @@ Key environment variables:
 | `LLM_BASE_URL` | OpenAI-compatible API base URL | `https://openrouter.ai/api/v1` |
 | `LLM_API_KEY` | API key for the LLM provider | — |
 | `LLM_MODEL` | Model identifier | `google/gemini-3-flash-preview` |
+| `OCR_LANGUAGE` | Default Tesseract language code | `eng` |
 | `JOB_TTL_HOURS` | Hours before jobs expire | `12` |
 | `VERAPDF_PATH` | Path to veraPDF binary | `verapdf` |
 | `GHOSTSCRIPT_PATH` | Path to Ghostscript binary | `gs` |
@@ -115,7 +116,7 @@ docker run -d \
 Notes:
 - The image preloads Docling models so there are no first-run downloads.
 - For subpath deployments, set `VITE_APP_BASE_PATH` before building (e.g., `/pdf-accessibility/`).
-- Only `tesseract-ocr-eng` is included. Add other language packs by extending the Dockerfile.
+- Tesseract language packs included: English, Spanish, French, German, Chinese (Simplified + Traditional), Russian, Arabic, Korean, Bengali, Polish, Hebrew, Yiddish, Haitian Creole, Hindi, Italian, Portuguese, Japanese. Add others by extending the Dockerfile.
 
 ## Project Structure
 
@@ -151,6 +152,14 @@ cd frontend
 bun run lint
 bun run build
 ```
+
+## OCR Language Support
+
+The app auto-detects the document language during classification and selects the appropriate Tesseract language pack for OCR. For digital/mixed PDFs, it extracts existing text and identifies the language with [lingua-py](https://github.com/pemistahl/lingua-py). For scanned PDFs, it runs a quick probe OCR on page 1 with all installed language packs, then identifies the language from the result.
+
+Language priority: **auto-detection > `OCR_LANGUAGE` env var default**.
+
+For local development, install Tesseract language packs via your package manager. On macOS, `brew install tesseract-lang` installs all languages. On Debian/Ubuntu, install individual packs (e.g., `apt install tesseract-ocr-spa`). If a language pack is missing, probe OCR falls back gracefully to the `OCR_LANGUAGE` default.
 
 ## Session Model
 

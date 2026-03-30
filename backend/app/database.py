@@ -51,6 +51,8 @@ def _ensure_schema(sync_conn, review_tasks_table, applied_changes_table) -> None
             sync_conn.execute(text("ALTER TABLE jobs ADD COLUMN fidelity_json TEXT"))
         if "owner_session_hash" not in columns:
             sync_conn.execute(text("ALTER TABLE jobs ADD COLUMN owner_session_hash TEXT"))
+        if "ocr_language" not in columns:
+            sync_conn.execute(text("ALTER TABLE jobs ADD COLUMN ocr_language TEXT"))
 
     if "review_tasks" not in table_names:
         review_tasks_table.create(bind=sync_conn, checkfirst=True)

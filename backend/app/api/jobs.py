@@ -57,6 +57,7 @@ def job_to_response(job: Job, *, include_step_results: bool = True) -> JobRespon
         original_filename=job.original_filename,
         status=job.status,
         classification=job.classification,
+        ocr_language=job.ocr_language,
         page_count=job.page_count,
         file_size_bytes=job.file_size_bytes,
         error=job.error,
@@ -86,6 +87,7 @@ async def _compensate_failed_job_creation(
     created_jobs: list[Job],
     submitted_job_ids: set[str],
     job_manager: JobManager,
+    uploaded_paths: list[Path],
 ) -> None:
     for job_id in submitted_job_ids:
         try:
@@ -101,6 +103,12 @@ async def _compensate_failed_job_creation(
             await mark_job_failed(db, job, error=JOB_START_FAILURE_ERROR)
         else:
             await db.delete(job)
+
+    for uploaded_path in uploaded_paths:
+        try:
+            uploaded_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to delete uploaded file after start failure: %s", uploaded_path)
 
     await db.commit()
 
@@ -179,6 +187,7 @@ async def create_jobs(
             created_jobs=created_jobs,
             submitted_job_ids=submitted_job_ids,
             job_manager=job_manager,
+            uploaded_paths=uploaded_paths,
         )
         raise HTTPException(status_code=500, detail=JOB_START_FAILURE_DETAIL) from exc
 
@@ -200,6 +209,7 @@ async def list_jobs(
                 Job.original_filename,
                 Job.status,
                 Job.classification,
+                Job.ocr_language,
                 Job.page_count,
                 Job.file_size_bytes,
                 Job.error,

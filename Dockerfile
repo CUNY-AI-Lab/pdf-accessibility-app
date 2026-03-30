@@ -39,6 +39,23 @@ RUN apt-get update \
         qpdf \
         tesseract-ocr \
         tesseract-ocr-eng \
+        tesseract-ocr-spa \
+        tesseract-ocr-fra \
+        tesseract-ocr-deu \
+        tesseract-ocr-chi-sim \
+        tesseract-ocr-chi-tra \
+        tesseract-ocr-rus \
+        tesseract-ocr-ara \
+        tesseract-ocr-kor \
+        tesseract-ocr-ben \
+        tesseract-ocr-pol \
+        tesseract-ocr-heb \
+        tesseract-ocr-yid \
+        tesseract-ocr-hat \
+        tesseract-ocr-hin \
+        tesseract-ocr-ita \
+        tesseract-ocr-por \
+        tesseract-ocr-jpn \
         tini \
         unpaper \
         unzip \

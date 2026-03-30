@@ -5,6 +5,8 @@ import PreviewImage from "./PreviewImage";
 interface FidelityIssueCardProps {
   jobId: string;
   task: ReviewTask;
+  onResolve?: (taskId: number) => void;
+  resolving?: boolean;
 }
 
 function num(task: ReviewTask, key: string): number {
@@ -141,9 +143,65 @@ const TASK_TYPE_LABELS: Record<string, string> = {
   font_text_fidelity: "Fonts",
 };
 
-export default function FidelityIssueCard({ jobId, task }: FidelityIssueCardProps) {
+const SUGGESTED_ACTION_LABELS: Record<string, string> = {
+  mark_decorative: "Hide this content from screen readers (mark as decorative)",
+  manual_only: "Review manually in an external tool like Adobe Acrobat Pro",
+  artifact_if_decorative: "Hide this content from screen readers if it is decorative",
+  actualtext_candidate: "Replace the garbled text with the correct readable text",
+  font_map_candidate: "Fix the font encoding so characters display correctly",
+};
+
+function suggestedActionLabel(action: string): string {
+  return SUGGESTED_ACTION_LABELS[action] ?? "Review manually";
+}
+
+/** Plain-language explanation of what was found, drawn from LLM analysis metadata. */
+function WhatWeFound({ task }: { task: ReviewTask }) {
+  const summary = task.metadata?.llm_summary as string | undefined;
+  const confidence = task.metadata?.llm_confidence as string | undefined;
+  const blocks = task.metadata?.flagged_blocks as Array<Record<string, unknown>> | undefined;
+
+  if (!summary && !blocks?.length) return null;
+
+  // Get the first block's suggested action for the recommendation
+  const firstBlock = blocks?.[0];
+  const suggestedAction = firstBlock?.suggested_action as string | undefined;
+
+  return (
+    <div className="mt-4 rounded-lg border border-ink/8 bg-white/70 px-4 py-3 space-y-3">
+      <div>
+        <h4 className="text-xs font-semibold uppercase tracking-wide text-ink-muted mb-1">
+          What we found
+        </h4>
+        <p className="text-sm text-ink leading-relaxed">
+          {summary}
+        </p>
+      </div>
+
+      {suggestedAction && (
+        <div>
+          <h4 className="text-xs font-semibold uppercase tracking-wide text-ink-muted mb-1">
+            Suggested fix
+          </h4>
+          <p className="text-sm text-ink">
+            {suggestedActionLabel(suggestedAction)}
+          </p>
+        </div>
+      )}
+
+      {confidence && (
+        <p className="text-xs text-ink-muted">
+          Confidence: <span className="font-medium">{confidence}</span>
+        </p>
+      )}
+    </div>
+  );
+}
+
+export default function FidelityIssueCard({ jobId, task, onResolve, resolving }: FidelityIssueCardProps) {
   const previewPages = previewPagesForTask(task);
   const pagesToCheck = pages(task);
+  const isResolved = task.status === "resolved";
   const hasMetadata = (() => {
     switch (task.task_type) {
       case "content_fidelity":
@@ -162,7 +220,11 @@ export default function FidelityIssueCard({ jobId, task }: FidelityIssueCardProp
   })();
   const typeLabel = TASK_TYPE_LABELS[task.task_type] ?? "Fidelity";
 
-  const severityBadge = task.blocking ? (
+  const severityBadge = isResolved ? (
+    <span className="rounded-full bg-success-light px-2 py-1 text-[11px] font-medium text-success">
+      Resolved
+    </span>
+  ) : task.blocking ? (
     <span className="rounded-full bg-error-light px-2 py-1 text-[11px] font-medium text-error">
       Needs Fix
     </span>
@@ -173,7 +235,13 @@ export default function FidelityIssueCard({ jobId, task }: FidelityIssueCardProp
   );
 
   return (
-    <div className={`rounded-xl border p-5 ${task.blocking ? "border-error/20 bg-error-light/5" : "border-ink/6 bg-cream"}`}>
+    <div className={`rounded-xl border p-5 transition-opacity ${
+      isResolved
+        ? "border-ink/6 bg-cream/50 opacity-60"
+        : task.blocking
+          ? "border-error/20 bg-error-light/5"
+          : "border-ink/6 bg-cream"
+    }`}>
       <div className="flex items-start justify-between gap-3">
         <div>
           <h3 className="font-display text-lg text-ink">{task.title}</h3>
@@ -204,6 +272,8 @@ export default function FidelityIssueCard({ jobId, task }: FidelityIssueCardProp
         </div>
       )}
 
+      <WhatWeFound task={task} />
+
       {(hasMetadata || pagesToCheck.length > 0) && (
         <div className="mt-4 rounded-lg border border-ink/8 bg-white/70 px-3 py-3 space-y-3">
           {hasMetadata && <MetadataPanel task={task} />}
@@ -212,6 +282,38 @@ export default function FidelityIssueCard({ jobId, task }: FidelityIssueCardProp
               Pages to check: {pagesToCheck.join(", ")}
             </p>
           )}
+        </div>
+      )}
+
+      {!isResolved && onResolve && (
+        <div className="mt-4 flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => onResolve(task.id)}
+            disabled={resolving}
+            className="
+              inline-flex items-center gap-1.5 rounded-lg
+              border border-ink/15 bg-white px-3.5 py-2
+              text-sm font-medium text-ink
+              hover:bg-cream hover:border-ink/25
+              disabled:opacity-50 disabled:cursor-not-allowed
+              transition-colors
+            "
+          >
+            {resolving ? (
+              <>
+                <svg className="animate-spin w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
+                </svg>
+                Resolving...
+              </>
+            ) : (
+              "Mark as Resolved"
+            )}
+          </button>
+          <span className="text-xs text-ink-muted">
+            I've reviewed this and it's acceptable or I'll fix it externally.
+          </span>
         </div>
       )}
     </div>

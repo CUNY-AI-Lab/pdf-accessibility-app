@@ -36,8 +36,8 @@ Frontend proxies `/api` and `/health` to `http://localhost:8001` via Vite config
 - `frontend/src/api/jobs.ts` — TanStack Query hooks for API calls
 
 ## Pipeline Steps
-1. Classify (scanned vs digital)
-2. OCR (OCRmyPDF)
+1. Classify (scanned vs digital + language detection)
+2. OCR (OCRmyPDF, auto-detected language)
 3. Structure (Docling — docling-serve or local fallback)
 4. Alt Text (Vision LLM via OpenAI-compatible API)
 5. Tag (pikepdf PDF/UA)
@@ -57,8 +57,22 @@ Key checks: text drift, reading order, table coverage, form labels, font fidelit
   OCR legitimately expands the text layer.
 
 Blocking fidelity tasks surface on the review page via `FidelityIssueCard` with
-task-type-specific metadata (similarity scores, page numbers, table counts, etc.).
-Task types are registered in `backend/app/services/review_surface.py`.
+task-type-specific metadata (similarity scores, page numbers, table counts, etc.)
+and a "Mark as Resolved" button. Cards show the LLM's plain-language analysis
+("What we found") and suggested fix. Resolving all blocking tasks upgrades the
+job from `manual_remediation` → `complete`. Task types are registered in
+`backend/app/services/review_surface.py`.
+
+## OCR Language Detection
+Auto-detects document language during classification. Shared utilities in
+`backend/app/pipeline/language.py` (BCP-47 ↔ Tesseract code mappings).
+
+- **Digital/mixed PDFs**: text extraction via pdfminer → lingua-py detection
+- **Scanned PDFs**: probe OCR on page 1 with all installed Tesseract packs →
+  lingua-py on the OCR'd text
+- Per-job `ocr_language` stored on the Job model; falls back to `OCR_LANGUAGE`
+  env var (default: `eng`)
+- Docker image includes 18 language packs (CUNY-relevant subset)
 
 ## docling-serve (Structure Extraction)
 Persistent Docling HTTP server on the Mac Studio, reachable via Tailscale

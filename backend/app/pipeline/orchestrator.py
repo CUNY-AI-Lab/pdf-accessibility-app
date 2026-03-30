@@ -19,6 +19,7 @@ from app.models import AltTextEntry, AppliedChange, Job, JobStep, ReviewTask
 from app.pipeline.alt_text import figure_applied_change_specs, generate_alt_text
 from app.pipeline.classify import classify_pdf
 from app.pipeline.fidelity import _table_semantics_risk, assess_fidelity
+from app.pipeline.language import bcp47_to_tesseract
 from app.pipeline.ocr import run_ocr
 from app.pipeline.structure import extract_structure
 from app.pipeline.subprocess_utils import SubprocessTimeout, communicate_with_timeout
@@ -4536,7 +4537,7 @@ async def _attempt_font_lane(
         ocr_result = await run_ocr(
             input_path=working_pdf,
             output_path=ocr_output,
-            language=settings.ocr_language,
+            language=job.ocr_language or settings.ocr_language,
             mode=mode,
             rotate_pages=settings.ocr_rotate_pages,
             deskew=settings.ocr_deskew,
@@ -4728,6 +4729,11 @@ async def run_pipeline(
 
             job.classification = classification.type
             job.page_count = classification.total_pages
+            # Set OCR language: auto-detection > global default.
+            if not job.ocr_language and classification.detected_language:
+                job.ocr_language = bcp47_to_tesseract(classification.detected_language, settings.ocr_language)
+            elif not job.ocr_language:
+                job.ocr_language = settings.ocr_language
             await _update_step(
                 db,
                 job_id,
@@ -4738,6 +4744,8 @@ async def run_pipeline(
                     "confidence": classification.confidence,
                     "pages_with_text": classification.pages_with_text,
                     "total_pages": classification.total_pages,
+                    "detected_language": classification.detected_language,
+                    "ocr_language": job.ocr_language,
                 },
             )
             job_manager.emit_progress(
@@ -4759,7 +4767,7 @@ async def run_pipeline(
                 ocr_result = await run_ocr(
                     input_path,
                     ocr_output,
-                    settings.ocr_language,
+                    job.ocr_language or settings.ocr_language,
                     rotate_pages=settings.ocr_rotate_pages,
                     deskew=settings.ocr_deskew,
                     timeout_seconds=settings.subprocess_timeout_ocr,

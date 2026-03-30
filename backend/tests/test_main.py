@@ -42,6 +42,7 @@ def test_create_app_serves_built_frontend(tmp_path, monkeypatch):
 
     monkeypatch.setattr(main, "ensure_dirs", lambda: None)
     monkeypatch.setattr(main, "init_db", _noop_async)
+    monkeypatch.setattr(main, "_cleanup_expired_jobs_once", _noop_async)
     monkeypatch.setattr(main, "_fail_abandoned_jobs_once", _noop_async)
     monkeypatch.setattr(main, "get_job_manager", lambda: _DummyJobManager())
 
@@ -70,6 +71,33 @@ def test_create_app_serves_built_frontend(tmp_path, monkeypatch):
 
         health_response = client.get("/health")
         assert health_response.status_code == 200
+
+
+def test_create_app_runs_startup_cleanup_before_failing_abandoned_jobs(monkeypatch):
+    call_order: list[str] = []
+
+    async def _cleanup_once(*, cutoff=None, batch_size=100):
+        del cutoff, batch_size
+        call_order.append("cleanup")
+        return 0
+
+    async def _fail_abandoned(*, error_message=RESTART_INTERRUPTED_ERROR):
+        del error_message
+        call_order.append("fail_abandoned")
+        return 0
+
+    monkeypatch.setattr(main, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(main, "init_db", _noop_async)
+    monkeypatch.setattr(main, "_cleanup_expired_jobs_once", _cleanup_once)
+    monkeypatch.setattr(main, "_fail_abandoned_jobs_once", _fail_abandoned)
+    monkeypatch.setattr(main, "get_job_manager", lambda: _DummyJobManager())
+
+    app = main.create_app()
+
+    with TestClient(app):
+        pass
+
+    assert call_order[:2] == ["cleanup", "fail_abandoned"]
 
 
 @pytest.mark.asyncio

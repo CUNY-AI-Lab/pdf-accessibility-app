@@ -26,6 +26,13 @@ class _DummyRestartJobManager:
         return None
 
 
+class _FailingRestartJobManager(_DummyRestartJobManager):
+    async def submit_job(self, job_id: str, coro):
+        self.submitted_job_ids.append(job_id)
+        coro.close()
+        raise RuntimeError("submit failed")
+
+
 @pytest.mark.asyncio
 async def test_keep_applied_change_returns_current_job_status():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -294,6 +301,83 @@ async def test_restart_tagging_rejects_stale_job_object_after_another_request_cl
 
         assert exc_info.value.status_code == 409
         assert job_manager.submitted_job_ids == []
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_restart_tagging_restores_previous_output_when_submission_fails(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    job_manager = _FailingRestartJobManager()
+    monkeypatch.setattr(review, "get_settings", lambda: object())
+    monkeypatch.setattr(review, "get_session_maker", lambda: None)
+    monkeypatch.setattr(review, "get_job_manager", lambda: job_manager)
+
+    async with session_maker() as db:
+        job = Job(
+            id="job-change-restore-1",
+            filename="sample.pdf",
+            original_filename="sample.pdf",
+            owner_session_hash=_session("session-1-token-value").session_hash,
+            status="complete",
+            input_path="/tmp/sample.pdf",
+            output_path="/tmp/accessible.pdf",
+            validation_json='{"compliant": true}',
+            fidelity_json='{"passed": true}',
+        )
+        db.add(job)
+        db.add_all(
+            [
+                JobStep(
+                    job_id="job-change-restore-1",
+                    step_name="tagging",
+                    status="complete",
+                    result_json='{"tags_added": 3}',
+                ),
+                JobStep(
+                    job_id="job-change-restore-1",
+                    step_name="validation",
+                    status="complete",
+                    result_json='{"compliant": true}',
+                ),
+                JobStep(
+                    job_id="job-change-restore-1",
+                    step_name="fidelity",
+                    status="complete",
+                    result_json='{"passed": true}',
+                ),
+            ]
+        )
+        await db.commit()
+
+        with pytest.raises(RuntimeError, match="submit failed"):
+            await review._restart_tagging_with_current_state(job=job, db=db)
+
+        await db.refresh(job)
+        steps = (
+            await db.execute(
+                review.select(JobStep).where(JobStep.job_id == "job-change-restore-1")
+            )
+        ).scalars().all()
+
+        assert job.status == "complete"
+        assert job.output_path == "/tmp/accessible.pdf"
+        assert job.validation_json == '{"compliant": true}'
+        assert job.fidelity_json == '{"passed": true}'
+        assert job_manager.submitted_job_ids == ["job-change-restore-1"]
+
+        by_name = {step.step_name: step for step in steps}
+        assert by_name["tagging"].status == "complete"
+        assert by_name["tagging"].result_json == '{"tags_added": 3}'
+        assert by_name["validation"].status == "complete"
+        assert by_name["validation"].result_json == '{"compliant": true}'
+        assert by_name["fidelity"].status == "complete"
+        assert by_name["fidelity"].result_json == '{"passed": true}'
 
     await engine.dispose()
 

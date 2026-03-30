@@ -36,6 +36,7 @@ export interface Job {
   original_filename: string;
   status: JobStatus;
   classification?: "scanned" | "digital" | "mixed";
+  ocr_language?: string;
   page_count?: number;
   file_size_bytes?: number;
   error?: string;

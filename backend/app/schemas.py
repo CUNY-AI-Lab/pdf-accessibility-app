@@ -19,6 +19,7 @@ class JobResponse(BaseModel):
     original_filename: str
     status: str
     classification: str | None = None
+    ocr_language: str | None = None
     page_count: int | None = None
     file_size_bytes: int | None = None
     error: str | None = None

@@ -49,6 +49,18 @@ export function useReviewTasks(jobId: string, enabled = true) {
   });
 }
 
+export function useResolveReviewTask(jobId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ taskId }: { taskId: number }) =>
+      apiFetch<{ status: string; message: string; job_status: string }>(
+        `/jobs/${jobId}/review-tasks/${taskId}/resolve`,
+        { method: "POST" },
+      ),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+  });
+}
+
 export function useAppliedChanges(jobId: string, enabled = true) {
   return useQuery({
     queryKey: ["jobs", jobId, "applied-changes"],

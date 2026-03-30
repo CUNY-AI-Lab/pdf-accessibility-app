@@ -185,6 +185,9 @@ def create_app(frontend_dist_dir: Path | None = None) -> FastAPI:
         ensure_dirs()
         await init_db()
         logger.info("Database initialized")
+        expired_jobs = await _cleanup_expired_jobs_once()
+        if expired_jobs:
+            logger.info("Removed %s expired job(s) during startup cleanup", expired_jobs)
         abandoned_jobs = await _fail_abandoned_jobs_once()
         if abandoned_jobs:
             logger.warning(

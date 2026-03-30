@@ -2480,7 +2480,7 @@ async def test_font_dict_lane_reuses_existing_tags(tmp_path, monkeypatch):
 
     result = await orchestrator._attempt_font_lane(
         job_id="job-1",
-        job=SimpleNamespace(original_filename="sample.pdf"),
+        job=SimpleNamespace(original_filename="sample.pdf", ocr_language=None),
         settings=_settings(),
         working_pdf=tmp_path / "working.pdf",
         tagged_pdf=tagged_pdf,
@@ -2548,7 +2548,7 @@ async def test_embed_lane_skips_local_attempt_when_diagnostics_rule_it_out(tmp_p
 
     result = await orchestrator._attempt_font_lane(
         job_id="job-embed",
-        job=SimpleNamespace(original_filename="sample.pdf"),
+        job=SimpleNamespace(original_filename="sample.pdf", ocr_language=None),
         settings=_settings(),
         working_pdf=tmp_path / "working.pdf",
         tagged_pdf=tagged_pdf,
@@ -2614,7 +2614,7 @@ async def test_ocr_lane_refreshes_structure_before_retag(tmp_path, monkeypatch):
 
     result = await orchestrator._attempt_font_lane(
         job_id="job-ocr",
-        job=SimpleNamespace(original_filename="sample.pdf"),
+        job=SimpleNamespace(original_filename="sample.pdf", ocr_language=None),
         settings=_settings(),
         working_pdf=working_pdf,
         tagged_pdf=tagged_pdf,

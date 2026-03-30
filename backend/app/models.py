@@ -41,6 +41,7 @@ class Job(Base):
     owner_session_hash: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
     classification: Mapped[str | None] = mapped_column(String, nullable=True)
+    ocr_language: Mapped[str | None] = mapped_column(String, nullable=True)
     input_path: Mapped[str] = mapped_column(String, nullable=False)
     output_path: Mapped[str | None] = mapped_column(String, nullable=True)
     structure_json: Mapped[str | None] = mapped_column(Text, nullable=True)

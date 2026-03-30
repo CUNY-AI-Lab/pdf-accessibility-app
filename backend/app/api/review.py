@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db, get_session_maker
-from app.models import AltTextEntry, AppliedChange, Job
+from app.models import AltTextEntry, AppliedChange, Job, JobStep, ReviewTask
 from app.pipeline.orchestrator import run_tagging_and_validation
 from app.pipeline.structure import FigureInfo
 from app.schemas import (
@@ -30,6 +31,7 @@ from app.services.intelligence_gemini_figures import generate_figure_intelligenc
 from app.services.job_manager import get_job_manager
 from app.services.job_state import (
     ACTIVE_JOB_STATUSES,
+    RERUN_STEP_NAMES,
     clear_terminal_artifacts,
     reset_rerun_steps,
 )
@@ -111,6 +113,65 @@ def _applied_change_to_response(change: AppliedChange) -> AppliedChangeResponse:
     return AppliedChangeResponse(**change_to_response_payload(change))
 
 
+def _snapshot_rerun_job_state(job: Job) -> dict[str, object | None]:
+    return {
+        "status": job.status,
+        "error": job.error,
+        "output_path": job.output_path,
+        "validation_json": job.validation_json,
+        "fidelity_json": job.fidelity_json,
+        "updated_at": job.updated_at,
+    }
+
+
+def _snapshot_rerun_step_state(steps: list[JobStep]) -> dict[str, dict[str, object | None]]:
+    return {
+        step.step_name: {
+            "status": step.status,
+            "started_at": step.started_at,
+            "completed_at": step.completed_at,
+            "result_json": step.result_json,
+            "error": step.error,
+        }
+        for step in steps
+    }
+
+
+def _restore_rerun_job_state(
+    job: Job,
+    *,
+    snapshot: dict[str, object | None],
+) -> None:
+    job.status = str(snapshot["status"] or "manual_remediation")
+    job.error = str(snapshot["error"]) if snapshot["error"] is not None else None
+    job.output_path = str(snapshot["output_path"]) if snapshot["output_path"] is not None else None
+    job.validation_json = (
+        str(snapshot["validation_json"]) if snapshot["validation_json"] is not None else None
+    )
+    job.fidelity_json = (
+        str(snapshot["fidelity_json"]) if snapshot["fidelity_json"] is not None else None
+    )
+    job.updated_at = snapshot["updated_at"]
+
+
+def _restore_rerun_step_state(
+    steps: list[JobStep],
+    *,
+    snapshot: dict[str, dict[str, object | None]],
+) -> None:
+    for step in steps:
+        state = snapshot.get(step.step_name)
+        if state is None:
+            continue
+        step.status = str(state["status"] or "pending")
+        step.started_at = state["started_at"]
+        step.completed_at = state["completed_at"]
+        step.result_json = (
+            str(state["result_json"]) if state["result_json"] is not None else None
+        )
+        step.error = str(state["error"]) if state["error"] is not None else None
+
+
 async def _restart_tagging_with_current_state(
     *,
     job: Job,
@@ -121,6 +182,17 @@ async def _restart_tagging_with_current_state(
     job_manager = get_job_manager()
     if job_manager.is_running(job.id):
         raise HTTPException(status_code=409, detail=_REVIEW_ACTION_IN_PROGRESS_DETAIL)
+
+    rerun_steps = (
+        await db.execute(
+            select(JobStep).where(
+                JobStep.job_id == job.id,
+                JobStep.step_name.in_(RERUN_STEP_NAMES),
+            )
+        )
+    ).scalars().all()
+    job_snapshot = _snapshot_rerun_job_state(job)
+    step_snapshot = _snapshot_rerun_step_state(list(rerun_steps))
 
     active_statuses = tuple(ACTIVE_JOB_STATUSES)
     claim_result = await db.execute(
@@ -166,8 +238,8 @@ async def _restart_tagging_with_current_state(
             _resume(job.id, session_maker, settings, job_manager),
         )
     except Exception:
-        # Rollback the "processing" status so the job isn't stuck
-        job.status = "manual_remediation"
+        _restore_rerun_job_state(job, snapshot=job_snapshot)
+        _restore_rerun_step_state(list(rerun_steps), snapshot=step_snapshot)
         await db.commit()
         raise
 
@@ -546,6 +618,59 @@ async def edit_applied_change(
         status="edited",
         message="Saved the edited figure description and restarted accessibility processing.",
         job_status="processing",
+    )
+
+
+@router.post("/review-tasks/{task_id}/resolve", response_model=AppliedChangeActionResponse)
+async def resolve_review_task(
+    job_id: str,
+    task_id: int,
+    db: AsyncSession = Depends(get_db),
+    session: AnonymousSession = Depends(get_anonymous_session),
+):
+    """Mark a review task as resolved (user has acknowledged/addressed the issue)."""
+    job = await _load_job(job_id=job_id, session_hash=session.session_hash, db=db)
+    _ensure_job_supports_in_app_review(job)
+
+    result = await db.execute(
+        select(ReviewTask).where(
+            ReviewTask.id == task_id,
+            ReviewTask.job_id == job_id,
+        )
+    )
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="Review task not found")
+    if task.status == "resolved":
+        raise HTTPException(status_code=409, detail="This task is already resolved.")
+
+    task.status = "resolved"
+    job.updated_at = datetime.now(UTC)
+
+    # If no blocking tasks remain unresolved, upgrade job to complete
+    # (provided validation was compliant).
+    remaining = await db.execute(
+        select(ReviewTask.id).where(
+            ReviewTask.job_id == job_id,
+            ReviewTask.blocking == True,  # noqa: E712
+            ReviewTask.status != "resolved",
+        )
+    )
+    if not remaining.scalars().first() and job.status == "manual_remediation":
+        validation = {}
+        if job.validation_json:
+            try:
+                validation = json.loads(job.validation_json)
+            except json.JSONDecodeError:
+                pass
+        if validation.get("compliant", False):
+            job.status = "complete"
+
+    await db.commit()
+    return AppliedChangeActionResponse(
+        status="resolved",
+        message="Marked this issue as resolved.",
+        job_status=str(job.status),
     )
 
 
