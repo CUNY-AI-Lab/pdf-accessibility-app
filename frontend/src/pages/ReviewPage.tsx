@@ -11,12 +11,13 @@ import {
   useReviseAppliedChange,
   useReviewTasks,
   useUndoAppliedChange,
+  useValidation,
 } from "../api/jobs";
 import AppliedChangeCard from "../components/AppliedChangeCard";
 import FidelityIssueCard from "../components/FidelityIssueCard";
 import { ChevronLeftIcon } from "../components/Icons";
 import ReviewTaskCard from "../components/ReviewTaskCard";
-import type { AppliedChange } from "../types";
+import type { AppliedChange, ValidationViolation } from "../types";
 
 const FIDELITY_TASK_TYPES = new Set([
   "content_fidelity",
@@ -28,6 +29,67 @@ const FIDELITY_TASK_TYPES = new Set([
 
 function actionSubject(change: AppliedChange): string {
   return change.change_type === "figure_semantics" ? "image description" : "change";
+}
+
+const CATEGORY_LABELS: Record<string, string> = {
+  fonts: "Font issues",
+  structure: "Document structure",
+  metadata: "Document metadata",
+  images: "Image accessibility",
+  color: "Color contrast",
+  language: "Language tagging",
+  annotations: "Annotations",
+};
+
+function categoryLabel(category: string | undefined): string {
+  return (category && CATEGORY_LABELS[category]) ?? "Accessibility issue";
+}
+
+/** Plain-language descriptions for common fix_hint patterns. */
+function plainFixDescription(violation: ValidationViolation): string {
+  if (violation.fix_hint) return violation.fix_hint;
+  return violation.description;
+}
+
+function UnremediatedViolations({ violations }: { violations: ValidationViolation[] }) {
+  if (violations.length === 0) return null;
+
+  // Group by category for cleaner display
+  const byCategory = new Map<string, ValidationViolation[]>();
+  for (const v of violations) {
+    const cat = v.category ?? "other";
+    const group = byCategory.get(cat) ?? [];
+    group.push(v);
+    byCategory.set(cat, group);
+  }
+
+  const totalCount = violations.reduce((sum, v) => sum + v.count, 0);
+
+  return (
+    <div className="mt-4 space-y-3">
+      <h3 className="text-sm font-semibold text-ink">
+        {totalCount} remaining {totalCount === 1 ? "error" : "errors"} found by the validator
+      </h3>
+      {[...byCategory.entries()].map(([cat, items]) => (
+        <div key={cat} className="rounded-lg border border-ink/8 bg-white/70 px-4 py-3">
+          <h4 className="text-xs font-semibold uppercase tracking-wide text-ink-muted mb-1">
+            {categoryLabel(cat)}
+          </h4>
+          <ul className="space-y-2">
+            {items.map((v) => (
+              <li key={v.rule_id} className="text-sm text-ink">
+                <p>{plainFixDescription(v)}</p>
+                <p className="text-xs text-ink-muted mt-0.5">
+                  {v.count} {v.count === 1 ? "occurrence" : "occurrences"}
+                  {v.location ? ` \u00b7 ${v.location}` : ""}
+                </p>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 export default function ReviewPage() {
@@ -54,6 +116,7 @@ export default function ReviewPage() {
     isLoading: figureChangesLoading,
     error: figureChangesError,
   } = useFigureChanges(id!, canInspectOutput);
+  const { data: validationReport } = useValidation(id!, canInspectOutput);
   const keepAppliedChange = useKeepAppliedChange(id!);
   const undoAppliedChange = useUndoAppliedChange(id!);
   const reviseAppliedChange = useReviseAppliedChange(id!);
@@ -86,7 +149,10 @@ export default function ReviewPage() {
     .filter((task) => !FIDELITY_TASK_TYPES.has(task.task_type))
     .filter((task) => !(task.task_type === "alt_text" && hasFigureCards));
   const additionalCheckTasks = [...nonBlockingFidelityTasks, ...optionalReviewTasks];
-  const hasReviewItems = pendingAppliedChanges.length > 0 || allOpenTasks.length > 0;
+  const unremediatedViolations = validationReport?.violations?.filter(
+    (v) => v.remediation_status === "needs_remediation" && v.severity === "error",
+  ) ?? [];
+  const hasReviewItems = pendingAppliedChanges.length > 0 || allOpenTasks.length > 0 || unremediatedViolations.length > 0;
 
   const handleKeepAppliedChange = async (change: AppliedChange) => {
     setChangeActionErrorId(null);
@@ -280,6 +346,7 @@ export default function ReviewPage() {
                 Download report
               </a>
             </div>
+            <UnremediatedViolations violations={unremediatedViolations} />
           </div>
           {blockingFidelityTasks.map((task) => (
             <FidelityIssueCard
@@ -299,7 +366,9 @@ export default function ReviewPage() {
             Needs manual fixes
           </h2>
           <p className="text-sm text-ink-muted">
-            Some issues could not be fixed automatically. Download the report and current PDF to continue in an external tool.
+            {unremediatedViolations.length > 0
+              ? "The validator found issues that could not be fixed automatically. Download the PDF and fix them in an external tool like Adobe Acrobat Pro."
+              : "Some issues could not be fixed automatically. Download the report and current PDF to continue in an external tool."}
           </p>
           <div className="mt-4 flex flex-wrap items-center gap-4">
             <a
@@ -317,6 +386,7 @@ export default function ReviewPage() {
               Download report
             </a>
           </div>
+          <UnremediatedViolations violations={unremediatedViolations} />
         </div>
       )}
 
