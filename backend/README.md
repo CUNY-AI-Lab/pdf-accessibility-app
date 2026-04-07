@@ -62,6 +62,17 @@ Main files:
 - [app/services/llm_client.py](app/services/llm_client.py)
 - [app/services/intelligence_llm_utils.py](app/services/intelligence_llm_utils.py)
 
+The same backend settings drive both the real app and the benchmark scripts. If `DOCLING_SERVE_URL` is set, the structure step uses that server; otherwise it falls back to local Docling. Semantic adjudication continues to use the configured OpenAI-compatible LLM endpoint.
+
+On Apple Silicon, the recommended local setup is `docling-serve` with `DOCLING_DEVICE=mps`. That accelerates structure extraction, but the tagging/writer step in [app/pipeline/tagger.py](app/pipeline/tagger.py) remains CPU-bound.
+
+Runtime check:
+
+```bash
+cd backend
+PYTHONPATH=. uv run python scripts/runtime_diagnostics.py
+```
+
 ## External binaries
 
 The backend depends on system binaries for OCR, previews, and validation:
@@ -120,6 +131,48 @@ Representative corpus:
 cd backend
 PYTHONPATH=. uv run python scripts/corpus_benchmark.py --exclude-wac
 ```
+
+Use the `assistive-core` profile when you want the full workflow semantics while temporarily skipping only the figure alt-text branch:
+
+```bash
+cd backend
+PYTHONPATH=. uv run python scripts/corpus_benchmark.py --profile assistive-core --exclude-wac
+```
+
+Round-trip strip step for gold accessible PDFs:
+
+```bash
+cd backend
+PYTHONPATH=. uv run python scripts/strip_accessibility.py \
+  --input /path/to/gold-accessible.pdf \
+  --output data/benchmarks/roundtrip/mydoc_stripped.pdf
+```
+
+Round-trip comparison against the gold file:
+
+```bash
+cd backend
+PYTHONPATH=. uv run python scripts/roundtrip_compare.py \
+  --gold /path/to/gold-accessible.pdf \
+  --candidate /path/to/remediated-output.pdf \
+  --manifest /path/to/mydoc.roundtrip.json
+```
+
+Round-trip corpus benchmark:
+
+```bash
+cd backend
+PYTHONPATH=. uv run python scripts/roundtrip_corpus_benchmark.py
+```
+
+The round-trip corpus runner defaults to the `assistive-core` profile. That profile runs the full workflow except for the figure alt-text branch, so validation, fidelity, review surfaces, grounded text, tables, widget cleanup, and form labeling all remain in the loop. Use the full workflow only when you specifically want to include figure/alt-text behavior:
+
+```bash
+cd backend
+PYTHONPATH=. uv run python scripts/roundtrip_corpus_benchmark.py --workflow-profile full
+```
+
+The round-trip comparison reports form field presence and field-type recovery separately from exact accessible-name replay. Use manifest assertions to encode the assistive requirement you actually care about: field existence, control type, required label terms, and disambiguating context.
 
 PDF/UA coverage matrix:
 

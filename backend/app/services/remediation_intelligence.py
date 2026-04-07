@@ -13,7 +13,11 @@ from app.services.font_unicode_override import inspect_context_font_target
 from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
 from app.services.intelligence_gemini_reading_order import generate_reading_order_intelligence
 from app.services.intelligence_gemini_tables import generate_table_intelligence
-from app.services.intelligence_llm_utils import job_pdf_path, request_llm_json
+from app.services.intelligence_llm_utils import (
+    job_pdf_path,
+    preferred_cache_breakpoint_index,
+    request_llm_json,
+)
 from app.services.intelligence_merge import (
     apply_suspicious_text_intelligence,
     apply_table_intelligence,
@@ -989,7 +993,11 @@ async def generate_remediation_intelligence(
     previous_intelligence = _previous_remediation_intelligence(task)
     if task.task_type == "font_text_fidelity":
         _prompt_text, content = _font_task_payload(job, task, reviewer_feedback=reviewer_feedback)
-        intelligence = await request_llm_json(llm_client=llm_client, content=content)
+        intelligence = await request_llm_json(
+            llm_client=llm_client,
+            content=content,
+            cache_breakpoint_index=preferred_cache_breakpoint_index(content),
+        )
     elif task.task_type == "reading_order":
         metadata = _parse_metadata(task)
         structure_fragments = _collect_structure_fragments_from_document(document)

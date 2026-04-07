@@ -8,11 +8,16 @@ from pathlib import Path
 from typing import Any
 
 from app.models import Job
-from app.services.llm_client import LlmClient
+from app.services.llm_client import LlmClient, is_retryable_llm_exception
 from app.services.path_safety import validate_path_within_allowed_roots
 from app.services.pdf_preview import render_page_jpeg_data_url
 
 logger = logging.getLogger(__name__)
+
+
+def _should_try_alternate_response_format(exc: BaseException) -> bool:
+    """Fallback formats help with capability/validation issues, not flaky endpoints."""
+    return not is_retryable_llm_exception(exc)
 
 
 def job_pdf_path(job: Job) -> Path:
@@ -117,6 +122,20 @@ def apply_cache_breakpoint(
     return prepared
 
 
+def preferred_cache_breakpoint_index(content: list[dict[str, Any]]) -> int | None:
+    if not content:
+        return None
+
+    last_image_index: int | None = None
+    for index, item in enumerate(content):
+        if isinstance(item, dict) and item.get("type") == "image_url":
+            last_image_index = index
+
+    if last_image_index is not None:
+        return last_image_index
+    return len(content) - 1
+
+
 async def request_llm_json(
     *,
     llm_client: LlmClient,
@@ -125,43 +144,76 @@ async def request_llm_json(
     response_schema: dict[str, Any] | None = None,
     cache_breakpoint_index: int | None = None,
 ) -> dict[str, Any]:
-    response = None
     provider_preferences = {"require_parameters": True}
-    prepared_content = apply_cache_breakpoint(content, cache_breakpoint_index)
-    if response_schema and schema_name:
-        try:
-            response = await llm_client.chat_completion(
-                messages=[{"role": "user", "content": prepared_content}],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": schema_name,
-                        "strict": True,
-                        "schema": response_schema,
-                    },
-                },
-                provider=provider_preferences,
-                temperature=0,
-            )
-        except Exception:
-            logger.debug("Structured json_schema LLM call failed, falling back to json_object")
-            response = None
-    if response is None:
-        try:
-            response = await llm_client.chat_completion(
-                messages=[{"role": "user", "content": prepared_content}],
-                response_format={"type": "json_object"},
-                provider=provider_preferences,
-                temperature=0,
-            )
-        except Exception:
-            response = await llm_client.chat_completion(
-                messages=[{"role": "user", "content": prepared_content}],
-                temperature=0,
-            )
+    repair_note: str | None = None
 
-    try:
-        message_content = response["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError(f"Unexpected LLM response format: {exc}") from exc
-    return extract_json_object(str(message_content))
+    async def _request_once(request_content: list[dict[str, Any]]) -> Any:
+        response = None
+        if response_schema and schema_name:
+            try:
+                response = await llm_client.chat_completion(
+                    messages=[{"role": "user", "content": request_content}],
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": schema_name,
+                            "strict": True,
+                            "schema": response_schema,
+                        },
+                    },
+                    provider=provider_preferences,
+                    temperature=0,
+                )
+            except Exception as exc:
+                if not _should_try_alternate_response_format(exc):
+                    raise
+                logger.debug("Structured json_schema LLM call failed, falling back to json_object")
+                response = None
+        if response is None:
+            try:
+                response = await llm_client.chat_completion(
+                    messages=[{"role": "user", "content": request_content}],
+                    response_format={"type": "json_object"},
+                    provider=provider_preferences,
+                    temperature=0,
+                )
+            except Exception as exc:
+                if not _should_try_alternate_response_format(exc):
+                    raise
+                response = await llm_client.chat_completion(
+                    messages=[{"role": "user", "content": request_content}],
+                    temperature=0,
+                )
+        return response
+
+    for attempt in range(2):
+        request_content = list(content)
+        if repair_note:
+            request_content = [
+                *request_content,
+                {
+                    "type": "text",
+                    "text": (
+                        "Your previous response could not be parsed as valid JSON. "
+                        "Re-evaluate the same evidence and return only one valid JSON object "
+                        "that matches the requested schema. Do not include markdown or extra prose.\n\n"
+                        f"Previous parse issue: {repair_note}"
+                    ),
+                },
+            ]
+        prepared_content = apply_cache_breakpoint(request_content, cache_breakpoint_index)
+        response = await _request_once(prepared_content)
+
+        try:
+            message_content = response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ValueError(f"Unexpected LLM response format: {exc}") from exc
+        try:
+            return extract_json_object(str(message_content))
+        except ValueError as exc:
+            if attempt == 1:
+                raise
+            repair_note = str(exc)
+            logger.info("Retrying malformed JSON LLM response: %s", repair_note)
+
+    raise RuntimeError("Unreachable")

@@ -8,12 +8,10 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from app.config import get_settings
 from app.pipeline.language import (
-    LINGUA_DETECTOR as _LINGUA_DETECTOR,
-    detect_language as _detect_language,
     normalize_lang_tag as _normalize_lang_tag,
 )
 from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
@@ -28,7 +26,7 @@ TOC_HEADING_TEXTS = {
     "table of contents",
 }
 TOC_TRAILING_PAGE_RE = re.compile(
-    r"(?:\.{2,}|\s{2,}|\t+)?\s*(?:\d+|[ivxlcdm]+)\s*$",
+    r"(?:\.{2,}\s*|(?:\.\s*){2,}|\s{2,}|\t+)(?:\d+|[ivxlcdm]+)\s*$|(?:\s+)(?:\d+)\s*$",
     re.IGNORECASE,
 )
 FORMULA_SHORT_TEXT_LIMIT = 160
@@ -61,6 +59,11 @@ FORMULA_ALLOWED_LONG_WORDS = {
     "root",
     "limit",
 }
+TITLE_SPACED_CAPS_RE = re.compile(r"\b(?:[A-Z]\s+){2,}[A-Z](?:\s+\d+)*\b")
+TOC_GROUP_HEADING_EXCLUDE = {
+    "page",
+    "lists",
+}
 
 
 @dataclass
@@ -81,6 +84,56 @@ class StructureResult:
     headings_count: int = 0
     tables_count: int = 0
     figures_count: int = 0
+
+
+def _normalize_native_toc(node: Any) -> dict[str, Any] | None:
+    """Convert a docling-parse table-of-contents tree into plain JSON-safe dicts."""
+    if node is None:
+        return None
+    if hasattr(node, "model_dump"):
+        data = node.model_dump()
+    elif isinstance(node, dict):
+        data = node
+    else:
+        return None
+
+    text = " ".join(str(data.get("text") or "").split()).strip()
+    orig = " ".join(str(data.get("orig") or "").split()).strip()
+    marker = " ".join(str(data.get("marker") or "").split()).strip()
+    children: list[dict[str, Any]] = []
+    for child in data.get("children") or []:
+        normalized_child = _normalize_native_toc(child)
+        if normalized_child is not None:
+            children.append(normalized_child)
+
+    normalized: dict[str, Any] = {"text": text, "children": children}
+    if orig:
+        normalized["orig"] = orig
+    if marker:
+        normalized["marker"] = marker
+    if text or children:
+        return normalized
+    return None
+
+
+def _extract_native_toc_from_pdf(pdf_path: Path) -> dict[str, Any] | None:
+    """Read the parser-native TOC tree when the source PDF exposes one."""
+    try:
+        from docling_parse.pdf_parser import DoclingPdfParser
+    except Exception:
+        return None
+
+    try:
+        parser_doc = DoclingPdfParser(loglevel="fatal").load(str(pdf_path), lazy=True)
+        native_toc = parser_doc.get_table_of_contents()
+    except Exception as exc:
+        logger.info("Native TOC extraction unavailable for %s: %s", pdf_path.name, exc)
+        return None
+
+    normalized = _normalize_native_toc(native_toc)
+    if not normalized or not normalized.get("children"):
+        return None
+    return normalized
 
 
 def _resolve_ref(doc_dict: dict, ref: str):
@@ -264,9 +317,8 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
 
         elif label in ("text", "paragraph", "caption", "reference"):
             if text.strip():
-                element_type = "formula" if _looks_like_formula_text(text) else "paragraph"
                 elem_dict = {
-                    "type": element_type,
+                    "type": "paragraph",
                     "text": text,
                     "page": page,
                     "bbox": bbox,
@@ -360,20 +412,7 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
                 "artifact_type": label,
             })
 
-    # Detect per-element language via lingua-py for elements that
-    # don't already have language from Docling metadata.  Only runs
-    # on text-bearing elements with enough words for reliable detection.
-    if _LINGUA_DETECTOR is not None:
-        _lang_eligible = {"heading", "paragraph", "list_item", "note", "code"}
-        for elem in elements:
-            if elem.get("lang") or elem.get("type") not in _lang_eligible:
-                continue
-            detected = _detect_language(elem.get("text", ""))
-            if detected:
-                elem["lang"] = _normalize_lang_tag(detected) or detected
-
-    _mark_toc_sequences(elements)
-    return _expand_toc_item_tables(elements)
+    return elements
 
 
 def _mark_toc_sequences(elements: list[dict]) -> None:
@@ -586,6 +625,288 @@ def _looks_like_toc_table(element: dict) -> bool:
     return matching_rows >= max(1, len(rows) // 2)
 
 
+def _rect_to_bbox(rect: Any) -> dict[str, float] | None:
+    """Convert a docling-parse rectangle into a bottom-left bbox dict."""
+    if rect is None or not hasattr(rect, "model_dump"):
+        return None
+    data = rect.model_dump()
+    xs = [float(data.get(key, 0.0)) for key in ("r_x0", "r_x1", "r_x2", "r_x3")]
+    ys = [float(data.get(key, 0.0)) for key in ("r_y0", "r_y1", "r_y2", "r_y3")]
+    return {
+        "l": min(xs),
+        "b": min(ys),
+        "r": max(xs),
+        "t": max(ys),
+    }
+
+
+def _toc_rows_from_word_cells(word_cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group word cells into visual TOC rows using shared y-position."""
+    rows: list[dict[str, Any]] = []
+    sorted_cells = sorted(
+        (
+            cell for cell in word_cells
+            if isinstance(cell, dict)
+            and isinstance(cell.get("bbox"), dict)
+            and str(cell.get("text") or "").strip()
+        ),
+        key=lambda cell: (
+            -float((cell["bbox"]["b"] + cell["bbox"]["t"]) / 2.0),
+            float(cell["bbox"]["l"]),
+        ),
+    )
+
+    for cell in sorted_cells:
+        bbox = cell["bbox"]
+        text = " ".join(str(cell.get("text") or "").split()).strip()
+        y_center = (float(bbox["b"]) + float(bbox["t"])) / 2.0
+        target_row = None
+        for row in rows:
+            if abs(float(row["y_center"]) - y_center) <= 4.0:
+                target_row = row
+                break
+        if target_row is None:
+            target_row = {
+                "y_center": y_center,
+                "parts": [],
+            }
+            rows.append(target_row)
+        target_row["parts"].append({
+            "text": text,
+            "bbox": bbox,
+        })
+
+    normalized_rows: list[dict[str, Any]] = []
+    for row in rows:
+        parts = sorted(row["parts"], key=lambda part: float(part["bbox"]["l"]))
+        if not parts:
+            continue
+        texts = [part["text"] for part in parts if part["text"]]
+        if not texts:
+            continue
+        merged_text = " ".join(texts).strip()
+        bbox = {
+            "l": min(float(part["bbox"]["l"]) for part in parts),
+            "b": min(float(part["bbox"]["b"]) for part in parts),
+            "r": max(float(part["bbox"]["r"]) for part in parts),
+            "t": max(float(part["bbox"]["t"]) for part in parts),
+        }
+        normalized_rows.append({
+            "text": merged_text,
+            "bbox": bbox,
+            "y_center": row["y_center"],
+        })
+
+    return normalized_rows
+
+
+def _looks_like_toc_group_heading(text: str) -> bool:
+    """Detect short section labels on TOC pages that group later entries."""
+    collapsed = " ".join(str(text or "").split()).strip()
+    if not collapsed or _looks_like_toc_entry(collapsed):
+        return False
+    lowercase = collapsed.lower()
+    if lowercase in TOC_GROUP_HEADING_EXCLUDE:
+        return False
+    if len(collapsed) > 80:
+        return False
+    words = [word for word in collapsed.split() if word]
+    if not 1 <= len(words) <= 4:
+        return False
+    if not re.search(r"[A-Za-z]", collapsed):
+        return False
+    return True
+
+
+def _looks_like_structured_toc_section(text: str) -> bool:
+    """Detect TOC entries that already carry an explicit section prefix."""
+    collapsed = " ".join(str(text or "").split()).strip()
+    if not collapsed:
+        return False
+    return bool(re.match(r"^(?:appendix\s+[a-z0-9]+|\d+(?:\.\d+)*)\b", collapsed, re.IGNORECASE))
+
+
+def _extract_docling_parse_toc_page_rows(page: Any) -> list[dict[str, Any]]:
+    """Build plausible TOC rows from docling-parse word cells on a page."""
+    try:
+        from docling_core.types.doc.page import TextCellUnit
+    except Exception:
+        return []
+
+    word_cells: list[dict[str, Any]] = []
+    try:
+        iterator = page.iterate_cells(TextCellUnit.WORD)
+    except Exception:
+        return []
+
+    for cell in iterator:
+        bbox = _rect_to_bbox(getattr(cell, "rect", None))
+        if not bbox:
+            continue
+        text = " ".join(str(getattr(cell, "text", "") or getattr(cell, "orig", "")).split()).strip()
+        if not text:
+            continue
+        word_cells.append({
+            "text": text,
+            "bbox": bbox,
+        })
+
+    return _toc_rows_from_word_cells(word_cells)
+
+
+def _rebuild_toc_elements_from_page_rows(
+    elements: list[dict[str, Any]],
+    toc_page_rows: dict[int, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Replace malformed TOC items with rows reconstructed from visible page words."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        toc_group_ref = element.get("toc_group_ref")
+        if toc_group_ref is None:
+            continue
+        if element.get("type") not in {"toc_caption", "toc_item", "toc_item_table"}:
+            continue
+        groups.setdefault(str(toc_group_ref), []).append(element)
+
+    if not groups:
+        return elements
+
+    replacements: dict[str, list[dict[str, Any]]] = {}
+    for toc_group_ref, group_entries in groups.items():
+        pages = sorted({
+            int(entry.get("page", 0) or 0)
+            for entry in group_entries
+            if isinstance(entry.get("page"), int) or str(entry.get("page", "")).isdigit()
+        })
+        if not pages:
+            continue
+
+        rebuilt_group: list[dict[str, Any]] = []
+        found_caption = False
+        pending_group_heading: str | None = None
+        pending_group_bbox: dict[str, Any] | None = None
+
+        for page_index in pages:
+            page_rows = toc_page_rows.get(page_index) or []
+            if not page_rows:
+                continue
+
+            started = found_caption
+            for row in page_rows:
+                row_text = " ".join(str(row.get("text") or "").split()).strip()
+                if not row_text:
+                    continue
+                lowered = row_text.lower()
+                if lowered in TOC_HEADING_TEXTS:
+                    if not found_caption:
+                        rebuilt_group.append({
+                            "type": "toc_caption",
+                            "page": page_index,
+                            "bbox": row.get("bbox"),
+                            "text": row_text,
+                            "toc_group_ref": toc_group_ref,
+                            "toc_source": "word_rows",
+                        })
+                        found_caption = True
+                    started = True
+                    pending_group_heading = None
+                    pending_group_bbox = None
+                    continue
+
+                if not started:
+                    continue
+
+                if _looks_like_toc_entry(row_text):
+                    if pending_group_heading:
+                        if not _looks_like_structured_toc_section(row_text):
+                            rebuilt_group.append({
+                                "type": "toc_item",
+                                "page": page_index,
+                                "bbox": pending_group_bbox,
+                                "text": pending_group_heading,
+                                "toc_group_ref": toc_group_ref,
+                                "toc_group_heading": True,
+                                "toc_source": "word_rows",
+                            })
+                        pending_group_heading = None
+                        pending_group_bbox = None
+                    rebuilt_group.append({
+                        "type": "toc_item",
+                        "page": page_index,
+                        "bbox": row.get("bbox"),
+                        "text": row_text,
+                        "toc_group_ref": toc_group_ref,
+                        "toc_source": "word_rows",
+                    })
+                    continue
+
+                if _looks_like_toc_group_heading(row_text):
+                    pending_group_heading = row_text
+                    pending_group_bbox = row.get("bbox")
+                    continue
+
+        if rebuilt_group:
+            replacements[toc_group_ref] = rebuilt_group
+
+    if not replacements:
+        return elements
+
+    rebuilt_elements: list[dict[str, Any]] = []
+    emitted_groups: set[str] = set()
+    for element in elements:
+        toc_group_ref = str(element.get("toc_group_ref")) if element.get("toc_group_ref") is not None else None
+        if toc_group_ref and toc_group_ref in replacements and element.get("type") in {"toc_caption", "toc_item", "toc_item_table"}:
+            if toc_group_ref not in emitted_groups:
+                rebuilt_elements.extend(replacements[toc_group_ref])
+                emitted_groups.add(toc_group_ref)
+            continue
+        rebuilt_elements.append(element)
+
+    return rebuilt_elements
+
+
+def _rebuild_toc_with_docling_parse(elements: list[dict], pdf_path: Path) -> list[dict]:
+    """Use docling-parse page words to rebuild visible TOC rows when available."""
+    if not any(
+        isinstance(element, dict) and element.get("type") == "toc_caption"
+        for element in elements
+    ):
+        return elements
+
+    try:
+        from docling_parse.pdf_parser import DoclingPdfParser
+    except Exception:
+        return elements
+
+    try:
+        parser_doc = DoclingPdfParser(loglevel="fatal").load(str(pdf_path), lazy=True)
+    except Exception as exc:
+        logger.info("TOC word-row reconstruction unavailable for %s: %s", pdf_path.name, exc)
+        return elements
+
+    toc_pages = sorted({
+        int(element.get("page", 0) or 0)
+        for element in elements
+        if isinstance(element, dict)
+        and element.get("type") in {"toc_caption", "toc_item", "toc_item_table"}
+        and (isinstance(element.get("page"), int) or str(element.get("page", "")).isdigit())
+    })
+    toc_page_rows: dict[int, list[dict[str, Any]]] = {}
+    for page_index in toc_pages:
+        page_no = page_index + 1
+        try:
+            if page_no > parser_doc.number_of_pages():
+                continue
+            page = parser_doc.get_page(page_no)
+        except Exception:
+            continue
+        toc_page_rows[page_index] = _extract_docling_parse_toc_page_rows(page)
+
+    return _rebuild_toc_elements_from_page_rows(elements, toc_page_rows)
+
+
 def _get_caption_text(item: dict, doc_dict: dict) -> str | None:
     """Extract caption text from a figure or table's caption references."""
     captions = item.get("captions", [])
@@ -672,23 +993,68 @@ def _infer_heading_levels(elements: list[dict]):
         h.pop("_is_title", None)
 
 
-def _extract_title_from_docling(doc_dict: dict, elements: list[dict] | None = None) -> str | None:
-    """Extract the document title from Docling's output."""
-    # Try Docling's texts array first
+def _clean_title_candidate_text(value: Any) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
+def _collapse_spaced_title_caps(value: Any) -> str:
+    text = _clean_title_candidate_text(value)
+    if not text:
+        return ""
+
+    def repl(match: re.Match[str]) -> str:
+        tokens = match.group(0).split()
+        letters = [token for token in tokens if len(token) == 1 and token.isalpha() and token.isupper()]
+        suffix = tokens[len(letters):]
+        collapsed = "".join(letters)
+        if suffix:
+            collapsed = " ".join([collapsed, *suffix])
+        return collapsed
+
+    return TITLE_SPACED_CAPS_RE.sub(repl, text)
+
+
+def _extract_title_from_docling(
+    doc_dict: dict,
+    elements: list[dict] | None = None,
+    *,
+    pdf_path: Path | None = None,
+) -> str | None:
+    """Extract a document title only from Docling-native title signals."""
     for item in doc_dict.get("texts", []):
-        if item.get("label") == "title":
-            title = item.get("text", "").strip()
-            if title:
-                return title
+        if not isinstance(item, dict) or item.get("label") != "title":
+            continue
+        text = _collapse_spaced_title_caps(item.get("text"))
+        if not text:
+            continue
+        return text
 
-    # Fall back to first H1 heading in normalized elements
-    if elements:
-        for el in elements:
-            if el.get("type") == "heading" and el.get("level") == 1:
-                title = el.get("text", "").strip()
-                if title:
-                    return title
+    metadata_title = _collapse_spaced_title_caps(doc_dict.get("title"))
+    return metadata_title or None
 
+
+def _infer_document_language(elements: list[dict], title: str | None = None) -> str | None:
+    """Resolve a document language only from Docling-provided element metadata."""
+    language_weights: dict[str, int] = {}
+
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        text = " ".join(str(element.get("text") or "").split()).strip()
+        lang = _normalize_lang_tag(element.get("lang"))
+        if lang:
+            language_weights[lang] = language_weights.get(lang, 0) + max(len(text.split()), 1)
+
+    if language_weights:
+        return max(
+            language_weights.items(),
+            key=lambda item: (
+                item[1],
+                item[0].count("-"),
+                len(item[0]),
+                item[0],
+            ),
+        )[0]
     return None
 
 
@@ -745,6 +1111,7 @@ async def _convert_via_docling_serve(
     timeout: int,
     ocr_engine: str = "rapidocr",
     token: str = "",
+    include_figure_images: bool = True,
 ) -> tuple[dict, list[FigureInfo]]:
     """Send PDF to a docling-serve instance and return (doc_dict, figures).
 
@@ -767,19 +1134,23 @@ async def _convert_via_docling_serve(
     per_request_timeout = httpx.Timeout(min(timeout, 120.0), connect=30.0)
     async with httpx.AsyncClient(timeout=per_request_timeout) as client:
         with open(pdf_path, "rb") as f:
+            data = {
+                "to_formats": "json",
+                "ocr_engine": ocr_engine,
+                "do_table_structure": "true",
+                "do_picture_classification": "true",
+            }
+            if include_figure_images:
+                data.update({
+                    "image_export_mode": "embedded",
+                    "include_images": "true",
+                    "images_scale": "2.0",
+                })
             resp = await client.post(
                 submit_url,
                 headers=auth_headers,
                 files={"files": (pdf_path.name, f, "application/pdf")},
-                data={
-                    "to_formats": "json",
-                    "image_export_mode": "embedded",
-                    "include_images": "true",
-                    "ocr_engine": ocr_engine,
-                    "do_table_structure": "true",
-                    "do_picture_classification": "true",
-                    "images_scale": "2.0",
-                },
+                data=data,
             )
         resp.raise_for_status()
         task_id = resp.json()["task_id"]
@@ -826,6 +1197,9 @@ async def _convert_via_docling_serve(
 
     # Extract figure images by cropping from embedded page renders
     figures: list[FigureInfo] = []
+    if not include_figure_images:
+        return doc_dict, figures
+
     figures_dir = job_dir / "figures"
     figures_dir.mkdir(exist_ok=True)
 
@@ -908,7 +1282,12 @@ async def _convert_via_docling_serve(
     return doc_dict, figures
 
 
-async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
+async def extract_structure(
+    pdf_path: Path,
+    job_dir: Path,
+    *,
+    include_figure_images: bool = True,
+) -> StructureResult:
     """Extract document structure using Docling.
 
     Priority: docling-serve → local Docling.
@@ -925,6 +1304,7 @@ async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
             settings.docling_serve_timeout,
             settings.docling_serve_ocr_engine,
             settings.docling_serve_token,
+            include_figure_images,
         )
         processed_pdf_path = pdf_path
     else:
@@ -945,7 +1325,7 @@ async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
 
             def _convert_one(path: Path):
                 pipeline_options = PdfPipelineOptions(
-                    generate_picture_images=True,
+                    generate_picture_images=include_figure_images,
                     images_scale=2.0,
                     do_picture_classification=True,
                     do_table_structure=True,
@@ -981,29 +1361,30 @@ async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
 
             # Extract and save figure images
             figures = []
-            figures_dir = job_dir / "figures"
-            figures_dir.mkdir(exist_ok=True)
+            if include_figure_images:
+                figures_dir = job_dir / "figures"
+                figures_dir.mkdir(exist_ok=True)
 
-            dict_pictures = doc_dict.get("pictures", [])
+                dict_pictures = doc_dict.get("pictures", [])
 
-            for i, element in enumerate(doc.pictures if hasattr(doc, 'pictures') else []):
-                try:
-                    img = element.get_image(conv_result)
-                    if img:
-                        fig_path = figures_dir / f"figure_{i}.png"
-                        img.save(str(fig_path), "PNG")
-                        caption = None
-                        if i < len(dict_pictures):
-                            caption = _get_caption_text(dict_pictures[i], doc_dict)
-                        figures.append(FigureInfo(
-                            index=i,
-                            path=fig_path,
-                            caption=caption,
-                            page=(element.prov[0].page_no - 1) if element.prov else None,
-                            bbox=_extract_bbox(element.prov) if getattr(element, "prov", None) else None,
-                        ))
-                except Exception as e:
-                    logger.warning(f"Failed to extract figure {i}: {e}")
+                for i, element in enumerate(doc.pictures if hasattr(doc, 'pictures') else []):
+                    try:
+                        img = element.get_image(conv_result)
+                        if img:
+                            fig_path = figures_dir / f"figure_{i}.png"
+                            img.save(str(fig_path), "PNG")
+                            caption = None
+                            if i < len(dict_pictures):
+                                caption = _get_caption_text(dict_pictures[i], doc_dict)
+                            figures.append(FigureInfo(
+                                index=i,
+                                path=fig_path,
+                                caption=caption,
+                                page=(element.prov[0].page_no - 1) if element.prov else None,
+                                bbox=_extract_bbox(element.prov) if getattr(element, "prov", None) else None,
+                            ))
+                    except Exception as e:
+                        logger.warning(f"Failed to extract figure {i}: {e}")
 
             return doc_dict, figures, result_processed_pdf_path
 
@@ -1011,8 +1392,13 @@ async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
 
     # Normalize into elements array and infer heading levels
     elements = _normalize_docling_elements(doc_dict)
-    _infer_heading_levels(elements)
-    title = _extract_title_from_docling(doc_dict, elements)
+    toc_source_pdf = processed_pdf_path or pdf_path
+    _mark_toc_sequences(elements)
+    elements = _expand_toc_item_tables(elements)
+    elements = _rebuild_toc_with_docling_parse(elements, toc_source_pdf)
+    title = _extract_title_from_docling(doc_dict, elements, pdf_path=pdf_path)
+    document_language = _infer_document_language(elements, title)
+    native_toc = await asyncio.to_thread(_extract_native_toc_from_pdf, toc_source_pdf)
 
     page_count = len(doc_dict.get("pages", {}))
     figures_count = len(figures)
@@ -1023,9 +1409,12 @@ async def extract_structure(pdf_path: Path, job_dir: Path) -> StructureResult:
         "source": str(pdf_path.name),
         "page_count": page_count,
         "title": title,
+        "language": document_language,
         "elements": elements,
         "figures_count": figures_count,
     }
+    if native_toc:
+        structure["native_toc"] = native_toc
 
     return StructureResult(
         document_json=structure,

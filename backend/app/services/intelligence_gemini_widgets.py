@@ -7,6 +7,7 @@ from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_llm_utils import (
     context_json_part,
     page_preview_parts,
+    preferred_cache_breakpoint_index,
     request_llm_json,
 )
 from app.services.llm_client import LlmClient
@@ -148,7 +149,7 @@ async def generate_widget_intelligence(
         content=content,
         schema_name="widget_page_intelligence",
         response_schema=WIDGET_BATCH_SCHEMA,
-        cache_breakpoint_index=1,
+        cache_breakpoint_index=preferred_cache_breakpoint_index(content),
     )
     decision = {}
     decisions = parsed.get("decisions")
@@ -193,7 +194,7 @@ async def generate_widget_intelligence_for_page(
         content=content,
         schema_name="widget_page_intelligence",
         response_schema=WIDGET_BATCH_SCHEMA,
-        cache_breakpoint_index=1,
+        cache_breakpoint_index=preferred_cache_breakpoint_index(content),
     )
 
     decision_map: dict[str, dict[str, Any]] = {}

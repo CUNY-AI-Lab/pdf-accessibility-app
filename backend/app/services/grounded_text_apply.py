@@ -11,21 +11,7 @@ PRETAG_GROUNDED_TEXT_TARGET_LIMIT = 12
 PRETAG_GROUNDED_TEXT_MAX_CHARS = 64
 PRETAG_GROUNDED_TEXT_ENCODING_MAX_CHARS = 128
 PRETAG_GROUNDED_TEXT_ENCODING_MIN_SIMILARITY = 0.94
-PRETAG_GROUNDED_TEXT_ALLOWED_ROLES = frozenset({
-    "heading",
-    "paragraph",
-    "note",
-    "toc_caption",
-    "toc_item",
-})
 PRETAG_GROUNDED_TEXT_ARTIFACT_MAX_CHARS = 96
-PRETAG_GROUNDED_TEXT_ALLOWED_ARTIFACT_ROLES = frozenset({
-    "heading",
-    "paragraph",
-    "note",
-    "toc_caption",
-    "toc_item",
-})
 PRETAG_GROUNDED_TEXT_ALLOWED_DUPLICATE_ROLES = frozenset({
     "heading",
     "paragraph",
@@ -174,9 +160,6 @@ def should_auto_apply_grounded_text_block(block: dict[str, object]) -> bool:
         return False
     if str(block.get("issue_type") or "").strip() != "spacing_only":
         return False
-    role = str(block.get("role") or "").strip()
-    if role not in PRETAG_GROUNDED_TEXT_ALLOWED_ROLES:
-        return False
     if len(readable_text) > PRETAG_GROUNDED_TEXT_MAX_CHARS:
         return False
     original_text = str(
@@ -191,8 +174,7 @@ def should_auto_apply_grounded_text_block(block: dict[str, object]) -> bool:
     dense_readable = re.sub(r"\s+", "", readable_text).lower()
     if not dense_original or dense_original != dense_readable:
         return False
-    chosen_source = str(block.get("chosen_source") or "").strip()
-    return chosen_source in {"ocr", "llm_inferred"}
+    return True
 
 
 def should_auto_apply_grounded_encoding_block(block: dict[str, object]) -> bool:
@@ -204,9 +186,6 @@ def should_auto_apply_grounded_encoding_block(block: dict[str, object]) -> bool:
     if not bool(block.get("should_block_accessibility", False)):
         return False
     if str(block.get("issue_type") or "").strip() != "encoding_problem":
-        return False
-    role = str(block.get("role") or "").strip()
-    if role not in PRETAG_GROUNDED_TEXT_ALLOWED_ROLES:
         return False
     if len(readable_text) > PRETAG_GROUNDED_TEXT_ENCODING_MAX_CHARS:
         return False
@@ -228,8 +207,7 @@ def should_auto_apply_grounded_encoding_block(block: dict[str, object]) -> bool:
     )
     if not has_compact_signal and len(readable_text.split()) > 10:
         return False
-    chosen_source = str(block.get("chosen_source") or "").strip()
-    return chosen_source in {"native", "ocr", "llm_inferred"}
+    return True
 
 
 def should_auto_apply_grounded_code_block(block: dict[str, object]) -> bool:
@@ -243,9 +221,6 @@ def should_auto_apply_grounded_code_block(block: dict[str, object]) -> bool:
     if not bool(block.get("should_block_accessibility", False)):
         return False
     if str(block.get("issue_type") or "").strip() != "encoding_problem":
-        return False
-    chosen_source = str(block.get("chosen_source") or "").strip()
-    if chosen_source not in {"ocr", "llm_inferred"}:
         return False
     if not _looks_like_code_resolution(readable_text):
         return False
@@ -327,12 +302,6 @@ def _should_auto_artifact_grounded_text_block(block: dict[str, object]) -> bool:
     if str(block.get("confidence") or "").strip() != "high":
         return False
     if not bool(block.get("should_block_accessibility", False)):
-        return False
-    role = str(block.get("role") or "").strip()
-    if role not in PRETAG_GROUNDED_TEXT_ALLOWED_ARTIFACT_ROLES:
-        return False
-    chosen_source = str(block.get("chosen_source") or "").strip()
-    if chosen_source not in {"ocr", "llm_inferred"}:
         return False
     if suggested_action == "mark_decorative":
         original_text = str(

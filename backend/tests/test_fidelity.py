@@ -358,6 +358,52 @@ def test_link_text_quality_ignores_generated_link_fallbacks(tmp_path):
     assert poor[0]["text"] == "click here"
 
 
+def test_link_text_quality_ignores_generated_internal_destination_labels(tmp_path):
+    import pikepdf
+
+    pdf_path = tmp_path / "generated_internal_links.pdf"
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    generated = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Link"),
+        "/Rect": pikepdf.Array([10, 10, 40, 20]),
+        "/Contents": pikepdf.String("jump to bibitem cite.AcroRead"),
+        "/Dest": pikepdf.Name("/cite.AcroRead"),
+    }))
+    page["/Annots"] = pikepdf.Array([generated])
+    pdf.save(str(pdf_path))
+
+    poor = _check_link_text_quality(pdf_path)
+
+    assert poor == []
+
+
+def test_link_text_quality_flags_implausibly_long_sentence_like_labels(tmp_path):
+    import pikepdf
+
+    pdf_path = tmp_path / "long_link_text.pdf"
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    paragraph_link = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Link"),
+        "/Rect": pikepdf.Array([10, 10, 40, 20]),
+        "/Contents": pikepdf.String(
+            "Adobe's Acrobat Reader also allows the contents of a PDF to be read out loud and saved "
+            "as accessible text, which is not a plausible anchor label for a single link."
+        ),
+        "/Dest": pikepdf.Name("/cite.AcroRead"),
+    }))
+    page["/Annots"] = pikepdf.Array([paragraph_link])
+    pdf.save(str(pdf_path))
+
+    poor = _check_link_text_quality(pdf_path)
+
+    assert len(poor) == 1
+    assert poor[0]["reason"] == "implausibly_long_or_sentence_like"
+
+
 def test_internal_link_destinations_support_name_objects_and_nested_name_trees(tmp_path):
     import pikepdf
 
@@ -395,6 +441,31 @@ def test_internal_link_destinations_support_name_objects_and_nested_name_trees(t
     assert broken_links == [
         {"page": 1, "dest": "MissingDest", "reason": "GoTo destination not found"},
     ]
+
+
+def test_internal_link_destinations_accept_direct_goto_page_arrays(tmp_path):
+    import pikepdf
+
+    pdf_path = tmp_path / "direct_goto.pdf"
+    pdf = pikepdf.new()
+    page1 = pdf.add_blank_page(page_size=(200, 200))
+    page2 = pdf.add_blank_page(page_size=(200, 200))
+
+    direct = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Link"),
+        "/Rect": pikepdf.Array([10, 10, 40, 20]),
+        "/A": pikepdf.Dictionary({
+            "/S": pikepdf.Name("/GoTo"),
+            "/D": pikepdf.Array([page2.obj, pikepdf.Name("/XYZ"), 0, 0, 0]),
+        }),
+    }))
+    page1["/Annots"] = pikepdf.Array([direct])
+    pdf.save(str(pdf_path))
+
+    broken_links = _check_internal_link_destinations(pdf_path)
+
+    assert broken_links == []
 
 
 def test_form_semantics_risk_flags_missing_accessible_labels(tmp_path):

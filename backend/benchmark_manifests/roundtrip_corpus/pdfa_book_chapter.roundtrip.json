@@ -1,0 +1,56 @@
+{
+  "id": "pdfa_book_chapter",
+  "lane": "recoverable-core",
+  "document_family": "book_chapter",
+  "product_priority": "primary",
+  "workflow_tags": ["academic", "bookmarks", "long_form_prose", "sections"],
+  "gold_pdf": "../../data/external_gold_candidates/pdfa_reference_suite_1_1/PDFUA-Ref-2-08_BookChapter.pdf",
+  "recoverable_assertions": [
+    {
+      "id": "lang",
+      "kind": "document_lang",
+      "expected": "en"
+    },
+    {
+      "id": "title",
+      "kind": "title_contains",
+      "expected": "Physical Development"
+    },
+    {
+      "id": "opening_text",
+      "kind": "text_contains",
+      "expected": "HAVE YOU EVER HEARD adults make these kinds of statements"
+    },
+    {
+      "id": "body_order",
+      "kind": "ordered_text",
+      "expected": [
+        "An Overview of Maturation and Growth",
+        "Development of the Brain",
+        "Motor Development",
+        "Puberty: The Physical Transition from Child to Adult"
+      ]
+    },
+    {
+      "id": "bookmark_chapter",
+      "kind": "bookmark_title",
+      "expected": "Physical Development"
+    },
+    {
+      "id": "bookmark_overview",
+      "kind": "bookmark_title",
+      "expected": "An Overview of Maturation and Growth"
+    },
+    {
+      "id": "bookmark_brain",
+      "kind": "bookmark_title",
+      "expected": "Development of the Brain"
+    },
+    {
+      "id": "bookmark_puberty",
+      "kind": "bookmark_title",
+      "expected": "Puberty: The Physical Transition from Child to Adult"
+    }
+  ],
+  "hidden_semantics_assertions": []
+}

@@ -28,6 +28,8 @@ from PIL import Image
 from rtree import index as rtree_index
 from scipy.optimize import linear_sum_assignment
 
+from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
+
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -46,8 +48,28 @@ BLANK_PAGE_MAX_INK_RATIO = 0.001
 OCR_NOISE_ONLY_OPERATORS = frozenset({
     "Do", "re", "W*", "n", "INLINE IMAGE", "w", "m", "l", "S",
 })
-
-
+LINK_TEXT_ELEMENT_TYPES = frozenset({
+    "heading",
+    "paragraph",
+    "list_item",
+    "note",
+    "code",
+    "formula",
+    "toc_caption",
+    "toc_item",
+    "toc_item_table",
+})
+LINK_LABEL_FRAGMENT_RE = re.compile(r"^(?:\d+|[ivxlcdm]+|[a-z])$", re.IGNORECASE)
+LINK_ROW_PAGE_FRAGMENT_RE = re.compile(r"^(?:\d+(?:\.\d+)*|[ivxlcdm]+)$", re.IGNORECASE)
+LINK_SAFE_MAX_CHARS = 160
+LINK_SAFE_MAX_WORDS = 18
+TOC_TRAILING_PAGE_RE = re.compile(
+    r"(?:\.{2,}\s*|(?:\.\s*){2,}|\s{2,}|\t+)(?:\d+|[ivxlcdm]+)\s*$|(?:\s+)(?:\d+)\s*$",
+    re.IGNORECASE,
+)
+APPENDIX_BOOKMARK_KEY_RE = re.compile(r"^(appendix\s+[a-z0-9]+(?:\.\d+)*)\b", re.IGNORECASE)
+NUMERIC_BOOKMARK_KEY_RE = re.compile(r"^(\d+(?:\.\d+)*)\b")
+BOOKMARK_SPACED_CAPS_RE = re.compile(r"\b(?:[A-Z]\s+){2,}[A-Z](?:\s+\d+)*\b")
 @dataclass
 class TaggingResult:
     output_path: Path
@@ -128,6 +150,13 @@ def _safe_float(val) -> float:
         return 0.0
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_text(text: str) -> str:
     """Lowercase and collapse non-word characters for fuzzy text matching."""
     if not text:
@@ -136,6 +165,27 @@ def _normalize_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"[^\w\s]", "", text)
     return text.strip()
+
+
+def _collapse_spaced_caps(text: Any) -> str:
+    collapsed = " ".join(str(text or "").split()).strip()
+    if not collapsed:
+        return ""
+
+    def repl(match: re.Match[str]) -> str:
+        tokens = match.group(0).split()
+        letters = [token for token in tokens if len(token) == 1 and token.isalpha() and token.isupper()]
+        suffix = tokens[len(letters):]
+        result = "".join(letters)
+        if suffix:
+            result = " ".join([result, *suffix])
+        return result
+
+    return BOOKMARK_SPACED_CAPS_RE.sub(repl, collapsed)
+
+
+def _normalize_title_like_text(text: Any) -> str:
+    return _normalize_text(_collapse_spaced_caps(text))
 
 
 def _decode_pdf_text_operand(value: Any) -> str:
@@ -218,6 +268,27 @@ def _bbox_from_center(cx: float, cy: float, width: float, height: float) -> dict
     }
 
 
+def _rect_array_to_bbox(rect: Any) -> dict[str, float] | None:
+    """Convert a PDF /Rect array into a bbox dict."""
+    if not isinstance(rect, pikepdf.Array) or len(rect) < 4:
+        return None
+    try:
+        left = float(rect[0])
+        bottom = float(rect[1])
+        right = float(rect[2])
+        top = float(rect[3])
+    except Exception:
+        return None
+    if right <= left or top <= bottom:
+        return None
+    return {
+        "l": left,
+        "b": bottom,
+        "r": right,
+        "t": top,
+    }
+
+
 def _region_bbox(region: "ContentRegion") -> dict[str, float] | None:
     """Return explicit region bbox when available."""
     return region.bbox
@@ -276,6 +347,50 @@ def _expand_bbox(bbox: dict[str, float], margin: float) -> dict[str, float]:
     }
 
 
+def _best_bbox_match(
+    target_bbox: dict[str, float] | None,
+    items: list[dict[str, Any]] | None,
+    *,
+    margin: float = 6.0,
+) -> dict[str, Any] | None:
+    """Return the best bbox-overlap match for a target region."""
+    if not target_bbox or not items:
+        return None
+
+    expanded_bbox = _expand_bbox(target_bbox, margin)
+    best_item: dict[str, Any] | None = None
+    best_score = 0.0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        bbox = item.get("bbox")
+        if not isinstance(bbox, dict):
+            continue
+
+        overlap = _bbox_intersection(target_bbox, bbox)
+        relaxed_overlap = _bbox_intersection(expanded_bbox, bbox)
+        score = max(
+            _bbox_iou(target_bbox, bbox),
+            _containment_ratio(target_bbox, bbox),
+            _containment_ratio(bbox, target_bbox),
+        )
+        if overlap <= 0 and relaxed_overlap <= 0 and score < 0.5:
+            continue
+        if score > best_score:
+            best_item = item
+            best_score = score
+    return best_item
+
+
+def _resolve_document_language(structure_json: dict[str, Any], explicit_language: str | None) -> str:
+    """Resolve the best available document-level language tag for tagging."""
+    structure_language = _normalize_lang_tag(structure_json.get("language"))
+    if structure_language:
+        return structure_language
+    explicit = _normalize_lang_tag(explicit_language)
+    return explicit or "en"
+
+
 def _as_positive_int(value: Any, default: int = 1) -> int:
     """Best-effort positive integer coercion."""
     try:
@@ -315,19 +430,341 @@ def _normalize_heading_hierarchy(elements: list[dict]) -> None:
         previous_level = heading["level"]
 
 
-def _infer_link_contents(annotation: pikepdf.Object) -> str:
+def _visible_link_contents_from_page_elements(
+    annotation: pikepdf.Object,
+    page_elements: list[dict[str, Any]] | None,
+) -> tuple[str, str]:
+    """Infer link contents from overlapping visible text on the same page."""
+    if not page_elements:
+        return "", ""
+    try:
+        annotation_bbox = _rect_array_to_bbox(annotation.get("/Rect"))
+    except Exception:
+        annotation_bbox = None
+    if not annotation_bbox:
+        return "", ""
+
+    best_text = ""
+    best_score = 0.0
+    best_element_type = ""
+    best_element_bbox: dict[str, float] | None = None
+    expanded_bbox = _expand_bbox(annotation_bbox, 6.0)
+    for element in page_elements:
+        if not isinstance(element, dict):
+            continue
+        elem_type = str(element.get("type") or "").strip()
+        if elem_type not in LINK_TEXT_ELEMENT_TYPES:
+            continue
+        element_bbox = element.get("bbox")
+        if not isinstance(element_bbox, dict):
+            continue
+        text = " ".join(_element_accessible_text(element).split()).strip()
+        if not text:
+            continue
+
+        overlap = _bbox_intersection(annotation_bbox, element_bbox)
+        relaxed_overlap = _bbox_intersection(expanded_bbox, element_bbox)
+        score = max(
+            _bbox_iou(annotation_bbox, element_bbox),
+            _containment_ratio(annotation_bbox, element_bbox),
+            _containment_ratio(element_bbox, annotation_bbox),
+        )
+        if overlap <= 0 and relaxed_overlap <= 0 and score < 0.5:
+            continue
+        if score > best_score or (math.isclose(score, best_score) and len(text) > len(best_text)):
+            best_text = text
+            best_score = score
+            best_element_type = elem_type
+            best_element_bbox = element_bbox
+
+    if not best_text:
+        return "", ""
+    if not _is_safe_inferred_link_label(
+        best_text,
+        annotation_bbox=annotation_bbox,
+        source_bbox=best_element_bbox,
+        source_type=best_element_type,
+    ):
+        return "", ""
+
+    return best_text, best_element_type
+
+
+def _visible_link_contents_from_page_words(
+    annotation: pikepdf.Object,
+    page_words: list[dict[str, Any]] | None,
+) -> tuple[str, dict[str, float] | None]:
+    """Infer link contents from overlapping word boxes on the same page."""
+    if not page_words:
+        return "", None
+    try:
+        annotation_bbox = _rect_array_to_bbox(annotation.get("/Rect"))
+    except Exception:
+        annotation_bbox = None
+    if not annotation_bbox:
+        return "", None
+
+    expanded_bbox = _expand_bbox(annotation_bbox, 3.0)
+    y_center = (annotation_bbox["b"] + annotation_bbox["t"]) / 2.0
+    y_tolerance = max(6.0, (annotation_bbox["t"] - annotation_bbox["b"]) * 1.25)
+    matched_words: list[tuple[float, float, str, dict[str, float]]] = []
+
+    for word in page_words:
+        if not isinstance(word, dict):
+            continue
+        bbox = word.get("bbox")
+        if not isinstance(bbox, dict):
+            continue
+        text = " ".join(
+            str(word.get("display_text") or word.get("text") or "").split()
+        ).strip()
+        if not text:
+            continue
+
+        overlap = _bbox_intersection(annotation_bbox, bbox)
+        relaxed_overlap = _bbox_intersection(expanded_bbox, bbox)
+        score = max(
+            _bbox_iou(annotation_bbox, bbox),
+            _containment_ratio(annotation_bbox, bbox),
+            _containment_ratio(bbox, annotation_bbox),
+        )
+        word_y = (float(bbox.get("b", 0.0)) + float(bbox.get("t", 0.0))) / 2.0
+        if abs(word_y - y_center) > y_tolerance and relaxed_overlap <= 0:
+            continue
+        if overlap <= 0 and relaxed_overlap <= 0 and score < 0.5:
+            continue
+        matched_words.append((word_y, float(bbox.get("l", 0.0)), text, bbox))
+
+    if not matched_words:
+        return "", None
+
+    matched_words.sort(key=lambda item: (-item[0], item[1]))
+    parts = [text for _, _, text, _ in matched_words if text]
+    if not parts:
+        return "", None
+
+    xs = [float(bbox["l"]) for _, _, _, bbox in matched_words] + [
+        float(bbox["r"]) for _, _, _, bbox in matched_words
+    ]
+    ys = [float(bbox["b"]) for _, _, _, bbox in matched_words] + [
+        float(bbox["t"]) for _, _, _, bbox in matched_words
+    ]
+    return " ".join(parts).strip(), _bbox_from_points(xs, ys)
+
+
+def _visible_link_contents_from_page_hyperlinks(
+    annotation: pikepdf.Object,
+    page_hyperlinks: list[dict[str, Any]] | None,
+) -> tuple[str, dict[str, float] | None]:
+    """Infer link contents from docling-parse hyperlink metadata when present."""
+    try:
+        annotation_bbox = _rect_array_to_bbox(annotation.get("/Rect"))
+    except Exception:
+        annotation_bbox = None
+    matched = _best_bbox_match(annotation_bbox, page_hyperlinks, margin=6.0)
+    if not matched:
+        return "", None
+
+    for key in ("widget_text", "widget_description"):
+        text = " ".join(str(matched.get(key) or "").split()).strip()
+        if text:
+            return text, matched.get("bbox")
+    return "", matched.get("bbox")
+
+
+def _needs_line_level_link_context(text: str) -> bool:
+    normalized = " ".join(str(text or "").split()).strip()
+    if not normalized:
+        return True
+    return bool(LINK_LABEL_FRAGMENT_RE.fullmatch(normalized))
+
+
+def _visible_link_contents_from_page_lines(
+    annotation: pikepdf.Object,
+    page_lines: list[dict[str, Any]] | None,
+) -> str:
+    """Infer link contents by reconstructing the same visual row from line cells."""
+    if not page_lines:
+        return ""
+    try:
+        annotation_bbox = _rect_array_to_bbox(annotation.get("/Rect"))
+    except Exception:
+        annotation_bbox = None
+    if not annotation_bbox:
+        return ""
+
+    y_center = (annotation_bbox["b"] + annotation_bbox["t"]) / 2.0
+    height = max(annotation_bbox["t"] - annotation_bbox["b"], 1.0)
+    y_tolerance = max(8.0, height * 0.9)
+    row_parts: list[tuple[float, str]] = []
+    overlaps_annotation = False
+
+    for line in page_lines:
+        if not isinstance(line, dict):
+            continue
+        bbox = line.get("bbox")
+        if not isinstance(bbox, dict):
+            continue
+        text = " ".join(
+            str(line.get("display_text") or line.get("text") or "").split()
+        ).strip()
+        if not text:
+            continue
+        line_y = (float(bbox.get("b", 0.0)) + float(bbox.get("t", 0.0))) / 2.0
+        if abs(line_y - y_center) > y_tolerance:
+            continue
+        if float(bbox.get("l", 0.0)) > annotation_bbox["r"] + 18.0:
+            continue
+        row_parts.append((float(bbox.get("l", 0.0)), text))
+        if _bbox_intersection(annotation_bbox, bbox) > 0:
+            overlaps_annotation = True
+
+    if not overlaps_annotation or len(row_parts) < 2:
+        return ""
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for _, text in sorted(row_parts, key=lambda item: item[0]):
+        if not text:
+            continue
+        key = f"{text}@{len(merged)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(text)
+
+    merged_text = " ".join(merged).strip()
+    if not _looks_like_toc_link_label(merged_text):
+        return ""
+    return merged_text
+
+
+def _looks_like_toc_link_label(text: str) -> bool:
+    normalized = " ".join(str(text or "").split()).strip()
+    if not normalized:
+        return False
+    if len(normalized) > LINK_SAFE_MAX_CHARS:
+        return False
+    words = [word for word in normalized.split(" ") if word]
+    if len(words) < 3 or len(words) > LINK_SAFE_MAX_WORDS:
+        return False
+    if not any(char.isalpha() for char in normalized):
+        return False
+    first = words[0].strip("().")
+    last = words[-1].strip("().")
+    if LINK_ROW_PAGE_FRAGMENT_RE.fullmatch(last):
+        return True
+    return bool(LINK_ROW_PAGE_FRAGMENT_RE.fullmatch(first))
+
+
+def _is_safe_inferred_link_label(
+    text: str,
+    *,
+    annotation_bbox: dict[str, float] | None,
+    source_bbox: dict[str, float] | None = None,
+    source_type: str = "",
+) -> bool:
+    normalized = " ".join(str(text or "").split()).strip()
+    if not normalized:
+        return False
+    words = [word for word in normalized.split(" ") if word]
+    if len(normalized) > LINK_SAFE_MAX_CHARS or len(words) > LINK_SAFE_MAX_WORDS:
+        return False
+    if re.search(r"[.!?]\s+[A-Z]", normalized):
+        return False
+    if not any(char.isalpha() for char in normalized):
+        return False
+    if not annotation_bbox or not source_bbox:
+        return True
+
+    ann_width = max(float(annotation_bbox["r"]) - float(annotation_bbox["l"]), 1.0)
+    src_width = max(float(source_bbox["r"]) - float(source_bbox["l"]), 1.0)
+    ann_height = max(float(annotation_bbox["t"]) - float(annotation_bbox["b"]), 1.0)
+    src_height = max(float(source_bbox["t"]) - float(source_bbox["b"]), 1.0)
+    ann_area = ann_width * ann_height
+    src_area = src_width * src_height
+
+    if source_type == "paragraph":
+        if normalized.endswith((".", "!", "?")) and len(words) > 6:
+            return False
+        if len(words) > 12 and src_width > ann_width * 2.5:
+            return False
+        if len(words) > 12 and src_area > ann_area * 6.0:
+            return False
+    return True
+
+
+def _infer_link_contents(
+    annotation: pikepdf.Object,
+    page_elements: list[dict[str, Any]] | None = None,
+    page_lines: list[dict[str, Any]] | None = None,
+    page_words: list[dict[str, Any]] | None = None,
+    page_hyperlinks: list[dict[str, Any]] | None = None,
+) -> str:
     """Create a useful /Contents description for link annotations."""
     try:
         existing = str(annotation.get("/Contents", "")).strip()
     except Exception:
         existing = ""
+
+    try:
+        action = annotation.get("/A")
+        uri = str(action.get("/URI", "")).strip() if action is not None and hasattr(action, "get") else ""
+    except Exception:
+        uri = ""
+    try:
+        dest = annotation.get("/Dest")
+        has_dest = bool(dest)
+    except Exception:
+        has_dest = False
+
+    try:
+        annotation_bbox = _rect_array_to_bbox(annotation.get("/Rect"))
+    except Exception:
+        annotation_bbox = None
+
+    visible_text = ""
+    visible_type = ""
+    hyperlink_text, hyperlink_bbox = _visible_link_contents_from_page_hyperlinks(
+        annotation,
+        page_hyperlinks,
+    )
+    if hyperlink_text and _is_safe_inferred_link_label(
+        hyperlink_text,
+        annotation_bbox=annotation_bbox,
+        source_bbox=hyperlink_bbox,
+        source_type="hyperlink",
+    ):
+        visible_text = hyperlink_text
+        visible_type = "hyperlink"
+
+    if not visible_text:
+        word_text, word_bbox = _visible_link_contents_from_page_words(annotation, page_words)
+        if word_text and _is_safe_inferred_link_label(
+            word_text,
+            annotation_bbox=annotation_bbox,
+            source_bbox=word_bbox,
+            source_type="word",
+        ):
+            visible_text = word_text
+            visible_type = "word"
+
+    if not visible_text:
+        visible_text, visible_type = _visible_link_contents_from_page_elements(annotation, page_elements)
+    existing_is_generated = (
+        not existing
+        or existing == "Link"
+        or existing == "Link to destination"
+        or (uri and existing == f"Link to {uri}")
+        or (has_dest and existing.startswith("Link to "))
+    )
+    if visible_text and existing_is_generated:
+        return visible_text
     if existing:
         return existing
 
     try:
-        action = annotation.get("/A")
         if action is not None and hasattr(action, "get"):
-            uri = str(action.get("/URI", "")).strip()
             if uri:
                 return f"Link to {uri}"
     except Exception:
@@ -341,6 +778,469 @@ def _infer_link_contents(annotation: pikepdf.Object) -> str:
         pass
 
     return "Link"
+
+
+def _infer_widget_accessible_name(
+    annotation: pikepdf.Object,
+    page_widgets: list[dict[str, Any]] | None = None,
+) -> str:
+    """Infer a widget accessible name from matched docling-parse widget metadata."""
+    try:
+        annotation_bbox = _rect_array_to_bbox(annotation.get("/Rect"))
+    except Exception:
+        annotation_bbox = None
+    matched = _best_bbox_match(annotation_bbox, page_widgets, margin=6.0)
+    if not matched:
+        return ""
+
+    for key in ("description", "field_name", "text"):
+        value = " ".join(str(matched.get(key) or "").split()).strip()
+        if value and len(value) <= 200:
+            return value
+    return ""
+
+
+def _clean_bookmark_label(text: Any) -> str:
+    label = " ".join(str(text or "").split()).strip()
+    if not label:
+        return ""
+    label = TOC_TRAILING_PAGE_RE.sub("", label).rstrip(" .\t")
+    return label.strip()
+
+
+def _bookmark_section_key(text: Any) -> str:
+    label = _clean_bookmark_label(text)
+    if not label:
+        return ""
+
+    appendix_match = APPENDIX_BOOKMARK_KEY_RE.match(label)
+    if appendix_match:
+        return re.sub(r"\s+", " ", appendix_match.group(1).lower()).strip()
+
+    numeric_match = NUMERIC_BOOKMARK_KEY_RE.match(label)
+    if numeric_match:
+        return numeric_match.group(1)
+
+    return ""
+
+
+def _bookmark_level_from_text(text: Any, *, default: int = 1, captioned_group: bool = False) -> int:
+    key = _bookmark_section_key(text)
+    if key.startswith("appendix "):
+        suffix = key.removeprefix("appendix ").strip()
+        base_level = max(1, suffix.count(".") + 1)
+    elif key:
+        base_level = max(1, key.count(".") + 1)
+    else:
+        base_level = max(1, default)
+    if captioned_group:
+        return base_level + 1
+    return base_level
+
+
+def _heading_bookmark_entries(headings: list[dict], page_count: int) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for order_index, heading in enumerate(headings):
+        text = _clean_bookmark_label(heading.get("text"))
+        if not text:
+            continue
+        try:
+            page_index = int(heading.get("page_index", -1))
+        except (TypeError, ValueError):
+            page_index = -1
+        if not 0 <= page_index < page_count:
+            continue
+        entries.append({
+            "text": text,
+            "page_index": page_index,
+            "level": max(1, min(6, _as_positive_int(heading.get("level", 1), default=1))),
+            "order_index": order_index,
+        })
+    return entries
+
+
+def _docling_heading_bookmark_entries(
+    elements: list[dict[str, Any]] | None,
+    page_count: int,
+    *,
+    selected_only: bool = False,
+) -> list[dict[str, Any]]:
+    if not elements:
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for order_index, element in enumerate(elements):
+        if not isinstance(element, dict) or element.get("type") != "heading":
+            continue
+        if selected_only and not bool(element.get("bookmark_include")):
+            continue
+        text = _clean_bookmark_label(
+            element.get("bookmark_text_override") or element.get("text")
+        )
+        if not text:
+            continue
+        try:
+            page_index = int(element.get("page", -1))
+        except (TypeError, ValueError):
+            page_index = -1
+        if not 0 <= page_index < page_count:
+            continue
+        entries.append({
+            "text": text,
+            "page_index": page_index,
+            "level": max(1, min(6, _as_positive_int(element.get("level", 1), default=1))),
+            "order_index": order_index,
+        })
+    return entries
+
+
+def _sort_heading_bookmark_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        entries,
+        key=lambda entry: (
+            _coerce_int(entry.get("page_index", -1), default=-1),
+            int(entry.get("order_index", 0) or 0),
+            _normalize_text(entry.get("text")),
+        ),
+    )
+
+
+def _maybe_synthesize_title_bookmark(
+    heading_entries: list[dict[str, Any]],
+    document_title: str | None,
+    toc_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if toc_entries or not heading_entries or not document_title:
+        return heading_entries
+
+    normalized_title = _normalize_title_like_text(document_title)
+    if not normalized_title:
+        return heading_entries
+
+    first_page_entries = [
+        entry for entry in heading_entries
+        if _coerce_int(entry.get("page_index", -1), default=-1) == 0
+    ]
+    if len(first_page_entries) < 2:
+        return heading_entries
+
+    fragment_indexes: list[int] = []
+    for index, entry in enumerate(first_page_entries[:4]):
+        normalized_entry = _normalize_title_like_text(entry.get("text"))
+        if not normalized_entry:
+            continue
+        if normalized_entry == normalized_title:
+            return heading_entries
+        if normalized_entry in normalized_title:
+            fragment_indexes.append(index)
+
+    if len(fragment_indexes) < 2:
+        return heading_entries
+
+    title_entry = {
+        "text": _collapse_spaced_caps(document_title),
+        "page_index": 0,
+        "level": 1,
+        "order_index": -1,
+    }
+
+    filtered_entries: list[dict[str, Any]] = []
+    for entry in heading_entries:
+        if _coerce_int(entry.get("page_index", -1), default=-1) != 0:
+            filtered_entries.append(entry)
+            continue
+        normalized_entry = _normalize_title_like_text(entry.get("text"))
+        if normalized_entry and normalized_entry in normalized_title and normalized_entry != normalized_title:
+            continue
+        filtered_entries.append(entry)
+
+    return [title_entry, *filtered_entries]
+
+
+def _select_heading_bookmark_target(
+    label: str,
+    heading_entries: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    normalized_label = _normalize_title_like_text(label)
+    if not normalized_label:
+        return None
+
+    for entry in heading_entries:
+        normalized_heading = _normalize_title_like_text(entry.get("text"))
+        if normalized_heading == normalized_label:
+            return entry
+
+    return None
+
+
+def _toc_bookmark_entries(
+    elements: list[dict[str, Any]] | None,
+    heading_entries: list[dict[str, Any]],
+    page_count: int,
+) -> list[dict[str, Any]]:
+    if not elements:
+        return []
+
+    captioned_groups = {
+        str(element.get("toc_group_ref"))
+        for element in elements
+        if isinstance(element, dict)
+        and element.get("type") == "toc_caption"
+        and element.get("toc_group_ref") is not None
+    }
+
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        elem_type = str(element.get("type") or "").strip()
+        if elem_type not in {"toc_caption", "toc_item", "toc_item_table"}:
+            continue
+
+        label = _clean_bookmark_label(element.get("text"))
+        if not label:
+            continue
+        if not re.search(r"[A-Za-z]", label):
+            continue
+
+        if elem_type == "toc_caption":
+            try:
+                page_index = int(element.get("page", 0))
+            except (TypeError, ValueError):
+                page_index = 0
+            if not 0 <= page_index < page_count:
+                page_index = 0
+            source_page_index = page_index
+            level = 1
+        else:
+            captioned_group = str(element.get("toc_group_ref")) in captioned_groups
+            target = _select_heading_bookmark_target(label, heading_entries)
+            if target is None:
+                try:
+                    page_index = int(element.get("page", 0))
+                except (TypeError, ValueError):
+                    page_index = 0
+                if not 0 <= page_index < page_count:
+                    page_index = 0
+                source_page_index = page_index
+                base_level = 1
+            else:
+                page_index = target["page_index"]
+                try:
+                    source_page_index = int(element.get("page", page_index))
+                except (TypeError, ValueError):
+                    source_page_index = page_index
+                if not 0 <= source_page_index < page_count:
+                    source_page_index = page_index
+                base_level = max(1, min(6, _as_positive_int(target.get("level", 1), default=1)))
+            level = base_level + 1 if captioned_group else base_level
+
+        key = (_normalize_text(label), page_index)
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append({
+            "text": label,
+            "page_index": page_index,
+            "source_page_index": source_page_index,
+            "level": max(1, min(6, level)),
+            "section_key": _bookmark_section_key(label),
+        })
+
+    return entries
+
+
+def _native_toc_bookmark_entries(
+    native_toc: dict[str, Any] | None,
+    heading_entries: list[dict[str, Any]],
+    page_count: int,
+) -> list[dict[str, Any]]:
+    """Build bookmark entries from docling-parse's native TOC tree when available."""
+    if not isinstance(native_toc, dict):
+        return []
+
+    children = native_toc.get("children")
+    if not isinstance(children, list) or not children:
+        return []
+
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+
+    def _walk(nodes: list[dict[str, Any]], depth: int) -> None:
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            label = _clean_bookmark_label(node.get("text"))
+            if not label:
+                continue
+
+            target = _select_heading_bookmark_target(label, heading_entries)
+            if target is None:
+                _walk(node.get("children") or [], depth + 1)
+                continue
+
+            page_index = target["page_index"]
+            if not 0 <= int(page_index) < page_count:
+                _walk(node.get("children") or [], depth + 1)
+                continue
+
+            key = (_normalize_text(label), int(page_index))
+            if key not in seen:
+                seen.add(key)
+                entries.append({
+                    "text": label,
+                    "page_index": int(page_index),
+                    "source_page_index": int(page_index),
+                    "level": max(1, min(6, depth)),
+                })
+
+            _walk(node.get("children") or [], depth + 1)
+
+    _walk(children, 1)
+    return entries
+
+
+def _combine_bookmark_source_entries(
+    primary_entries: list[dict[str, Any]],
+    secondary_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge bookmark entry sources while preserving primary ordering."""
+    combined = list(primary_entries)
+    seen = {
+        (_normalize_text(entry.get("text")), _coerce_int(entry.get("page_index", -1), default=-1))
+        for entry in primary_entries
+        if entry.get("text")
+    }
+    seen_section_keys = {
+        str(entry.get("section_key") or "").strip()
+        for entry in primary_entries
+        if str(entry.get("section_key") or "").strip()
+    }
+
+    for entry in secondary_entries:
+        text_key = (
+            _normalize_text(entry.get("text")),
+            _coerce_int(entry.get("page_index", -1), default=-1),
+        )
+        section_key = str(entry.get("section_key") or "").strip()
+        if text_key in seen:
+            continue
+        if section_key and section_key in seen_section_keys:
+            continue
+        combined.append(entry)
+        seen.add(text_key)
+        if section_key:
+            seen_section_keys.add(section_key)
+
+    return combined
+
+
+def _bookmark_plan_entries(
+    bookmark_plan: list[dict[str, Any]] | None,
+    page_count: int,
+) -> list[dict[str, Any]]:
+    if not isinstance(bookmark_plan, list):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for order_index, plan_entry in enumerate(bookmark_plan):
+        if not isinstance(plan_entry, dict):
+            continue
+        text = " ".join(str(plan_entry.get("text") or "").split()).strip()
+        if not text:
+            continue
+        page_index = _coerce_int(plan_entry.get("page_index", -1), default=-1)
+        if not 0 <= page_index < page_count:
+            continue
+        level = max(1, min(6, _as_positive_int(plan_entry.get("level", 1), default=1)))
+        key = (_normalize_text(text), page_index)
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append({
+            "text": text,
+            "page_index": page_index,
+            "source_page_index": page_index,
+            "level": level,
+            "order_index": order_index,
+        })
+    return entries
+
+
+def _merge_bookmark_entries(
+    toc_entries: list[dict[str, Any]],
+    heading_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not toc_entries:
+        return heading_entries
+
+    def _keep_heading_entry(
+        entry: dict[str, Any],
+        last_toc_page_index: int,
+        first_section_page_index: int | None,
+    ) -> bool:
+        text = _clean_bookmark_label(entry.get("text"))
+        if not text:
+            return False
+
+        normalized_text = _normalize_text(text)
+        keyword_text = re.sub(r"[^\w\s]", "", normalized_text).strip()
+        section_key = str(entry.get("section_key") or "").strip()
+        if section_key:
+            return True
+
+        if keyword_text in {"references", "figures", "photo gallery"}:
+            return True
+
+        page_index = _coerce_int(entry.get("page_index", -1), default=-1)
+        level = max(1, min(6, _as_positive_int(entry.get("level", 1), default=1)))
+        if (
+            first_section_page_index is not None
+            and last_toc_page_index < page_index < first_section_page_index
+            and level <= 5
+        ):
+            return True
+        return page_index > last_toc_page_index and level <= 2
+
+    merged = list(toc_entries)
+    seen_texts = {_normalize_text(entry.get("text")) for entry in toc_entries if entry.get("text")}
+    seen_section_keys = {
+        str(entry.get("section_key"))
+        for entry in toc_entries
+        if str(entry.get("section_key") or "").strip()
+    }
+    last_toc_page_index = max(
+        _coerce_int(entry.get("source_page_index", entry.get("page_index", 0)), default=0)
+        for entry in toc_entries
+    )
+    first_section_page_index = min(
+        (
+            _coerce_int(entry.get("page_index", 0), default=0)
+            for entry in heading_entries
+            if str(entry.get("section_key") or "").strip()
+        ),
+        default=None,
+    )
+
+    for entry in heading_entries:
+        if not _keep_heading_entry(entry, last_toc_page_index, first_section_page_index):
+            continue
+        normalized_text = _normalize_text(entry.get("text"))
+        section_key = str(entry.get("section_key") or "").strip()
+        if normalized_text and normalized_text in seen_texts:
+            continue
+        if section_key and section_key in seen_section_keys:
+            continue
+        merged.append(entry)
+        if normalized_text:
+            seen_texts.add(normalized_text)
+        if section_key:
+            seen_section_keys.add(section_key)
+
+    return merged
 
 
 def _table_has_consistent_column_count(cells: list[dict]) -> bool:
@@ -702,34 +1602,141 @@ def _build_docling_parse_page_lines(
     cache: dict[int, list[dict]],
 ) -> list[dict]:
     """Extract line-level text cells from docling-parse for one page."""
+    page = _get_docling_parse_page(parser_doc, page_index)
+    if page is None:
+        cache[page_index] = []
+        return []
+    if page_index in cache:
+        return cache[page_index]
+
+    lines = _extract_docling_parse_text_cells(page, TextCellUnit.LINE)
+    cache[page_index] = lines
+    return lines
+
+
+def _get_docling_parse_page(parser_doc: Any | None, page_index: int) -> Any | None:
+    """Return a docling-parse page object for a 0-indexed page, if available."""
+    if parser_doc is None:
+        return None
+
+    page_no = page_index + 1  # docling-parse is 1-indexed
+    try:
+        if page_no > parser_doc.number_of_pages():
+            return None
+        return parser_doc.get_page(page_no)
+    except Exception:
+        return None
+
+
+def _extract_docling_parse_text_cells(page: Any, unit: TextCellUnit) -> list[dict]:
+    """Extract normalized text cells from a docling-parse page."""
+    cells: list[dict] = []
+    try:
+        iterator = page.iterate_cells(unit)
+    except Exception:
+        return cells
+
+    for cell in iterator:
+        bbox = _rect_to_bbox(cell.rect)
+        if not bbox:
+            continue
+        raw_text = " ".join(str(getattr(cell, "text", "") or getattr(cell, "orig", "")).split()).strip()
+        text = _normalize_text(raw_text)
+        cells.append({
+            "bbox": bbox,
+            "display_text": raw_text,
+            "text": text,
+            "index": _as_positive_int(getattr(cell, "index", len(cells) + 1), default=len(cells) + 1),
+        })
+    return cells
+
+
+def _build_docling_parse_page_words(
+    parser_doc: Any | None,
+    page_index: int,
+    cache: dict[int, list[dict]],
+) -> list[dict]:
+    """Extract word-level text cells from docling-parse for one page."""
     if parser_doc is None:
         return []
     if page_index in cache:
         return cache[page_index]
 
-    page_no = page_index + 1  # docling-parse is 1-indexed
-    try:
-        if page_no > parser_doc.number_of_pages():
-            cache[page_index] = []
-            return []
-        page = parser_doc.get_page(page_no)
-    except Exception:
+    page = _get_docling_parse_page(parser_doc, page_index)
+    if page is None:
         cache[page_index] = []
         return []
 
-    lines: list[dict] = []
-    for cell in page.iterate_cells(TextCellUnit.LINE):
-        bbox = _rect_to_bbox(cell.rect)
+    words = _extract_docling_parse_text_cells(page, TextCellUnit.WORD)
+    cache[page_index] = words
+    return words
+
+
+def _build_docling_parse_page_hyperlinks(
+    parser_doc: Any | None,
+    page_index: int,
+    cache: dict[int, list[dict]],
+) -> list[dict]:
+    """Extract hyperlink rectangles and metadata from docling-parse for one page."""
+    if parser_doc is None:
+        return []
+    if page_index in cache:
+        return cache[page_index]
+
+    page = _get_docling_parse_page(parser_doc, page_index)
+    if page is None:
+        cache[page_index] = []
+        return []
+
+    hyperlinks: list[dict] = []
+    for link in getattr(page, "hyperlinks", []) or []:
+        bbox = _rect_to_bbox(getattr(link, "rect", None))
         if not bbox:
             continue
-        text = _normalize_text(getattr(cell, "text", "") or getattr(cell, "orig", ""))
-        lines.append({
+        hyperlinks.append({
             "bbox": bbox,
-            "text": text,
+            "uri": str(getattr(link, "uri", "") or "").strip(),
+            "widget_text": " ".join(str(getattr(link, "widget_text", "") or "").split()).strip(),
+            "widget_description": " ".join(str(getattr(link, "widget_description", "") or "").split()).strip(),
+            "index": _as_positive_int(getattr(link, "index", len(hyperlinks) + 1), default=len(hyperlinks) + 1),
         })
 
-    cache[page_index] = lines
-    return lines
+    cache[page_index] = hyperlinks
+    return hyperlinks
+
+
+def _build_docling_parse_page_widgets(
+    parser_doc: Any | None,
+    page_index: int,
+    cache: dict[int, list[dict]],
+) -> list[dict]:
+    """Extract widget rectangles and metadata from docling-parse for one page."""
+    if parser_doc is None:
+        return []
+    if page_index in cache:
+        return cache[page_index]
+
+    page = _get_docling_parse_page(parser_doc, page_index)
+    if page is None:
+        cache[page_index] = []
+        return []
+
+    widgets: list[dict] = []
+    for widget in getattr(page, "widgets", []) or []:
+        bbox = _rect_to_bbox(getattr(widget, "rect", None))
+        if not bbox:
+            continue
+        widgets.append({
+            "bbox": bbox,
+            "field_name": " ".join(str(getattr(widget, "widget_field_name", "") or "").split()).strip(),
+            "description": " ".join(str(getattr(widget, "widget_description", "") or "").split()).strip(),
+            "text": " ".join(str(getattr(widget, "widget_text", "") or "").split()).strip(),
+            "field_type": str(getattr(widget, "widget_field_type", "") or "").strip(),
+            "index": _as_positive_int(getattr(widget, "index", len(widgets) + 1), default=len(widgets) + 1),
+        })
+
+    cache[page_index] = widgets
+    return widgets
 
 
 def _refine_text_regions_with_docling_parse(
@@ -2121,7 +3128,7 @@ def _normalize_type1_font_charsets(pdf: pikepdf.Pdf) -> int:
 def _normalize_media_clip_data_dicts(pdf: pikepdf.Pdf) -> int:
     """Backfill syntax-critical CT/Alt entries on media clip data dictionaries."""
     changes = 0
-    seen: set[tuple[int, int]] = set()
+    seen_indirect: set[tuple[int, int]] = set()
 
     def _string_or_empty(value) -> str:
         if value is None:
@@ -2189,20 +3196,35 @@ def _normalize_media_clip_data_dicts(pdf: pikepdf.Pdf) -> int:
 
         return "application/octet-stream"
 
-    def _walk(obj) -> None:
-        nonlocal changes
-        if isinstance(obj, pikepdf.Array):
-            for item in obj:
-                _walk(item)
-            return
-        if not _is_mapping(obj):
-            return
+    active_direct_ids: set[int] = set()
+    stack: list[tuple[object | None, str | int | None]] = [(pdf.Root, None)]
 
-        objgen = getattr(obj, "objgen", None)
-        if objgen and objgen != (0, 0):
-            if objgen in seen:
-                return
-            seen.add(objgen)
+    while stack:
+        obj, exit_mode = stack.pop()
+        if isinstance(exit_mode, int):
+            active_direct_ids.discard(exit_mode)
+            continue
+        if obj is None:
+            continue
+
+        indirect_key = _obj_key(obj)
+        if indirect_key:
+            if indirect_key in seen_indirect:
+                continue
+            seen_indirect.add(indirect_key)
+        elif isinstance(obj, (pikepdf.Array, pikepdf.Dictionary, pikepdf.Stream)):
+            direct_id = id(obj)
+            if direct_id in active_direct_ids:
+                continue
+            active_direct_ids.add(direct_id)
+            stack.append((None, direct_id))
+
+        if isinstance(obj, pikepdf.Array):
+            for item in reversed(list(obj)):
+                stack.append((item, None))
+            continue
+        if not _is_mapping(obj):
+            continue
 
         try:
             is_media_clip_data = obj.get("/S") == pikepdf.Name("/MCD")
@@ -2222,31 +3244,55 @@ def _normalize_media_clip_data_dicts(pdf: pikepdf.Pdf) -> int:
                 ])
                 changes += 1
 
-        for _, value in obj.items():
-            _walk(value)
+        for _, value in reversed(list(obj.items())):
+            stack.append((value, None))
 
-    _walk(pdf.Root)
     return changes
 
 
-def _add_bookmarks(pdf: pikepdf.Pdf, headings: list[dict]):
-    """Build bookmarks (outlines) from heading elements."""
-    if not headings:
+def _add_bookmarks(
+    pdf: pikepdf.Pdf,
+    headings: list[dict],
+    elements: list[dict[str, Any]] | None = None,
+    bookmark_plan: list[dict[str, Any]] | None = None,
+    native_toc: dict[str, Any] | None = None,
+    document_title: str | None = None,
+):
+    """Build bookmarks from TOC semantics when available, else fall back to headings."""
+    page_count = len(pdf.pages)
+    plan_entries = _bookmark_plan_entries(bookmark_plan, page_count)
+    heading_entries = _docling_heading_bookmark_entries(elements, page_count)
+    selected_heading_entries = _docling_heading_bookmark_entries(
+        elements,
+        page_count,
+        selected_only=True,
+    )
+    if not heading_entries:
+        heading_entries = _heading_bookmark_entries(headings, page_count)
+    native_toc_entries = _native_toc_bookmark_entries(native_toc, heading_entries, page_count)
+    toc_entries = _toc_bookmark_entries(elements, heading_entries, page_count)
+    if plan_entries:
+        bookmark_entries = plan_entries
+    elif native_toc_entries:
+        bookmark_entries = native_toc_entries
+    elif toc_entries:
+        bookmark_entries = _combine_bookmark_source_entries(toc_entries, selected_heading_entries)
+    else:
+        bookmark_entries = _sort_heading_bookmark_entries(
+            _maybe_synthesize_title_bookmark(heading_entries, document_title, [])
+        )
+    if not bookmark_entries:
         return 0
 
-    valid_headings = [h for h in headings if 0 <= h["page_index"] < len(pdf.pages)]
-    if not valid_headings:
-        return 0
-
-    items = [pikepdf.OutlineItem(h["text"], h["page_index"]) for h in valid_headings]
+    items = [pikepdf.OutlineItem(entry["text"], entry["page_index"]) for entry in bookmark_entries]
     if not items:
         return 0
 
     root_items = []
     stack: list[tuple[int, pikepdf.OutlineItem]] = []
 
-    for h, item in zip(valid_headings, items, strict=True):
-        level = h["level"]
+    for entry, item in zip(bookmark_entries, items, strict=True):
+        level = entry["level"]
 
         while stack and stack[-1][0] >= level:
             stack.pop()
@@ -2272,6 +3318,10 @@ def _tag_link_annotations(
     page: pikepdf.Page,
     page_ref: pikepdf.Object,
     builder: StructTreeBuilder,
+    page_elements: list[dict[str, Any]] | None = None,
+    docling_page_lines: list[dict[str, Any]] | None = None,
+    docling_page_words: list[dict[str, Any]] | None = None,
+    docling_page_hyperlinks: list[dict[str, Any]] | None = None,
 ) -> int:
     """Tag link annotations as /Link struct elements using OBJR."""
     annots = page.get("/Annots")
@@ -2287,8 +3337,16 @@ def _tag_link_annotations(
         except Exception:
             continue
         has_link_annotation = True
-        if not str(annotation.get("/Contents", "")).strip():
-            annotation["/Contents"] = pikepdf.String(_infer_link_contents(annotation))
+        current_contents = str(annotation.get("/Contents", "")).strip()
+        inferred_contents = _infer_link_contents(
+            annotation,
+            page_elements,
+            docling_page_lines,
+            docling_page_words,
+            docling_page_hyperlinks,
+        )
+        if inferred_contents and inferred_contents != current_contents:
+            annotation["/Contents"] = pikepdf.String(inferred_contents)
 
         if not getattr(annotation, "is_indirect", False):
             try:
@@ -2310,6 +3368,7 @@ def _tag_widget_annotations(
     page: pikepdf.Page,
     page_ref: pikepdf.Object,
     builder: StructTreeBuilder,
+    docling_page_widgets: list[dict[str, Any]] | None = None,
 ) -> int:
     """Tag widget annotations as /Form struct elements using OBJR."""
     annots = page.get("/Annots")
@@ -2323,6 +3382,11 @@ def _tag_widget_annotations(
                 continue
         except Exception:
             continue
+
+        if not str(annotation.get("/TU", "")).strip():
+            inferred_name = _infer_widget_accessible_name(annotation, docling_page_widgets)
+            if inferred_name:
+                annotation["/TU"] = pikepdf.String(inferred_name)
 
         if not getattr(annotation, "is_indirect", False):
             try:
@@ -2518,7 +3582,7 @@ async def tag_pdf(
     output_path: Path,
     structure_json: dict,
     alt_texts: list[dict] | None = None,
-    language: str = "en",
+    language: str | None = "en",
     original_filename: str = "",
 ) -> TaggingResult:
     """Write PDF/UA structure tags into the PDF."""
@@ -2527,6 +3591,10 @@ async def tag_pdf(
         tags_added = 0
         parser_doc = None
         docling_parse_cache: dict[int, list[dict]] = {}
+        docling_parse_word_cache: dict[int, list[dict]] = {}
+        docling_parse_hyperlink_cache: dict[int, list[dict]] = {}
+        docling_parse_widget_cache: dict[int, list[dict]] = {}
+        document_language = _resolve_document_language(structure_json, language)
 
         try:
             parser_doc = DoclingPdfParser(loglevel="fatal").load(
@@ -2549,7 +3617,7 @@ async def tag_pdf(
             tags_added += 1
 
             # 2. Set document language
-            pdf.Root["/Lang"] = pikepdf.String(language)
+            pdf.Root["/Lang"] = pikepdf.String(document_language)
             tags_added += 1
 
             # 3. Set document title
@@ -2564,7 +3632,7 @@ async def tag_pdf(
             _normalize_media_clip_data_dicts(pdf)
 
             # 4. Build structure tree
-            builder = StructTreeBuilder(pdf, doc_lang=language)
+            builder = StructTreeBuilder(pdf, doc_lang=document_language)
             builder.setup()
             tags_added += 1
 
@@ -2603,12 +3671,27 @@ async def tag_pdf(
 
             for page_index, page in enumerate(pdf.pages):
                 page_elems = pages_elements.get(page_index, [])
+                page_lines = _build_docling_parse_page_lines(
+                    parser_doc,
+                    page_index,
+                    docling_parse_cache,
+                )
+                page_words = _build_docling_parse_page_words(
+                    parser_doc,
+                    page_index,
+                    docling_parse_word_cache,
+                )
+                page_hyperlinks = _build_docling_parse_page_hyperlinks(
+                    parser_doc,
+                    page_index,
+                    docling_parse_hyperlink_cache,
+                )
+                page_widgets = _build_docling_parse_page_widgets(
+                    parser_doc,
+                    page_index,
+                    docling_parse_widget_cache,
+                )
                 if page_elems:
-                    page_lines = _build_docling_parse_page_lines(
-                        parser_doc,
-                        page_index,
-                        docling_parse_cache,
-                    )
                     _rewrite_content_stream(
                         pdf, page, page_index, page_elems,
                         builder, page.obj, alt_lookup,
@@ -2638,15 +3721,30 @@ async def tag_pdf(
                     )
 
                 _ensure_annotation_baseline(page)
-                links_tagged += _tag_link_annotations(page, page.obj, builder)
-                _tag_widget_annotations(page, page.obj, builder)
+                links_tagged += _tag_link_annotations(
+                    page,
+                    page.obj,
+                    builder,
+                    page_elems,
+                    page_lines,
+                    page_words,
+                    page_hyperlinks,
+                )
+                _tag_widget_annotations(page, page.obj, builder, page_widgets)
                 annotations_tagged += _tag_generic_annotations(page, page.obj, builder)
 
             # 5. Finalize structure tree
             builder.finalize()
 
             # 6. Add bookmarks from headings
-            bookmarks_added = _add_bookmarks(pdf, builder._headings)
+            bookmarks_added = _add_bookmarks(
+                pdf,
+                builder._headings,
+                elements,
+                structure_json.get("bookmark_plan"),
+                structure_json.get("native_toc"),
+                structure_json.get("title"),
+            )
 
             pdf.save(str(output_path))
 

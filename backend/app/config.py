@@ -32,13 +32,17 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "google/gemini-3-flash-preview"
     llm_timeout: int = 120
+    llm_pretag_timeout: int = 45
     llm_strict_validation: bool = True
     auto_approve_generated_alt_text: bool = True
+    skip_alt_text_generation: bool = False
     auto_apply_llm_font_map: bool = True
     auto_apply_grounded_text: bool = True
     auto_apply_table_intelligence: bool = True
     auto_apply_form_intelligence: bool = True
     assist_toc_with_llm: bool = True
+    assist_title_with_llm: bool = True
+    assist_bookmarks_with_llm: bool = True
 
     # veraPDF
     verapdf_path: str = "verapdf"
@@ -86,6 +90,7 @@ class Settings(BaseSettings):
 
     # LLM retry
     llm_max_retries: int = 3
+    llm_pretag_max_retries: int = 0
     llm_retry_backoff_base: float = 2.0
     llm_retry_max_backoff_seconds: float = 60.0
     llm_max_concurrency: int = 4

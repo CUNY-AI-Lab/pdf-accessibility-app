@@ -1,0 +1,56 @@
+{
+  "id": "pdfa_academic_abstract",
+  "lane": "recoverable-core",
+  "document_family": "conference_paper",
+  "product_priority": "primary",
+  "workflow_tags": ["academic", "bookmarks", "short_form", "sections"],
+  "gold_pdf": "../../data/external_gold_candidates/pdfa_reference_suite_1_1/PDFUA-Ref-2-03_AcademicAbstract.pdf",
+  "recoverable_assertions": [
+    {
+      "id": "lang",
+      "kind": "document_lang",
+      "expected": "en"
+    },
+    {
+      "id": "title",
+      "kind": "title_contains",
+      "expected": "More than just digital paper"
+    },
+    {
+      "id": "opening_text",
+      "kind": "text_contains",
+      "expected": "PDF has long been established as the de facto format"
+    },
+    {
+      "id": "body_order",
+      "kind": "ordered_text",
+      "expected": [
+        "ABSTRACT",
+        "SUMMARY",
+        "TOPICS",
+        "ABOUT THE ORGANIZERS"
+      ]
+    },
+    {
+      "id": "bookmark_abstract",
+      "kind": "bookmark_title",
+      "expected": "Abstract"
+    },
+    {
+      "id": "bookmark_summary",
+      "kind": "bookmark_title",
+      "expected": "Summary"
+    },
+    {
+      "id": "bookmark_topics",
+      "kind": "bookmark_title",
+      "expected": "Topics"
+    },
+    {
+      "id": "bookmark_organizers",
+      "kind": "bookmark_title",
+      "expected": "About the Organizers"
+    }
+  ],
+  "hidden_semantics_assertions": []
+}

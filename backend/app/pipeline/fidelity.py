@@ -64,6 +64,13 @@ _POOR_LINK_TEXT_RE = re.compile(
     r"|^link\s*to\s+https?://",  # "Link to http://..." (our inferred fallback)
     re.IGNORECASE,
 )
+_GENERATED_LINK_TEXT_RE = re.compile(
+    r"^(?:jump|go)\s+to\s+"
+    r"(?:destination|bibitem|cite(?:\b|[._:-])|section|subsection|appendix|figure|table|equation|eqn|footnote|endnote|page)\b",
+    re.IGNORECASE,
+)
+IMPLAUSIBLE_LINK_TEXT_MAX_CHARS = 160
+IMPLAUSIBLE_LINK_TEXT_MAX_WORDS = 18
 
 TEXT_SAMPLE_MAX_PAGES = 10
 TEXT_SAMPLE_MAX_CHARS = 20000
@@ -533,11 +540,32 @@ def _is_poor_link_text(text: str) -> bool:
     return bool(_POOR_LINK_TEXT_RE.match(normalised))
 
 
+def _is_implausible_link_text(text: str) -> bool:
+    """Return True when /Contents looks like paragraph spill rather than anchor text."""
+    normalized = " ".join(str(text or "").split()).strip()
+    if not normalized:
+        return False
+    words = [word for word in normalized.split(" ") if word]
+    if len(normalized) > IMPLAUSIBLE_LINK_TEXT_MAX_CHARS:
+        return True
+    if len(words) > IMPLAUSIBLE_LINK_TEXT_MAX_WORDS:
+        return True
+    if re.search(r"[.!?]\s+[A-Z]", normalized):
+        return True
+    return False
+
+
 def _canonical_named_destination(value) -> str | None:
     if value is None:
         return None
     try:
-        text = str(value).strip()
+        resolved = value.get_object()
+    except Exception:
+        resolved = value
+    if isinstance(resolved, (pikepdf.Array, pikepdf.Dictionary)):
+        return None
+    try:
+        text = str(resolved).strip()
     except Exception:
         return None
     if not text or text == "None":
@@ -569,14 +597,21 @@ def _iter_name_tree_entries(node) -> list[tuple[str, Any]]:
 
 
 def _is_generated_link_contents(text: str, *, uri: str = "", has_dest: bool = False) -> bool:
-    normalized = text.strip()
+    normalized = " ".join(text.strip().split())
+    lowered = normalized.lower()
     if not normalized:
         return False
-    if normalized == "Link":
+    if lowered == "link":
         return True
-    if has_dest and normalized == "Link to destination":
+    if _GENERATED_LINK_TEXT_RE.match(lowered):
         return True
-    if uri and normalized == f"Link to {uri}":
+    if lowered.startswith("jump to destination ") or lowered.startswith("go to destination "):
+        return True
+    if has_dest and (lowered == "link to destination" or lowered.startswith("link to destination ")):
+        return True
+    if uri and lowered == f"link to {uri.lower()}":
+        return True
+    if uri and lowered == "link to external destination":
         return True
     return False
 
@@ -607,12 +642,17 @@ def _check_link_text_quality(output_pdf: Path) -> list[dict[str, Any]]:
                         )
                         if _is_generated_link_contents(contents, uri=uri, has_dest=has_dest):
                             continue
-                        if not contents or _is_poor_link_text(contents):
+                        if not contents or _is_poor_link_text(contents) or _is_implausible_link_text(contents):
                             poor_links.append(
                                 {
                                     "page": page_idx,
                                     "text": contents or "(empty)",
                                     "uri": uri,
+                                    "reason": (
+                                        "implausibly_long_or_sentence_like"
+                                        if contents and _is_implausible_link_text(contents)
+                                        else "non_descriptive"
+                                    ),
                                 }
                             )
                     except Exception:

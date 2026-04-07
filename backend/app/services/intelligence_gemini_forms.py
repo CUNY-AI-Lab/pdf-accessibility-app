@@ -8,6 +8,7 @@ from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
 from app.services.intelligence_llm_utils import (
     context_json_part,
     page_preview_parts,
+    preferred_cache_breakpoint_index,
     request_llm_json,
 )
 from app.services.llm_client import LlmClient
@@ -24,11 +25,14 @@ Goal:
 
 Rules:
 - Return one decision per provided field_review_id when possible.
-- Prefer concise labels that match the visible label or nearby control text.
+- Prefer labels that preserve the same meaning a screen reader user needs, even when that means including short section or group context.
+- When a short visible label would be ambiguous on its own, include the nearby section, group, or question text that disambiguates it.
 - For checkbox and radio controls, combine nearby group text and option text when that is what a screen reader should hear.
+- Preserve short action cues like "Enter" or "Select" when they are clearly supported by the control type and nearby text.
+- Do not shorten a clearly helpful accessible label just because a shorter visible label exists.
 - Do not copy long instruction paragraphs verbatim when a shorter faithful label is visible.
 - Use confirm_current_label only when the current accessible label is already good.
-- Use set_field_label when a better concise label is clearly supported.
+- Use set_field_label when a better faithful label is clearly supported.
 - Use manual_only when the field is ambiguous from the page image and nearby context.
 """
 
@@ -212,7 +216,7 @@ async def generate_form_intelligence_for_page(
         content=content,
         schema_name="form_page_intelligence",
         response_schema=FORM_BATCH_SCHEMA,
-        cache_breakpoint_index=1,
+        cache_breakpoint_index=preferred_cache_breakpoint_index(content),
     )
 
     decision_map: dict[str, dict[str, Any]] = {}

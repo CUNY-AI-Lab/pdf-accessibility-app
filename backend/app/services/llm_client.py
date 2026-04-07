@@ -60,6 +60,11 @@ def _is_retryable(exc: BaseException) -> bool:
     return False
 
 
+def is_retryable_llm_exception(exc: BaseException) -> bool:
+    """Return True when an LLM failure is transient and retry-oriented."""
+    return _is_retryable(exc)
+
+
 def _retry_after_seconds(exc: BaseException) -> float | None:
     if not isinstance(exc, httpx.HTTPStatusError):
         return None
@@ -209,13 +214,31 @@ class LlmClient:
 
 
 def make_llm_client(settings: Any) -> LlmClient:
+    return make_llm_client_with_overrides(settings)
+
+
+def make_llm_client_with_overrides(
+    settings: Any,
+    *,
+    timeout: int | None = None,
+    max_retries: int | None = None,
+    retry_backoff_base: float | None = None,
+    max_backoff_seconds: float | None = None,
+    max_concurrency: int | None = None,
+) -> LlmClient:
     return LlmClient(
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
         model=settings.llm_model,
-        timeout=settings.llm_timeout,
-        max_retries=settings.llm_max_retries,
-        retry_backoff_base=settings.llm_retry_backoff_base,
-        max_backoff_seconds=settings.llm_retry_max_backoff_seconds,
-        max_concurrency=settings.llm_max_concurrency,
+        timeout=settings.llm_timeout if timeout is None else timeout,
+        max_retries=settings.llm_max_retries if max_retries is None else max_retries,
+        retry_backoff_base=(
+            settings.llm_retry_backoff_base if retry_backoff_base is None else retry_backoff_base
+        ),
+        max_backoff_seconds=(
+            settings.llm_retry_max_backoff_seconds
+            if max_backoff_seconds is None
+            else max_backoff_seconds
+        ),
+        max_concurrency=settings.llm_max_concurrency if max_concurrency is None else max_concurrency,
     )

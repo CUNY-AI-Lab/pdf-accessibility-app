@@ -167,6 +167,9 @@ def test_generate_form_intelligence_for_page_normalizes_batch_response(monkeypat
 
     assert captured["schema_name"] == "form_page_intelligence"
     assert captured["cache_breakpoint_index"] == 1
+    prompt = captured["content"][0]["text"]
+    assert "section or group context" in prompt
+    assert "Do not shorten a clearly helpful accessible label" in prompt
     assert len(result) == 2
     assert result[0]["field_review_id"] == "field-widget-10-0"
     assert result[0]["suggested_action"] == "set_field_label"

@@ -56,6 +56,7 @@ Key environment variables:
 | `LLM_BASE_URL` | OpenAI-compatible API base URL | `https://openrouter.ai/api/v1` |
 | `LLM_API_KEY` | API key for the LLM provider | — |
 | `LLM_MODEL` | Model identifier | `google/gemini-3-flash-preview` |
+| `DOCLING_SERVE_URL` | Local or remote `docling-serve` URL for structure extraction | — |
 | `OCR_LANGUAGE` | Default Tesseract language code | `eng` |
 | `JOB_TTL_HOURS` | Hours before jobs expire | `12` |
 | `VERAPDF_PATH` | Path to veraPDF binary | `verapdf` |
@@ -84,6 +85,23 @@ bun dev
 - Backend API: http://localhost:8001
 
 The frontend proxies `/api` and `/health` to the backend via Vite config.
+
+### Recommended Mac Runtime
+
+For the main app on this machine, the intended setup is:
+
+- LLM semantics through an OpenAI-compatible API endpoint such as OpenRouter
+- structure extraction through local `docling-serve`
+- Apple GPU acceleration through MPS on the `docling-serve` process when available
+
+Set `DOCLING_SERVE_URL=http://localhost:5001` in `.env`, and start `docling-serve` with `DOCLING_DEVICE=mps`. The structure step will use that server. The later PDF tagging/writing step is still local CPU work.
+
+You can verify the effective runtime with:
+
+```bash
+cd backend
+PYTHONPATH=. uv run python scripts/runtime_diagnostics.py
+```
 
 ## Docker
 

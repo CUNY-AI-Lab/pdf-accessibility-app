@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pikepdf
 from sqlalchemy import select
@@ -26,13 +27,20 @@ from app.config import get_settings
 from app.models import AppliedChange, Base, Job, JobStep, ReviewTask
 from app.pipeline.classify import classify_pdf
 from app.pipeline.ocr import run_ocr
-from app.pipeline.orchestrator import run_pipeline
+from app.pipeline.orchestrator import (
+    _apply_pretag_form_intelligence,
+    _apply_pretag_grounded_text_resolutions,
+    _apply_pretag_table_intelligence,
+    _apply_pretag_widget_rationalization,
+    run_pipeline,
+)
 from app.pipeline.structure import extract_structure
 from app.pipeline.tagger import tag_pdf
 from app.pipeline.validator import validate_pdf
 from app.services.file_storage import cleanup_job_files
 from app.services.job_manager import JobManager
-from app.services.llm_client import track_llm_usage
+from app.services.llm_client import make_llm_client, track_llm_usage
+from app.services.toc_intelligence import enhance_toc_structure_with_intelligence
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 OUTPUT_ROOT = ROOT_DIR / "data" / "benchmarks"
@@ -72,6 +80,15 @@ FONT_DICT_REPAIR_RULE_MARKERS = ("-7.21.3.2-", "-7.21.4.2-")
 FONT_SUBSET_RE = re.compile(r"^[A-Z]{6}\+.+")
 HEX_STR_RE = re.compile(r"<([0-9A-Fa-f]+)>")
 PIPELINE_STEPS = ("classify", "ocr", "structure", "alt_text", "tagging", "validation", "fidelity")
+BENCHMARK_OWNER_SESSION_HASH = "benchmark-session"
+BENCHMARK_PROFILE_FULL = "full"
+BENCHMARK_PROFILE_ASSISTIVE_CORE = "assistive-core"
+BENCHMARK_PROFILE_DETERMINISTIC = "deterministic"
+BENCHMARK_PROFILE_CHOICES = (
+    BENCHMARK_PROFILE_FULL,
+    BENCHMARK_PROFILE_ASSISTIVE_CORE,
+    BENCHMARK_PROFILE_DETERMINISTIC,
+)
 
 
 @dataclass
@@ -1097,6 +1114,39 @@ async def _finalize_review_if_needed(
         await asyncio.sleep(0.1)
 
 
+def benchmark_runner_for_profile(profile: str):
+    normalized = str(profile or "").strip().lower()
+    if normalized == BENCHMARK_PROFILE_FULL:
+        return benchmark_one_workflow
+    if normalized == BENCHMARK_PROFILE_ASSISTIVE_CORE:
+        async def _runner(pdf_path, run_dir, settings, session_maker=None, job_manager=None):
+            profile_settings = settings.model_copy(update={"skip_alt_text_generation": True})
+            return await benchmark_one_workflow(
+                pdf_path,
+                run_dir,
+                profile_settings,
+                session_maker,
+                job_manager,
+            )
+
+        return _runner
+    if normalized == BENCHMARK_PROFILE_DETERMINISTIC:
+        async def _runner(pdf_path, run_dir, settings, session_maker=None, job_manager=None):
+            return await benchmark_one(pdf_path, run_dir, settings)
+
+        return _runner
+    raise ValueError(f"Unknown benchmark profile: {profile}")
+
+
+def _benchmark_job_stub(job_id: str, pdf_path: Path, working_pdf: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=job_id,
+        original_filename=pdf_path.name,
+        input_path=str(working_pdf),
+        output_path=str(working_pdf),
+    )
+
+
 async def benchmark_one_workflow(
     pdf_path: Path,
     run_dir: Path,
@@ -1176,6 +1226,7 @@ async def benchmark_one_workflow(
                 id=job_id,
                 filename=pdf_path.name,
                 original_filename=pdf_path.name,
+                owner_session_hash=BENCHMARK_OWNER_SESSION_HASH,
                 status="queued",
                 input_path=str(pdf_path),
                 file_size_bytes=size,
@@ -1204,6 +1255,10 @@ async def benchmark_one_workflow(
 
             classification_type = (job.classification or "unknown").strip() or "unknown"
             structure_json = _parse_json(job.structure_json)
+            if structure_json:
+                (run_dir / f"{pdf_path.stem}_workflow_structure.json").write_text(
+                    json.dumps(structure_json, indent=2, sort_keys=True) + "\n"
+                )
             validation_json = _parse_json(job.validation_json)
             fidelity_json = _parse_json(job.fidelity_json)
             final_status = str(job.status or "unknown")
@@ -1446,7 +1501,13 @@ async def benchmark_one_workflow(
     )
 
 
-async def benchmark_one(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
+async def benchmark_one(
+    pdf_path: Path,
+    run_dir: Path,
+    settings,
+    *,
+    assistive_core: bool = False,
+) -> DocMetrics:
     started = time.perf_counter()
     structure_secs = 0.0
     tagging_secs = 0.0
@@ -1478,16 +1539,28 @@ async def benchmark_one(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
     font_lane_first_warnings = 0
     font_lane_second_errors = 0
     font_lane_second_warnings = 0
+    toc_llm_assist_attempted = False
+    toc_llm_assist_applied = False
+    toc_llm_groups_considered = 0
+    toc_llm_groups_applied = 0
+    llm_requests = 0
+    llm_prompt_tokens = 0
+    llm_completion_tokens = 0
+    llm_total_tokens = 0
+    llm_cost_usd = 0.0
 
     pages, source_links, source_has_forms = _count_source_features(pdf_path)
     size = pdf_path.stat().st_size if pdf_path.exists() else 0
     classification_type = "unknown"
+    job_id = str(uuid.uuid4())
 
     elements_total = 0
     elements_headings = 0
     elements_figures = 0
     elements_tables = 0
     elements_list_items = 0
+    elements_toc_captions = 0
+    elements_toc_items = 0
 
     tags_total = 0
     struct_elems_created = 0
@@ -1530,19 +1603,91 @@ async def benchmark_one(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
         structure_ok = True
         if structure.processed_pdf_path:
             tag_input_path = structure.processed_pdf_path
+        structure_json = structure.document_json
 
-        elements = structure.document_json.get("elements", [])
+        if assistive_core:
+            toc_intelligence_assist = {
+                "attempted": False,
+                "applied": False,
+                "reason": "disabled",
+                "groups_considered": 0,
+                "groups_applied": 0,
+            }
+            with track_llm_usage() as llm_usage:
+                if settings.assist_toc_with_llm:
+                    llm_client = make_llm_client(settings)
+                    try:
+                        structure_json, toc_intelligence_assist = await enhance_toc_structure_with_intelligence(
+                            pdf_path=tag_input_path,
+                            structure_json=structure_json,
+                            original_filename=pdf_path.name,
+                            llm_client=llm_client,
+                        )
+                    except Exception as exc:
+                        toc_intelligence_assist = {
+                            "attempted": True,
+                            "applied": False,
+                            "reason": str(exc),
+                            "groups_considered": 0,
+                            "groups_applied": 0,
+                        }
+                    finally:
+                        await llm_client.close()
+
+                benchmark_job = _benchmark_job_stub(job_id, pdf_path, tag_input_path)
+                structure_json, _ = await _apply_pretag_grounded_text_resolutions(
+                    job=benchmark_job,
+                    settings=settings,
+                    working_pdf=tag_input_path,
+                    structure_json=structure_json,
+                )
+                structure_json, _ = await _apply_pretag_table_intelligence(
+                    job=benchmark_job,
+                    settings=settings,
+                    structure_json=structure_json,
+                )
+                tag_input_path, _ = await _apply_pretag_widget_rationalization(
+                    job=benchmark_job,
+                    settings=settings,
+                    working_pdf=tag_input_path,
+                    structure_json=structure_json,
+                )
+                tag_input_path, _ = await _apply_pretag_form_intelligence(
+                    job=benchmark_job,
+                    settings=settings,
+                    working_pdf=tag_input_path,
+                    structure_json=structure_json,
+                )
+
+            llm_requests = llm_usage.request_count
+            llm_prompt_tokens = llm_usage.prompt_tokens
+            llm_completion_tokens = llm_usage.completion_tokens
+            llm_total_tokens = llm_usage.total_tokens
+            llm_cost_usd = llm_usage.cost_usd
+            toc_llm_assist_attempted = bool(toc_intelligence_assist.get("attempted", False))
+            toc_llm_assist_applied = bool(toc_intelligence_assist.get("applied", False))
+            toc_llm_groups_considered = int(toc_intelligence_assist.get("groups_considered", 0) or 0)
+            toc_llm_groups_applied = int(toc_intelligence_assist.get("groups_applied", 0) or 0)
+
+        elements = structure_json.get("elements", [])
+        (run_dir / f"{pdf_path.stem}_workflow_structure.json").write_text(
+            json.dumps(structure_json, indent=2, sort_keys=True) + "\n"
+        )
         elements_total = len(elements)
         elements_headings = sum(1 for e in elements if e.get("type") == "heading")
         elements_figures = sum(1 for e in elements if e.get("type") == "figure")
         elements_tables = sum(1 for e in elements if e.get("type") == "table")
         elements_list_items = sum(1 for e in elements if e.get("type") == "list_item")
+        elements_toc_captions = sum(1 for e in elements if e.get("type") == "toc_caption")
+        elements_toc_items = sum(
+            1 for e in elements if e.get("type") in {"toc_item", "toc_item_table"}
+        )
 
         t1 = time.perf_counter()
         tagging = await tag_pdf(
             input_path=tag_input_path,
             output_path=tagged_path,
-            structure_json=structure.document_json,
+            structure_json=structure_json,
             alt_texts=[],
             original_filename=pdf_path.name,
         )
@@ -1626,7 +1771,7 @@ async def benchmark_one(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
                 lane_tagging = await tag_pdf(
                     input_path=remediation_input,
                     output_path=lane_tagged,
-                    structure_json=structure.document_json,
+                    structure_json=structure_json,
                     alt_texts=[],
                     original_filename=pdf_path.name,
                 )
@@ -1670,8 +1815,13 @@ async def benchmark_one(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
         )
         final_status = "complete" if compliant else "manual_remediation"
         fidelity_passed = compliant
+        workflow_output = run_dir / f"{pdf_path.stem}_workflow_output.pdf"
+        if selected_tagging.output_path.exists():
+            shutil.copy2(selected_tagging.output_path, workflow_output)
     except Exception as exc:
         error = re.sub(r"\s+", " ", str(exc)).strip()
+    finally:
+        cleanup_job_files(job_id, input_path=None)
 
     total_secs = time.perf_counter() - started
     return DocMetrics(
@@ -1685,6 +1835,11 @@ async def benchmark_one(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
         tagging_secs=round(tagging_secs, 3),
         validation_secs=round(validation_secs, 3),
         total_secs=round(total_secs, 3),
+        llm_requests=llm_requests,
+        llm_prompt_tokens=llm_prompt_tokens,
+        llm_completion_tokens=llm_completion_tokens,
+        llm_total_tokens=llm_total_tokens,
+        llm_cost_usd=round(llm_cost_usd, 6),
         structure_ok=structure_ok,
         tag_ok=tag_ok,
         validation_ok=validation_ok,
@@ -1717,6 +1872,8 @@ async def benchmark_one(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
         elements_figures=elements_figures,
         elements_tables=elements_tables,
         elements_list_items=elements_list_items,
+        elements_toc_captions=elements_toc_captions,
+        elements_toc_items=elements_toc_items,
         tags_total=tags_total,
         struct_elems_created=struct_elems_created,
         headings_tagged=headings_tagged,
@@ -1726,11 +1883,24 @@ async def benchmark_one(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
         lists_tagged=lists_tagged,
         links_tagged=links_tagged,
         bookmarks_added=bookmarks_added,
+        toc_llm_assist_attempted=toc_llm_assist_attempted,
+        toc_llm_assist_applied=toc_llm_assist_applied,
+        toc_llm_groups_considered=toc_llm_groups_considered,
+        toc_llm_groups_applied=toc_llm_groups_applied,
         heading_coverage=round(_safe_ratio(headings_tagged, elements_headings), 3),
         figure_coverage=round(_safe_ratio(figures_tagged, elements_figures), 3),
         table_coverage=round(_safe_ratio(tables_tagged, elements_tables), 3),
         list_coverage=round(_safe_ratio(lists_tagged, elements_list_items), 3),
         link_coverage=round(_safe_ratio(links_tagged, source_links), 3),
+    )
+
+
+async def benchmark_one_assistive_core(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
+    return await benchmark_one(
+        pdf_path,
+        run_dir,
+        settings,
+        assistive_core=True,
     )
 
 
@@ -1917,6 +2087,17 @@ def write_outputs(output_dir: Path, rows: list[DocMetrics], mode: str) -> None:
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--profile",
+        choices=BENCHMARK_PROFILE_CHOICES,
+        default=BENCHMARK_PROFILE_FULL,
+        help=(
+            "Benchmark execution profile. "
+            "`full` runs the complete remediation workflow, "
+            "`assistive-core` runs the full workflow with alt-text generation skipped, "
+            "and `deterministic` stays fully local."
+        ),
+    )
+    parser.add_argument(
         "--exclude-wac",
         action="store_true",
         help="Skip backend/test_wac.pdf from discovery.",
@@ -1960,12 +2141,13 @@ async def main() -> None:
     workflow_db = out_dir / "workflow_benchmark.sqlite3"
     workflow_engine, workflow_session_maker = await _init_workflow_db(workflow_db)
     workflow_job_manager = JobManager()
+    runner = benchmark_runner_for_profile(args.profile)
 
     for idx, pdf in enumerate(pdfs, start=1):
         print(f"[{idx}/{len(pdfs)}] {pdf}")
         doc_dir = run_dir / f"{idx:03d}"
         doc_dir.mkdir(parents=True, exist_ok=True)
-        row = await benchmark_one_workflow(
+        row = await runner(
             pdf,
             doc_dir,
             settings,
@@ -1982,7 +2164,7 @@ async def main() -> None:
             f"time={row.total_secs:.2f}s"
         )
 
-    write_outputs(out_dir, rows, "workflow")
+    write_outputs(out_dir, rows, args.profile)
     await workflow_engine.dispose()
     print(f"\nWrote benchmark outputs to: {out_dir}")
 

@@ -1,0 +1,56 @@
+{
+  "id": "springmt2023",
+  "lane": "recoverable-core",
+  "document_family": "technical_report",
+  "product_priority": "primary",
+  "workflow_tags": ["toc", "bookmarks", "front_matter", "academic", "tables"],
+  "gold_pdf": "../../data/external_gold_candidates/SpringMT2023.pdf",
+  "recoverable_assertions": [
+    {
+      "id": "lang",
+      "kind": "document_lang",
+      "expected": "en"
+    },
+    {
+      "id": "title",
+      "kind": "title_contains",
+      "expected": "Management Track Assessments Spring 2023"
+    },
+    {
+      "id": "opening_text",
+      "kind": "text_contains",
+      "expected": "Northeast Fisheries Science Center Technical Memorandum 308"
+    },
+    {
+      "id": "toc_order",
+      "kind": "ordered_text",
+      "expected": [
+        "List of Tables",
+        "List of Figures",
+        "Abbreviations for fish stocks reviewed",
+        "Abbreviations and Acronyms"
+      ]
+    },
+    {
+      "id": "bookmark_toc",
+      "kind": "bookmark_title",
+      "expected": "TABLE OF CONTENTS"
+    },
+    {
+      "id": "bookmark_tables",
+      "kind": "bookmark_title",
+      "expected": "List of Tables"
+    },
+    {
+      "id": "bookmark_panel",
+      "kind": "bookmark_title",
+      "expected": "1 Panel Report"
+    },
+    {
+      "id": "bookmark_bluefish",
+      "kind": "bookmark_title",
+      "expected": "2 Atlantic Bluefish"
+    }
+  ],
+  "hidden_semantics_assertions": []
+}

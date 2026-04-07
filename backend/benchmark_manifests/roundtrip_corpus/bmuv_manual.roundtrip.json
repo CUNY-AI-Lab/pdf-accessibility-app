@@ -1,0 +1,46 @@
+{
+  "id": "bmuv_manual",
+  "lane": "recoverable-core",
+  "document_family": "manual",
+  "product_priority": "primary",
+  "workflow_tags": ["toc", "bookmarks", "prose", "manual"],
+  "gold_pdf": "../../data/toc_samples/bmuv_accessible_pdf_manual.pdf",
+  "recoverable_assertions": [
+    {
+      "id": "lang",
+      "kind": "document_lang",
+      "expected": "en"
+    },
+    {
+      "id": "title",
+      "kind": "title_contains",
+      "expected": "Creating Accessible PDF Documents"
+    },
+    {
+      "id": "opening_text",
+      "kind": "text_contains",
+      "expected": "information and notes for contractors"
+    },
+    {
+      "id": "toc_order",
+      "kind": "ordered_text",
+      "expected": [
+        "1 Introduction",
+        "2 Standards and legal provisions",
+        "3 Making documents accessible in MS Word"
+      ]
+    },
+    {
+      "id": "bookmark_intro",
+      "kind": "bookmark_title",
+      "expected": "1 Introduction"
+    },
+    {
+      "id": "toc_link_intro",
+      "kind": "link_contents",
+      "page": 2,
+      "expected": "1 Introduction 6"
+    }
+  ],
+  "hidden_semantics_assertions": []
+}

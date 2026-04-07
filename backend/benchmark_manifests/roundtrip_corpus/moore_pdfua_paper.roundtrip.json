@@ -1,0 +1,56 @@
+{
+  "id": "moore_pdfua_paper",
+  "lane": "recoverable-core",
+  "document_family": "conference_paper",
+  "product_priority": "primary",
+  "workflow_tags": ["academic", "bookmarks", "figures", "sections"],
+  "gold_pdf": "../../data/external_gold_candidates/moore-pdfua-paper-tagged17-18Sept.pdf",
+  "recoverable_assertions": [
+    {
+      "id": "lang",
+      "kind": "document_lang",
+      "expected": "en"
+    },
+    {
+      "id": "title",
+      "kind": "title_contains",
+      "expected": "Fully Accessible PDFUA documents"
+    },
+    {
+      "id": "opening_text",
+      "kind": "text_contains",
+      "expected": "It has frequently been said that PDF files are not accessible"
+    },
+    {
+      "id": "body_order",
+      "kind": "ordered_text",
+      "expected": [
+        "Abstract",
+        "PDF/UA and Accessibility",
+        "Case study: Fish stock reviews",
+        "Recommendations"
+      ]
+    },
+    {
+      "id": "bookmark_abstract",
+      "kind": "bookmark_title",
+      "expected": "Abstract"
+    },
+    {
+      "id": "bookmark_accessibility",
+      "kind": "bookmark_title",
+      "expected": "PDF/UA and Accessibility"
+    },
+    {
+      "id": "bookmark_case_study",
+      "kind": "bookmark_title",
+      "expected": "Case study: Fish stock reviews"
+    },
+    {
+      "id": "bookmark_tools",
+      "kind": "bookmark_title",
+      "expected": "Software tools and techniques, organisations, websites"
+    }
+  ],
+  "hidden_semantics_assertions": []
+}

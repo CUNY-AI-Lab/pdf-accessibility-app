@@ -20,6 +20,20 @@ def _default_entry_types(candidate_elements: list[dict[str, Any]], entry_indexes
     return normalized
 
 
+def _filter_entry_text_overrides(
+    overrides: dict[str, str],
+    entry_indexes: list[int],
+) -> dict[str, str]:
+    if not overrides:
+        return {}
+    allowed = {str(index) for index in entry_indexes}
+    return {
+        key: value
+        for key, value in overrides.items()
+        if key in allowed and str(value or "").strip()
+    }
+
+
 async def generate_toc_group_intelligence(
     *,
     pdf_path,
@@ -65,6 +79,10 @@ async def generate_toc_group_intelligence(
         ]
     if entry_indexes and not entry_types:
         entry_types = _default_entry_types(candidate_elements, entry_indexes)
+    entry_text_overrides = _filter_entry_text_overrides(
+        decision.entry_text_overrides,
+        entry_indexes,
+    )
 
     return {
         "caption_index": int(candidate_group.get("caption_index")) if isinstance(candidate_group.get("caption_index"), int) else -1,
@@ -73,4 +91,6 @@ async def generate_toc_group_intelligence(
         "reason": decision.reason,
         "entry_indexes": entry_indexes,
         "entry_types": entry_types,
+        "caption_text_override": decision.caption_text_override,
+        "entry_text_overrides": entry_text_overrides,
     }

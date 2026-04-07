@@ -100,3 +100,46 @@ The biggest clean wins so far come from:
 - provider retry/backoff instead of rerunning whole workflows after transient failures
 
 The next likely cost target for the real CUNY audience is figure-heavy guide/admin documents.
+
+## Stronger verification direction
+
+There is now an explicit round-trip benchmark design for stronger verification than compliance plus fidelity alone:
+
+- start from a gold accessible PDF
+- strip benchmark-target accessibility semantics
+- remediate the stripped file
+- compare the output back to the gold file
+
+See:
+
+- [Gold-To-Stripped Round-Trip Benchmark](./roundtrip_benchmark.md)
+
+Current stripping utility:
+
+```bash
+cd backend
+PYTHONPATH=. uv run python scripts/strip_accessibility.py \
+  --input /path/to/gold-accessible.pdf \
+  --output data/benchmarks/roundtrip/mydoc_stripped.pdf
+```
+
+Comparison utility:
+
+```bash
+cd backend
+PYTHONPATH=. uv run python scripts/roundtrip_compare.py \
+  --gold /path/to/gold-accessible.pdf \
+  --candidate /path/to/remediated-output.pdf \
+  --manifest /path/to/mydoc.roundtrip.json
+```
+
+Corpus runner:
+
+```bash
+cd backend
+PYTHONPATH=. uv run python scripts/roundtrip_corpus_benchmark.py
+```
+
+The round-trip runner defaults to the `assistive-core` workflow profile. That profile keeps the full downstream validation/fidelity/review loop and skips only the figure alt-text branch. Use `--workflow-profile full` when you want figure/alt-text behavior included as well.
+
+The round-trip comparison now reports form field presence and field-type recovery separately from exact accessible-name replay, so assistive-core form checks can be written against name/role/value semantics rather than a single gold `/TU` string.

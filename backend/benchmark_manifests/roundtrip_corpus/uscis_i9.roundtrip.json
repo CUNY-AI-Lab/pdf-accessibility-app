@@ -1,0 +1,95 @@
+{
+  "id": "uscis_i9",
+  "lane": "recoverable-core",
+  "document_family": "form",
+  "product_priority": "secondary",
+  "workflow_tags": ["forms", "widgets", "fields"],
+  "gold_pdf": "../../data/form_samples_official/uscis_i9.pdf",
+  "recoverable_assertions": [
+    {
+      "id": "lang",
+      "kind": "document_lang",
+      "expected": "en"
+    },
+    {
+      "id": "title",
+      "kind": "title_contains",
+      "expected": "Form I-9"
+    },
+    {
+      "id": "opening_text",
+      "kind": "text_contains",
+      "expected": "employment eligibility verification"
+    },
+    {
+      "id": "field_last_name_present",
+      "kind": "field_present",
+      "field_name": "Last Name (Family Name)"
+    },
+    {
+      "id": "field_last_name_type",
+      "kind": "field_type",
+      "field_name": "Last Name (Family Name)",
+      "field_type": "text"
+    },
+    {
+      "id": "field_last_name",
+      "kind": "field_accessible_name",
+      "field_name": "Last Name (Family Name)",
+      "required_terms_all": [
+        "last name",
+        "family name"
+      ],
+      "required_terms_any": [
+        "employee",
+        "section 1"
+      ]
+    },
+    {
+      "id": "field_state_present",
+      "kind": "field_present",
+      "field_name": "State"
+    },
+    {
+      "id": "field_state_type",
+      "kind": "field_type",
+      "field_name": "State",
+      "field_type": "combo_box"
+    },
+    {
+      "id": "field_state",
+      "kind": "field_accessible_name",
+      "field_name": "State",
+      "field_type": "combo_box",
+      "required_terms_all": [
+        "state"
+      ],
+      "required_terms_any": [
+        "section 1"
+      ]
+    },
+    {
+      "id": "field_zip_present",
+      "kind": "field_present",
+      "field_name": "ZIP Code"
+    },
+    {
+      "id": "field_zip_type",
+      "kind": "field_type",
+      "field_name": "ZIP Code",
+      "field_type": "text"
+    },
+    {
+      "id": "field_zip",
+      "kind": "field_accessible_name",
+      "field_name": "ZIP Code",
+      "required_terms_all": [
+        "zip code"
+      ],
+      "required_terms_any": [
+        "section 1"
+      ]
+    }
+  ],
+  "hidden_semantics_assertions": []
+}

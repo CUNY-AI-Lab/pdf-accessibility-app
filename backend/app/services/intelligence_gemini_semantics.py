@@ -84,12 +84,14 @@ Table rules:
 
 Form-field rules:
 - Use confirm_current_label when the current accessible label is already good.
-- Use set_field_label when one concise accessible label is clearly supported by the visible label and nearby context.
+- Use set_field_label when one faithful accessible label is clearly supported by the visible label and nearby context.
 - If the current accessible label is missing, cryptic, or technical, prefer set_field_label when the visible nearby text supports a better label.
+- When a short visible label would be ambiguous on its own, include nearby section, group, or question context so assistive technology preserves the same meaning.
 - For checkbox and radio controls, use nearby group labels and option text together when they clearly identify what assistive technology should announce.
 - When a checkbox or radio button is paired with a long instruction paragraph, prefer a short label that preserves the control's meaning instead of copying the full paragraph verbatim.
+- Preserve short action cues like "Enter" or "Select" when they are clearly supported by the control type and nearby text.
 - Use manual_only when the field is ambiguous or depends on context you cannot infer confidently.
-- Keep form labels concise and factual. Do not add help text unless it is part of the visible label.
+- Keep form labels concise and factual, but not at the cost of losing disambiguating context or meaning. Do not add help text unless it is part of the visible label.
 
 Figure rules:
 - Use set_alt_text when one concise meaningful description is clearly supported by the image and local context.
@@ -110,6 +112,9 @@ TOC-group rules:
 - entry_indexes must only reference candidate elements present in semantic_unit.metadata.candidate_elements.
 - Use toc_item_table only for candidate elements whose source type is table.
 - Use toc_item for heading, paragraph, or list-style entries.
+- When the visible TOC text is clear, provide entry_text_overrides for affected candidate indexes using short visible entry labels.
+- entry_text_overrides should remove leader dots and trailing page numbers, preserve visible numbering or appendix labels, and avoid paragraph spill.
+- Use caption_text_override only when the visible caption text should be normalized, such as "TABLE OF CONTENTS".
 """
 
 SEMANTIC_DECISION_SCHEMA: dict[str, Any] = {
@@ -173,6 +178,11 @@ SEMANTIC_DECISION_SCHEMA: dict[str, Any] = {
         "entry_types": {
             "type": "object",
             "additionalProperties": {"type": "string", "enum": ["toc_item", "toc_item_table"]},
+        },
+        "caption_text_override": {"type": "string"},
+        "entry_text_overrides": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
         },
     },
     "required": [
@@ -239,6 +249,19 @@ def _normalize_entry_types(values: Any) -> dict[str, str]:
     for key, value in values.items():
         key_text = str(key).strip()
         value_text = str(value).strip()
+        if not key_text or not value_text:
+            continue
+        normalized[key_text] = value_text
+    return normalized
+
+
+def _normalize_string_map(values: Any) -> dict[str, str]:
+    if not isinstance(values, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for key, value in values.items():
+        key_text = str(key).strip()
+        value_text = " ".join(str(value or "").split()).strip()
         if not key_text or not value_text:
             continue
         normalized[key_text] = value_text
@@ -343,6 +366,8 @@ async def adjudicate_semantic_unit(
         is_toc=bool(parsed.get("is_toc", False)),
         entry_indexes=_normalize_indices(parsed.get("entry_indexes")),
         entry_types=_normalize_entry_types(parsed.get("entry_types")),
+        caption_text_override=str(parsed.get("caption_text_override") or "").strip() or None,
+        entry_text_overrides=_normalize_string_map(parsed.get("entry_text_overrides")),
     )
 
 

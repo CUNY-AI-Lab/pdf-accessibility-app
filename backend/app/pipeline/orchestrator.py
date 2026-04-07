@@ -27,6 +27,7 @@ from app.pipeline.tagger import tag_pdf
 from app.pipeline.validator import validate_pdf
 from app.services.applied_changes import add_applied_change
 from app.services.auto_structure_apply import auto_apply_structure_tasks
+from app.services.bookmark_intelligence import enhance_bookmark_structure_with_intelligence
 from app.services.file_storage import create_job_dir, get_output_path
 from app.services.font_intelligence_auto import (
     attempt_auto_llm_font_map as _attempt_auto_llm_font_map,
@@ -58,7 +59,10 @@ from app.services.intelligence_gemini_forms import (
     generate_form_intelligence_for_page,
 )
 from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
-from app.services.intelligence_gemini_tables import generate_table_intelligence
+from app.services.intelligence_gemini_tables import (
+    generate_table_intelligence,
+    generate_table_intelligence_for_page,
+)
 from app.services.intelligence_gemini_widgets import (
     generate_widget_intelligence,
     generate_widget_intelligence_for_page,
@@ -66,7 +70,7 @@ from app.services.intelligence_gemini_widgets import (
 from app.services.job_manager import JobManager
 from app.services.job_state import clear_terminal_artifacts
 from app.services.llm_client import LlmClient as _LlmClient
-from app.services.llm_client import make_llm_client
+from app.services.llm_client import make_llm_client, make_llm_client_with_overrides, track_llm_usage
 from app.services.page_intelligence import collect_grounded_text_candidates
 from app.services.review_surface import (
     filter_user_visible_review_tasks,
@@ -103,6 +107,7 @@ from app.services.semantic_pretag_policy import (
 from app.services.semantic_pretag_policy import (
     widget_targets_for_rationalization as _widget_targets_for_rationalization,
 )
+from app.services.title_intelligence import enhance_document_title_with_intelligence
 from app.services.toc_intelligence import enhance_toc_structure_with_intelligence
 from app.services.validation_compare import is_better_validation as _is_better_validation
 from app.services.visual_figure_rationalization import synthesize_missing_visual_figures
@@ -127,6 +132,117 @@ FONT_SUBSET_RE = re.compile(r"^[A-Z]{6}\+.+")
 FONT_NAME_RE = re.compile(r"[^A-Za-z0-9]+")
 HEX_STR_RE = re.compile(r"<([0-9A-Fa-f]+)>")
 MAX_TOUNICODE_BFRANGE_SPAN = 65536
+
+
+def _llm_operation_timeout_seconds_from_values(
+    *,
+    per_attempt: float,
+    retries: int,
+    retry_backoff_cap: float,
+) -> float:
+    retry_slack = min(retry_backoff_cap * retries, max(30.0, per_attempt * 0.5))
+    completion_slack = min(15.0, max(1.0, per_attempt * 0.25))
+    return per_attempt + retry_slack + completion_slack
+
+
+def _llm_operation_timeout_seconds(settings: Settings) -> float:
+    """Bound one logical LLM operation, including modest retry/backoff slack."""
+    return _llm_operation_timeout_seconds_from_values(
+        per_attempt=max(1.0, float(getattr(settings, "llm_timeout", 120) or 120)),
+        retries=max(0, int(getattr(settings, "llm_max_retries", 0) or 0)),
+        retry_backoff_cap=max(
+            0.0,
+            float(getattr(settings, "llm_retry_max_backoff_seconds", 0.0) or 0.0),
+        ),
+    )
+
+
+def _pretag_llm_operation_timeout_seconds(settings: Settings) -> float:
+    """Bound non-critical pretag intelligence so flaky endpoints fail open quickly."""
+    return _llm_operation_timeout_seconds_from_values(
+        per_attempt=max(
+            1.0,
+            float(getattr(settings, "llm_pretag_timeout", getattr(settings, "llm_timeout", 120)) or 120),
+        ),
+        retries=max(
+            0,
+            int(getattr(settings, "llm_pretag_max_retries", getattr(settings, "llm_max_retries", 0)) or 0),
+        ),
+        retry_backoff_cap=max(
+            0.0,
+            float(getattr(settings, "llm_retry_max_backoff_seconds", 0.0) or 0.0),
+        ),
+    )
+
+
+def _make_pretag_llm_client(settings: Settings) -> _LlmClient:
+    return make_llm_client_with_overrides(
+        settings,
+        timeout=int(getattr(settings, "llm_pretag_timeout", settings.llm_timeout) or settings.llm_timeout),
+        max_retries=int(
+            getattr(settings, "llm_pretag_max_retries", settings.llm_max_retries) or settings.llm_max_retries
+        ),
+    )
+
+
+async def _await_llm_operation(
+    *,
+    settings: Settings,
+    label: str,
+    awaitable,
+    timeout_seconds: float | None = None,
+):
+    timeout = timeout_seconds if timeout_seconds is not None else _llm_operation_timeout_seconds(settings)
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+    except TimeoutError as exc:
+        raise RuntimeError(f"{label} timed out after {timeout:.1f}s") from exc
+
+
+def _empty_llm_usage() -> dict[str, float | int]:
+    return {
+        "request_count": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0,
+    }
+
+
+def _llm_usage_snapshot(recorder) -> dict[str, float | int]:
+    if recorder is None:
+        return _empty_llm_usage()
+    return {
+        "request_count": int(getattr(recorder, "request_count", 0) or 0),
+        "prompt_tokens": int(getattr(recorder, "prompt_tokens", 0) or 0),
+        "completion_tokens": int(getattr(recorder, "completion_tokens", 0) or 0),
+        "total_tokens": int(getattr(recorder, "total_tokens", 0) or 0),
+        "cost_usd": float(getattr(recorder, "cost_usd", 0.0) or 0.0),
+    }
+
+
+def _accumulate_llm_usage(
+    total: dict[str, float | int],
+    delta: dict[str, float | int] | None,
+) -> dict[str, float | int]:
+    if not delta:
+        return total
+    total["request_count"] = int(total.get("request_count", 0) or 0) + int(
+        delta.get("request_count", 0) or 0
+    )
+    total["prompt_tokens"] = int(total.get("prompt_tokens", 0) or 0) + int(
+        delta.get("prompt_tokens", 0) or 0
+    )
+    total["completion_tokens"] = int(total.get("completion_tokens", 0) or 0) + int(
+        delta.get("completion_tokens", 0) or 0
+    )
+    total["total_tokens"] = int(total.get("total_tokens", 0) or 0) + int(
+        delta.get("total_tokens", 0) or 0
+    )
+    total["cost_usd"] = float(total.get("cost_usd", 0.0) or 0.0) + float(
+        delta.get("cost_usd", 0.0) or 0.0
+    )
+    return total
 SAFE_IMPLICIT_STANDARD_BASEFONTS = frozenset(
     {
         "TimesRoman",
@@ -582,6 +698,7 @@ async def _apply_pretag_grounded_text_resolutions(
         "applied_artifact_count": 0,
         "pages": [],
         "review_ids": [],
+        "llm_usage": _empty_llm_usage(),
     }
     if not settings.auto_apply_grounded_text:
         audit["reason"] = "disabled"
@@ -613,19 +730,27 @@ async def _apply_pretag_grounded_text_resolutions(
     audit["attempted"] = True
     audit["candidate_count"] = len(suspicious_blocks)
 
-    llm_client = make_llm_client(settings)
-    try:
-        adjudication = await generate_suspicious_text_intelligence(
-            job=job,
-            page_numbers=pages_to_check,
-            suspicious_blocks=suspicious_blocks,
-            llm_client=llm_client,
-        )
-    except Exception as exc:
-        audit["reason"] = f"llm_failed: {exc}"
-        return structure_json, audit
-    finally:
-        await llm_client.close()
+    llm_client = _make_pretag_llm_client(settings)
+    pretag_timeout = _pretag_llm_operation_timeout_seconds(settings)
+    with track_llm_usage() as usage:
+        try:
+            adjudication = await _await_llm_operation(
+                settings=settings,
+                label="grounded_text_intelligence",
+                timeout_seconds=pretag_timeout,
+                awaitable=generate_suspicious_text_intelligence(
+                    job=job,
+                    page_numbers=pages_to_check,
+                    suspicious_blocks=suspicious_blocks,
+                    llm_client=llm_client,
+                ),
+            )
+        except Exception as exc:
+            audit["reason"] = f"llm_failed: {exc}"
+            return structure_json, audit
+        finally:
+            audit["llm_usage"] = _llm_usage_snapshot(usage)
+            await llm_client.close()
 
     approved_by_key = _collect_safe_grounded_text_resolutions(adjudication)
     updated_structure, apply_audit = _apply_grounded_text_resolutions_to_structure(
@@ -649,12 +774,17 @@ async def _apply_pretag_table_intelligence(
         "reason": "",
         "candidate_count": 0,
         "applied_count": 0,
+        "page_batch_count": 0,
+        "page_batch_resolved_count": 0,
+        "page_batch_failed_count": 0,
+        "individual_fallback_count": 0,
         "pages": [],
         "review_ids": [],
         "confirmed_count": 0,
         "set_headers_count": 0,
         "aggressive_retry_count": 0,
         "confirm_existing_retry_count": 0,
+        "llm_usage": _empty_llm_usage(),
     }
     if not settings.auto_apply_table_intelligence:
         audit["reason"] = "disabled"
@@ -679,101 +809,162 @@ async def _apply_pretag_table_intelligence(
     audit["attempted"] = True
     audit["candidate_count"] = len(targets)
 
-    llm_client = make_llm_client(settings)
-    try:
-        intelligence_items: list[dict[str, object]] = []
-        targets_by_review_id = {
-            str(target.get("table_review_id") or "").strip(): target
-            for target in targets
-            if isinstance(target, dict) and str(target.get("table_review_id") or "").strip()
-        }
-        for target in targets:
-            if not isinstance(target, dict):
-                continue
-            review_id = str(target.get("table_review_id") or "").strip()
-            page = target.get("page")
-            page_fragments = _table_page_structure_fragments(
-                structure_json,
-                page_numbers=[int(page)] if isinstance(page, int) else [],
+    llm_client = _make_pretag_llm_client(settings)
+    pretag_timeout = _pretag_llm_operation_timeout_seconds(settings)
+    with track_llm_usage() as usage:
+        try:
+            intelligence_items: list[dict[str, object]] = []
+            targets_by_review_id = {
+                str(target.get("table_review_id") or "").strip(): target
+                for target in targets
+                if isinstance(target, dict) and str(target.get("table_review_id") or "").strip()
+            }
+            detailed_targets_by_review_id: dict[str, dict[str, object]] = {}
+            targets_by_page: dict[int, list[dict[str, object]]] = {}
+            page_fragments_by_page: dict[int, list[dict[str, object]]] = {}
+            for target in targets:
+                if not isinstance(target, dict):
+                    continue
+                review_id = str(target.get("table_review_id") or "").strip()
+                if not review_id:
+                    continue
+                page = target.get("page")
+                page_number = int(page) if isinstance(page, int) else None
+                page_fragments = _table_page_structure_fragments(
+                    structure_json,
+                    page_numbers=[page_number] if page_number is not None else [],
+                )
+                detailed_target = dict(detailed_targets.get(review_id) or target)
+                if isinstance(target.get("risk_reasons"), list):
+                    detailed_target["risk_reasons"] = list(target.get("risk_reasons") or [])
+                if isinstance(target.get("risk_score"), (int, float)):
+                    detailed_target["risk_score"] = float(target.get("risk_score"))
+                detailed_targets_by_review_id[review_id] = detailed_target
+                if page_number is None or page_number <= 0:
+                    continue
+                targets_by_page.setdefault(page_number, []).append(detailed_target)
+                if page_number not in page_fragments_by_page:
+                    page_fragments_by_page[page_number] = page_fragments
+
+            audit["page_batch_count"] = len(targets_by_page)
+            page_items_by_id: dict[str, dict[str, object]] = {}
+            for page_number, page_targets in sorted(targets_by_page.items()):
+                try:
+                    page_items = await _await_llm_operation(
+                        settings=settings,
+                        label=f"table_page_intelligence[{page_number}]",
+                        timeout_seconds=pretag_timeout,
+                        awaitable=generate_table_intelligence_for_page(
+                            job=job,
+                            page_number=page_number,
+                            targets=page_targets,
+                            page_structure_fragments=page_fragments_by_page.get(page_number) or [],
+                            llm_client=llm_client,
+                        ),
+                    )
+                except Exception:
+                    audit["page_batch_failed_count"] = int(audit.get("page_batch_failed_count", 0)) + 1
+                    continue
+                for item in page_items:
+                    if not isinstance(item, dict):
+                        continue
+                    review_id = str(item.get("table_review_id") or "").strip()
+                    if review_id:
+                        page_items_by_id[review_id] = item
+                    intelligence_items.append(item)
+
+            resolved_page_results = sum(
+                1 for item in page_items_by_id.values() if _should_auto_apply_table_intelligence(item)
             )
-            detailed_target = dict(detailed_targets.get(review_id) or target)
-            if isinstance(target.get("risk_reasons"), list):
-                detailed_target["risk_reasons"] = list(target.get("risk_reasons") or [])
-            if isinstance(target.get("risk_score"), (int, float)):
-                detailed_target["risk_score"] = float(target.get("risk_score"))
-            intelligence = await generate_table_intelligence(
-                job=job,
-                target=detailed_target,
-                page_structure_fragments=page_fragments,
-                llm_client=llm_client,
-            )
-            intelligence_items.append(intelligence)
-        retried = 0
-        for idx, item in enumerate(list(intelligence_items)):
-            if not isinstance(item, dict):
-                continue
-            review_id = str(item.get("table_review_id") or "").strip()
-            target = targets_by_review_id.get(review_id)
-            if not _should_retry_table_intelligence_aggressively(target or {}, item):
-                continue
-            if not target:
-                continue
-            detailed_target = dict(detailed_targets.get(review_id) or target)
-            if isinstance(target.get("risk_reasons"), list):
-                detailed_target["risk_reasons"] = list(target.get("risk_reasons") or [])
-            if isinstance(target.get("risk_score"), (int, float)):
-                detailed_target["risk_score"] = float(target.get("risk_score"))
-            page = detailed_target.get("page")
-            page_fragments = _table_page_structure_fragments(
-                structure_json,
-                page_numbers=[int(page)] if isinstance(page, int) else [],
-            )
-            retried_item = await generate_table_intelligence(
-                job=job,
-                target=detailed_target,
-                page_structure_fragments=page_fragments,
-                llm_client=llm_client,
-                aggressive=True,
-            )
-            intelligence_items[idx] = retried_item
-            retried += 1
-        audit["aggressive_retry_count"] = retried
-        confirm_existing_retried = 0
-        for idx, item in enumerate(list(intelligence_items)):
-            if not isinstance(item, dict):
-                continue
-            review_id = str(item.get("table_review_id") or "").strip()
-            target = targets_by_review_id.get(review_id)
-            if not _should_retry_table_intelligence_confirm_existing(target or {}, item):
-                continue
-            if not target:
-                continue
-            detailed_target = dict(detailed_targets.get(review_id) or target)
-            if isinstance(target.get("risk_reasons"), list):
-                detailed_target["risk_reasons"] = list(target.get("risk_reasons") or [])
-            if isinstance(target.get("risk_score"), (int, float)):
-                detailed_target["risk_score"] = float(target.get("risk_score"))
-            page = detailed_target.get("page")
-            page_fragments = _table_page_structure_fragments(
-                structure_json,
-                page_numbers=[int(page)] if isinstance(page, int) else [],
-            )
-            retried_item = await generate_table_intelligence(
-                job=job,
-                target=detailed_target,
-                page_structure_fragments=page_fragments,
-                llm_client=llm_client,
-                aggressive=True,
-                confirm_existing=True,
-            )
-            intelligence_items[idx] = retried_item
-            confirm_existing_retried += 1
-        audit["confirm_existing_retry_count"] = confirm_existing_retried
-    except Exception as exc:
-        audit["reason"] = f"llm_failed: {exc}"
-        return structure_json, audit
-    finally:
-        await llm_client.close()
+            audit["page_batch_resolved_count"] = resolved_page_results
+
+            unresolved_targets = [
+                target
+                for review_id, target in detailed_targets_by_review_id.items()
+                if not _should_auto_apply_table_intelligence(page_items_by_id.get(review_id, {}))
+            ]
+            audit["individual_fallback_count"] = len(unresolved_targets)
+            for target in unresolved_targets:
+                review_id = str(target.get("table_review_id") or "").strip()
+                page = target.get("page")
+                page_number = int(page) if isinstance(page, int) else None
+                intelligence = await _await_llm_operation(
+                    settings=settings,
+                    label=f"table_intelligence[{review_id or '?'}]",
+                    timeout_seconds=pretag_timeout,
+                    awaitable=generate_table_intelligence(
+                        job=job,
+                        target=target,
+                        page_structure_fragments=page_fragments_by_page.get(page_number or -1) or [],
+                        llm_client=llm_client,
+                    ),
+                )
+                page_items_by_id[review_id] = intelligence
+
+            intelligence_items = list(page_items_by_id.values())
+            retried = 0
+            for idx, item in enumerate(list(intelligence_items)):
+                if not isinstance(item, dict):
+                    continue
+                review_id = str(item.get("table_review_id") or "").strip()
+                target = targets_by_review_id.get(review_id)
+                if not _should_retry_table_intelligence_aggressively(target or {}, item):
+                    continue
+                if not target:
+                    continue
+                detailed_target = detailed_targets_by_review_id.get(review_id) or dict(detailed_targets.get(review_id) or target)
+                page = detailed_target.get("page")
+                page_number = int(page) if isinstance(page, int) else None
+                retried_item = await _await_llm_operation(
+                    settings=settings,
+                    label=f"table_intelligence[{review_id or '?'}].aggressive",
+                    timeout_seconds=pretag_timeout,
+                    awaitable=generate_table_intelligence(
+                        job=job,
+                        target=detailed_target,
+                        page_structure_fragments=page_fragments_by_page.get(page_number or -1) or [],
+                        llm_client=llm_client,
+                        aggressive=True,
+                    ),
+                )
+                intelligence_items[idx] = retried_item
+                retried += 1
+            audit["aggressive_retry_count"] = retried
+            confirm_existing_retried = 0
+            for idx, item in enumerate(list(intelligence_items)):
+                if not isinstance(item, dict):
+                    continue
+                review_id = str(item.get("table_review_id") or "").strip()
+                target = targets_by_review_id.get(review_id)
+                if not _should_retry_table_intelligence_confirm_existing(target or {}, item):
+                    continue
+                if not target:
+                    continue
+                detailed_target = detailed_targets_by_review_id.get(review_id) or dict(detailed_targets.get(review_id) or target)
+                page = detailed_target.get("page")
+                page_number = int(page) if isinstance(page, int) else None
+                retried_item = await _await_llm_operation(
+                    settings=settings,
+                    label=f"table_intelligence[{review_id or '?'}].confirm_existing",
+                    timeout_seconds=pretag_timeout,
+                    awaitable=generate_table_intelligence(
+                        job=job,
+                        target=detailed_target,
+                        page_structure_fragments=page_fragments_by_page.get(page_number or -1) or [],
+                        llm_client=llm_client,
+                        aggressive=True,
+                        confirm_existing=True,
+                    ),
+                )
+                intelligence_items[idx] = retried_item
+                confirm_existing_retried += 1
+            audit["confirm_existing_retry_count"] = confirm_existing_retried
+        except Exception as exc:
+            audit["reason"] = f"llm_failed: {exc}"
+            return structure_json, audit
+        finally:
+            audit["llm_usage"] = _llm_usage_snapshot(usage)
+            await llm_client.close()
 
     approved_by_id: dict[str, dict[str, object]] = {}
     for item in intelligence_items:
@@ -869,6 +1060,7 @@ async def _apply_pretag_widget_rationalization(
         "individual_fallback_count": 0,
         "pages": [],
         "review_ids": [],
+        "llm_usage": _empty_llm_usage(),
     }
     if not settings.auto_apply_form_intelligence:
         audit["reason"] = "disabled"
@@ -891,88 +1083,102 @@ async def _apply_pretag_widget_rationalization(
     audit["attempted"] = True
     audit["candidate_count"] = len(targets)
     preview_job = _preview_job_for_pdf(job, working_pdf)
-    llm_client = make_llm_client(settings)
-    try:
-        semaphore = asyncio.Semaphore(max(1, settings.llm_max_concurrency))
-        targets_by_review_id = {
-            str(target.get("field_review_id") or "").strip(): target
-            for target in targets
-            if str(target.get("field_review_id") or "").strip()
-        }
-        targets_by_page: dict[int, list[dict[str, object]]] = {}
-        for target in targets:
-            page = target.get("page")
-            if not isinstance(page, int) or page <= 0:
-                continue
-            targets_by_page.setdefault(page, []).append(target)
-        audit["page_batch_count"] = len(targets_by_page)
-
-        async def _generate(target: dict[str, object]) -> dict[str, object]:
-            async with semaphore:
-                return await generate_widget_intelligence(
-                    job=preview_job,
-                    target=target,
-                    llm_client=llm_client,
-                )
-
-        async def _generate_page(
-            page_number: int, page_targets: list[dict[str, object]]
-        ) -> list[dict[str, object]]:
-            async with semaphore:
-                return await generate_widget_intelligence_for_page(
-                    job=preview_job,
-                    page_number=page_number,
-                    targets=page_targets,
-                    llm_client=llm_client,
-                )
-
-        intelligence_items: list[dict[str, object]] = []
-        page_items_by_id: dict[str, dict[str, object]] = {}
-        for page_number, page_targets in sorted(targets_by_page.items()):
-            try:
-                page_items = await _generate_page(page_number, page_targets)
-            except Exception:
-                audit["page_batch_failed_count"] = int(audit.get("page_batch_failed_count", 0)) + 1
-                continue
-            for item in page_items:
-                if not isinstance(item, dict):
+    llm_client = _make_pretag_llm_client(settings)
+    pretag_timeout = _pretag_llm_operation_timeout_seconds(settings)
+    with track_llm_usage() as usage:
+        try:
+            semaphore = asyncio.Semaphore(max(1, settings.llm_max_concurrency))
+            targets_by_review_id = {
+                str(target.get("field_review_id") or "").strip(): target
+                for target in targets
+                if str(target.get("field_review_id") or "").strip()
+            }
+            targets_by_page: dict[int, list[dict[str, object]]] = {}
+            for target in targets:
+                page = target.get("page")
+                if not isinstance(page, int) or page <= 0:
                     continue
-                review_id = str(item.get("field_review_id") or "").strip()
-                if review_id:
-                    page_items_by_id[review_id] = item
-                intelligence_items.append(item)
+                targets_by_page.setdefault(page, []).append(target)
+            audit["page_batch_count"] = len(targets_by_page)
 
-        resolved_page_results = sum(
-            1
-            for item in page_items_by_id.values()
-            if str(item.get("suggested_action") or "").strip()
-            in {"preserve_control", "remove_static_widget"}
-        )
-        audit["page_batch_resolved_count"] = resolved_page_results
+            async def _generate(target: dict[str, object]) -> dict[str, object]:
+                async with semaphore:
+                    review_id = str(target.get("field_review_id") or "?").strip() or "?"
+                    return await _await_llm_operation(
+                        settings=settings,
+                        label=f"widget_intelligence[{review_id}]",
+                        timeout_seconds=pretag_timeout,
+                        awaitable=generate_widget_intelligence(
+                            job=preview_job,
+                            target=target,
+                            llm_client=llm_client,
+                        ),
+                    )
 
-        unresolved_targets = [
-            target
-            for review_id, target in targets_by_review_id.items()
-            if str(page_items_by_id.get(review_id, {}).get("suggested_action") or "").strip()
-            not in {"preserve_control", "remove_static_widget"}
-        ]
-        audit["individual_fallback_count"] = len(unresolved_targets)
-        if unresolved_targets:
-            fallback_items = await asyncio.gather(
-                *[_generate(target) for target in unresolved_targets]
+            async def _generate_page(
+                page_number: int, page_targets: list[dict[str, object]]
+            ) -> list[dict[str, object]]:
+                async with semaphore:
+                    return await _await_llm_operation(
+                        settings=settings,
+                        label=f"widget_page_intelligence[{page_number}]",
+                        timeout_seconds=pretag_timeout,
+                        awaitable=generate_widget_intelligence_for_page(
+                            job=preview_job,
+                            page_number=page_number,
+                            targets=page_targets,
+                            llm_client=llm_client,
+                        ),
+                    )
+
+            intelligence_items: list[dict[str, object]] = []
+            page_items_by_id: dict[str, dict[str, object]] = {}
+            for page_number, page_targets in sorted(targets_by_page.items()):
+                try:
+                    page_items = await _generate_page(page_number, page_targets)
+                except Exception:
+                    audit["page_batch_failed_count"] = int(audit.get("page_batch_failed_count", 0)) + 1
+                    continue
+                for item in page_items:
+                    if not isinstance(item, dict):
+                        continue
+                    review_id = str(item.get("field_review_id") or "").strip()
+                    if review_id:
+                        page_items_by_id[review_id] = item
+                    intelligence_items.append(item)
+
+            resolved_page_results = sum(
+                1
+                for item in page_items_by_id.values()
+                if str(item.get("suggested_action") or "").strip()
+                in {"preserve_control", "remove_static_widget"}
             )
-            for item in fallback_items:
-                if not isinstance(item, dict):
-                    continue
-                review_id = str(item.get("field_review_id") or "").strip()
-                if review_id:
-                    page_items_by_id[review_id] = item
-            intelligence_items = list(page_items_by_id.values())
-    except Exception as exc:
-        audit["reason"] = f"llm_failed: {exc}"
-        return working_pdf, audit
-    finally:
-        await llm_client.close()
+            audit["page_batch_resolved_count"] = resolved_page_results
+
+            unresolved_targets = [
+                target
+                for review_id, target in targets_by_review_id.items()
+                if str(page_items_by_id.get(review_id, {}).get("suggested_action") or "").strip()
+                not in {"preserve_control", "remove_static_widget"}
+            ]
+            audit["individual_fallback_count"] = len(unresolved_targets)
+            if unresolved_targets:
+                fallback_items = await asyncio.gather(
+                    *[_generate(target) for target in unresolved_targets]
+                )
+                for item in fallback_items:
+                    if not isinstance(item, dict):
+                        continue
+                    review_id = str(item.get("field_review_id") or "").strip()
+                    if review_id:
+                        page_items_by_id[review_id] = item
+                intelligence_items = list(page_items_by_id.values())
+        except Exception as exc:
+            audit["reason"] = f"llm_failed: {exc}"
+            return working_pdf, audit
+        finally:
+            audit["llm_usage"] = _llm_usage_snapshot(usage)
+            await llm_client.close()
 
     remove_review_ids = [
         str(item.get("field_review_id") or "").strip()
@@ -1035,6 +1241,7 @@ async def _apply_pretag_form_intelligence(
         "individual_fallback_count": 0,
         "pages": [],
         "review_ids": [],
+        "llm_usage": _empty_llm_usage(),
     }
     if not settings.auto_apply_form_intelligence:
         audit["reason"] = "disabled"
@@ -1057,85 +1264,99 @@ async def _apply_pretag_form_intelligence(
     audit["attempted"] = True
     audit["candidate_count"] = len(targets)
     preview_job = _preview_job_for_pdf(job, working_pdf)
-    llm_client = make_llm_client(settings)
-    try:
-        semaphore = asyncio.Semaphore(max(1, settings.llm_max_concurrency))
+    llm_client = _make_pretag_llm_client(settings)
+    pretag_timeout = _pretag_llm_operation_timeout_seconds(settings)
+    with track_llm_usage() as usage:
+        try:
+            semaphore = asyncio.Semaphore(max(1, settings.llm_max_concurrency))
 
-        targets_by_review_id = {
-            str(target.get("field_review_id") or "").strip(): target
-            for target in targets
-            if str(target.get("field_review_id") or "").strip()
-        }
-        targets_by_page: dict[int, list[dict[str, object]]] = {}
-        for target in targets:
-            page = target.get("page")
-            if not isinstance(page, int) or page <= 0:
-                continue
-            targets_by_page.setdefault(page, []).append(target)
-        audit["page_batch_count"] = len(targets_by_page)
-
-        async def _generate(target: dict[str, object]) -> dict[str, object]:
-            async with semaphore:
-                return await generate_form_intelligence(
-                    job=preview_job,
-                    target={key: value for key, value in target.items() if key != "nearby_blocks"},
-                    nearby_blocks=list(target.get("nearby_blocks") or []),
-                    llm_client=llm_client,
-                )
-
-        async def _generate_page(
-            page_number: int, page_targets: list[dict[str, object]]
-        ) -> list[dict[str, object]]:
-            async with semaphore:
-                return await generate_form_intelligence_for_page(
-                    job=preview_job,
-                    page_number=page_number,
-                    targets=page_targets,
-                    llm_client=llm_client,
-                )
-
-        intelligence_items: list[dict[str, object]] = []
-        page_items_by_id: dict[str, dict[str, object]] = {}
-        for page_number, page_targets in sorted(targets_by_page.items()):
-            try:
-                page_items = await _generate_page(page_number, page_targets)
-            except Exception:
-                audit["page_batch_failed_count"] = int(audit.get("page_batch_failed_count", 0)) + 1
-                continue
-            for item in page_items:
-                if not isinstance(item, dict):
+            targets_by_review_id = {
+                str(target.get("field_review_id") or "").strip(): target
+                for target in targets
+                if str(target.get("field_review_id") or "").strip()
+            }
+            targets_by_page: dict[int, list[dict[str, object]]] = {}
+            for target in targets:
+                page = target.get("page")
+                if not isinstance(page, int) or page <= 0:
                     continue
-                review_id = str(item.get("field_review_id") or "").strip()
-                if review_id:
-                    page_items_by_id[review_id] = item
-                intelligence_items.append(item)
-        safe_page_results = sum(
-            1 for item in page_items_by_id.values() if _should_auto_apply_form_intelligence(item)
-        )
-        audit["page_batch_resolved_count"] = safe_page_results
+                targets_by_page.setdefault(page, []).append(target)
+            audit["page_batch_count"] = len(targets_by_page)
 
-        unresolved_targets = [
-            target
-            for review_id, target in targets_by_review_id.items()
-            if not _should_auto_apply_form_intelligence(page_items_by_id.get(review_id, {}))
-        ]
-        audit["individual_fallback_count"] = len(unresolved_targets)
-        if unresolved_targets:
-            fallback_items = await asyncio.gather(
-                *[_generate(target) for target in unresolved_targets]
+            async def _generate(target: dict[str, object]) -> dict[str, object]:
+                async with semaphore:
+                    review_id = str(target.get("field_review_id") or "?").strip() or "?"
+                    return await _await_llm_operation(
+                        settings=settings,
+                        label=f"form_intelligence[{review_id}]",
+                        timeout_seconds=pretag_timeout,
+                        awaitable=generate_form_intelligence(
+                            job=preview_job,
+                            target={key: value for key, value in target.items() if key != "nearby_blocks"},
+                            nearby_blocks=list(target.get("nearby_blocks") or []),
+                            llm_client=llm_client,
+                        ),
+                    )
+
+            async def _generate_page(
+                page_number: int, page_targets: list[dict[str, object]]
+            ) -> list[dict[str, object]]:
+                async with semaphore:
+                    return await _await_llm_operation(
+                        settings=settings,
+                        label=f"form_page_intelligence[{page_number}]",
+                        timeout_seconds=pretag_timeout,
+                        awaitable=generate_form_intelligence_for_page(
+                            job=preview_job,
+                            page_number=page_number,
+                            targets=page_targets,
+                            llm_client=llm_client,
+                        ),
+                    )
+
+            intelligence_items: list[dict[str, object]] = []
+            page_items_by_id: dict[str, dict[str, object]] = {}
+            for page_number, page_targets in sorted(targets_by_page.items()):
+                try:
+                    page_items = await _generate_page(page_number, page_targets)
+                except Exception:
+                    audit["page_batch_failed_count"] = int(audit.get("page_batch_failed_count", 0)) + 1
+                    continue
+                for item in page_items:
+                    if not isinstance(item, dict):
+                        continue
+                    review_id = str(item.get("field_review_id") or "").strip()
+                    if review_id:
+                        page_items_by_id[review_id] = item
+                    intelligence_items.append(item)
+            safe_page_results = sum(
+                1 for item in page_items_by_id.values() if _should_auto_apply_form_intelligence(item)
             )
-            for item in fallback_items:
-                if not isinstance(item, dict):
-                    continue
-                review_id = str(item.get("field_review_id") or "").strip()
-                if review_id:
-                    page_items_by_id[review_id] = item
-            intelligence_items = list(page_items_by_id.values())
-    except Exception as exc:
-        audit["reason"] = f"llm_failed: {exc}"
-        return working_pdf, audit
-    finally:
-        await llm_client.close()
+            audit["page_batch_resolved_count"] = safe_page_results
+
+            unresolved_targets = [
+                target
+                for review_id, target in targets_by_review_id.items()
+                if not _should_auto_apply_form_intelligence(page_items_by_id.get(review_id, {}))
+            ]
+            audit["individual_fallback_count"] = len(unresolved_targets)
+            if unresolved_targets:
+                fallback_items = await asyncio.gather(
+                    *[_generate(target) for target in unresolved_targets]
+                )
+                for item in fallback_items:
+                    if not isinstance(item, dict):
+                        continue
+                    review_id = str(item.get("field_review_id") or "").strip()
+                    if review_id:
+                        page_items_by_id[review_id] = item
+                intelligence_items = list(page_items_by_id.values())
+        except Exception as exc:
+            audit["reason"] = f"llm_failed: {exc}"
+            return working_pdf, audit
+        finally:
+            audit["llm_usage"] = _llm_usage_snapshot(usage)
+            await llm_client.close()
 
     approved_labels: dict[str, str] = {}
     approved_pages: set[int] = set()
@@ -4816,27 +5037,101 @@ async def run_pipeline(
                 "reason": "disabled",
                 "groups_considered": 0,
                 "groups_applied": 0,
+                "llm_usage": _empty_llm_usage(),
             }
-            if settings.assist_toc_with_llm:
+            title_intelligence_assist = {
+                "attempted": False,
+                "applied": False,
+                "reason": "disabled",
+                "llm_usage": _empty_llm_usage(),
+            }
+            bookmark_intelligence_assist = {
+                "attempted": False,
+                "applied": False,
+                "reason": "disabled",
+                "selected_heading_count": 0,
+                "llm_usage": _empty_llm_usage(),
+            }
+            structure_intelligence_llm_usage = _empty_llm_usage()
+            if (
+                settings.assist_toc_with_llm
+                or settings.assist_title_with_llm
+                or settings.assist_bookmarks_with_llm
+            ):
                 llm_client = make_llm_client(settings)
                 try:
-                    structure.document_json, toc_intelligence_assist = await enhance_toc_structure_with_intelligence(
-                        pdf_path=working_pdf,
-                        structure_json=structure.document_json,
-                        original_filename=job.original_filename or input_path.name,
-                        llm_client=llm_client,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        f"TOC intelligence assist failed for {job.original_filename}: {exc}"
-                    )
-                    toc_intelligence_assist = {
-                        "attempted": True,
-                        "applied": False,
-                        "reason": str(exc),
-                        "groups_considered": 0,
-                        "groups_applied": 0,
-                    }
+                    if settings.assist_toc_with_llm:
+                        with track_llm_usage() as usage:
+                            try:
+                                structure.document_json, toc_intelligence_assist = await enhance_toc_structure_with_intelligence(
+                                    pdf_path=working_pdf,
+                                    structure_json=structure.document_json,
+                                    original_filename=job.original_filename or input_path.name,
+                                    llm_client=llm_client,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    f"TOC intelligence assist failed for {job.original_filename}: {exc}"
+                                )
+                                toc_intelligence_assist = {
+                                    "attempted": True,
+                                    "applied": False,
+                                    "reason": str(exc),
+                                    "groups_considered": 0,
+                                    "groups_applied": 0,
+                                }
+                            toc_intelligence_assist["llm_usage"] = _llm_usage_snapshot(usage)
+                            _accumulate_llm_usage(
+                                structure_intelligence_llm_usage,
+                                toc_intelligence_assist.get("llm_usage"),
+                            )
+                    if settings.assist_title_with_llm:
+                        with track_llm_usage() as usage:
+                            try:
+                                structure.document_json, title_intelligence_assist = await enhance_document_title_with_intelligence(
+                                    pdf_path=working_pdf,
+                                    structure_json=structure.document_json,
+                                    original_filename=job.original_filename or input_path.name,
+                                    llm_client=llm_client,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    f"Title intelligence assist failed for {job.original_filename}: {exc}"
+                                )
+                                title_intelligence_assist = {
+                                    "attempted": True,
+                                    "applied": False,
+                                    "reason": str(exc),
+                                }
+                            title_intelligence_assist["llm_usage"] = _llm_usage_snapshot(usage)
+                            _accumulate_llm_usage(
+                                structure_intelligence_llm_usage,
+                                title_intelligence_assist.get("llm_usage"),
+                            )
+                    if settings.assist_bookmarks_with_llm:
+                        with track_llm_usage() as usage:
+                            try:
+                                structure.document_json, bookmark_intelligence_assist = await enhance_bookmark_structure_with_intelligence(
+                                    pdf_path=working_pdf,
+                                    structure_json=structure.document_json,
+                                    original_filename=job.original_filename or input_path.name,
+                                    llm_client=llm_client,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    f"Bookmark intelligence assist failed for {job.original_filename}: {exc}"
+                                )
+                                bookmark_intelligence_assist = {
+                                    "attempted": True,
+                                    "applied": False,
+                                    "reason": str(exc),
+                                    "selected_heading_count": 0,
+                                }
+                            bookmark_intelligence_assist["llm_usage"] = _llm_usage_snapshot(usage)
+                            _accumulate_llm_usage(
+                                structure_intelligence_llm_usage,
+                                bookmark_intelligence_assist.get("llm_usage"),
+                            )
                 finally:
                     await llm_client.close()
 
@@ -4872,6 +5167,9 @@ async def run_pipeline(
                     "toc_captions": toc_caption_count,
                     "toc_items": toc_item_count,
                     "toc_intelligence_assist": toc_intelligence_assist,
+                    "title_intelligence_assist": title_intelligence_assist,
+                    "bookmark_intelligence_assist": bookmark_intelligence_assist,
+                    "structure_intelligence_llm_usage": structure_intelligence_llm_usage,
                     "synthetic_figure_rationalization": synthetic_figure_rationalization,
                 },
             )
@@ -4884,6 +5182,13 @@ async def run_pipeline(
                     "toc_captions": toc_caption_count,
                     "toc_items": toc_item_count,
                     "toc_intelligence_assist_applied": bool(toc_intelligence_assist.get("applied", False)),
+                    "title_intelligence_assist_applied": bool(title_intelligence_assist.get("applied", False)),
+                    "bookmark_intelligence_assist_applied": bool(
+                        bookmark_intelligence_assist.get("applied", False)
+                    ),
+                    "structure_intelligence_llm_request_count": int(
+                        structure_intelligence_llm_usage.get("request_count", 0) or 0
+                    ),
                     "synthetic_figure_count": int(
                         synthetic_figure_rationalization.get("applied_count", 0) or 0
                     ),
@@ -4893,6 +5198,35 @@ async def run_pipeline(
             # ── Step 4: Alt Text Generation ──
             current_step = "alt_text"
             if structure.figures:
+                if settings.skip_alt_text_generation:
+                    skip_result = {
+                        "count": 0,
+                        "approved": 0,
+                        "rejected": 0,
+                        "reviewable_changes": 0,
+                        "reclassified": 0,
+                        "auto_approve_enabled": settings.auto_approve_generated_alt_text,
+                        "reason": "disabled_by_settings",
+                        "skipped_figure_count": len(structure.figures),
+                    }
+                    await _update_step(
+                        db,
+                        job_id,
+                        "alt_text",
+                        "skipped",
+                        result=skip_result,
+                    )
+                    job_manager.emit_progress(
+                        job_id,
+                        step="alt_text",
+                        status="skipped",
+                        result=skip_result,
+                    )
+                    await run_tagging_and_validation(
+                        job_id, db, settings, job_manager, working_pdf, structure.document_json
+                    )
+                    return
+
                 await _update_step(db, job_id, "alt_text", "running")
                 job_manager.emit_progress(job_id, step="alt_text", status="running")
 

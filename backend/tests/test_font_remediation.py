@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,6 +42,9 @@ from app.services.form_fields import (
 )
 from app.services.form_fields import remove_widget_fields as _remove_widget_fields
 from app.services.grounded_text_apply import (
+    _should_auto_artifact_grounded_text_block as _should_auto_artifact_grounded_text_block,
+)
+from app.services.grounded_text_apply import (
     has_grounded_text_candidate_task as _has_grounded_text_candidate_task,
 )
 from app.services.grounded_text_apply import (
@@ -48,6 +52,9 @@ from app.services.grounded_text_apply import (
 )
 from app.services.grounded_text_apply import (
     should_auto_apply_grounded_encoding_block as _should_auto_apply_grounded_encoding_block,
+)
+from app.services.grounded_text_apply import (
+    should_auto_apply_grounded_text_block as _should_auto_apply_grounded_text_block,
 )
 from app.services.grounded_text_intelligence import (
     apply_grounded_text_adjudication as _apply_grounded_text_adjudication,
@@ -711,9 +718,23 @@ def test_should_auto_apply_grounded_code_block_accepts_grounded_multiline_code()
     assert _should_auto_apply_grounded_code_block(block) is True
 
 
+def test_should_auto_apply_grounded_text_block_accepts_nonlegacy_role_when_text_match_is_exact():
+    block = {
+        "role": "list_item",
+        "readable_text_hint": "S a m p l e ID",
+        "chosen_source": "llm_inferred",
+        "issue_type": "spacing_only",
+        "confidence": "high",
+        "should_block_accessibility": True,
+        "original_text_candidate": "S a m p l e ID",
+    }
+
+    assert _should_auto_apply_grounded_text_block(block) is True
+
+
 def test_should_auto_apply_grounded_encoding_block_accepts_localized_high_similarity_fix():
     block = {
-        "role": "paragraph",
+        "role": "list_item",
         "readable_text_hint": "2c 2d 3a 3b 3c 4a 4b 5a 5b 6 7 8a 8b 8ba 8bb 8bc 8c 8d 9 11 12a 12b 13 14 15 16 17",
         "chosen_source": "native",
         "issue_type": "encoding_problem",
@@ -724,6 +745,21 @@ def test_should_auto_apply_grounded_encoding_block_accepts_localized_high_simila
     }
 
     assert _should_auto_apply_grounded_encoding_block(block) is True
+
+
+def test_should_auto_artifact_grounded_text_block_accepts_nonlegacy_role_with_strong_model_signal():
+    block = {
+        "role": "list_item",
+        "readable_text_hint": "2c 2d 3a 3b",
+        "chosen_source": "llm_inferred",
+        "suggested_action": "mark_decorative",
+        "issue_type": "encoding_problem",
+        "confidence": "high",
+        "should_block_accessibility": True,
+        "original_text_candidate": "2c 2d 3a 3b",
+    }
+
+    assert _should_auto_artifact_grounded_text_block(block) is True
 
 
 @pytest.mark.asyncio
@@ -944,6 +980,24 @@ async def test_pretag_table_intelligence_applies_high_confidence_header_fix(monk
             "summary": "Add simple row and column headers.",
         }
 
+    async def _fake_generate_page(**kwargs):
+        assert kwargs["page_number"] == 3
+        assert len(kwargs["targets"]) == 1
+        return [
+            {
+                "table_review_id": "review-7",
+                "page": 3,
+                "confidence": "high",
+                "confidence_score": 1.0,
+                "suggested_action": "set_table_headers",
+                "reason": "First row and first column act as headers.",
+                "header_rows": [0],
+                "row_header_columns": [0],
+                "summary": "Add simple row and column headers.",
+            }
+        ]
+
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence_for_page", _fake_generate_page)
     monkeypatch.setattr(orchestrator, "generate_table_intelligence", _fake_generate)
 
     updated, audit = await _apply_pretag_table_intelligence(
@@ -976,6 +1030,9 @@ async def test_pretag_table_intelligence_applies_high_confidence_header_fix(monk
     table = updated["elements"][0]
     assert audit["applied"] is True
     assert audit["applied_count"] == 1
+    assert audit["page_batch_count"] == 1
+    assert audit["page_batch_resolved_count"] == 1
+    assert audit["individual_fallback_count"] == 0
     assert audit["set_headers_count"] == 1
     assert table["table_llm_confirmed"] is True
     assert table["table_llm_action"] == "set_table_headers"
@@ -1044,7 +1101,7 @@ async def test_pretag_form_intelligence_sets_accessible_label(monkeypatch, tmp_p
         assert str(widget["/TU"]) == "First name and middle initial"
 
 
-def test_widget_targets_for_rationalization_ignore_real_fields_and_flag_static_text(tmp_path):
+def test_widget_targets_for_rationalization_is_disabled_without_stronger_evidence(tmp_path):
     real_pdf = tmp_path / "real_form.pdf"
     static_pdf = tmp_path / "static_widgets.pdf"
     _pdf_with_real_widget(real_pdf)
@@ -1070,12 +1127,7 @@ def test_widget_targets_for_rationalization_ignore_real_fields_and_flag_static_t
     )
 
     assert real_targets == []
-    assert len(static_targets) == 4
-    assert {
-        reason
-        for target in static_targets
-        for reason in target.get("suspicion_reasons", [])
-    } >= {"page_chrome", "repeated_across_pages"}
+    assert static_targets == []
 
 
 def test_remove_widget_fields_clears_annotations_and_empty_acroform(tmp_path):
@@ -1101,7 +1153,7 @@ def test_remove_widget_fields_clears_annotations_and_empty_acroform(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pretag_widget_rationalization_removes_static_widgets(monkeypatch, tmp_path):
+async def test_pretag_widget_rationalization_noops_without_nonheuristic_targets(monkeypatch, tmp_path):
     pdf_path = tmp_path / "static_widgets.pdf"
     _pdf_with_static_text_widgets(pdf_path)
 
@@ -1157,13 +1209,9 @@ async def test_pretag_widget_rationalization_removes_static_widgets(monkeypatch,
         },
     )
 
-    assert audit["applied"] is True
-    assert audit["applied_count"] == 4
-    assert updated_pdf != pdf_path
-    with pikepdf.Pdf.open(updated_pdf) as pdf:
-        assert "/AcroForm" not in pdf.Root
-        assert "/Annots" not in pdf.pages[0]
-        assert "/Annots" not in pdf.pages[1]
+    assert audit["applied"] is False
+    assert audit["applied_count"] == 0
+    assert updated_pdf == pdf_path
 
 
 @pytest.mark.asyncio
@@ -1224,6 +1272,22 @@ async def test_pretag_table_intelligence_retries_manual_only_aggressively(monkey
             "summary": "Manual review may be needed.",
         }
 
+    async def _fake_generate_page(**kwargs):
+        return [
+            {
+                "table_review_id": "review-9",
+                "page": 3,
+                "confidence": "medium",
+                "confidence_score": 0.6,
+                "suggested_action": "manual_only",
+                "reason": "Initial page-batch pass was conservative.",
+                "header_rows": [],
+                "row_header_columns": [],
+                "summary": "Manual review may be needed.",
+            }
+        ]
+
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence_for_page", _fake_generate_page)
     monkeypatch.setattr(orchestrator, "generate_table_intelligence", _fake_generate)
 
     updated, audit = await _apply_pretag_table_intelligence(
@@ -1255,6 +1319,8 @@ async def test_pretag_table_intelligence_retries_manual_only_aggressively(monkey
 
     table = updated["elements"][0]
     assert calls == [False, True]
+    assert audit["page_batch_count"] == 1
+    assert audit["individual_fallback_count"] == 1
     assert audit["applied"] is True
     assert audit["aggressive_retry_count"] == 1
     assert table["table_llm_confirmed"] is True
@@ -1319,6 +1385,22 @@ async def test_pretag_table_intelligence_retries_to_confirm_existing_headers(mon
             "summary": "Manual review may be needed.",
         }
 
+    async def _fake_generate_page(**kwargs):
+        return [
+            {
+                "table_review_id": "review-11",
+                "page": 4,
+                "confidence": "medium",
+                "confidence_score": 0.6,
+                "suggested_action": "manual_only",
+                "reason": "Initial page-batch pass was conservative.",
+                "header_rows": [],
+                "row_header_columns": [],
+                "summary": "Manual review may be needed.",
+            }
+        ]
+
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence_for_page", _fake_generate_page)
     monkeypatch.setattr(orchestrator, "generate_table_intelligence", _fake_generate)
 
     updated, audit = await _apply_pretag_table_intelligence(
@@ -1350,11 +1432,188 @@ async def test_pretag_table_intelligence_retries_to_confirm_existing_headers(mon
 
     table = updated["elements"][0]
     assert calls == [(False, False), (True, False), (True, True)]
+    assert audit["page_batch_count"] == 1
+    assert audit["individual_fallback_count"] == 1
     assert audit["applied"] is True
     assert audit["confirm_existing_retry_count"] == 1
     assert audit["confirmed_count"] == 1
     assert table["table_llm_confirmed"] is True
     assert table["table_llm_action"] == "confirm_current_headers"
+
+
+@pytest.mark.asyncio
+async def test_pretag_table_intelligence_times_out_cleanly(monkeypatch, tmp_path):
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+    monkeypatch.setattr(
+        orchestrator,
+        "_table_semantics_risk",
+        lambda *_args, **_kwargs: {
+            "targets": [
+                {
+                    "table_review_id": "review-timeout",
+                    "page": 2,
+                    "bbox": {"l": 10, "t": 20, "r": 100, "b": 60},
+                    "num_rows": 4,
+                    "num_cols": 3,
+                    "risk_score": 2.5,
+                    "risk_reasons": ["weak header signal"],
+                    "header_rows": [],
+                    "row_header_columns": [],
+                }
+            ]
+        },
+    )
+
+    async def _fake_generate(**kwargs):
+        await asyncio.sleep(3)
+        return {
+            "table_review_id": "review-timeout",
+            "page": 2,
+            "confidence": "high",
+            "confidence_score": 1.0,
+            "suggested_action": "set_table_headers",
+            "reason": "Too late.",
+            "header_rows": [0],
+            "row_header_columns": [0],
+            "summary": "Too late.",
+        }
+
+    async def _fake_generate_page(**kwargs):
+        return [
+            {
+                "table_review_id": "review-timeout",
+                "page": 2,
+                "confidence": "medium",
+                "confidence_score": 0.6,
+                "suggested_action": "manual_only",
+                "reason": "Initial page-batch pass was conservative.",
+                "header_rows": [],
+                "row_header_columns": [],
+                "summary": "Manual review may be needed.",
+            }
+        ]
+
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence_for_page", _fake_generate_page)
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence", _fake_generate)
+
+    original_structure = {
+        "elements": [
+            {
+                "review_id": "review-timeout",
+                "type": "table",
+                "page": 1,
+                "num_rows": 4,
+                "num_cols": 3,
+                "cells": [
+                    {"row": 0, "col": 0, "text": "A"},
+                    {"row": 0, "col": 1, "text": "B"},
+                    {"row": 1, "col": 0, "text": "C"},
+                    {"row": 1, "col": 1, "text": "D"},
+                ],
+            }
+        ]
+    }
+
+    updated, audit = await _apply_pretag_table_intelligence(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(
+            auto_apply_table_intelligence=True,
+            llm_timeout=1,
+            llm_max_retries=0,
+            llm_pretag_timeout=1,
+            llm_pretag_max_retries=0,
+            llm_retry_max_backoff_seconds=0,
+        ),
+        structure_json=original_structure,
+    )
+
+    assert updated == original_structure
+    assert audit["applied"] is False
+    assert audit["reason"].startswith("llm_failed: table_intelligence[review-timeout] timed out after ")
+
+
+@pytest.mark.asyncio
+async def test_pretag_table_intelligence_uses_pretag_timeout_override(monkeypatch, tmp_path):
+    async def _fake_generate(**kwargs):
+        await asyncio.sleep(2)
+        return {
+            "table_review_id": "review-timeout",
+            "suggested_action": "set_table_headers",
+            "confidence": "high",
+            "header_rows": [0],
+            "row_header_columns": [0],
+            "summary": "Too late.",
+        }
+
+    async def _fake_generate_page(**kwargs):
+        return [
+            {
+                "table_review_id": "review-timeout",
+                "page": 1,
+                "confidence": "medium",
+                "confidence_score": 0.6,
+                "suggested_action": "manual_only",
+                "reason": "Initial page-batch pass was conservative.",
+                "header_rows": [],
+                "row_header_columns": [],
+                "summary": "Manual review may be needed.",
+            }
+        ]
+
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence_for_page", _fake_generate_page)
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence", _fake_generate)
+
+    original_structure = {
+        "elements": [
+            {
+                "review_id": "review-timeout",
+                "type": "table",
+                "page": 1,
+                "num_rows": 2,
+                "num_cols": 2,
+                "cells": [
+                    {"row": 0, "col": 0, "text": "A"},
+                    {"row": 0, "col": 1, "text": "B"},
+                    {"row": 1, "col": 0, "text": "C"},
+                    {"row": 1, "col": 1, "text": "D"},
+                ],
+            }
+        ]
+    }
+
+    updated, audit = await _apply_pretag_table_intelligence(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(
+            auto_apply_table_intelligence=True,
+            llm_timeout=999,
+            llm_max_retries=3,
+            llm_pretag_timeout=1,
+            llm_pretag_max_retries=0,
+            llm_retry_max_backoff_seconds=0,
+        ),
+        structure_json=original_structure,
+    )
+
+    assert updated == original_structure
+    assert audit["applied"] is False
+    assert audit["reason"].startswith("llm_failed: table_intelligence[review-timeout] timed out after ")
 
 
 def test_font_name_normalization_strips_subset_prefix_and_punctuation():

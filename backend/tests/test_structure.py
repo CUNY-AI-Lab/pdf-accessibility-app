@@ -1,10 +1,16 @@
 from types import SimpleNamespace
 
 from app.pipeline.structure import (
+    _expand_toc_item_tables,
     _extract_bbox,
+    _extract_title_from_docling,
     _looks_like_formula_text,
+    _mark_toc_sequences,
     _normalize_docling_elements,
     _normalize_lang_tag,
+    _normalize_native_toc,
+    _rebuild_toc_elements_from_page_rows,
+    _toc_rows_from_word_cells,
 )
 
 
@@ -74,7 +80,7 @@ def test_normalize_docling_elements_normalizes_metadata_language_tags():
     assert elements[0]["lang"] == "fr"
 
 
-def test_normalize_docling_elements_marks_table_of_contents_sequences():
+def test_normalize_docling_elements_keeps_visible_contents_as_heading_and_paragraphs():
     doc_dict = {
         "body": {
             "children": [
@@ -104,13 +110,15 @@ def test_normalize_docling_elements_marks_table_of_contents_sequences():
 
     elements = _normalize_docling_elements(doc_dict)
 
-    assert elements[0]["type"] == "toc_caption"
-    assert elements[1]["type"] == "toc_item"
-    assert elements[2]["type"] == "toc_item"
-    assert elements[0]["toc_group_ref"] == elements[1]["toc_group_ref"] == elements[2]["toc_group_ref"]
+    assert [element["type"] for element in elements] == ["heading", "paragraph", "paragraph"]
+    assert [element["text"] for element in elements] == [
+        "Contents",
+        "Introduction ........ 1",
+        "Methods ........ 3",
+    ]
 
 
-def test_normalize_docling_elements_marks_toc_tables_and_heading_entries():
+def test_normalize_docling_elements_keeps_toc_like_tables_as_tables():
     doc_dict = {
         "body": {
             "children": [
@@ -153,12 +161,10 @@ def test_normalize_docling_elements_marks_toc_tables_and_heading_entries():
 
     elements = _normalize_docling_elements(doc_dict)
 
-    assert elements[0]["type"] == "toc_caption"
-    assert [el["type"] for el in elements[1:4]] == ["toc_item", "toc_item", "toc_item"]
-    assert elements[1]["text"] == "1 Introduction 3"
-    assert elements[2]["text"] == "2 Installation 6"
-    assert elements[3]["text"] == "PDFlib GmbH ........ 7"
-    assert elements[0]["toc_group_ref"] == elements[1]["toc_group_ref"] == elements[2]["toc_group_ref"] == elements[3]["toc_group_ref"]
+    assert [el["type"] for el in elements] == ["heading", "table", "heading"]
+    assert elements[1]["cells"][0]["text"] == "1"
+    assert elements[1]["cells"][1]["text"] == "Introduction"
+    assert elements[2]["text"] == "PDFlib GmbH ........ 7"
 
 
 def test_looks_like_formula_text_detects_short_equation_blocks():
@@ -172,7 +178,7 @@ def test_looks_like_formula_text_rejects_prose_with_embedded_math():
     ) is False
 
 
-def test_normalize_docling_elements_reclassifies_formula_like_paragraphs():
+def test_normalize_docling_elements_keeps_formula_like_paragraphs_as_paragraphs():
     doc_dict = {
         "body": {"children": [{"$ref": "#/texts/0"}]},
         "texts": [
@@ -186,10 +192,10 @@ def test_normalize_docling_elements_reclassifies_formula_like_paragraphs():
 
     elements = _normalize_docling_elements(doc_dict)
 
-    assert elements[0]["type"] == "formula"
+    assert elements[0]["type"] == "paragraph"
 
 
-def test_normalize_docling_elements_splits_toc_table_rows_into_separate_items():
+def test_normalize_docling_elements_does_not_expand_toc_tables_into_items():
     doc_dict = {
         "body": {
             "children": [
@@ -229,10 +235,145 @@ def test_normalize_docling_elements_splits_toc_table_rows_into_separate_items():
 
     elements = _normalize_docling_elements(doc_dict)
 
-    assert [el["type"] for el in elements] == ["toc_caption", "toc_item", "toc_item", "toc_item"]
-    assert [el["text"] for el in elements[1:]] == [
+    assert [el["type"] for el in elements] == ["heading", "table"]
+    assert elements[0]["text"] == "Table of Contents"
+    assert elements[1]["num_rows"] == 3
+    assert elements[1]["num_cols"] == 3
+
+
+def test_mark_toc_sequences_and_expand_tables_build_row_level_toc_items():
+    elements = [
+        {"type": "heading", "text": "Table of Contents", "page": 0},
+        {
+            "type": "table",
+            "page": 0,
+            "bbox": {"l": 10, "b": 20, "r": 200, "t": 170},
+            "num_rows": 3,
+            "num_cols": 3,
+            "cells": [
+                {"text": "1.1", "row": 0, "col": 0},
+                {"text": "Introduction", "row": 0, "col": 1},
+                {"text": "3", "row": 0, "col": 2},
+                {"text": "1.2", "row": 1, "col": 0},
+                {"text": "Methods", "row": 1, "col": 1},
+                {"text": "6", "row": 1, "col": 2},
+                {"text": "1.3", "row": 2, "col": 0},
+                {"text": "Results", "row": 2, "col": 1},
+                {"text": "9", "row": 2, "col": 2},
+            ],
+        },
+    ]
+
+    _mark_toc_sequences(elements)
+    expanded = _expand_toc_item_tables(elements)
+
+    assert [element["type"] for element in expanded] == [
+        "toc_caption",
+        "toc_item",
+        "toc_item",
+        "toc_item",
+    ]
+    assert [element["text"] for element in expanded[1:]] == [
         "1.1 Introduction 3",
         "1.2 Methods 6",
         "1.3 Results 9",
     ]
-    assert all(elements[idx]["bbox"]["t"] > elements[idx]["bbox"]["b"] for idx in (1, 2, 3))
+    assert all(element.get("toc_group_ref") == "toc-0" for element in expanded)
+
+
+def test_normalize_native_toc_preserves_hierarchy_and_discards_empty_nodes():
+    native_toc = {
+        "text": " <root> ",
+        "children": [
+            {"text": " Cover ", "children": []},
+            {
+                "text": " Glossaries ",
+                "children": [
+                    {"text": " Abbreviations and Acronyms ", "children": []},
+                    {"text": " ", "children": []},
+                ],
+            },
+        ],
+    }
+
+    normalized = _normalize_native_toc(native_toc)
+
+    assert normalized == {
+        "text": "<root>",
+        "children": [
+            {"text": "Cover", "children": []},
+            {
+                "text": "Glossaries",
+                "children": [
+                    {"text": "Abbreviations and Acronyms", "children": []},
+                ],
+            },
+        ],
+    }
+
+
+def test_toc_rows_from_word_cells_reconstructs_visible_rows():
+    word_cells = [
+        {"text": "TABLE", "bbox": {"l": 54.0, "b": 690.0, "r": 107.0, "t": 705.0}},
+        {"text": "OF", "bbox": {"l": 113.0, "b": 690.0, "r": 135.0, "t": 705.0}},
+        {"text": "CONTENTS", "bbox": {"l": 141.0, "b": 690.0, "r": 233.0, "t": 705.0}},
+        {"text": "GLOSSARIES", "bbox": {"l": 49.0, "b": 586.0, "r": 120.0, "t": 596.0}},
+        {"text": "Abbreviations", "bbox": {"l": 54.0, "b": 568.0, "r": 130.0, "t": 579.0}},
+        {"text": "and", "bbox": {"l": 133.0, "b": 568.0, "r": 150.0, "t": 579.0}},
+        {"text": "Acronyms", "bbox": {"l": 153.0, "b": 568.0, "r": 215.0, "t": 579.0}},
+        {"text": ".", "bbox": {"l": 220.0, "b": 568.0, "r": 223.0, "t": 579.0}},
+        {"text": ".", "bbox": {"l": 232.0, "b": 568.0, "r": 235.0, "t": 579.0}},
+        {"text": "viii", "bbox": {"l": 520.0, "b": 568.0, "r": 540.0, "t": 579.0}},
+    ]
+
+    rows = _toc_rows_from_word_cells(word_cells)
+
+    assert [row["text"] for row in rows] == [
+        "TABLE OF CONTENTS",
+        "GLOSSARIES",
+        "Abbreviations and Acronyms . . viii",
+    ]
+
+
+def test_rebuild_toc_elements_from_page_rows_replaces_malformed_entries():
+    elements = [
+        {"type": "heading", "text": "Management Track Assessments Fall 2022", "page": 0},
+        {"type": "toc_caption", "text": "TABLE OF CONTENTS", "page": 3, "toc_group_ref": "toc-0"},
+        {"type": "toc_item", "text": "1.1. Executive . . . . . . . . . . . . . . . . 1", "page": 3, "toc_group_ref": "toc-0"},
+        {"type": "toc_item", "text": "5.1. Reviewer Comments: Georges . . . . . . . . . . . . . . 52", "page": 3, "toc_group_ref": "toc-0"},
+    ]
+    page_rows = {
+        3: [
+            {"text": "TABLE OF CONTENTS", "bbox": {"l": 50.0, "b": 690.0, "r": 230.0, "t": 705.0}},
+            {"text": "GLOSSARIES", "bbox": {"l": 49.0, "b": 586.0, "r": 120.0, "t": 596.0}},
+            {"text": "Abbreviations and Acronyms . . . . . . . . . . viii", "bbox": {"l": 54.0, "b": 568.0, "r": 540.0, "t": 579.0}},
+            {"text": "1.1. Executive Summary . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 1", "bbox": {"l": 54.0, "b": 454.0, "r": 540.0, "t": 465.0}},
+            {"text": "5.1. Reviewer Comments: Georges Bank haddock . . . . . . . . . . . . . . . . . . . 52", "bbox": {"l": 54.0, "b": 215.0, "r": 540.0, "t": 226.0}},
+        ],
+    }
+
+    rebuilt = _rebuild_toc_elements_from_page_rows(elements, page_rows)
+
+    toc_items = [element for element in rebuilt if element.get("type") == "toc_item"]
+    assert [item["text"] for item in toc_items] == [
+        "GLOSSARIES",
+        "Abbreviations and Acronyms . . . . . . . . . . viii",
+        "1.1. Executive Summary . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 1",
+        "5.1. Reviewer Comments: Georges Bank haddock . . . . . . . . . . . . . . . . . . . 52",
+    ]
+    assert toc_items[0]["toc_group_heading"] is True
+
+
+def test_extract_title_from_docling_uses_only_docling_title_labels():
+    doc_dict = {
+        "texts": [
+            {
+                "label": "title",
+                "text": "C H A P T E R 5",
+            }
+        ]
+    }
+
+    title = _extract_title_from_docling(doc_dict, elements=[])
+
+    assert title == "CHAPTER 5"

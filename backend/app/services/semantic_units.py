@@ -49,6 +49,8 @@ class SemanticDecision:
     is_toc: bool = False
     entry_indexes: list[int] = field(default_factory=list)
     entry_types: dict[str, str] = field(default_factory=dict)
+    caption_text_override: str | None = None
+    entry_text_overrides: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

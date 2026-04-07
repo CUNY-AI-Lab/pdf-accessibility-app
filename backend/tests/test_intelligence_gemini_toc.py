@@ -22,6 +22,8 @@ def test_generate_toc_group_intelligence_maps_entry_indexes(monkeypatch, tmp_pat
             is_toc=True,
             entry_indexes=[5, 6],
             entry_types={"5": "toc_item", "6": "toc_item_table"},
+            caption_text_override="TABLE OF CONTENTS",
+            entry_text_overrides={"5": "Introduction", "6": "Appendix material"},
         )
 
     monkeypatch.setattr(
@@ -53,6 +55,8 @@ def test_generate_toc_group_intelligence_maps_entry_indexes(monkeypatch, tmp_pat
         "reason": "The candidate rows are TOC entries with page numbers.",
         "entry_indexes": [5, 6],
         "entry_types": {"5": "toc_item", "6": "toc_item_table"},
+        "caption_text_override": "TABLE OF CONTENTS",
+        "entry_text_overrides": {"5": "Introduction", "6": "Appendix material"},
     }
     unit = captured["unit"]
     assert unit.unit_type == "toc_group"
@@ -76,6 +80,7 @@ def test_generate_toc_group_intelligence_defaults_to_all_candidates_for_positive
             is_toc=True,
             entry_indexes=[],
             entry_types={},
+            entry_text_overrides={"5": "Intro", "999": "Ignore me"},
         )
 
     monkeypatch.setattr(
@@ -102,3 +107,4 @@ def test_generate_toc_group_intelligence_defaults_to_all_candidates_for_positive
 
     assert result["entry_indexes"] == [5, 6]
     assert result["entry_types"] == {"5": "toc_item", "6": "toc_item_table"}
+    assert result["entry_text_overrides"] == {"5": "Intro"}

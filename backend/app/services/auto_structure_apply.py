@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
+import logging
 from types import SimpleNamespace
 from typing import Any
 
-from app.services.llm_client import make_llm_client
+from app.services.llm_client import make_llm_client_with_overrides
 from app.services.remediation_intelligence import generate_remediation_intelligence
 from app.services.structure_intelligence_apply import (
     apply_reading_order_change,
@@ -16,6 +18,9 @@ from app.services.structure_intelligence_apply import (
 
 READING_ORDER_NOOP_ACTIONS = {"confirm_current_order"}
 TABLE_NOOP_ACTIONS = {"confirm_current_headers"}
+AUTO_STRUCTURE_TIMEOUT_BUFFER_SECONDS = 30.0
+
+logger = logging.getLogger(__name__)
 
 
 def _metadata(task: dict[str, Any]) -> dict[str, Any]:
@@ -34,6 +39,23 @@ def _pseudo_task(task: dict[str, Any]) -> Any:
     )
 
 
+def _auto_structure_llm_timeout_seconds(settings: Any) -> int:
+    raw_timeout = getattr(settings, "llm_pretag_timeout", getattr(settings, "llm_timeout", 120))
+    return max(1, int(raw_timeout or 120))
+
+
+def _auto_structure_llm_max_retries(settings: Any) -> int:
+    raw_retries = getattr(settings, "llm_pretag_max_retries", getattr(settings, "llm_max_retries", 0))
+    return max(0, int(raw_retries or 0))
+
+
+def _auto_structure_task_timeout_seconds(settings: Any) -> float:
+    # Table follow-up can issue several sequential LLM calls; keep the whole
+    # auto-apply lane bounded so optional assistance cannot stall the workflow.
+    per_request_timeout = float(_auto_structure_llm_timeout_seconds(settings))
+    return max(60.0, per_request_timeout * 6 + AUTO_STRUCTURE_TIMEOUT_BUFFER_SECONDS)
+
+
 async def auto_apply_structure_tasks(
     *, job, settings, review_tasks: list[dict[str, Any]], structure_json: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
@@ -47,8 +69,13 @@ async def auto_apply_structure_tasks(
     remaining_tasks: list[dict[str, Any]] = []
     applied_specs: list[dict[str, Any]] = []
     current_structure = copy.deepcopy(structure_json)
+    task_timeout_seconds = _auto_structure_task_timeout_seconds(settings)
 
-    llm_client = make_llm_client(settings)
+    llm_client = make_llm_client_with_overrides(
+        settings,
+        timeout=_auto_structure_llm_timeout_seconds(settings),
+        max_retries=_auto_structure_llm_max_retries(settings),
+    )
     try:
         for index, task in enumerate(review_tasks):
             if not isinstance(task, dict):
@@ -62,15 +89,42 @@ async def auto_apply_structure_tasks(
                 continue
 
             pseudo_task = _pseudo_task(task)
+            task_metadata = _metadata(task)
             try:
-                intelligence = await generate_remediation_intelligence(
-                    job=job, task=pseudo_task, llm_client=llm_client
+                logger.info(
+                    "Auto-applying structure intelligence for %s (timeout=%ss)",
+                    task_type,
+                    int(task_timeout_seconds),
                 )
-            except Exception:
-                remaining_tasks.append(task)
+                intelligence = await asyncio.wait_for(
+                    generate_remediation_intelligence(
+                        job=job, task=pseudo_task, llm_client=llm_client
+                    ),
+                    timeout=task_timeout_seconds,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Auto structure intelligence timed out for %s after %.1fs; keeping manual review task.",
+                    task_type,
+                    task_timeout_seconds,
+                )
+                task_metadata["auto_apply_attempted"] = True
+                task_metadata["auto_apply_error"] = "timeout"
+                task_metadata["auto_apply_timeout_seconds"] = round(task_timeout_seconds, 1)
+                remaining_tasks.append({**task, "metadata": task_metadata})
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "Auto structure intelligence failed for %s: %s; keeping manual review task.",
+                    task_type,
+                    exc,
+                )
+                task_metadata["auto_apply_attempted"] = True
+                task_metadata["auto_apply_error"] = str(exc)
+                remaining_tasks.append({**task, "metadata": task_metadata})
                 continue
 
-            task_metadata = _metadata(task)
+            task_metadata["auto_apply_attempted"] = True
             task_metadata["remediation_intelligence"] = intelligence
             enriched_task = {**task, "metadata": task_metadata}
             suggested_action = str(intelligence.get("suggested_action") or "").strip()

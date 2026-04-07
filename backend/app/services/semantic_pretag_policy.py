@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
 from app.services.document_intelligence import (
@@ -11,7 +11,7 @@ from app.services.document_intelligence import (
     collect_nearby_blocks,
     collect_structure_fragments,
 )
-from app.services.form_fields import field_label_quality, is_technical_field_name
+from app.services.form_fields import field_label_quality
 
 PRETAG_TABLE_ALLOWED_ACTIONS = frozenset({"confirm_current_headers", "set_table_headers"})
 PRETAG_FORM_ALLOWED_TYPES = frozenset({
@@ -38,47 +38,9 @@ def _looks_like_page_chrome(value: str) -> bool:
 
 
 def suspicious_widget_candidates(fields: list[dict[str, object]]) -> list[dict[str, object]]:
-    label_counts: Counter[str] = Counter()
-    label_pages: defaultdict[str, set[int]] = defaultdict(set)
-
-    for field in fields:
-        if str(field.get("field_type") or "").strip() not in PRETAG_WIDGET_RATIONALIZATION_ALLOWED_TYPES:
-            continue
-        accessible_name = _normalize_widget_text(field.get("accessible_name"))
-        field_name = _normalize_widget_text(field.get("field_name"))
-        label = accessible_name or field_name
-        if not label or is_technical_field_name(field_name):
-            continue
-        page = field.get("page")
-        label_counts[label] += 1
-        if isinstance(page, int) and page > 0:
-            label_pages[label].add(page)
-
-    candidates: list[dict[str, object]] = []
-    for field in fields:
-        if str(field.get("field_type") or "").strip() not in PRETAG_WIDGET_RATIONALIZATION_ALLOWED_TYPES:
-            continue
-        accessible_name = _normalize_widget_text(field.get("accessible_name"))
-        field_name = _normalize_widget_text(field.get("field_name"))
-        label = accessible_name or field_name
-        if not label or is_technical_field_name(field_name):
-            continue
-        suspicion_reasons: list[str] = []
-        if _looks_like_page_chrome(label):
-            suspicion_reasons.append("page_chrome")
-        if len(label_pages.get(label, set())) >= 2:
-            suspicion_reasons.append("repeated_across_pages")
-        if len(label) >= 28 and " " in label and not is_technical_field_name(label):
-            suspicion_reasons.append("natural_language_static_text")
-        if not suspicion_reasons:
-            continue
-        candidate = dict(field)
-        candidate["suspicion_reasons"] = suspicion_reasons
-        candidate["same_label_count"] = int(label_counts.get(label, 0))
-        candidate["same_label_pages"] = sorted(label_pages.get(label, set()))
-        candidate["looks_like_page_chrome"] = _looks_like_page_chrome(label)
-        candidates.append(candidate)
-    return candidates
+    # Disable heuristic auto-rationalization of widgets. Static text widgets now
+    # require stronger document evidence or manual review instead of rule-based suspicion.
+    return []
 
 
 def table_page_structure_fragments(

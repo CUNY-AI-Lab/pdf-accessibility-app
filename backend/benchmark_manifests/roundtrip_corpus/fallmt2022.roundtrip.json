@@ -1,0 +1,56 @@
+{
+  "id": "fallmt2022",
+  "lane": "recoverable-core",
+  "document_family": "technical_report",
+  "product_priority": "primary",
+  "workflow_tags": ["toc", "bookmarks", "front_matter", "academic", "tables"],
+  "gold_pdf": "../../data/external_gold_candidates/FallMT2022.pdf",
+  "recoverable_assertions": [
+    {
+      "id": "lang",
+      "kind": "document_lang",
+      "expected": "en"
+    },
+    {
+      "id": "title",
+      "kind": "title_contains",
+      "expected": "Management Track Assessments Fall 2022"
+    },
+    {
+      "id": "opening_text",
+      "kind": "text_contains",
+      "expected": "This document may be cited as"
+    },
+    {
+      "id": "toc_order",
+      "kind": "ordered_text",
+      "expected": [
+        "Editorial Treatment",
+        "Information Quality Act Compliance",
+        "Species Names",
+        "Statistical Terms"
+      ]
+    },
+    {
+      "id": "bookmark_toc",
+      "kind": "bookmark_title",
+      "expected": "TABLE OF CONTENTS"
+    },
+    {
+      "id": "bookmark_glossary",
+      "kind": "bookmark_title",
+      "expected": "Abbreviations and Acronyms"
+    },
+    {
+      "id": "bookmark_panel_report",
+      "kind": "bookmark_title",
+      "expected": "Panel Report"
+    },
+    {
+      "id": "bookmark_stock_section",
+      "kind": "bookmark_title",
+      "expected": "2 Atlantic wolffish"
+    }
+  ],
+  "hidden_semantics_assertions": []
+}
