@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 from app.pipeline.alt_text import generate_alt_text
 from app.pipeline.structure import FigureInfo
@@ -341,3 +342,195 @@ def test_generate_alt_text_uses_batched_figure_intelligence(monkeypatch, tmp_pat
     assert captured["original_filename"] == "doc.pdf"
     assert results[0].figure_index == 1 and results[0].generated_text == "Chart showing enrollment."
     assert results[1].figure_index == 2 and results[1].status == "reclassified" and results[1].resolved_kind == "table"
+
+
+def test_generate_figures_intelligence_uses_cached_pdf_page_with_direct_gemini(monkeypatch, tmp_path):
+    image_paths = []
+    for name in ("a.png", "b.png", "c.png", "d.png", "e.png"):
+        path = tmp_path / name
+        path.write_bytes(b"fake-image")
+        image_paths.append(path)
+
+    fake_pdf_path = tmp_path / "doc.pdf"
+    fake_pdf_path.write_bytes(b"%PDF-1.7 fake")
+    calls = {"cached": [], "created": [], "deleted": [], "fallback": []}
+
+    async def _fake_create_cache(*, pdf_path, page_numbers=None, system_instruction=None, ttl="3600s", settings=None):
+        calls["created"].append(
+            {
+                "pdf_path": pdf_path,
+                "page_numbers": list(page_numbers or []),
+                "ttl": ttl,
+                "system_instruction": system_instruction,
+            }
+        )
+        return SimpleNamespace(cache_name="cache-1", uploaded_file_name="file-1", model_name="gemini")
+
+    async def _fake_cached_json(*, cache_handle, prompt, context_payload=None, response_schema=None, settings=None):
+        candidate_indexes = [item["figure_index"] for item in context_payload["candidates"]]
+        calls["cached"].append(candidate_indexes)
+        return {
+            "task_type": "figure_batch_intelligence",
+            "decisions": [
+                {
+                    "figure_index": figure_index,
+                    "summary": f"Figure {figure_index}",
+                    "confidence": "high",
+                    "suggested_action": "set_alt_text",
+                    "reason": "Visible chart on the page.",
+                    "alt_text": f"Chart {figure_index}",
+                }
+                for figure_index in candidate_indexes
+            ],
+        }
+
+    async def _fake_delete_cache(cache_handle, *, settings=None):
+        calls["deleted"].append(cache_handle.cache_name)
+
+    async def _unexpected_request_llm_json(**kwargs):
+        raise AssertionError("request_llm_json should not be used when cached direct Gemini succeeds")
+
+    async def _unexpected_single(**kwargs):
+        calls["fallback"].append(kwargs["figure"].index)
+        raise AssertionError("single-figure fallback should not run when cached batch resolves all figures")
+
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.direct_gemini_pdf_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.job_pdf_path",
+        lambda job: fake_pdf_path,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.create_direct_gemini_pdf_cache",
+        _fake_create_cache,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.request_direct_gemini_cached_json",
+        _fake_cached_json,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.delete_direct_gemini_pdf_cache",
+        _fake_delete_cache,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.request_llm_json",
+        _unexpected_request_llm_json,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.generate_figure_intelligence",
+        _unexpected_single,
+    )
+
+    figures = [
+        FigureInfo(index=index + 1, path=path, caption=f"Figure {index + 1}", page=0)
+        for index, path in enumerate(image_paths)
+    ]
+    job = SimpleNamespace(original_filename="doc.pdf", output_path=str(fake_pdf_path))
+
+    results = asyncio.run(
+        generate_figures_intelligence(
+            figures=figures,
+            llm_client=object(),
+            job=job,
+            original_filename="doc.pdf",
+        )
+    )
+
+    assert len(results) == 5
+    assert [result["figure_index"] for result in results] == [1, 2, 3, 4, 5]
+    assert calls["created"] == [
+        {
+            "pdf_path": fake_pdf_path,
+            "page_numbers": [1],
+            "ttl": "900s",
+            "system_instruction": "You are evaluating PDF accessibility and figure semantics. Stay grounded in the provided PDF page and return JSON only.",
+        }
+    ]
+    assert calls["cached"] == [[1, 2, 3, 4], [5]]
+    assert calls["deleted"] == ["cache-1"]
+    assert calls["fallback"] == []
+
+
+def test_generate_figures_intelligence_direct_gemini_retries_unresolved_batch_items(monkeypatch, tmp_path):
+    image_path = tmp_path / "a.png"
+    image_path.write_bytes(b"fake-image")
+    fake_pdf_path = tmp_path / "doc.pdf"
+    fake_pdf_path.write_bytes(b"%PDF-1.7 fake")
+    fallback_calls = []
+
+    async def _fake_create_cache(*, pdf_path, page_numbers=None, system_instruction=None, ttl="3600s", settings=None):
+        return SimpleNamespace(cache_name="cache-1", uploaded_file_name="file-1", model_name="gemini")
+
+    async def _fake_cached_json(*, cache_handle, prompt, context_payload=None, response_schema=None, settings=None):
+        return {
+            "task_type": "figure_batch_intelligence",
+            "decisions": [
+                {
+                    "figure_index": 1,
+                    "summary": "Unclear small figure.",
+                    "confidence": "low",
+                    "suggested_action": "manual_only",
+                    "reason": "Page-level evidence is ambiguous.",
+                    "alt_text": "",
+                }
+            ],
+        }
+
+    async def _fake_delete_cache(cache_handle, *, settings=None):
+        return None
+
+    async def _fake_single(**kwargs):
+        fallback_calls.append(kwargs["figure"].index)
+        return {
+            "task_type": "figure_intelligence",
+            "summary": "Fallback resolved the figure.",
+            "confidence": "high",
+            "confidence_score": 0.9,
+            "suggested_action": "set_alt_text",
+            "reason": "Crop clarifies the chart.",
+            "figure_index": kwargs["figure"].index,
+            "alt_text": "Line chart of enrollment.",
+            "resolved_kind": None,
+            "is_decorative": False,
+        }
+
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.direct_gemini_pdf_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.job_pdf_path",
+        lambda job: fake_pdf_path,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.create_direct_gemini_pdf_cache",
+        _fake_create_cache,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.request_direct_gemini_cached_json",
+        _fake_cached_json,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.delete_direct_gemini_pdf_cache",
+        _fake_delete_cache,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.generate_figure_intelligence",
+        _fake_single,
+    )
+
+    job = SimpleNamespace(original_filename="doc.pdf", output_path=str(fake_pdf_path))
+    results = asyncio.run(
+        generate_figures_intelligence(
+            figures=[FigureInfo(index=1, path=image_path, caption="Figure 1", page=0)],
+            llm_client=object(),
+            job=job,
+            original_filename="doc.pdf",
+        )
+    )
+
+    assert fallback_calls == [1]
+    assert results[0]["suggested_action"] == "set_alt_text"
+    assert results[0]["alt_text"] == "Line chart of enrollment."

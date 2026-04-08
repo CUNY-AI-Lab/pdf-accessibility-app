@@ -8,10 +8,17 @@ from typing import Any
 
 from app.models import Job
 from app.pipeline.structure import FigureInfo
+from app.services.gemini_direct import (
+    create_direct_gemini_pdf_cache,
+    delete_direct_gemini_pdf_cache,
+    direct_gemini_pdf_enabled,
+    request_direct_gemini_cached_json,
+)
 from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
 from app.services.intelligence_llm_utils import (
     context_json_part,
+    job_pdf_path,
     page_preview_parts,
     request_llm_json,
 )
@@ -30,8 +37,9 @@ For each candidate, decide whether it should:
 
 Rules:
 - Decide each figure candidate independently.
+- Use the PDF page as the primary evidence.
+- Use each candidate's bbox, caption, and page-local context to locate it on the page.
 - Preserve visible meaning.
-- Use the full page preview and each crop together.
 - Prefer reclassification when the crop is clearly not a standalone figure.
 - When the same page also contains a much larger screenshot or interface image, tiny icon or button crops are usually child UI details, not standalone figures.
 - In those cases, prefer `mark_decorative` unless the small crop has clear standalone instructional meaning that would be lost if it were hidden.
@@ -43,6 +51,11 @@ Rules:
 - Use `manual_only` when the image purpose is unclear.
 - Do not start alt text with "Image of" or "Picture of".
 """
+
+FIGURE_DIRECT_GEMINI_SYSTEM_INSTRUCTION = (
+    "You are evaluating PDF accessibility and figure semantics. "
+    "Stay grounded in the provided PDF page and return JSON only."
+)
 
 FIGURE_BATCH_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -228,6 +241,19 @@ def _finalize_figure_result(
     return _normalize_figure_result(figure_index=figure_index, raw=raw)
 
 
+def _requires_single_figure_followup(result: dict[str, object]) -> bool:
+    suggested_action = str(result.get("suggested_action") or "").strip() or "manual_only"
+    confidence = confidence_label(result.get("confidence"))
+    alt_text = str(result.get("alt_text") or "").strip()
+    if confidence == "low":
+        return True
+    if suggested_action == "manual_only":
+        return True
+    if suggested_action == "set_alt_text" and not alt_text:
+        return True
+    return False
+
+
 async def generate_figure_intelligence(
     *,
     figure: FigureInfo,
@@ -305,82 +331,118 @@ async def generate_figures_intelligence(
     for page in sorted(grouped):
         page_figures = sorted(grouped[page], key=lambda fig: fig.index)
         page_context = _figure_page_context(page_figures)
-        for start in range(0, len(page_figures), MAX_FIGURES_PER_BATCH):
-            chunk = page_figures[start : start + MAX_FIGURES_PER_BATCH]
-            page_images: list[dict[str, Any]] = page_preview_parts(job, [page])
-
-            payload_candidates = [
-                {
-                    "figure_index": figure.index,
-                    "caption": str(figure.caption or "").strip(),
-                    "page": page,
-                    "bbox": figure.bbox,
-                    **page_context.get(figure.index, {}),
-                }
-                for figure in chunk
-            ]
-            content: list[dict[str, Any]] = [
-                {"type": "text", "text": FIGURE_BATCH_PROMPT},
-                *page_images,
-                context_json_part(
-                    {
-                        "job_filename": getattr(job, "original_filename", original_filename)
-                        if job is not None
-                        else original_filename,
-                        "page": page,
-                        "candidates": payload_candidates,
-                    }
-                ),
-            ]
-            for figure in chunk:
-                if figure.path.exists():
-                    content.extend(
-                        [
-                            {"type": "text", "text": f"Figure candidate {figure.index} crop:"},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": _image_data_url(figure.path)},
-                            },
-                        ]
-                    )
-
-            parsed: dict[str, Any] | None = None
+        pdf_page_cache = None
+        if direct_gemini_pdf_enabled() and job is not None:
             try:
-                parsed = await request_llm_json(
-                    llm_client=llm_client,
-                    content=content,
-                    schema_name="figure_batch_intelligence",
-                    response_schema=FIGURE_BATCH_SCHEMA,
-                    cache_breakpoint_index=len(page_images) if page_images else 0,
+                pdf_path = job_pdf_path(job)
+                pdf_page_cache = await create_direct_gemini_pdf_cache(
+                    pdf_path=pdf_path,
+                    page_numbers=[page],
+                    system_instruction=FIGURE_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
+                    ttl="900s",
                 )
             except Exception:
-                parsed = None
+                pdf_page_cache = None
 
-            chunk_index_set = {figure.index for figure in chunk}
-            seen: set[int] = set()
-            if parsed is not None:
-                for item in parsed.get("decisions") or []:
-                    if not isinstance(item, dict):
+        try:
+            for start in range(0, len(page_figures), MAX_FIGURES_PER_BATCH):
+                chunk = page_figures[start : start + MAX_FIGURES_PER_BATCH]
+                payload_candidates = [
+                    {
+                        "figure_index": figure.index,
+                        "caption": str(figure.caption or "").strip(),
+                        "page": page,
+                        "bbox": figure.bbox,
+                        **page_context.get(figure.index, {}),
+                    }
+                    for figure in chunk
+                ]
+
+                parsed: dict[str, Any] | None = None
+                if pdf_page_cache is not None:
+                    try:
+                        parsed = await request_direct_gemini_cached_json(
+                            cache_handle=pdf_page_cache,
+                            prompt=FIGURE_BATCH_PROMPT,
+                            context_payload={
+                                "job_filename": getattr(job, "original_filename", original_filename)
+                                if job is not None
+                                else original_filename,
+                                "page": page,
+                                "candidates": payload_candidates,
+                            },
+                            response_schema=FIGURE_BATCH_SCHEMA,
+                        )
+                    except Exception:
+                        parsed = None
+                if parsed is None:
+                    page_images: list[dict[str, Any]] = page_preview_parts(job, [page])
+                    content: list[dict[str, Any]] = [
+                        {"type": "text", "text": FIGURE_BATCH_PROMPT},
+                        *page_images,
+                        context_json_part(
+                            {
+                                "job_filename": getattr(job, "original_filename", original_filename)
+                                if job is not None
+                                else original_filename,
+                                "page": page,
+                                "candidates": payload_candidates,
+                            }
+                        ),
+                    ]
+                    for figure in chunk:
+                        if figure.path.exists():
+                            content.extend(
+                                [
+                                    {"type": "text", "text": f"Figure candidate {figure.index} crop:"},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": _image_data_url(figure.path)},
+                                    },
+                                ]
+                            )
+                    try:
+                        parsed = await request_llm_json(
+                            llm_client=llm_client,
+                            content=content,
+                            schema_name="figure_batch_intelligence",
+                            response_schema=FIGURE_BATCH_SCHEMA,
+                            cache_breakpoint_index=len(page_images) if page_images else 0,
+                        )
+                    except Exception:
+                        parsed = None
+
+                chunk_index_set = {figure.index for figure in chunk}
+                seen: set[int] = set()
+                if parsed is not None:
+                    for item in parsed.get("decisions") or []:
+                        if not isinstance(item, dict):
+                            continue
+                        figure_index = item.get("figure_index")
+                        if not isinstance(figure_index, int) or figure_index not in chunk_index_set:
+                            continue
+                        finalized = _finalize_figure_result(
+                            figure_index=figure_index,
+                            figure_context=page_context.get(figure_index),
+                            raw=item,
+                        )
+                        if _requires_single_figure_followup(finalized):
+                            continue
+                        results[figure_index] = finalized
+                        seen.add(figure_index)
+
+                for figure in chunk:
+                    if figure.index in seen:
                         continue
-                    figure_index = item.get("figure_index")
-                    if not isinstance(figure_index, int) or figure_index not in chunk_index_set:
-                        continue
-                    results[figure_index] = _finalize_figure_result(
-                        figure_index=figure_index,
-                        figure_context=page_context.get(figure_index),
-                        raw=item,
+                    results[figure.index] = await generate_figure_intelligence(
+                        figure=figure,
+                        llm_client=llm_client,
+                        job=job,
+                        original_filename=original_filename,
+                        figure_context=page_context.get(figure.index),
                     )
-                    seen.add(figure_index)
-
-            for figure in chunk:
-                if figure.index in seen:
-                    continue
-                results[figure.index] = await generate_figure_intelligence(
-                    figure=figure,
-                    llm_client=llm_client,
-                    job=job,
-                    original_filename=original_filename,
-                    figure_context=page_context.get(figure.index),
-                )
+        finally:
+            if pdf_page_cache is not None:
+                await delete_direct_gemini_pdf_cache(pdf_page_cache)
 
     return [results[figure.index] for figure in sorted(figures, key=lambda fig: fig.index)]
