@@ -1,12 +1,57 @@
 import asyncio
 
+import pikepdf
+import pytest
+
 from app.services.bookmark_intelligence import (
+    BOOKMARK_DOCUMENT_CANDIDATE_PLAN_PROMPT,
+    BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_PROMPT,
+    BOOKMARK_DOCUMENT_LANDMARK_PLAN_PROMPT,
+    BOOKMARK_INTELLIGENCE_PROMPT,
+    BOOKMARK_LANDMARK_PROMPT,
+    BOOKMARK_OUTLINE_PROMPT,
     _build_landmark_candidate_chunks,
     _local_toc_entries_for_chunk,
+    _materialize_outline_entries_from_plan,
+    _serialize_outline_candidates_for_direct_llm,
     _serialize_outline_candidates_for_llm,
+    _serialize_selected_outline_for_landmark_llm,
     collect_bookmark_heading_candidates,
     enhance_bookmark_structure_with_intelligence,
 )
+
+
+@pytest.fixture(autouse=True)
+def _disable_direct_gemini_by_default(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.direct_gemini_pdf_enabled",
+        lambda: False,
+    )
+
+
+def _make_pdf(pdf_path, page_count=6):
+    pdf = pikepdf.Pdf.new()
+    for _ in range(page_count):
+        pdf.add_blank_page(page_size=(200, 200))
+    pdf.save(str(pdf_path))
+
+
+def test_bookmark_prompts_stay_evidence_grounded():
+    prompts = [
+        BOOKMARK_INTELLIGENCE_PROMPT,
+        BOOKMARK_LANDMARK_PROMPT,
+        BOOKMARK_OUTLINE_PROMPT,
+        BOOKMARK_DOCUMENT_CANDIDATE_PLAN_PROMPT,
+        BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_PROMPT,
+        BOOKMARK_DOCUMENT_LANDMARK_PLAN_PROMPT,
+    ]
+
+    for prompt in prompts:
+        assert "Do not aggressively compress" not in prompt
+        assert "procedural waypoint" not in prompt.lower()
+        assert "callout title" not in prompt.lower()
+        assert "preserving useful visible subsection navigation rather than compressing aggressively" not in prompt
+        assert "visible document evidence" in prompt or "cached PDF" in prompt
 
 
 def test_collect_bookmark_heading_candidates_uses_toc_and_post_toc_headings():
@@ -177,6 +222,80 @@ def test_serialize_outline_candidates_for_llm_omits_empty_and_redundant_fields()
     ]
 
 
+def test_serialize_outline_candidates_for_direct_llm_keeps_label_variants_and_raw_text():
+    serialized = _serialize_outline_candidates_for_direct_llm(
+        [
+            {
+                "candidate_id": "heading:4",
+                "source_kind": "heading",
+                "source_index": 4,
+                "preferred_label": "The concept of tagged PDF",
+                "supported_labels": ["The concept of tagged PDF", "The concept of t agged PDF"],
+                "raw_text": "The concept of t agged PDF",
+                "target_page_index": 41,
+                "source_page": 42,
+                "default_level": 2,
+            }
+        ]
+    )
+
+    assert serialized == [
+        {
+            "candidate_id": "heading:4",
+            "source_kind": "heading",
+            "source_index": 4,
+            "preferred_label": "The concept of tagged PDF",
+            "supported_labels": ["The concept of tagged PDF", "The concept of t agged PDF"],
+            "raw_text": "The concept of t agged PDF",
+            "target_page_index": 41,
+            "source_page": 42,
+            "default_level": 2,
+        }
+    ]
+
+
+def test_selected_outline_for_landmark_llm_keeps_outline_evidence_fields():
+    outline_entries, _ = _materialize_outline_entries_from_plan(
+        [
+            {"candidate_id": "heading:4", "level": 2, "label_override": ""},
+        ],
+        outline_candidates=[
+            {
+                "candidate_id": "heading:4",
+                "source_kind": "heading",
+                "source_index": 4,
+                "preferred_label": "Adding IDs",
+                "supported_labels": ["Adding IDs", "ADDING IDs"],
+                "raw_text": "ADDING IDs",
+                "target_page_index": 41,
+                "source_page": 42,
+                "default_level": 2,
+                "previous_visible_label": "4.3.8. Footnotes and endnotes",
+                "next_visible_label": "Procedure:",
+                "previous_body_text": "Section overview paragraph",
+                "following_body_text": "Every footnote must have a unique ID",
+            }
+        ],
+    )
+
+    serialized = _serialize_selected_outline_for_landmark_llm(outline_entries)
+
+    assert serialized == [
+        {
+            "candidate_id": "heading:4",
+            "source_kind": "heading",
+            "label": "Adding IDs",
+            "raw_text": "ADDING IDs",
+            "supported_labels": ["Adding IDs", "ADDING IDs"],
+            "level": 2,
+            "page": 42,
+            "previous_visible_label": "4.3.8. Footnotes and endnotes",
+            "next_visible_label": "Procedure:",
+            "previous_body_text": "Section overview paragraph",
+            "following_body_text": "Every footnote must have a unique ID",
+        }
+    ]
+
 def test_bookmark_intelligence_marks_selected_headings(monkeypatch, tmp_path):
     pdf_path = tmp_path / "sample.pdf"
     pdf_path.write_bytes(b"%PDF-1.4\n% test\n")
@@ -242,6 +361,253 @@ def test_bookmark_intelligence_marks_selected_headings(monkeypatch, tmp_path):
     assert audit["front_matter_applied"] is False
 
 
+def test_bookmark_intelligence_can_use_direct_gemini_for_front_matter(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "sample.pdf"
+    _make_pdf(pdf_path, page_count=4)
+    deleted: list[str] = []
+
+    async def _fake_create_cache(**kwargs):
+        assert kwargs["pdf_path"] == pdf_path
+        return type("CacheHandle", (), {"cache_name": "cache-1", "uploaded_file_name": "file-1"})()
+
+    async def _fake_delete_cache(cache_handle, **kwargs):
+        deleted.append(cache_handle.cache_name)
+
+    async def _fake_cached_request(**kwargs):
+        task_type = kwargs["response_schema"]["properties"]["task_type"]["enum"][0]
+        if task_type == "bookmark_document_candidate_plan":
+            return {
+                "task_type": "bookmark_document_candidate_plan",
+                "summary": "Keep TOC and front matter.",
+                "confidence": "high",
+                "reason": "Grounded visible outline.",
+                "front_matter_entries": [
+                    {"page": 1, "label": "Cover"},
+                ],
+                "outline_entries": [
+                    {"candidate_id": "toc:0", "supported_label": "TABLE OF CONTENTS", "level": 1},
+                    {"candidate_id": "toc:1", "supported_label": "1 Intro", "level": 2},
+                ],
+            }
+        assert task_type == "bookmark_document_heading_supplement"
+        return {
+            "task_type": "bookmark_document_heading_supplement",
+            "summary": "No extra headings beyond the TOC skeleton.",
+            "confidence": "high",
+            "reason": "No additional visible heading improves navigation here.",
+            "outline_entries": [],
+        }
+
+    async def _unexpected_request_llm_json(**kwargs):
+        raise AssertionError("legacy non-direct bookmark path should not be used")
+
+    monkeypatch.setattr("app.services.bookmark_intelligence.direct_gemini_pdf_enabled", lambda: True)
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.create_direct_gemini_pdf_cache",
+        _fake_create_cache,
+    )
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.delete_direct_gemini_pdf_cache",
+        _fake_delete_cache,
+    )
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.request_direct_gemini_cached_json",
+        _fake_cached_request,
+    )
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.request_llm_json",
+        _unexpected_request_llm_json,
+    )
+
+    structure_json = {
+        "elements": [
+            {"type": "heading", "text": "Manual Title", "page": 0, "level": 1},
+            {"type": "toc_caption", "text": "TABLE OF CONTENTS", "page": 1, "toc_group_ref": "toc-0"},
+            {"type": "toc_item", "text": "1 Intro", "page": 1, "toc_group_ref": "toc-0"},
+            {"type": "heading", "text": "1 Intro", "page": 2, "level": 1},
+        ],
+    }
+
+    updated, audit = asyncio.run(
+        enhance_bookmark_structure_with_intelligence(
+            pdf_path=pdf_path,
+            structure_json=structure_json,
+            original_filename="report.pdf",
+            llm_client=object(),
+        )
+    )
+
+    assert updated["bookmark_plan"][0]["text"] == "Cover"
+    assert audit["front_matter_applied"] is True
+    assert deleted == ["cache-1"]
+
+
+def test_bookmark_intelligence_can_use_direct_gemini_for_heading_and_outline(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "sample.pdf"
+    _make_pdf(pdf_path, page_count=4)
+    seen_prompts: list[str] = []
+
+    async def _fake_create_cache(**kwargs):
+        return type("CacheHandle", (), {"cache_name": "cache-2", "uploaded_file_name": "file-2"})()
+
+    async def _fake_delete_cache(cache_handle, **kwargs):
+        return None
+
+    async def _fake_cached_request(**kwargs):
+        seen_prompts.append(kwargs["prompt"])
+        task_type = kwargs["response_schema"]["properties"]["task_type"]["enum"][0]
+        if task_type == "bookmark_document_candidate_plan":
+            return {
+                "task_type": "bookmark_document_candidate_plan",
+                "summary": "Built the final outline.",
+                "confidence": "high",
+                "reason": "Grounded visible outline.",
+                "front_matter_entries": [],
+                "outline_entries": [
+                    {"candidate_id": "toc:0", "supported_label": "TABLE OF CONTENTS", "level": 1},
+                    {"candidate_id": "toc:1", "supported_label": "1 Panel Report", "level": 2},
+                    {"candidate_id": "heading:3", "supported_label": "2 Atlantic Bluefish", "level": 2},
+                ],
+            }
+        assert task_type == "bookmark_document_heading_supplement"
+        return {
+            "task_type": "bookmark_document_heading_supplement",
+            "summary": "No extra headings remain.",
+            "confidence": "high",
+            "reason": "The main outline already contains the useful visible headings.",
+            "outline_entries": [],
+        }
+
+    async def _unexpected_request_llm_json(**kwargs):
+        raise AssertionError("legacy non-direct bookmark path should not be used")
+
+    monkeypatch.setattr("app.services.bookmark_intelligence.direct_gemini_pdf_enabled", lambda: True)
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.create_direct_gemini_pdf_cache",
+        _fake_create_cache,
+    )
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.delete_direct_gemini_pdf_cache",
+        _fake_delete_cache,
+    )
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.request_direct_gemini_cached_json",
+        _fake_cached_request,
+    )
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.request_llm_json",
+        _unexpected_request_llm_json,
+    )
+
+    structure_json = {
+        "elements": [
+            {"type": "toc_caption", "text": "TABLE OF CONTENTS", "page": 1, "toc_group_ref": "toc-0"},
+            {"type": "toc_item", "text": "1 Panel Report", "page": 1, "toc_group_ref": "toc-0"},
+            {"type": "heading", "text": "1 Panel Report", "page": 2, "level": 1},
+            {"type": "heading", "text": "2. ATLANTIC BLUEFISH", "page": 3, "level": 2},
+        ],
+    }
+
+    updated, audit = asyncio.run(
+        enhance_bookmark_structure_with_intelligence(
+            pdf_path=pdf_path,
+            structure_json=structure_json,
+            original_filename="report.pdf",
+            llm_client=object(),
+        )
+    )
+
+    assert any("candidate inventory" in prompt.lower() for prompt in seen_prompts)
+    assert updated["bookmark_plan"][-1]["text"] == "2. ATLANTIC BLUEFISH"
+    assert audit["applied"] is True
+
+
+def test_bookmark_intelligence_can_use_direct_gemini_for_landmark_candidates(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "sample.pdf"
+    _make_pdf(pdf_path, page_count=4)
+
+    async def _fake_create_cache(**kwargs):
+        return type("CacheHandle", (), {"cache_name": "cache-3", "uploaded_file_name": "file-3"})()
+
+    async def _fake_delete_cache(cache_handle, **kwargs):
+        return None
+
+    async def _fake_cached_request(**kwargs):
+        task_type = kwargs["response_schema"]["properties"]["task_type"]["enum"][0]
+        if task_type == "bookmark_document_candidate_plan":
+            return {
+                "task_type": "bookmark_document_candidate_plan",
+                "summary": "Kept the TOC skeleton.",
+                "confidence": "high",
+                "reason": "The TOC already provides the primary section skeleton.",
+                "front_matter_entries": [],
+                "outline_entries": [
+                    {"candidate_id": "toc:0", "supported_label": "TABLE OF CONTENTS", "level": 1},
+                    {"candidate_id": "toc:1", "supported_label": "3 Links", "level": 2},
+                ],
+            }
+        if task_type == "bookmark_document_heading_supplement":
+            return {
+                "task_type": "bookmark_document_heading_supplement",
+                "summary": "No extra visible headings.",
+                "confidence": "high",
+                "reason": "The TOC skeleton already covers the heading structure.",
+                "outline_entries": [],
+            }
+        assert task_type == "bookmark_document_landmark_plan"
+        return {
+            "task_type": "bookmark_document_landmark_plan",
+            "summary": "Selected one visible landmark.",
+            "confidence": "high",
+            "reason": "The paragraph behaves like a visible subsection title.",
+            "selected_landmarks": [
+                {
+                    "page": 4,
+                    "label": "Link texts and the Contents key",
+                    "anchor_candidate_id": "toc:1",
+                    "level": 3,
+                }
+            ],
+        }
+
+    monkeypatch.setattr("app.services.bookmark_intelligence.direct_gemini_pdf_enabled", lambda: True)
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.create_direct_gemini_pdf_cache",
+        _fake_create_cache,
+    )
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.delete_direct_gemini_pdf_cache",
+        _fake_delete_cache,
+    )
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.request_direct_gemini_cached_json",
+        _fake_cached_request,
+    )
+
+    structure_json = {
+        "elements": [
+            {"type": "toc_caption", "text": "TABLE OF CONTENTS", "page": 1, "toc_group_ref": "toc-0"},
+            {"type": "toc_item", "text": "3 Links", "page": 1, "toc_group_ref": "toc-0"},
+            {"type": "heading", "text": "3 Links", "page": 2, "level": 1},
+            {"type": "paragraph", "text": "Introductory body paragraph.", "page": 2},
+            {"type": "paragraph", "text": "Link texts and the Contents key", "page": 3},
+            {"type": "paragraph", "text": "Meaningful link texts help users understand the purpose of the link.", "page": 3},
+        ],
+    }
+
+    updated, audit = asyncio.run(
+        enhance_bookmark_structure_with_intelligence(
+            pdf_path=pdf_path,
+            structure_json=structure_json,
+            original_filename="report.pdf",
+            llm_client=object(),
+        )
+    )
+
+    assert updated["bookmark_plan"][-1]["text"] == "Link texts and the Contents key"
+    assert audit["selected_landmark_count"] == 1
+
+
 def test_bookmark_intelligence_materializes_outline_plan(monkeypatch, tmp_path):
     pdf_path = tmp_path / "sample.pdf"
     pdf_path.write_bytes(b"%PDF-1.4\n% test\n")
@@ -300,34 +666,56 @@ def test_bookmark_intelligence_materializes_outline_plan(monkeypatch, tmp_path):
         )
     )
 
-    assert updated["bookmark_plan"] == [
-        {
-            "candidate_id": "toc:0",
-            "source_kind": "toc",
-            "source_index": 0,
-            "text": "TABLE OF CONTENTS",
-            "page_index": 2,
-            "level": 1,
-        },
-        {
-            "candidate_id": "toc:1",
-            "source_kind": "toc",
-            "source_index": 1,
-            "text": "1 Panel Report",
-            "page_index": 3,
-            "level": 2,
-        },
-        {
-            "candidate_id": "heading:3",
-            "source_kind": "heading",
-            "source_index": 3,
-            "text": "2 Atlantic Bluefish",
-            "page_index": 4,
-            "level": 2,
-        },
+    assert [(entry["candidate_id"], entry["text"], entry["level"]) for entry in updated["bookmark_plan"]] == [
+        ("toc:0", "TABLE OF CONTENTS", 1),
+        ("toc:1", "1 Panel Report", 2),
+        ("heading:3", "2 Atlantic Bluefish", 2),
     ]
+    assert updated["bookmark_plan"][-1]["raw_text"] == "2. ATLANTIC BLUEFISH"
+    assert updated["bookmark_plan"][-1]["supported_labels"] == ["2 Atlantic Bluefish"]
     assert audit["outline_plan_applied"] is True
     assert audit["outline_entry_count"] == 3
+
+
+def test_materialize_outline_entries_accepts_supported_label_field():
+    outline_entries, seen_ids = _materialize_outline_entries_from_plan(
+        [
+            {"candidate_id": "heading:4", "level": 2, "supported_label": "Adding IDs"},
+        ],
+        outline_candidates=[
+            {
+                "candidate_id": "heading:4",
+                "source_kind": "heading",
+                "source_index": 4,
+                "preferred_label": "Adding IDs",
+                "supported_labels": ["Adding IDs", "ADDING IDs"],
+                "raw_text": "ADDING IDs",
+                "target_page_index": 41,
+                "source_page": 42,
+                "default_level": 2,
+            }
+        ],
+    )
+
+    assert seen_ids == {"heading:4"}
+    assert outline_entries == [
+        {
+            "candidate_id": "heading:4",
+            "source_kind": "heading",
+            "source_index": 4,
+            "text": "Adding IDs",
+            "raw_text": "ADDING IDs",
+            "preferred_label": "Adding IDs",
+            "supported_labels": ["Adding IDs", "ADDING IDs"],
+            "page_index": 41,
+            "level": 2,
+            "previous_visible_label": None,
+            "next_visible_label": None,
+            "anchor_heading_text": None,
+            "previous_body_text": None,
+            "following_body_text": None,
+        }
+    ]
 
 
 def test_bookmark_intelligence_materializes_non_heading_landmark_candidates(monkeypatch, tmp_path):
@@ -397,42 +785,24 @@ def test_bookmark_intelligence_materializes_non_heading_landmark_candidates(monk
         )
     )
 
-    assert updated["bookmark_plan"] == [
-        {
-            "candidate_id": "toc:0",
-            "source_kind": "toc",
-            "source_index": 0,
-            "text": "TABLE OF CONTENTS",
-            "page_index": 2,
-            "level": 1,
-        },
-        {
-            "candidate_id": "toc:1",
-            "source_kind": "toc",
-            "source_index": 1,
-            "text": "1 Panel Report",
-            "page_index": 3,
-            "level": 2,
-        },
-        {
-            "candidate_id": "landmark:3",
-            "source_kind": "landmark",
-            "source_index": 3,
-            "text": "Link texts and the Contents key",
-            "page_index": 4,
-            "level": 3,
-        },
+    assert [(entry["candidate_id"], entry["text"], entry["level"]) for entry in updated["bookmark_plan"]] == [
+        ("toc:0", "TABLE OF CONTENTS", 1),
+        ("toc:1", "1 Panel Report", 2),
+        ("landmark:3", "Link texts and the Contents key", 3),
     ]
+    assert updated["bookmark_plan"][-1]["raw_text"] == "Link texts and the Contents key"
     assert audit["selected_landmark_count"] == 1
     assert audit["outline_plan_applied"] is True
 
 
 def test_bookmark_intelligence_prepends_front_matter_entries(monkeypatch, tmp_path):
     pdf_path = tmp_path / "sample.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4\n% test\n")
+    _make_pdf(pdf_path)
 
     async def _fake_request_llm_json(*, llm_client, content, schema_name, response_schema, cache_breakpoint_index):
         if schema_name == "bookmark_front_matter":
+            assert sum(1 for part in content if part.get("type") == "file") == 1
+            assert not any(part.get("type") == "image_url" for part in content)
             return {
                 "task_type": "bookmark_front_matter",
                 "summary": "Identified the three pre-TOC page roles.",
@@ -520,6 +890,109 @@ def test_bookmark_intelligence_prepends_front_matter_entries(monkeypatch, tmp_pa
     assert audit["front_matter_entry_count"] == 3
 
 
+def test_bookmark_intelligence_uses_prefetched_front_matter_entries(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "sample.pdf"
+    _make_pdf(pdf_path)
+    seen_schema_names: list[str] = []
+
+    async def _fake_request_llm_json(*, llm_client, content, schema_name, response_schema, cache_breakpoint_index):
+        seen_schema_names.append(schema_name)
+        if schema_name == "bookmark_front_matter":
+            raise AssertionError("prefetched front matter should skip a second front-matter LLM call")
+        if schema_name == "bookmark_heading_selection":
+            return {
+                "task_type": "bookmark_heading_selection",
+                "summary": "No extra headings beyond the TOC.",
+                "confidence": "high",
+                "reason": "The TOC already covers the visible structure.",
+                "selected_heading_indexes": [],
+                "label_overrides": {},
+            }
+        assert schema_name == "bookmark_outline_plan"
+        return {
+            "task_type": "bookmark_outline_plan",
+            "summary": "Built the TOC outline.",
+            "confidence": "high",
+            "reason": "The TOC should remain intact after the front-matter entries.",
+            "outline_entries": [
+                {"candidate_id": "toc:0", "level": 1, "label_override": ""},
+                {"candidate_id": "toc:1", "level": 2, "label_override": ""},
+            ],
+        }
+
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.request_llm_json",
+        _fake_request_llm_json,
+    )
+
+    structure_json = {
+        "elements": [
+            {"type": "heading", "text": "Management Track Assessments Spring 2023", "page": 0, "level": 1},
+            {"type": "heading", "text": "U.S. Department of Commerce", "page": 1, "level": 1},
+            {"type": "heading", "text": "NOAA Technical Memorandum, Editorial Notes", "page": 2, "level": 1},
+            {"type": "toc_caption", "text": "TABLE OF CONTENTS", "page": 3, "toc_group_ref": "toc-0"},
+            {"type": "toc_item", "text": "1 Panel Report", "page": 3, "toc_group_ref": "toc-0"},
+            {"type": "heading", "text": "1 Panel Report", "page": 4, "level": 1},
+        ],
+    }
+
+    updated, audit = asyncio.run(
+        enhance_bookmark_structure_with_intelligence(
+            pdf_path=pdf_path,
+            structure_json=structure_json,
+            original_filename="report.pdf",
+            llm_client=object(),
+            prefetched_front_matter_entries=[
+                {
+                    "candidate_id": "front:0",
+                    "source_kind": "front_matter",
+                    "source_index": 0,
+                    "text": "Cover",
+                    "page_index": 0,
+                    "level": 1,
+                },
+                {
+                    "candidate_id": "front:1",
+                    "source_kind": "front_matter",
+                    "source_index": 1,
+                    "text": "Inside-Cover page",
+                    "page_index": 1,
+                    "level": 1,
+                },
+            ],
+            prefetched_front_matter_audit={
+                "attempted": True,
+                "applied": True,
+                "reason": "Combined early-pages intelligence already identified front matter.",
+                "confidence": "high",
+                "entry_count": 2,
+            },
+        )
+    )
+
+    assert "bookmark_front_matter" not in seen_schema_names
+    assert updated["bookmark_plan"][:2] == [
+        {
+            "candidate_id": "front:0",
+            "source_kind": "front_matter",
+            "source_index": 0,
+            "text": "Cover",
+            "page_index": 0,
+            "level": 1,
+        },
+        {
+            "candidate_id": "front:1",
+            "source_kind": "front_matter",
+            "source_index": 1,
+            "text": "Inside-Cover page",
+            "page_index": 1,
+            "level": 1,
+        },
+    ]
+    assert audit["front_matter_applied"] is True
+    assert audit["front_matter_entry_count"] == 2
+
+
 def test_bookmark_intelligence_passes_duplicate_evidence_to_outline_llm(monkeypatch, tmp_path):
     pdf_path = tmp_path / "sample.pdf"
     pdf_path.write_bytes(b"%PDF-1.4\n% test\n")
@@ -595,23 +1068,12 @@ def test_bookmark_intelligence_passes_duplicate_evidence_to_outline_llm(monkeypa
     )
 
     assert updated["elements"][2]["bookmark_include"] is True
-    assert updated["bookmark_plan"] == [
-        {
-            "candidate_id": "toc:0",
-            "source_kind": "toc",
-            "source_index": 0,
-            "text": "TABLE OF CONTENTS",
-            "page_index": 2,
-            "level": 1,
-        },
-        {
-            "candidate_id": "toc:1",
-            "source_kind": "toc",
-            "source_index": 1,
-            "text": "7.1. Automated testing with PAC: PDF Accessibility Checker",
-            "page_index": 58,
-            "level": 2,
-        },
+    assert [(entry["candidate_id"], entry["text"], entry["level"]) for entry in updated["bookmark_plan"]] == [
+        ("toc:0", "TABLE OF CONTENTS", 1),
+        ("toc:1", "7.1. Automated testing with PAC: PDF Accessibility Checker", 2),
+    ]
+    assert updated["bookmark_plan"][1]["supported_labels"] == [
+        "7.1. Automated testing with PAC: PDF Accessibility Checker"
     ]
     assert '"candidate_id": "heading:2"' in outline_contexts[0]
     assert audit["outline_entry_count"] == 3
@@ -1013,8 +1475,16 @@ def test_bookmark_intelligence_splits_large_candidate_sets_into_chunks(monkeypat
                 "summary": "No extra headings in this chunk.",
                 "confidence": "high",
                 "reason": "No durable extra landmarks here.",
-                "selected_heading_indexes": [],
-                "label_overrides": {},
+                    "selected_heading_indexes": [],
+                    "label_overrides": {},
+                }
+        if schema_name == "bookmark_chunk_shortlist":
+            return {
+                "task_type": "bookmark_chunk_shortlist",
+                "summary": "Review both heading chunks.",
+                "confidence": "low",
+                "reason": "Keep the full heading candidate set in play.",
+                "selected_chunk_indexes": [0, 1],
             }
         assert schema_name == "bookmark_outline_plan"
         return {

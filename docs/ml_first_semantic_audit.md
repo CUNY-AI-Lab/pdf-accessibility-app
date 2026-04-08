@@ -2,6 +2,24 @@
 
 This audit separates acceptable deterministic logic from places where the app is still making semantic decisions locally instead of relying on Docling evidence and LLM judgment.
 
+## Current target architecture
+
+This is the current direction for the app's semantic pipeline and bookmark/navigation work.
+
+- Use direct Gemini for PDF-understanding lanes, not a proxy layer, whenever the task depends on document-native evidence.
+- Upload or reuse bounded PDF slices through Gemini's file/document path and context caching when the same slice will support multiple semantic questions.
+- Use Gemini native structured output with JSON Schema instead of prompt-only schema descriptions.
+- Give the model grounded candidate inventories with stable `candidate_id` values and source provenance, then let the model adjudicate keep/drop, label, level, and parent relationships.
+- Split long-document work by coherent slices or candidate groups when recall depends on many specific items; use caching to preserve economics across those follow-up calls.
+- Keep deterministic code limited to evidence gathering, candidate IDs, schema validation, dedupe, safety bounds, audit logging, and PDF writing.
+
+This means the app should not drift back toward:
+
+- prompt language that encodes benchmark-shaped navigation policy
+- local ranking rules for which bookmarks "feel" useful
+- fuzzy post-hoc interpretation of model labels when the model could have selected a grounded candidate ID directly
+- whole-document freeform summarization when the task really needs exhaustive retrieval over many specific candidates
+
 The standard:
 
 - Extraction should gather raw document evidence.

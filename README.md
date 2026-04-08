@@ -24,7 +24,7 @@ Upload a PDF and the app automatically remediates it through a multi-step pipeli
 | Frontend | React, TypeScript, Vite, Tailwind CSS 4, TanStack Query |
 | PDF Processing | pikepdf, OCRmyPDF, Ghostscript, Poppler, QPDF |
 | Structure Extraction | Docling (local or docling-serve) |
-| Semantic Analysis | Vision LLM via OpenAI-compatible API (e.g., OpenRouter) |
+| Semantic Analysis | Gemini Developer API (`gemini-3-flash-preview`) |
 | OCR | OCRmyPDF, Tesseract |
 | Validation | veraPDF |
 
@@ -46,17 +46,20 @@ On macOS: install via Homebrew. On Ubuntu/Debian: `ghostscript`, `poppler-utils`
 
 ```bash
 cp .env.example .env
-# Edit .env — at minimum, set LLM_API_KEY
+# Edit .env — at minimum, set GEMINI_API_KEY
 ```
 
 Key environment variables:
 
 | Variable | Description | Default |
 |---|---|---|
-| `LLM_BASE_URL` | OpenAI-compatible API base URL | `https://openrouter.ai/api/v1` |
-| `LLM_API_KEY` | API key for the LLM provider | — |
+| `GEMINI_API_KEY` | Google Gemini API key for direct PDF understanding and fallback chat-completions calls | — |
+| `LLM_BASE_URL` | Gemini Developer API chat-completions base URL | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| `LLM_API_KEY` | Optional override for the chat-completions client; falls back to `GEMINI_API_KEY` when unset | — |
 | `LLM_MODEL` | Model identifier | `google/gemini-3-flash-preview` |
+| `GEMINI_MODEL` | Direct Gemini model identifier for native PDF lanes | `gemini-3-flash-preview` |
 | `DOCLING_SERVE_URL` | Local or remote `docling-serve` URL for structure extraction | — |
+| `DOCLING_SERVE_TOKEN` | Optional bearer token for a protected `docling-serve` proxy | — |
 | `OCR_LANGUAGE` | Default Tesseract language code | `eng` |
 | `JOB_TTL_HOURS` | Hours before jobs expire | `12` |
 | `VERAPDF_PATH` | Path to veraPDF binary | `verapdf` |
@@ -90,7 +93,7 @@ The frontend proxies `/api` and `/health` to the backend via Vite config.
 
 For the main app on this machine, the intended setup is:
 
-- LLM semantics through an OpenAI-compatible API endpoint such as OpenRouter
+- LLM semantics through the Gemini Developer API
 - structure extraction through local `docling-serve`
 - Apple GPU acceleration through MPS on the `docling-serve` process when available
 

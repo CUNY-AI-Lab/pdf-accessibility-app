@@ -11,7 +11,7 @@ def _ok_response(request: httpx.Request, payload: dict | None = None) -> httpx.R
 
 def test_llm_client_honors_retry_after_header(monkeypatch):
     client = LlmClient(
-        base_url="https://openrouter.ai/api/v1",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
         api_key="test",
         model="google/gemini-3-flash-preview",
         max_retries=1,
@@ -48,7 +48,7 @@ def test_llm_client_honors_retry_after_header(monkeypatch):
 
 def test_llm_client_retries_transport_error_then_succeeds(monkeypatch):
     client = LlmClient(
-        base_url="https://openrouter.ai/api/v1",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
         api_key="test",
         model="google/gemini-3-flash-preview",
         max_retries=2,
@@ -81,7 +81,7 @@ def test_llm_client_retries_transport_error_then_succeeds(monkeypatch):
 
 def test_llm_client_limits_concurrency(monkeypatch):
     client = LlmClient(
-        base_url="https://openrouter.ai/api/v1",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
         api_key="test",
         model="google/gemini-3-flash-preview",
         max_retries=0,
@@ -115,9 +115,9 @@ def test_llm_client_limits_concurrency(monkeypatch):
     assert state["max_seen"] == 2
 
 
-def test_llm_client_tracks_openrouter_usage_cost(monkeypatch):
+def test_llm_client_tracks_usage_cost(monkeypatch):
     client = LlmClient(
-        base_url="https://openrouter.ai/api/v1",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
         api_key="test",
         model="google/gemini-3-flash-preview",
         max_retries=0,

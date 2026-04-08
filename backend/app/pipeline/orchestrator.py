@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import pikepdf
 from sqlalchemy import delete, select
@@ -28,6 +29,9 @@ from app.pipeline.validator import validate_pdf
 from app.services.applied_changes import add_applied_change
 from app.services.auto_structure_apply import auto_apply_structure_tasks
 from app.services.bookmark_intelligence import enhance_bookmark_structure_with_intelligence
+from app.services.early_pages_intelligence import (
+    enhance_document_title_and_front_matter_with_intelligence,
+)
 from app.services.file_storage import create_job_dir, get_output_path
 from app.services.font_intelligence_auto import (
     attempt_auto_llm_font_map as _attempt_auto_llm_font_map,
@@ -850,7 +854,7 @@ async def _apply_pretag_table_intelligence(
             page_items_by_id: dict[str, dict[str, object]] = {}
             for page_number, page_targets in sorted(targets_by_page.items()):
                 try:
-                    page_items = await _await_llm_operation(
+                    page_result = await _await_llm_operation(
                         settings=settings,
                         label=f"table_page_intelligence[{page_number}]",
                         timeout_seconds=pretag_timeout,
@@ -865,6 +869,7 @@ async def _apply_pretag_table_intelligence(
                 except Exception:
                     audit["page_batch_failed_count"] = int(audit.get("page_batch_failed_count", 0)) + 1
                     continue
+                page_items = page_result
                 for item in page_items:
                     if not isinstance(item, dict):
                         continue
@@ -1135,10 +1140,11 @@ async def _apply_pretag_widget_rationalization(
             page_items_by_id: dict[str, dict[str, object]] = {}
             for page_number, page_targets in sorted(targets_by_page.items()):
                 try:
-                    page_items = await _generate_page(page_number, page_targets)
+                    page_result = await _generate_page(page_number, page_targets)
                 except Exception:
                     audit["page_batch_failed_count"] = int(audit.get("page_batch_failed_count", 0)) + 1
                     continue
+                page_items = page_result
                 for item in page_items:
                     if not isinstance(item, dict):
                         continue
@@ -1318,10 +1324,11 @@ async def _apply_pretag_form_intelligence(
             page_items_by_id: dict[str, dict[str, object]] = {}
             for page_number, page_targets in sorted(targets_by_page.items()):
                 try:
-                    page_items = await _generate_page(page_number, page_targets)
+                    page_result = await _generate_page(page_number, page_targets)
                 except Exception:
                     audit["page_batch_failed_count"] = int(audit.get("page_batch_failed_count", 0)) + 1
                     continue
+                page_items = page_result
                 for item in page_items:
                     if not isinstance(item, dict):
                         continue
@@ -5060,6 +5067,9 @@ async def run_pipeline(
             ):
                 llm_client = make_llm_client(settings)
                 try:
+                    combined_early_pages_used = False
+                    prefetched_front_matter_entries: list[dict[str, Any]] | None = None
+                    prefetched_front_matter_audit: dict[str, Any] | None = None
                     if settings.assist_toc_with_llm:
                         with track_llm_usage() as usage:
                             try:
@@ -5085,29 +5095,64 @@ async def run_pipeline(
                                 structure_intelligence_llm_usage,
                                 toc_intelligence_assist.get("llm_usage"),
                             )
-                    if settings.assist_title_with_llm:
+                    if settings.assist_title_with_llm and settings.assist_bookmarks_with_llm:
                         with track_llm_usage() as usage:
                             try:
-                                structure.document_json, title_intelligence_assist = await enhance_document_title_with_intelligence(
+                                (
+                                    structure.document_json,
+                                    combined_title_assist,
+                                    prefetched_front_matter_entries,
+                                    prefetched_front_matter_audit,
+                                ) = await enhance_document_title_and_front_matter_with_intelligence(
                                     pdf_path=working_pdf,
                                     structure_json=structure.document_json,
                                     original_filename=job.original_filename or input_path.name,
                                     llm_client=llm_client,
                                 )
+                                combined_early_pages_used = bool(
+                                    combined_title_assist.get("attempted", False)
+                                ) or bool(
+                                    (prefetched_front_matter_audit or {}).get("attempted", False)
+                                )
+                                if combined_early_pages_used:
+                                    title_intelligence_assist = combined_title_assist
                             except Exception as exc:
                                 logger.warning(
-                                    f"Title intelligence assist failed for {job.original_filename}: {exc}"
+                                    f"Early-pages intelligence assist failed for {job.original_filename}: {exc}"
                                 )
-                                title_intelligence_assist = {
-                                    "attempted": True,
-                                    "applied": False,
-                                    "reason": str(exc),
-                                }
-                            title_intelligence_assist["llm_usage"] = _llm_usage_snapshot(usage)
-                            _accumulate_llm_usage(
-                                structure_intelligence_llm_usage,
-                                title_intelligence_assist.get("llm_usage"),
-                            )
+                                combined_early_pages_used = False
+                                prefetched_front_matter_entries = None
+                                prefetched_front_matter_audit = None
+                            if combined_early_pages_used:
+                                title_intelligence_assist["llm_usage"] = _llm_usage_snapshot(usage)
+                                _accumulate_llm_usage(
+                                    structure_intelligence_llm_usage,
+                                    title_intelligence_assist.get("llm_usage"),
+                                )
+                    if settings.assist_title_with_llm:
+                        if not combined_early_pages_used:
+                            with track_llm_usage() as usage:
+                                try:
+                                    structure.document_json, title_intelligence_assist = await enhance_document_title_with_intelligence(
+                                        pdf_path=working_pdf,
+                                        structure_json=structure.document_json,
+                                        original_filename=job.original_filename or input_path.name,
+                                        llm_client=llm_client,
+                                    )
+                                except Exception as exc:
+                                    logger.warning(
+                                        f"Title intelligence assist failed for {job.original_filename}: {exc}"
+                                    )
+                                    title_intelligence_assist = {
+                                        "attempted": True,
+                                        "applied": False,
+                                        "reason": str(exc),
+                                    }
+                                title_intelligence_assist["llm_usage"] = _llm_usage_snapshot(usage)
+                                _accumulate_llm_usage(
+                                    structure_intelligence_llm_usage,
+                                    title_intelligence_assist.get("llm_usage"),
+                                )
                     if settings.assist_bookmarks_with_llm:
                         with track_llm_usage() as usage:
                             try:
@@ -5116,6 +5161,16 @@ async def run_pipeline(
                                     structure_json=structure.document_json,
                                     original_filename=job.original_filename or input_path.name,
                                     llm_client=llm_client,
+                                    prefetched_front_matter_entries=(
+                                        prefetched_front_matter_entries
+                                        if combined_early_pages_used
+                                        else None
+                                    ),
+                                    prefetched_front_matter_audit=(
+                                        prefetched_front_matter_audit
+                                        if combined_early_pages_used
+                                        else None
+                                    ),
                                 )
                             except Exception as exc:
                                 logger.warning(
@@ -5460,6 +5515,15 @@ async def run_tagging_and_validation(
         )
         job.structure_json = json.dumps(structure_json)
 
+        pretag_llm_usage = _empty_llm_usage()
+        for audit in (
+            pretag_grounded_text,
+            pretag_table_intelligence,
+            pretag_widget_rationalization,
+            pretag_form_intelligence,
+        ):
+            _accumulate_llm_usage(pretag_llm_usage, audit.get("llm_usage"))
+
         tagging_result = await tag_pdf(
             input_path=working_pdf,
             output_path=output_path,
@@ -5513,6 +5577,11 @@ async def run_tagging_and_validation(
                 "form_intelligence_auto_applied_count": int(
                     pretag_form_intelligence.get("applied_count", 0) or 0
                 ),
+                "pretag_llm_usage": pretag_llm_usage,
+                "grounded_text_audit": pretag_grounded_text,
+                "table_intelligence_audit": pretag_table_intelligence,
+                "widget_rationalization_audit": pretag_widget_rationalization,
+                "form_intelligence_audit": pretag_form_intelligence,
             },
         )
         job_manager.emit_progress(job_id, step="tagging", status="complete")

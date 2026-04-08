@@ -6,15 +6,16 @@ from app.models import Job
 from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_llm_utils import (
     context_json_part,
-    page_preview_parts,
+    pdf_file_parts,
     preferred_cache_breakpoint_index,
     request_llm_json,
+    request_llm_json_with_response,
 )
 from app.services.llm_client import LlmClient
 
 WIDGET_BATCH_PROMPT = """You are a PDF accessibility widget-rationalization assistant.
 
-You will receive exactly one PDF page preview and a list of suspicious widget annotations from that page.
+You will receive exactly one PDF page and a list of suspicious widget annotations from that page.
 
 Goal:
 - decide whether each widget should remain as a real interactive control
@@ -141,7 +142,7 @@ async def generate_widget_intelligence(
     }
     content = [
         {"type": "text", "text": WIDGET_BATCH_PROMPT},
-        *page_preview_parts(job, [page_number]),
+        *pdf_file_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
         context_json_part(payload),
     ]
     parsed = await request_llm_json(
@@ -186,10 +187,10 @@ async def generate_widget_intelligence_for_page(
     }
     content = [
         {"type": "text", "text": WIDGET_BATCH_PROMPT},
-        *page_preview_parts(job, [page_number]),
+        *pdf_file_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
         context_json_part(payload),
     ]
-    parsed = await request_llm_json(
+    parsed, _response = await request_llm_json_with_response(
         llm_client=llm_client,
         content=content,
         schema_name="widget_page_intelligence",
@@ -208,7 +209,7 @@ async def generate_widget_intelligence_for_page(
                 continue
             decision_map[field_review_id] = item
 
-    return [
+    results = [
         _normalize_widget_intelligence_result(
             field_review_id=str(target.get("field_review_id") or "").strip(),
             page_number=page_number,
@@ -219,3 +220,4 @@ async def generate_widget_intelligence_for_page(
         )
         for target in targets
     ]
+    return results

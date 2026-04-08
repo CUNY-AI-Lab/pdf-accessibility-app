@@ -8,7 +8,8 @@ from app.models import Job
 from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_llm_utils import (
     context_json_part,
-    page_preview_parts,
+    pdf_file_parts,
+    preferred_cache_breakpoint_index,
     request_llm_json,
 )
 from app.services.llm_client import LlmClient
@@ -30,8 +31,8 @@ Your goal is to decide the most faithful local accessible interpretation of that
 
 Rules:
 - Only decide for the provided unit_id and unit_type.
-- Preserve visible meaning. Do not invent document content that is not supported by the image and local evidence.
-- Use the page image, local crop, native_text_candidate, ocr_text_candidate, nearby_context, structure_context, and metadata together.
+- Preserve visible meaning. Do not invent document content that is not supported by the provided PDF pages, crop preview, and local evidence.
+- Use the PDF page evidence, local crop, native_text_candidate, ocr_text_candidate, nearby_context, structure_context, and metadata together.
 - When semantic_unit.metadata.reviewer_feedback is present, treat it as a human correction of previous intelligence output. Use it as high-value context, but only follow it when it still matches the visible evidence and accessibility goal.
 - When semantic_unit.metadata.previous_intelligence is present, treat it as the prior intelligence output for this same local unit. Revise it minimally when it still matches the visible evidence, and diverge from it explicitly when the visible evidence or reviewer feedback requires a different interpretation.
 - Prefer one of the provided text candidates when it clearly matches the visible content.
@@ -284,7 +285,11 @@ async def adjudicate_semantic_unit(
         page_numbers.extend(
             page_number for page_number in extra_pages if isinstance(page_number, int)
         )
-    page_images = page_preview_parts(job, page_numbers)
+    page_images = pdf_file_parts(
+        job,
+        page_numbers,
+        filename=getattr(job, "original_filename", None),
+    )
     try:
         if job is not None and unit.bbox:
             from app.services.intelligence_llm_utils import job_pdf_path
@@ -313,19 +318,16 @@ async def adjudicate_semantic_unit(
     }
     prompt_text = (
         f"{SEMANTIC_ADJUDICATION_PROMPT}\n\n"
-        "Image order: full-page preview first when available, followed by any extra page previews, "
-        "then the crop preview for this semantic unit if available, then any unit-specific image previews."
+        "Evidence order: PDF page input first, followed by the crop preview for this semantic unit "
+        "if available, then any unit-specific image previews."
     )
     content = [
-        {
-            "type": "text",
-            "text": prompt_text,
-        },
+        {"type": "text", "text": prompt_text},
         *page_images,
-        context_json_part(payload),
         *unit_images,
+        context_json_part(payload),
     ]
-    cache_breakpoint_index = len(page_images) if page_images else 0
+    cache_breakpoint_index = preferred_cache_breakpoint_index(content)
 
     parsed = await request_llm_json(
         llm_client=llm_client,

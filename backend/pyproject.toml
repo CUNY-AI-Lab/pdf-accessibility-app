@@ -24,6 +24,7 @@ dependencies = [
     "scipy>=1.17.0",
     "rtree>=1.4.0",
     "tenacity>=9.0.0",
+    "google-genai>=1.30.0",
 ]
 
 [project.optional-dependencies]

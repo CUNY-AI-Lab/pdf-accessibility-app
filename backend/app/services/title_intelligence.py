@@ -4,9 +4,13 @@ from types import SimpleNamespace
 from typing import Any
 
 from app.pipeline.structure import _collapse_spaced_title_caps
+from app.services.gemini_direct import (
+    direct_gemini_pdf_enabled,
+    request_direct_gemini_pdf_json,
+)
 from app.services.intelligence_llm_utils import (
     context_json_part,
-    page_preview_parts,
+    pdf_file_parts,
     preferred_cache_breakpoint_index,
     request_llm_json,
 )
@@ -30,7 +34,7 @@ TITLE_INTELLIGENCE_PROMPT = """You are a PDF accessibility title extraction assi
 Decide the best document title for assistive metadata using early-page visible evidence and structural candidates.
 
 Rules:
-- Use only visible evidence from the page previews and the provided structural candidates.
+- Use only visible evidence from the provided PDF pages and the structural candidates.
 - Prefer the document's main title, not author lines, institutional boilerplate, dates, running headers, or filenames.
 - When the visible title is split across adjacent heading fragments, combine them into one natural title.
 - Preserve numbering only when it is visibly part of the title, such as a chapter number.
@@ -112,9 +116,13 @@ async def enhance_document_title_with_intelligence(
             "type": "text",
             "text": TITLE_INTELLIGENCE_PROMPT,
         },
-        *page_preview_parts(job, list(range(1, TITLE_MAX_PAGES + 1))),
+        *pdf_file_parts(
+            job,
+            list(range(1, TITLE_MAX_PAGES + 1)),
+            filename=original_filename,
+        ),
         context_json_part(
-            {
+            context_payload := {
                 "job_filename": original_filename,
                 "title_candidates": candidates,
                 "current_title": existing_title,
@@ -122,13 +130,26 @@ async def enhance_document_title_with_intelligence(
             prefix="Title extraction context:\n",
         ),
     ]
-    parsed = await request_llm_json(
-        llm_client=llm_client,
-        content=content,
-        schema_name="document_title_extraction",
-        response_schema=TITLE_DECISION_SCHEMA,
-        cache_breakpoint_index=preferred_cache_breakpoint_index(content),
-    )
+    if direct_gemini_pdf_enabled():
+        parsed = await request_direct_gemini_pdf_json(
+            pdf_path=pdf_path,
+            page_numbers=list(range(1, TITLE_MAX_PAGES + 1)),
+            prompt=TITLE_INTELLIGENCE_PROMPT,
+            context_payload=context_payload,
+            response_schema=TITLE_DECISION_SCHEMA,
+            system_instruction=(
+                "You are evaluating PDF accessibility and document title metadata. "
+                "Stay grounded in the provided PDF pages."
+            ),
+        )
+    else:
+        parsed = await request_llm_json(
+            llm_client=llm_client,
+            content=content,
+            schema_name="document_title_extraction",
+            response_schema=TITLE_DECISION_SCHEMA,
+            cache_breakpoint_index=preferred_cache_breakpoint_index(content),
+        )
     confidence = str(parsed.get("confidence") or "").strip().lower()
     title = _collapse_spaced_title_caps(parsed.get("title"))
     applied = confidence in {"high", "medium"} and bool(title)

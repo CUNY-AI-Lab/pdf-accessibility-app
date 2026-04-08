@@ -37,7 +37,7 @@ Status legend:
 | Outcome summary in UI | Covered | [frontend/src/pages/JobDetailPage.tsx](../frontend/src/pages/JobDetailPage.tsx), [frontend/src/components/OutcomeHero.tsx](../frontend/src/components/OutcomeHero.tsx) | The UI clearly shows whether a job is release-ready. |
 | Compliance provenance | Covered | [backend/app/pipeline/orchestrator.py](../backend/app/pipeline/orchestrator.py), [frontend/src/components/ValidationReport.tsx](../frontend/src/components/ValidationReport.tsx) | Validator name, timing, and report details are exposed. |
 | Distinguish release-ready, optional review, and manual remediation | Covered | [backend/app/services/review_surface.py](../backend/app/services/review_surface.py), [frontend/src/pages/ReviewPage.tsx](../frontend/src/pages/ReviewPage.tsx), [frontend/src/components/OutcomeHero.tsx](../frontend/src/components/OutcomeHero.tsx) | Only human-legible follow-up items are shown. Structural blockers stay off-screen and drive manual remediation. |
-| Structured benchmark/cost output | Covered | [backend/scripts/corpus_benchmark.py](../backend/scripts/corpus_benchmark.py), [backend/app/services/llm_client.py](../backend/app/services/llm_client.py) | Benchmark output now includes real OpenRouter cost data. |
+| Structured benchmark/cost output | Covered | [backend/scripts/corpus_benchmark.py](../backend/scripts/corpus_benchmark.py), [backend/app/services/llm_client.py](../backend/app/services/llm_client.py) | Benchmark output now includes recorded Gemini/provider usage and cost data. |
 | Search/catalog-facing accessibility metadata | Missing | - | No downstream discovery/catalog export model yet. |
 
 ## Current Product Position

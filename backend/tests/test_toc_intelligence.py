@@ -1,6 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
+from app.services.intelligence_gemini_toc import generate_toc_group_intelligence
 from app.services.toc_intelligence import (
     apply_toc_intelligence,
     collect_toc_candidates,
@@ -224,3 +225,51 @@ def test_enhance_toc_structure_chunks_large_existing_toc_groups(monkeypatch, tmp
     assert updated["elements"][25]["text"] == "6.1 Reviewer Comments: Scup"
     assert audit["applied"] is True
     assert audit["chunk_count"] == 2
+
+
+def test_generate_toc_group_intelligence_can_use_direct_gemini(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "sample.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n% test\n")
+
+    async def _fake_direct_request(**kwargs):
+        assert kwargs["page_numbers"] == [1, 2]
+        assert kwargs["context_payload"]["semantic_unit"]["caption_index"] == 0
+        return {
+            "task_type": "toc_group_intelligence",
+            "summary": "Visible TOC confirmed.",
+            "confidence": "high",
+            "reason": "The pages show a standard TOC.",
+            "is_toc": True,
+            "entry_indexes": [1, 2],
+            "entry_types": {"1": "toc_item", "2": "toc_item_table"},
+            "caption_text_override": "TABLE OF CONTENTS",
+            "entry_text_overrides": {"1": "Introduction"},
+        }
+
+    monkeypatch.setattr("app.services.intelligence_gemini_toc.direct_gemini_pdf_enabled", lambda: True)
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_toc.request_direct_gemini_pdf_json",
+        _fake_direct_request,
+    )
+
+    result = asyncio.run(
+        generate_toc_group_intelligence(
+            pdf_path=pdf_path,
+            original_filename="report.pdf",
+            candidate_group={
+                "caption_index": 0,
+                "caption_text": "Contents",
+                "pages": [1, 2],
+                "candidate_elements": [
+                    {"index": 1, "type": "paragraph", "text": "Introduction"},
+                    {"index": 2, "type": "table", "text": ""},
+                ],
+            },
+            llm_client=SimpleNamespace(model="test-model"),
+        )
+    )
+
+    assert result["is_toc"] is True
+    assert result["entry_indexes"] == [1, 2]
+    assert result["entry_types"] == {"1": "toc_item", "2": "toc_item_table"}
+    assert result["caption_text_override"] == "TABLE OF CONTENTS"

@@ -5,9 +5,17 @@ import re
 from types import SimpleNamespace
 from typing import Any
 
+from app.services.gemini_direct import (
+    create_direct_gemini_pdf_cache,
+    delete_direct_gemini_pdf_cache,
+    direct_gemini_pdf_enabled,
+    request_direct_gemini_cached_json,
+    request_direct_gemini_content_json,
+    request_direct_gemini_pdf_json,
+)
 from app.services.intelligence_llm_utils import (
     context_json_part,
-    page_preview_parts,
+    pdf_file_parts,
     preferred_cache_breakpoint_index,
     request_llm_json,
 )
@@ -64,6 +72,46 @@ BOOKMARK_LANDMARK_SCHEMA: dict[str, Any] = {
         "reason",
         "selected_candidate_indexes",
         "label_overrides",
+    ],
+}
+
+BOOKMARK_SECTION_REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "task_type": {"type": "string", "enum": ["bookmark_section_review"]},
+        "summary": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reason": {"type": "string"},
+        "selected_heading_indexes": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 0},
+        },
+        "label_overrides": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        },
+        "selected_landmarks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "page": {"type": "integer", "minimum": 1},
+                    "label": {"type": "string"},
+                },
+                "required": ["page", "label"],
+            },
+        },
+    },
+    "required": [
+        "task_type",
+        "summary",
+        "confidence",
+        "reason",
+        "selected_heading_indexes",
+        "label_overrides",
+        "selected_landmarks",
     ],
 }
 
@@ -153,17 +201,12 @@ The document already has explicit TOC-derived bookmark entries. Your task is to 
 after the TOC should also become bookmarks to preserve useful navigation.
 
 Rules:
-- Use the provided TOC-derived labels as the primary navigation plan.
+- Use the provided TOC-derived labels as the starting navigation plan.
 - Treat the visible heading evidence as authoritative.
-- Select extra heading indexes when they would be useful landmarks for assistive navigation beyond the TOC-derived entries.
-- Do not aggressively compress. If a visible heading looks like a real navigational landmark and is not boilerplate or page furniture, prefer keeping it.
-- Use the local TOC slice and neighboring heading context to judge whether the heading already has enough navigation support.
-- Use the nearby body-text excerpt when available. A concise heading can still be a strong bookmark when the following body text shows that it introduces a substantive subsection, requirement, or workflow step.
-- Preserve consistent visible section patterns. When nearby sections use numbered reviewer-comments headings, keep the matching numbered reviewer-comments heading for the current section as well.
-- Generic headings like Special Comments or References should not replace a visible numbered section heading that serves as the primary navigation landmark for that section. If both are useful, keep both.
+- Select extra heading indexes when the visible document evidence shows that they materially improve navigation beyond the TOC-derived entries.
+- Use the local TOC slice, neighboring heading context, and nearby body-text excerpt as evidence when deciding whether a heading adds navigation value.
 - Use label_overrides only for light cleanup grounded in the visible heading text itself.
 - Do not add parenthetical context, parent-section names, or other words that are not visibly present in the heading text.
-- Do not append inferred parent context to generic headings like References or Special Comments when that context is not visibly present in the heading.
 - Preserve visible meaning and numbering. Do not invent headings that are not supported by the provided evidence.
 - If no extra headings should become bookmarks, return an empty selected_heading_indexes list.
 """
@@ -176,11 +219,10 @@ Your task is to decide which additional visible non-heading blocks after the TOC
 Rules:
 - Use the TOC-derived entries as the primary navigation skeleton.
 - Each landmark candidate appears inside the span after one of the listed heading candidates and before the next anchor heading.
-- Use that anchor heading span as the primary local context for deciding whether a non-heading block is a useful bookmark.
+- Use that anchor heading span, neighboring visible labels, and nearby body text as the local evidence for deciding whether a non-heading block improves navigation.
 - Treat the visible non-heading block evidence as authoritative.
-- Use the nearby body-text excerpts when available. A short paragraph or list item can still be a strong bookmark when it behaves like a visible subsection title and is followed by substantive explanatory text or command steps.
-- Select a block only when it clearly functions as a standalone navigational landmark in the visible document.
-- Do not aggressively compress, but do reject ordinary running text, captions, or page furniture that would not help navigation.
+- Select a block only when the visible document evidence shows that it functions as a standalone navigational landmark.
+- Reject ordinary running text, captions, or page furniture that would not help navigation.
 - Preserve visible meaning and numbering.
 - Use label_overrides only for light cleanup grounded in the visible candidate text or nearby document evidence.
 - Do not invent landmarks that are not supported by the provided evidence.
@@ -210,22 +252,15 @@ Rules:
 - Use only the provided candidate_id values. Do not invent entries.
 - All candidate_id values listed as required must appear exactly once in outline_entries.
 - Required candidates include TOC/front-matter entries and heading candidates already selected by an earlier model pass. Preserve them unless the input itself is invalid.
-- Candidate_id values listed as optional are suggestions and may be omitted when they do not improve navigation.
+- Candidate_id values listed as optional may be omitted when they do not materially improve navigation.
 - Preserve visible meaning and numbering.
-- Use TOC-derived entries as the primary navigation skeleton when they are present.
-- Treat the optional heading and landmark candidates as evidence-backed suggestions from earlier model passes.
-- Use each candidate's local evidence fields, especially anchor headings and nearby body-text excerpts, when deciding whether a selected landmark adds real navigational value beyond the TOC.
-- Preserve useful navigation rather than compressing aggressively. Omit optional candidates only when they are clearly redundant, noisy, or not useful to navigation.
-- Do not omit a selected landmark merely because it is not tagged as a heading. Keep it when the local evidence shows it functions like a visible subsection title, numbered subsection, or procedural waypoint.
-- Preserve model-selected numbered subsection landmarks when they add clear granularity beneath a broader TOC section.
-- Repeated visible labels like References can still be useful bookmarks when they occur under different sections or on different pages. Do not omit a candidate solely because another candidate uses the same label.
-- Multiple candidates may refer to the same visible section from different evidence sources. When that happens, keep the strongest candidate or the smallest useful set rather than mechanically keeping duplicates.
-- Prefer a clean, useful hierarchy over mechanically copying every visible line at the same level.
-- Keep top-level outline depth stable and understandable for assistive technology.
+- Use the document evidence and each candidate's local evidence fields when deciding whether an optional candidate improves navigation.
+- Repeated visible labels may still be useful when they point to different visible sections or locations.
+- When multiple candidates refer to the same visible section, keep the strongest useful set rather than duplicates.
+- Prefer a stable, understandable hierarchy.
 - Each candidate includes a preferred_label and supported_labels.
 - Use label_override only when choosing one of that candidate's supported_labels.
-- Prefer the visible label that best matches the document evidence. When supported_labels include a plain visible heading and a more elaborated paraphrase, prefer the plain visible heading unless the elaboration is also visibly present.
-- When supported_labels include both a cleaned TOC-style label and a raw visible heading label, prefer the raw visible heading label if the visible heading evidence clearly supports it.
+- Choose the label that best matches the visible document evidence.
 - When a candidate is not worth keeping in the final outline, omit it.
 - If no outline should be written, return an empty outline_entries list.
 """
@@ -251,6 +286,196 @@ Rules:
 - If none of the pages clearly support these roles, return an empty entries list.
 """
 
+BOOKMARK_DOCUMENT_CANDIDATE_PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "task_type": {"type": "string", "enum": ["bookmark_document_candidate_plan"]},
+        "summary": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reason": {"type": "string"},
+        "front_matter_entries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "page": {"type": "integer", "minimum": 1},
+                    "label": {
+                        "type": "string",
+                        "enum": ["Cover", "Inside-Cover page", "Series Information"],
+                    },
+                },
+                "required": ["page", "label"],
+            },
+        },
+        "outline_entries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "candidate_id": {"type": "string"},
+                    "level": {"type": "integer", "minimum": 1, "maximum": 6},
+                    "supported_label": {"type": "string"},
+                },
+                "required": ["candidate_id", "level", "supported_label"],
+            },
+        },
+    },
+    "required": [
+        "task_type",
+        "summary",
+        "confidence",
+        "reason",
+        "front_matter_entries",
+        "outline_entries",
+    ],
+}
+
+BOOKMARK_DOCUMENT_CANDIDATE_PLAN_PROMPT = """You are a PDF accessibility bookmark planning assistant.
+
+The cached PDF is the primary source of truth. The JSON context contains an exhaustive inventory of bookmark candidates
+derived from Docling-visible evidence.
+
+Your job is to adjudicate that candidate inventory and return the final bookmark outline.
+
+Rules:
+- Use the cached PDF as the main evidence. The JSON context is only an index into candidate IDs and page anchors.
+- Use only the provided candidate_id values in outline_entries. Do not invent bookmark entries there.
+- Treat TOC candidates as the baseline skeleton unless the cached PDF makes one clearly invalid.
+- Heading, heading_variant, and landmark candidates are optional evidence-backed suggestions.
+- Keep optional candidates when the cached PDF shows that they materially improve navigation.
+- Repeated visible labels on different pages are distinct candidates and may each be kept when they mark different visible sections.
+- Only suppress a candidate as redundant when the cached PDF shows it points to the same visible section as another kept candidate.
+- Use supported_label only when choosing one of that candidate's supported_labels.
+- Choose the label variant that best matches the visible document evidence.
+- For higher-order pre-TOC roles, use front_matter_entries with a 1-based page and one of these exact labels:
+  - Cover
+  - Inside-Cover page
+  - Series Information
+- Do not invent labels that are not visibly supported by the cached PDF.
+- Return the final outline in document order.
+"""
+
+BOOKMARK_DOCUMENT_LANDMARK_PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "task_type": {"type": "string", "enum": ["bookmark_document_landmark_plan"]},
+        "summary": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reason": {"type": "string"},
+        "selected_landmarks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "page": {"type": "integer", "minimum": 1},
+                    "label": {"type": "string"},
+                    "anchor_candidate_id": {"type": "string"},
+                    "level": {"type": "integer", "minimum": 1, "maximum": 6},
+                },
+                "required": ["page", "label", "anchor_candidate_id", "level"],
+            },
+        },
+    },
+    "required": [
+        "task_type",
+        "summary",
+        "confidence",
+        "reason",
+        "selected_landmarks",
+    ],
+}
+
+BOOKMARK_DOCUMENT_LANDMARK_PLAN_PROMPT = """You are a PDF accessibility bookmark landmark planning assistant.
+
+The cached PDF is the primary source of truth. You already have a selected bookmark skeleton from the TOC and visible headings.
+
+Your job is to identify additional useful non-heading visible landmarks that should be inserted beneath that skeleton.
+
+Rules:
+- Use the cached PDF as the main evidence.
+- Return only non-heading landmarks that are visibly distinct and materially improve navigation beneath the selected skeleton.
+- Do not return ordinary running prose, captions, or page furniture.
+- Use the provided anchor_candidate_id values to attach each extra landmark beneath the most appropriate selected outline entry.
+- Return the exact visible label from the document.
+- Keep the list selective. Do not omit a visibly supported landmark that materially improves navigation.
+"""
+
+BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "task_type": {"type": "string", "enum": ["bookmark_document_heading_supplement"]},
+        "summary": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reason": {"type": "string"},
+        "outline_entries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "candidate_id": {"type": "string"},
+                    "level": {"type": "integer", "minimum": 1, "maximum": 6},
+                    "supported_label": {"type": "string"},
+                },
+                "required": ["candidate_id", "level", "supported_label"],
+            },
+        },
+    },
+    "required": [
+        "task_type",
+        "summary",
+        "confidence",
+        "reason",
+        "outline_entries",
+    ],
+}
+
+BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_PROMPT = """You are a PDF accessibility bookmark supplement planning assistant.
+
+The cached PDF is the primary source of truth. You already have a selected bookmark skeleton.
+Your job is to review the remaining heading candidates only and return any additional visible headings that materially improve navigation.
+
+Rules:
+- Use the cached PDF as the main evidence.
+- Use only the provided candidate_id values in outline_entries.
+- Return only additional heading or heading_variant candidates that should be added to the existing skeleton.
+- Repeated visible labels on different pages are distinct candidates and may each be kept when they mark different visible sections.
+- Short visible subsection headings may still be useful when they clearly identify a navigable subsection.
+- Use supported_label only when choosing one of that candidate's supported_labels.
+- Do not invent labels or candidates that are not visibly supported by the cached PDF.
+- Keep the list selective, but do not omit a visibly supported heading only because its label resembles another heading elsewhere in the document.
+"""
+
+BOOKMARK_SECTION_REVIEW_PROMPT = """You are a PDF accessibility section bookmark review assistant.
+
+The cached PDF document is the primary source of truth. Focus only on the specified page range.
+
+Your task is to review one bounded section of the document and return:
+- which heading candidate indexes should become bookmarks
+- which additional non-heading visible landmarks in this page range should also become bookmarks
+
+Rules:
+- Use the cached PDF pages as the primary evidence. The JSON context is only a guide.
+- Focus only on the specified page range. Ignore content outside it.
+- Select heading indexes only from the provided heading_candidates list.
+- Select headings and non-heading landmarks only when the visible evidence in this page range shows that they materially improve navigation.
+- Do not return ordinary running body text, captions, or footer/header furniture.
+- For selected_landmarks, return the visible label exactly as it appears on the page and the 1-based page number where it appears.
+- Use label_overrides only for light cleanup grounded in the visible heading text itself.
+- Do not invent labels that are not visible in the document.
+"""
+
+BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION = (
+    "You are evaluating PDF accessibility and bookmark/navigation semantics. "
+    "Stay grounded in the provided document evidence and return only valid JSON."
+)
+
 MAX_BOOKMARK_TOC_ITEMS = 80
 BOOKMARK_HEADING_TYPES = {"heading"}
 BOOKMARK_LANDMARK_TYPES = {"paragraph", "list_item", "note"}
@@ -272,6 +497,7 @@ TOC_TRAILING_PAGE_RE = re.compile(
 )
 APPENDIX_BOOKMARK_KEY_RE = re.compile(r"^(appendix\s+[a-z0-9]+(?:\.\d+)*)\b", re.IGNORECASE)
 NUMERIC_BOOKMARK_KEY_RE = re.compile(r"^(\d+(?:\.\d+)*)\b")
+FRAGMENTED_WORD_RE = re.compile(r"\b([A-Za-z])\s+([a-z]{2,})\b")
 
 
 def _normalize_text(value: Any) -> str:
@@ -299,6 +525,18 @@ def _normalize_title_like_text(value: Any) -> str:
     text = _normalize_text(value).lower()
     text = "".join(ch for ch in text if ch.isalnum() or ch.isspace())
     return " ".join(text.split()).strip()
+
+
+def _collapse_fragmented_words(value: Any) -> str:
+    text = _normalize_text(value)
+    if not text:
+        return ""
+    previous = None
+    current = text
+    while current != previous:
+        previous = current
+        current = FRAGMENTED_WORD_RE.sub(lambda match: match.group(1) + match.group(2), current)
+    return current
 
 
 def _bookmark_section_key(value: Any) -> str:
@@ -343,12 +581,12 @@ def _dedupe_supported_labels(labels: list[Any]) -> list[str]:
     deduped: list[str] = []
     seen: set[str] = set()
     for label in labels:
-        normalized_label = _normalize_text(label)
-        normalized = _normalize_title_like_text(normalized_label)
-        if not normalized_label or not normalized or normalized in seen:
-            continue
-        deduped.append(normalized_label[:240])
-        seen.add(normalized)
+        for variant in (_normalize_text(label), _collapse_fragmented_words(label)):
+            normalized = _normalize_title_like_text(variant)
+            if not variant or not normalized or normalized in seen:
+                continue
+            deduped.append(variant[:240])
+            seen.add(normalized)
     return deduped
 
 
@@ -439,6 +677,7 @@ def _serialize_heading_candidates_for_llm(entries: list[dict[str, Any]]) -> list
                 "page": entry.get("page"),
                 "level": entry.get("level"),
                 "text": entry.get("text"),
+                "raw_text": entry.get("raw_text"),
                 "previous_heading_text": entry.get("previous_heading_text"),
                 "next_heading_text": entry.get("next_heading_text"),
                 "previous_body_text": entry.get("previous_body_text"),
@@ -459,12 +698,59 @@ def _serialize_landmark_candidates_for_llm(entries: list[dict[str, Any]]) -> lis
                 "page": entry.get("page"),
                 "type": entry.get("type"),
                 "text": entry.get("text"),
+                "raw_text": entry.get("raw_text"),
                 "anchor_heading_text": entry.get("anchor_heading_text"),
                 "anchor_heading_page": entry.get("anchor_heading_page"),
                 "previous_visible_text": entry.get("previous_visible_text"),
                 "next_visible_text": entry.get("next_visible_text"),
                 "previous_body_text": entry.get("previous_body_text"),
                 "following_body_text": entry.get("following_body_text"),
+            })
+        )
+    return serialized
+
+
+def _serialize_heading_candidates_minimal_for_llm(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        serialized.append(
+            _compact_llm_mapping({
+                "index": entry.get("index"),
+                "page": entry.get("page"),
+                "level": entry.get("level"),
+                "text": entry.get("text"),
+            })
+        )
+    return serialized
+
+
+def _serialize_landmark_candidates_minimal_for_llm(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        serialized.append(
+            _compact_llm_mapping({
+                "index": entry.get("index"),
+                "page": entry.get("page"),
+                "type": entry.get("type"),
+                "text": entry.get("text"),
+            })
+        )
+    return serialized
+
+
+def _serialize_toc_entries_minimal_for_llm(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        serialized.append(
+            _compact_llm_mapping({
+                "target_page": entry.get("target_page"),
+                "text": entry.get("text"),
             })
         )
     return serialized
@@ -512,6 +798,164 @@ def _serialize_outline_candidates_for_llm(entries: list[dict[str, Any]]) -> list
             })
         )
     return serialized
+
+
+def _serialize_outline_candidates_for_direct_llm(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        preferred_label = _normalize_text(entry.get("preferred_label") or entry.get("text"))
+        supported_labels = [
+            str(label).strip()
+            for label in (entry.get("supported_labels") or [])
+            if str(label).strip()
+        ]
+        serialized.append(
+            _compact_llm_mapping({
+                "candidate_id": entry.get("candidate_id"),
+                "source_kind": entry.get("source_kind"),
+                "source_index": entry.get("source_index"),
+                "preferred_label": preferred_label,
+                "supported_labels": supported_labels,
+                "raw_text": entry.get("raw_text"),
+                "target_page_index": entry.get("target_page_index"),
+                "source_page": entry.get("source_page"),
+                "default_level": entry.get("default_level"),
+                "previous_visible_label": entry.get("previous_visible_label"),
+                "next_visible_label": entry.get("next_visible_label"),
+                "anchor_heading_text": entry.get("anchor_heading_text"),
+                "previous_body_text": entry.get("previous_body_text"),
+                "following_body_text": entry.get("following_body_text"),
+            })
+        )
+    return serialized
+
+
+def _serialize_heading_supplement_candidates_for_direct_llm(
+    entries: list[dict[str, Any]],
+    *,
+    selected_outline_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    selected_by_page = sorted(
+        [
+            entry
+            for entry in selected_outline_entries
+            if isinstance(entry, dict) and isinstance(entry.get("page_index"), int)
+        ],
+        key=lambda item: (
+            _int_or_default(item.get("page_index"), 10**9),
+            _int_or_default(item.get("level"), 1),
+            _normalize_text(item.get("text")),
+        ),
+    )
+    serialized: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        page_index = _int_or_default(entry.get("target_page_index"), -1)
+        previous_outline_label = ""
+        next_outline_label = ""
+        for outline_entry in selected_by_page:
+            outline_page_index = _int_or_default(outline_entry.get("page_index"), -1)
+            if outline_page_index < 0:
+                continue
+            if outline_page_index <= page_index:
+                previous_outline_label = _normalize_text(outline_entry.get("text"))
+                continue
+            next_outline_label = _normalize_text(outline_entry.get("text"))
+            break
+        serialized.append(
+            _compact_llm_mapping({
+                "candidate_id": entry.get("candidate_id"),
+                "source_kind": entry.get("source_kind"),
+                "source_index": entry.get("source_index"),
+                "preferred_label": _normalize_text(entry.get("preferred_label") or entry.get("text")),
+                "supported_labels": [
+                    str(label).strip()
+                    for label in (entry.get("supported_labels") or [])
+                    if str(label).strip()
+                ],
+                "raw_text": entry.get("raw_text"),
+                "target_page_index": entry.get("target_page_index"),
+                "source_page": entry.get("source_page"),
+                "default_level": entry.get("default_level"),
+                "previous_outline_label": previous_outline_label,
+                "next_outline_label": next_outline_label,
+                "previous_visible_label": entry.get("previous_visible_label"),
+                "next_visible_label": entry.get("next_visible_label"),
+                "previous_body_text": entry.get("previous_body_text"),
+                "following_body_text": entry.get("following_body_text"),
+            })
+        )
+    return serialized
+
+
+def _local_landmark_candidates_for_pages(
+    candidate_payload: dict[str, Any],
+    *,
+    start_page: int,
+    end_page: int,
+) -> list[dict[str, Any]]:
+    if end_page < start_page:
+        return []
+    return [
+        entry
+        for entry in (candidate_payload.get("landmark_candidates") or [])
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get("page"), int)
+            and start_page <= int(entry["page"]) <= end_page
+        )
+    ]
+
+
+def _match_section_landmark_selections(
+    selected_landmarks: Any,
+    *,
+    landmark_candidates: list[dict[str, Any]],
+) -> tuple[set[int], dict[str | int, str]]:
+    matched_indexes: set[int] = set()
+    label_overrides: dict[str | int, str] = {}
+    if not isinstance(selected_landmarks, list):
+        return matched_indexes, label_overrides
+    for item in selected_landmarks:
+        if not isinstance(item, dict):
+            continue
+        page = _int_or_default(item.get("page"), -1)
+        label = _clean_bookmark_label(item.get("label"))
+        normalized = _normalize_title_like_text(label)
+        if page <= 0 or not normalized:
+            continue
+        page_matches = [
+            entry
+            for entry in landmark_candidates
+            if isinstance(entry.get("page"), int) and int(entry["page"]) == page
+        ]
+        best: dict[str, Any] | None = None
+        for entry in page_matches:
+            entry_text = _clean_bookmark_label(entry.get("text"))
+            entry_norm = _normalize_title_like_text(entry_text)
+            if entry_norm == normalized:
+                best = entry
+                break
+        if best is None:
+            for entry in page_matches:
+                entry_text = _clean_bookmark_label(entry.get("text"))
+                entry_norm = _normalize_title_like_text(entry_text)
+                if normalized in entry_norm or entry_norm in normalized:
+                    best = entry
+                    break
+        if best is None:
+            continue
+        index = _int_or_default(best.get("index"), -1)
+        if index < 0:
+            continue
+        matched_indexes.add(index)
+        if label and _normalize_text(label) != _normalize_text(best.get("text")):
+            label_overrides[str(index)] = label
+            label_overrides[index] = label
+    return matched_indexes, label_overrides
 
 
 def _summarize_heading_chunk_for_shortlist(
@@ -690,13 +1134,20 @@ async def _shortlist_bookmark_chunks(
             prefix="Bookmark chunk shortlist context:\n",
         ),
     ]
-    parsed = await request_llm_json(
-        llm_client=llm_client,
-        content=content,
-        schema_name="bookmark_chunk_shortlist",
-        response_schema=BOOKMARK_CHUNK_SHORTLIST_SCHEMA,
-        cache_breakpoint_index=preferred_cache_breakpoint_index(content),
-    )
+    if direct_gemini_pdf_enabled():
+        parsed = await request_direct_gemini_content_json(
+            content=content,
+            response_schema=BOOKMARK_CHUNK_SHORTLIST_SCHEMA,
+            system_instruction=BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
+        )
+    else:
+        parsed = await request_llm_json(
+            llm_client=llm_client,
+            content=content,
+            schema_name="bookmark_chunk_shortlist",
+            response_schema=BOOKMARK_CHUNK_SHORTLIST_SCHEMA,
+            cache_breakpoint_index=preferred_cache_breakpoint_index(content),
+        )
     confidence = str(parsed.get("confidence") or "").strip().lower()
     valid_indexes = {int(item.get("chunk_index")) for item in chunk_payloads if isinstance(item.get("chunk_index"), int)}
     selected = sorted(
@@ -714,6 +1165,256 @@ async def _shortlist_bookmark_chunks(
         "confidence": confidence or "low",
         "selected_chunk_indexes": selected if applied else list(range(len(chunk_payloads))),
     }
+
+
+def _materialize_outline_entries_from_plan(
+    outline_entries_raw: Any,
+    *,
+    outline_candidates: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], set[str]]:
+    candidates_by_id = {
+        str(candidate["candidate_id"]): candidate
+        for candidate in outline_candidates
+        if isinstance(candidate, dict) and str(candidate.get("candidate_id") or "").strip()
+    }
+    outline_entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    if not isinstance(outline_entries_raw, list):
+        outline_entries_raw = []
+    for item in outline_entries_raw:
+        if not isinstance(item, dict):
+            continue
+        candidate_id = str(item.get("candidate_id") or "").strip()
+        if not candidate_id or candidate_id in seen_ids:
+            continue
+        candidate = candidates_by_id.get(candidate_id)
+        if candidate is None:
+            continue
+        try:
+            level = int(item.get("level", candidate.get("default_level", 1)) or 1)
+        except (TypeError, ValueError):
+            level = int(candidate.get("default_level", 1) or 1)
+        label = _resolve_supported_label(
+            list(candidate.get("supported_labels") or []),
+            item.get("supported_label", item.get("label_override")),
+            fallback=str(candidate.get("preferred_label") or candidate["text"]),
+        )
+        if not label:
+            continue
+        outline_entries.append({
+            "candidate_id": candidate_id,
+            "source_kind": candidate.get("source_kind"),
+            "source_index": candidate.get("source_index"),
+            "text": label,
+            "raw_text": candidate.get("raw_text"),
+            "preferred_label": candidate.get("preferred_label"),
+            "supported_labels": list(candidate.get("supported_labels") or []),
+            "page_index": int(candidate["target_page_index"]),
+            "level": max(1, min(6, level)),
+            "previous_visible_label": candidate.get("previous_visible_label"),
+            "next_visible_label": candidate.get("next_visible_label"),
+            "anchor_heading_text": candidate.get("anchor_heading_text"),
+            "previous_body_text": candidate.get("previous_body_text"),
+            "following_body_text": candidate.get("following_body_text"),
+        })
+        seen_ids.add(candidate_id)
+    return outline_entries, seen_ids
+
+
+def _merge_outline_entries(
+    primary_entries: list[dict[str, Any]],
+    supplemental_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged_by_id: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for entry in [*primary_entries, *supplemental_entries]:
+        if not isinstance(entry, dict):
+            continue
+        candidate_id = str(entry.get("candidate_id") or "").strip()
+        if not candidate_id:
+            continue
+        if candidate_id not in merged_by_id:
+            order.append(candidate_id)
+            merged_by_id[candidate_id] = dict(entry)
+            continue
+        merged_by_id[candidate_id].update(entry)
+    merged = [merged_by_id[candidate_id] for candidate_id in order]
+    merged.sort(
+        key=lambda item: (
+            _int_or_default(item.get("page_index"), 10**9),
+            _int_or_default(item.get("level"), 1),
+            _int_or_default(item.get("source_index"), 10**9),
+            _normalize_text(item.get("text")),
+        )
+    )
+    return merged
+
+
+def _materialize_front_matter_entries(
+    front_matter_entries_raw: Any,
+    *,
+    front_matter_page_candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    valid_front_pages = {
+        int(page.get("page_number")): int(page.get("page_index"))
+        for page in front_matter_page_candidates
+        if isinstance(page, dict)
+        and isinstance(page.get("page_number"), int)
+        and isinstance(page.get("page_index"), int)
+    }
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    if not isinstance(front_matter_entries_raw, list):
+        front_matter_entries_raw = []
+    for order_index, item in enumerate(front_matter_entries_raw):
+        if not isinstance(item, dict):
+            continue
+        page_number = _int_or_default(item.get("page"), -1)
+        label = _normalize_text(item.get("label"))
+        page_index = valid_front_pages.get(page_number)
+        if page_index is None or label not in {"Cover", "Inside-Cover page", "Series Information"}:
+            continue
+        key = (_normalize_title_like_text(label), page_index)
+        if key in seen:
+            continue
+        entries.append({
+            "candidate_id": f"front:auto:{order_index}",
+            "source_kind": "front_matter",
+            "source_index": page_index,
+            "text": label,
+            "page_index": page_index,
+            "level": 1,
+        })
+        seen.add(key)
+    return entries
+
+
+def _serialize_selected_outline_for_landmark_llm(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    ordered = sorted(
+        [entry for entry in entries if isinstance(entry, dict)],
+        key=lambda item: (
+            _int_or_default(item.get("page_index"), 10**9),
+            _int_or_default(item.get("level"), 1),
+            _normalize_text(item.get("text")),
+        ),
+    )
+    for idx, entry in enumerate(ordered):
+        page_index = _int_or_default(entry.get("page_index"), -1)
+        if page_index < 0:
+            continue
+        next_page_index = _int_or_default(ordered[idx + 1].get("page_index"), -1) if idx + 1 < len(ordered) else None
+        serialized.append(
+            _compact_llm_mapping({
+                "candidate_id": entry.get("candidate_id"),
+                "source_kind": entry.get("source_kind"),
+                "label": entry.get("text"),
+                "raw_text": entry.get("raw_text"),
+                "supported_labels": entry.get("supported_labels"),
+                "level": entry.get("level"),
+                "page": page_index + 1,
+                "next_outline_page": (next_page_index + 1) if next_page_index is not None and next_page_index >= 0 else None,
+                "previous_visible_label": entry.get("previous_visible_label"),
+                "next_visible_label": entry.get("next_visible_label"),
+                "anchor_heading_text": entry.get("anchor_heading_text"),
+                "previous_body_text": entry.get("previous_body_text"),
+                "following_body_text": entry.get("following_body_text"),
+            })
+        )
+    return serialized
+
+
+def _materialize_landmark_entries_from_plan(
+    selected_landmarks_raw: Any,
+    *,
+    landmark_candidates: list[dict[str, Any]],
+    anchor_level_by_id: dict[str, int],
+) -> tuple[list[dict[str, Any]], set[int]]:
+    if not isinstance(selected_landmarks_raw, list):
+        return [], set()
+    entries: list[dict[str, Any]] = []
+    selected_indexes: set[int] = set()
+    seen: set[tuple[str, int]] = set()
+    for item in selected_landmarks_raw:
+        if not isinstance(item, dict):
+            continue
+        anchor_candidate_id = str(item.get("anchor_candidate_id") or "").strip()
+        if anchor_candidate_id not in anchor_level_by_id:
+            continue
+        matched_indexes, landmark_label_overrides = _match_section_landmark_selections(
+            [{"page": item.get("page"), "label": item.get("label")}],
+            landmark_candidates=landmark_candidates,
+        )
+        if not matched_indexes:
+            continue
+        source_index = min(matched_indexes)
+        candidate = next(
+            (
+                entry
+                for entry in landmark_candidates
+                if isinstance(entry, dict) and _int_or_default(entry.get("index"), -1) == source_index
+            ),
+            None,
+        )
+        if candidate is None:
+            continue
+        label = _normalize_text(
+            landmark_label_overrides.get(str(source_index))
+            or landmark_label_overrides.get(source_index)
+            or candidate.get("text")
+        )
+        page_index = _int_or_default(candidate.get("page"), 1) - 1
+        if not label or page_index < 0:
+            continue
+        try:
+            requested_level = int(item.get("level") or (anchor_level_by_id[anchor_candidate_id] + 1))
+        except (TypeError, ValueError):
+            requested_level = anchor_level_by_id[anchor_candidate_id] + 1
+        level = max(1, min(6, requested_level))
+        key = (_normalize_title_like_text(label), page_index)
+        if key in seen:
+            continue
+        entries.append({
+            "candidate_id": f"landmark:{source_index}",
+            "source_kind": "landmark",
+            "source_index": source_index,
+            "text": label,
+            "page_index": page_index,
+            "level": level,
+            "anchor_candidate_id": anchor_candidate_id,
+        })
+        selected_indexes.add(source_index)
+        seen.add(key)
+    return entries, selected_indexes
+
+
+def _merge_outline_with_landmarks(
+    outline_entries: list[dict[str, Any]],
+    landmark_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not landmark_entries:
+        return list(outline_entries)
+    by_anchor: dict[str, list[dict[str, Any]]] = {}
+    for entry in landmark_entries:
+        if not isinstance(entry, dict):
+            continue
+        anchor = str(entry.get("anchor_candidate_id") or "").strip()
+        by_anchor.setdefault(anchor, []).append(entry)
+    for anchor_entries in by_anchor.values():
+        anchor_entries.sort(
+            key=lambda item: (
+                _int_or_default(item.get("page_index"), 10**9),
+                _normalize_text(item.get("text")),
+            )
+        )
+    merged: list[dict[str, Any]] = []
+    for entry in outline_entries:
+        merged.append(entry)
+        anchor_id = str(entry.get("candidate_id") or "").strip()
+        merged.extend(by_anchor.pop(anchor_id, []))
+    for leftovers in by_anchor.values():
+        merged.extend(leftovers)
+    return merged
 
 
 def _landmark_anchor_entries(
@@ -1001,6 +1702,7 @@ def _build_outline_candidates(
             "source_kind": "toc",
             "source_index": entry_index,
             "text": label[:240],
+            "raw_text": _normalize_text(toc_entry.get("text")),
             "target_page_index": target_page_index,
             "source_page": toc_entry.get("page"),
             "default_level": max(1, min(6, int(default_level))),
@@ -1024,6 +1726,7 @@ def _build_outline_candidates(
                 "source_kind": "heading_variant",
                 "source_index": int(target.get("index", -1)),
                 "text": raw_target_text[:240],
+                "raw_text": raw_target_text[:240],
                 "target_page_index": target_page_index,
                 "source_page": (target_page_index + 1),
                 "default_level": max(1, min(6, int(default_level))),
@@ -1054,6 +1757,7 @@ def _build_outline_candidates(
             "source_kind": "heading",
             "source_index": index,
             "text": label[:240],
+            "raw_text": raw_visible_label[:240],
             "target_page_index": page,
             "source_page": page + 1,
             "default_level": max(1, min(6, int(element.get("level", 1) or 1))),
@@ -1082,6 +1786,7 @@ def _build_outline_candidates(
             "source_kind": "landmark",
             "source_index": index,
             "text": label[:240],
+            "raw_text": _normalize_text(element.get("text"))[:240],
             "target_page_index": page,
             "source_page": page + 1,
             "default_level": 2,
@@ -1201,22 +1906,35 @@ async def _generate_front_matter_entries(
     )
     content = [
         {"type": "text", "text": BOOKMARK_FRONT_MATTER_PROMPT},
-        *page_preview_parts(job, preview_pages),
+        *pdf_file_parts(job, preview_pages, filename=original_filename),
         context_json_part(
-            {
+            context_payload := {
                 "job_filename": original_filename,
                 "front_matter_pages": page_candidates,
             },
             prefix="Front-matter bookmark context:\n",
         ),
     ]
-    parsed = await request_llm_json(
-        llm_client=llm_client,
-        content=content,
-        schema_name="bookmark_front_matter",
-        response_schema=BOOKMARK_FRONT_MATTER_SCHEMA,
-        cache_breakpoint_index=preferred_cache_breakpoint_index(content),
-    )
+    if direct_gemini_pdf_enabled():
+        parsed = await request_direct_gemini_pdf_json(
+            pdf_path=pdf_path,
+            page_numbers=preview_pages,
+            prompt=BOOKMARK_FRONT_MATTER_PROMPT,
+            context_payload=context_payload,
+            response_schema=BOOKMARK_FRONT_MATTER_SCHEMA,
+            system_instruction=(
+                "You are evaluating PDF accessibility and front-matter navigation. "
+                "Stay grounded in the provided PDF pages."
+            ),
+        )
+    else:
+        parsed = await request_llm_json(
+            llm_client=llm_client,
+            content=content,
+            schema_name="bookmark_front_matter",
+            response_schema=BOOKMARK_FRONT_MATTER_SCHEMA,
+            cache_breakpoint_index=preferred_cache_breakpoint_index(content),
+        )
     confidence = str(parsed.get("confidence") or "").strip().lower()
     if confidence not in FRONT_MATTER_AUTO_CONFIDENCE:
         return [], {
@@ -1304,50 +2022,6 @@ async def _generate_bookmark_outline_plan(
             prefix="Bookmark outline context:\n",
         ),
     ]
-    candidates_by_id = {
-        str(candidate["candidate_id"]): candidate
-        for candidate in outline_candidates
-        if isinstance(candidate, dict) and str(candidate.get("candidate_id") or "").strip()
-    }
-
-    def _materialize_outline(parsed: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
-        outline_entries_raw = parsed.get("outline_entries")
-        if not isinstance(outline_entries_raw, list):
-            outline_entries_raw = []
-
-        outline_entries: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        for item in outline_entries_raw:
-            if not isinstance(item, dict):
-                continue
-            candidate_id = str(item.get("candidate_id") or "").strip()
-            if not candidate_id or candidate_id in seen_ids:
-                continue
-            candidate = candidates_by_id.get(candidate_id)
-            if candidate is None:
-                continue
-            try:
-                level = int(item.get("level", candidate.get("default_level", 1)) or 1)
-            except (TypeError, ValueError):
-                level = int(candidate.get("default_level", 1) or 1)
-            label = _resolve_supported_label(
-                list(candidate.get("supported_labels") or []),
-                item.get("label_override"),
-                fallback=str(candidate.get("preferred_label") or candidate["text"]),
-            )
-            if not label:
-                continue
-            outline_entries.append({
-                "candidate_id": candidate_id,
-                "source_kind": candidate.get("source_kind"),
-                "source_index": candidate.get("source_index"),
-                "text": label,
-                "page_index": int(candidate["target_page_index"]),
-                "level": max(1, min(6, level)),
-            })
-            seen_ids.add(candidate_id)
-        return outline_entries, seen_ids
-
     repair_note = None
     for attempt in range(2):
         if attempt == 0:
@@ -1368,7 +2042,13 @@ async def _generate_bookmark_outline_plan(
             ]
         try:
             parsed = await asyncio.wait_for(
-                request_llm_json(
+                request_direct_gemini_content_json(
+                    content=request_content,
+                    response_schema=BOOKMARK_OUTLINE_PLAN_SCHEMA,
+                    system_instruction=BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
+                )
+                if direct_gemini_pdf_enabled()
+                else request_llm_json(
                     llm_client=llm_client,
                     content=request_content,
                     schema_name="bookmark_outline_plan",
@@ -1394,7 +2074,10 @@ async def _generate_bookmark_outline_plan(
                 "confidence": confidence,
                 "outline_entry_count": 0,
             }
-        outline_entries, seen_ids = _materialize_outline(parsed)
+        outline_entries, seen_ids = _materialize_outline_entries_from_plan(
+            parsed.get("outline_entries"),
+            outline_candidates=outline_candidates,
+        )
         missing_required_ids = [
             candidate_id for candidate_id in required_candidate_ids if candidate_id not in seen_ids
         ]
@@ -1479,6 +2162,7 @@ def collect_bookmark_heading_candidates(structure_json: dict[str, Any]) -> dict[
                     "index": index,
                     "page": page_number,
                     "level": element.get("level"),
+                    "raw_text": _normalize_text(element.get("text")),
                     "text": text[:240],
                     "section_key": _bookmark_section_key(text),
                     "parent_section_key": _parent_section_key(text),
@@ -1489,6 +2173,7 @@ def collect_bookmark_heading_candidates(structure_json: dict[str, Any]) -> dict[
                 "index": index,
                 "page": page_number,
                 "level": element.get("level"),
+                "raw_text": _normalize_text(element.get("text")),
                 "text": text[:240],
                 "section_key": _bookmark_section_key(text),
                 "parent_section_key": _parent_section_key(text),
@@ -1499,6 +2184,7 @@ def collect_bookmark_heading_candidates(structure_json: dict[str, Any]) -> dict[
                 "page": page_number,
                 "type": element_type,
                 "level": element.get("level"),
+                "raw_text": _normalize_text(element.get("text")),
                 "text": text[:240],
                 "section_key": _bookmark_section_key(text),
                 "parent_section_key": _parent_section_key(text),
@@ -1515,6 +2201,7 @@ def collect_bookmark_heading_candidates(structure_json: dict[str, Any]) -> dict[
             "page": page,
             "level": heading.get("level"),
             "text": heading["text"],
+            "raw_text": heading.get("raw_text"),
             "section_key": heading.get("section_key"),
             "parent_section_key": heading.get("parent_section_key"),
             "previous_heading_text": all_headings[heading_pos - 1]["text"] if heading_pos > 0 else "",
@@ -1535,6 +2222,7 @@ def collect_bookmark_heading_candidates(structure_json: dict[str, Any]) -> dict[
             "page": block["page"],
             "type": block["type"],
             "text": block["text"],
+            "raw_text": block.get("raw_text"),
             "section_key": block.get("section_key"),
             "parent_section_key": block.get("parent_section_key"),
             "previous_visible_text": visible_blocks[block_pos - 1]["text"] if block_pos > 0 else "",
@@ -1585,6 +2273,8 @@ async def enhance_bookmark_structure_with_intelligence(
     structure_json: dict[str, Any],
     original_filename: str,
     llm_client: LlmClient,
+    prefetched_front_matter_entries: list[dict[str, Any]] | None = None,
+    prefetched_front_matter_audit: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     candidate_payload = collect_bookmark_heading_candidates(structure_json)
     if not candidate_payload["toc_entries"]:
@@ -1594,13 +2284,172 @@ async def enhance_bookmark_structure_with_intelligence(
             "reason": "no_toc_entries",
             "selected_heading_count": 0,
         }
-    front_matter_entries, front_matter_audit = await _generate_front_matter_entries(
-        pdf_path=pdf_path,
-        structure_json=structure_json,
-        candidate_payload=candidate_payload,
-        original_filename=original_filename,
-        llm_client=llm_client,
-    )
+    if direct_gemini_pdf_enabled():
+        all_heading_indexes = _valid_index_set(candidate_payload["heading_candidates"])
+        document_outline_candidates = _build_outline_candidates(
+            structure_json=structure_json,
+            candidate_payload=candidate_payload,
+            selected_heading_indexes=all_heading_indexes,
+            selected_landmark_indexes=set(),
+        )
+        front_matter_page_candidates = _front_matter_page_candidates(
+            candidate_payload,
+            structure_json.get("elements") or [],
+        )
+        cache_handle = await create_direct_gemini_pdf_cache(
+            pdf_path=pdf_path,
+            system_instruction=BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
+            ttl="1800s",
+        )
+        try:
+            parsed = await request_direct_gemini_cached_json(
+                cache_handle=cache_handle,
+                prompt=BOOKMARK_DOCUMENT_CANDIDATE_PLAN_PROMPT,
+                context_payload={
+                    "job_filename": original_filename,
+                    "outline_candidates": _serialize_outline_candidates_for_direct_llm(document_outline_candidates),
+                    "front_matter_page_candidates": front_matter_page_candidates,
+                },
+                response_schema=BOOKMARK_DOCUMENT_CANDIDATE_PLAN_SCHEMA,
+            )
+            confidence = str(parsed.get("confidence") or "").strip().lower()
+            candidate_plan_reason = str(parsed.get("reason") or "").strip()
+            outline_entries, _seen_outline_ids = _materialize_outline_entries_from_plan(
+                parsed.get("outline_entries"),
+                outline_candidates=document_outline_candidates,
+            )
+
+            front_matter_entries = _materialize_front_matter_entries(
+                parsed.get("front_matter_entries"),
+                front_matter_page_candidates=front_matter_page_candidates,
+            )
+            supplement_confidence = "low"
+            supplement_reason = ""
+            if outline_entries:
+                remaining_heading_candidates = [
+                    candidate
+                    for candidate in document_outline_candidates
+                    if candidate.get("source_kind") in {"heading", "heading_variant"}
+                    and str(candidate.get("candidate_id") or "").strip()
+                    not in {
+                        str(entry.get("candidate_id") or "").strip()
+                        for entry in outline_entries
+                        if isinstance(entry, dict)
+                    }
+                ]
+                if remaining_heading_candidates:
+                    heading_supplement_parsed = await request_direct_gemini_cached_json(
+                        cache_handle=cache_handle,
+                        prompt=BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_PROMPT,
+                        context_payload={
+                            "job_filename": original_filename,
+                            "selected_outline_entries": _serialize_selected_outline_for_landmark_llm(outline_entries),
+                            "remaining_heading_candidates": _serialize_heading_supplement_candidates_for_direct_llm(
+                                remaining_heading_candidates,
+                                selected_outline_entries=outline_entries,
+                            ),
+                        },
+                        response_schema=BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_SCHEMA,
+                    )
+                    supplement_confidence = (
+                        str(heading_supplement_parsed.get("confidence") or "").strip().lower() or "low"
+                    )
+                    supplement_reason = str(heading_supplement_parsed.get("reason") or "").strip()
+                    if supplement_confidence in {"high", "medium"}:
+                        supplement_entries, _ = _materialize_outline_entries_from_plan(
+                            heading_supplement_parsed.get("outline_entries"),
+                            outline_candidates=remaining_heading_candidates,
+                        )
+                        outline_entries = _merge_outline_entries(outline_entries, supplement_entries)
+            selected_heading_indexes = {
+                _int_or_default(entry.get("source_index"), -1)
+                for entry in outline_entries
+                if entry.get("source_kind") in {"heading", "heading_variant"}
+                and _int_or_default(entry.get("source_index"), -1) >= 0
+            }
+            landmark_entries: list[dict[str, Any]] = []
+            selected_landmark_indexes: set[int] = set()
+            landmark_confidence = "low"
+            landmark_reason = ""
+            if outline_entries and candidate_payload.get("landmark_candidates"):
+                landmark_parsed = await request_direct_gemini_cached_json(
+                    cache_handle=cache_handle,
+                    prompt=BOOKMARK_DOCUMENT_LANDMARK_PLAN_PROMPT,
+                    context_payload={
+                        "job_filename": original_filename,
+                        "selected_outline_entries": _serialize_selected_outline_for_landmark_llm(outline_entries),
+                    },
+                    response_schema=BOOKMARK_DOCUMENT_LANDMARK_PLAN_SCHEMA,
+                )
+                landmark_confidence = str(landmark_parsed.get("confidence") or "").strip().lower() or "low"
+                landmark_reason = str(landmark_parsed.get("reason") or "").strip()
+                if landmark_confidence in {"high", "medium"}:
+                    landmark_entries, selected_landmark_indexes = _materialize_landmark_entries_from_plan(
+                        landmark_parsed.get("selected_landmarks"),
+                        landmark_candidates=candidate_payload.get("landmark_candidates") or [],
+                        anchor_level_by_id={
+                            str(entry.get("candidate_id") or ""): _int_or_default(entry.get("level"), 1)
+                            for entry in outline_entries
+                            if isinstance(entry, dict) and str(entry.get("candidate_id") or "").strip()
+                        },
+                    )
+        finally:
+            await delete_direct_gemini_pdf_cache(cache_handle)
+
+        overall_confidence = _best_confidence_label([confidence, supplement_confidence, landmark_confidence])
+        merged_outline_entries = _merge_outline_with_landmarks(outline_entries, landmark_entries)
+        plan_entries = _merge_bookmark_plan_entries(front_matter_entries, merged_outline_entries)
+        if plan_entries:
+            structure_json["bookmark_plan"] = plan_entries
+        else:
+            structure_json.pop("bookmark_plan", None)
+        return structure_json, {
+            "attempted": True,
+            "applied": bool(plan_entries),
+            "reason": " | ".join(
+                part
+                for part in [
+                    candidate_plan_reason,
+                    supplement_reason,
+                    landmark_reason,
+                ]
+                if part
+            ),
+            "confidence": overall_confidence or "low",
+            "selected_heading_count": len(selected_heading_indexes),
+            "selected_landmark_count": len(selected_landmark_indexes),
+            "chunk_count": 0,
+            "heading_chunks_reviewed": 0,
+            "heading_chunk_shortlist_applied": False,
+            "heading_chunk_failures": 0,
+            "landmark_chunk_count": 0,
+            "landmark_chunks_reviewed": 0,
+            "landmark_chunk_shortlist_applied": False,
+            "landmark_chunk_failures": 0,
+            "outline_plan_applied": bool(plan_entries),
+            "outline_entry_count": len(plan_entries),
+            "front_matter_applied": any(entry.get("source_kind") == "front_matter" for entry in plan_entries),
+            "front_matter_entry_count": sum(1 for entry in plan_entries if entry.get("source_kind") == "front_matter"),
+        }
+    if prefetched_front_matter_entries is not None or prefetched_front_matter_audit is not None:
+        front_matter_entries = list(prefetched_front_matter_entries or [])
+        front_matter_audit = dict(
+            prefetched_front_matter_audit
+            or {
+                "attempted": False,
+                "applied": False,
+                "reason": "no_prefetched_front_matter",
+                "entry_count": 0,
+            }
+        )
+    else:
+        front_matter_entries, front_matter_audit = await _generate_front_matter_entries(
+            pdf_path=pdf_path,
+            structure_json=structure_json,
+            candidate_payload=candidate_payload,
+            original_filename=original_filename,
+            llm_client=llm_client,
+        )
     if (
         not candidate_payload["heading_candidates"]
         and not candidate_payload.get("landmark_candidates")
@@ -1698,7 +2547,13 @@ async def enhance_bookmark_structure_with_intelligence(
             ),
         ]
         return await asyncio.wait_for(
-            request_llm_json(
+            request_direct_gemini_content_json(
+                content=content,
+                response_schema=BOOKMARK_DECISION_SCHEMA,
+                system_instruction=BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
+            )
+            if direct_gemini_pdf_enabled()
+            else request_llm_json(
                 llm_client=llm_client,
                 content=content,
                 schema_name="bookmark_heading_selection",
@@ -1811,7 +2666,13 @@ async def enhance_bookmark_structure_with_intelligence(
             ),
         ]
         return await asyncio.wait_for(
-            request_llm_json(
+            request_direct_gemini_content_json(
+                content=content,
+                response_schema=BOOKMARK_LANDMARK_SCHEMA,
+                system_instruction=BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
+            )
+            if direct_gemini_pdf_enabled()
+            else request_llm_json(
                 llm_client=llm_client,
                 content=content,
                 schema_name="bookmark_landmark_selection",

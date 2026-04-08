@@ -10,7 +10,7 @@ PLACEHOLDER_LLM_KEYS = {
     "ollama",
     "changeme",
     "your-api-key",
-    "your_openrouter_api_key",
+    "your_gemini_api_key",
     "replace_me",
 }
 LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -27,10 +27,13 @@ class Settings(BaseSettings):
     processing_dir: Path = BASE_DIR / "data" / "processing"
     output_dir: Path = BASE_DIR / "data" / "output"
 
-    # LLM (OpenAI-compatible)
-    llm_base_url: str = "https://openrouter.ai/api/v1"
+    # Gemini
+    llm_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
     llm_api_key: str = ""
     llm_model: str = "google/gemini-3-flash-preview"
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-3-flash-preview"
+    use_direct_gemini_pdf: bool = True
     llm_timeout: int = 120
     llm_pretag_timeout: int = 45
     llm_strict_validation: bool = True
@@ -109,7 +112,7 @@ class Settings(BaseSettings):
     def validate_llm_settings(self):
         base_url = self.llm_base_url.strip()
         model = self.llm_model.strip()
-        api_key = self.llm_api_key.strip()
+        api_key = self.llm_api_key.strip() or self.gemini_api_key.strip()
 
         if not base_url:
             raise ValueError("LLM_BASE_URL must be set")

@@ -44,7 +44,7 @@ Current result:
 
 ### Cost summary
 
-Measured from OpenRouter `usage.cost`, not a hand-built pricing estimate.
+Measured from recorded provider usage/cost fields, not a hand-built pricing estimate.
 
 | Metric | Value |
 |---|---:|
@@ -96,7 +96,7 @@ Delta:
 The biggest clean wins so far come from:
 - semantic-unit prompt caching
 - page-scoped form batching with per-field fallback
-- OpenRouter structured outputs instead of looser JSON prompting
+- Gemini structured outputs instead of looser JSON prompting
 - provider retry/backoff instead of rerunning whole workflows after transient failures
 
 The next likely cost target for the real CUNY audience is figure-heavy guide/admin documents.

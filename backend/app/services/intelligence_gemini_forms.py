@@ -7,16 +7,16 @@ from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
 from app.services.intelligence_llm_utils import (
     context_json_part,
-    page_preview_parts,
+    pdf_file_parts,
     preferred_cache_breakpoint_index,
-    request_llm_json,
+    request_llm_json_with_response,
 )
 from app.services.llm_client import LlmClient
 from app.services.semantic_units import SemanticUnit
 
 FORM_BATCH_PROMPT = """You are a PDF accessibility form-label assistant.
 
-You will receive exactly one PDF page preview and a list of form-field candidates from that same page.
+You will receive exactly one PDF page and a list of form-field candidates from that same page.
 
 Goal:
 - choose the accessible field label that assistive technology should announce for each field
@@ -175,7 +175,11 @@ async def generate_form_intelligence(
             "previous_intelligence": previous_intelligence or {},
         },
     )
-    decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)
+    decision = await adjudicate_semantic_unit(
+        job=job,
+        unit=unit,
+        llm_client=llm_client,
+    )
     return _normalize_form_intelligence_result(
         field_review_id=unit.unit_id,
         page_number=unit.page,
@@ -208,10 +212,10 @@ async def generate_form_intelligence_for_page(
     }
     content = [
         {"type": "text", "text": FORM_BATCH_PROMPT},
-        *page_preview_parts(job, [page_number]),
+        *pdf_file_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
         context_json_part(payload),
     ]
-    parsed = await request_llm_json(
+    parsed, _response = await request_llm_json_with_response(
         llm_client=llm_client,
         content=content,
         schema_name="form_page_intelligence",
@@ -230,7 +234,7 @@ async def generate_form_intelligence_for_page(
                 continue
             decision_map[field_review_id] = item
 
-    return [
+    results = [
         _normalize_form_intelligence_result(
             field_review_id=str(target.get("field_review_id") or "").strip(),
             page_number=page_number,
@@ -241,3 +245,4 @@ async def generate_form_intelligence_for_page(
         )
         for target in targets
     ]
+    return results

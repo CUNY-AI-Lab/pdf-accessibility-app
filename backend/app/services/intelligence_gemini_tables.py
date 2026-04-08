@@ -7,16 +7,16 @@ from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
 from app.services.intelligence_llm_utils import (
     context_json_part,
-    page_preview_parts,
+    pdf_file_parts,
     preferred_cache_breakpoint_index,
-    request_llm_json,
+    request_llm_json_with_response,
 )
 from app.services.llm_client import LlmClient
 from app.services.semantic_units import SemanticUnit
 
 TABLE_BATCH_PROMPT = """You are a PDF accessibility table-semantics assistant.
 
-You will receive exactly one PDF page preview, one page-structure excerpt, and a list of table candidates from that same page.
+You will receive exactly one PDF page, one page-structure excerpt, and a list of table candidates from that same page.
 
 Goal:
 - decide whether each table already has sufficient simple header rows and row-header columns
@@ -184,7 +184,11 @@ async def generate_table_intelligence(
             "previous_intelligence": previous_intelligence or {},
         },
     )
-    decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)
+    decision = await adjudicate_semantic_unit(
+        job=job,
+        unit=unit,
+        llm_client=llm_client,
+    )
     result = {
         "task_type": "table_intelligence",
         "summary": decision.summary,
@@ -221,10 +225,10 @@ async def generate_table_intelligence_for_page(
     }
     content = [
         {"type": "text", "text": TABLE_BATCH_PROMPT},
-        *page_preview_parts(job, [page_number]),
+        *pdf_file_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
         context_json_part(payload),
     ]
-    parsed = await request_llm_json(
+    parsed, _response = await request_llm_json_with_response(
         llm_client=llm_client,
         content=content,
         schema_name="table_page_intelligence",
@@ -243,7 +247,7 @@ async def generate_table_intelligence_for_page(
                 continue
             decision_map[table_review_id] = item
 
-    return [
+    results = [
         _normalize_table_intelligence_result(
             table_review_id=str(target.get("table_review_id") or "").strip(),
             page_number=page_number,
@@ -252,3 +256,4 @@ async def generate_table_intelligence_for_page(
         )
         for target in targets
     ]
+    return results

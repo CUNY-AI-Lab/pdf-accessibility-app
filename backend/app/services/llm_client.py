@@ -135,8 +135,26 @@ def _record_response_usage(response_json: dict) -> None:
     )
 
 
+def record_external_llm_usage(
+    *,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+    cost_usd: float = 0.0,
+) -> None:
+    recorder = _ACTIVE_USAGE_RECORDER.get()
+    if recorder is None:
+        return
+    recorder.record(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        cost_usd=cost_usd,
+    )
+
+
 class LlmClient:
-    """Thin wrapper around any OpenAI-compatible chat completions API."""
+    """Thin wrapper around a chat-completions API."""
 
     def __init__(
         self,
@@ -226,9 +244,12 @@ def make_llm_client_with_overrides(
     max_backoff_seconds: float | None = None,
     max_concurrency: int | None = None,
 ) -> LlmClient:
+    api_key = (getattr(settings, "llm_api_key", "") or "").strip() or (
+        getattr(settings, "gemini_api_key", "") or ""
+    ).strip()
     return LlmClient(
         base_url=settings.llm_base_url,
-        api_key=settings.llm_api_key,
+        api_key=api_key,
         model=settings.llm_model,
         timeout=settings.llm_timeout if timeout is None else timeout,
         max_retries=settings.llm_max_retries if max_retries is None else max_retries,

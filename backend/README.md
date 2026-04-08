@@ -48,11 +48,10 @@ Wrappers over the shared engine:
 
 ## LLM transport
 
-The backend currently uses OpenRouter with Gemini models and structured outputs.
+The backend now uses Gemini directly for PDF-native understanding and the Gemini Developer API chat-completions endpoint for the remaining structured JSON lanes.
 
 Important behaviors:
 - `json_schema` structured output requests
-- `provider.require_parameters=true`
 - retry and `Retry-After` handling
 - concurrency limits
 - prompt caching breakpoints
@@ -62,7 +61,7 @@ Main files:
 - [app/services/llm_client.py](app/services/llm_client.py)
 - [app/services/intelligence_llm_utils.py](app/services/intelligence_llm_utils.py)
 
-The same backend settings drive both the real app and the benchmark scripts. If `DOCLING_SERVE_URL` is set, the structure step uses that server; otherwise it falls back to local Docling. Semantic adjudication continues to use the configured OpenAI-compatible LLM endpoint.
+The same backend settings drive both the real app and the benchmark scripts. If `DOCLING_SERVE_URL` is set, the structure step uses that server; otherwise it falls back to local Docling. Semantic adjudication uses Gemini directly for PDF-native lanes and the configured Gemini chat-completions endpoint for the remaining JSON-only lanes.
 
 On Apple Silicon, the recommended local setup is `docling-serve` with `DOCLING_DEVICE=mps`. That accelerates structure extraction, but the tagging/writer step in [app/pipeline/tagger.py](app/pipeline/tagger.py) remains CPU-bound.
 

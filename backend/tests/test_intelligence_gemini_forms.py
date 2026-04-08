@@ -1,6 +1,8 @@
 import asyncio
 from types import SimpleNamespace
 
+import pikepdf
+
 from app.services.intelligence_gemini_forms import (
     generate_form_intelligence,
     generate_form_intelligence_for_page,
@@ -10,7 +12,10 @@ from app.services.semantic_units import SemanticDecision
 
 def _job(tmp_path):
     pdf_path = tmp_path / "sample.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4\n% test\n")
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(200, 200))
+    pdf.add_blank_page(page_size=(200, 200))
+    pdf.save(str(pdf_path))
     return SimpleNamespace(
         original_filename="sample.pdf",
         input_path=str(pdf_path),
@@ -88,47 +93,51 @@ def test_generate_form_intelligence_normalizes_response(monkeypatch, tmp_path):
 def test_generate_form_intelligence_for_page_normalizes_batch_response(monkeypatch, tmp_path):
     captured = {}
 
-    async def _fake_request_llm_json(
+    async def _fake_request_llm_json_with_response(
         *,
         llm_client,
         content,
         schema_name=None,
         response_schema=None,
         cache_breakpoint_index=None,
+        conversation_prefix=None,
     ):
         captured["content"] = content
         captured["schema_name"] = schema_name
         captured["cache_breakpoint_index"] = cache_breakpoint_index
-        return {
-            "task_type": "form_page_intelligence",
-            "page": 2,
-            "summary": "Visible labels identify the controls.",
-            "decisions": [
-                {
-                    "field_review_id": "field-widget-10-0",
-                    "summary": "Visible label matches the first field.",
-                    "confidence": "high",
-                    "suggested_action": "set_field_label",
-                    "reason": "The label is printed directly above the field.",
-                    "accessible_label": "First name and middle initial",
-                },
-                {
-                    "field_review_id": "field-widget-11-0",
-                    "summary": "Ambiguous checkbox context.",
-                    "confidence": "low",
-                    "suggested_action": "manual_only",
-                    "reason": "The visible context is too ambiguous.",
-                },
-            ],
-        }
+        return (
+            {
+                "task_type": "form_page_intelligence",
+                "page": 2,
+                "summary": "Visible labels identify the controls.",
+                "decisions": [
+                    {
+                        "field_review_id": "field-widget-10-0",
+                        "summary": "Visible label matches the first field.",
+                        "confidence": "high",
+                        "suggested_action": "set_field_label",
+                        "reason": "The label is printed directly above the field.",
+                        "accessible_label": "First name and middle initial",
+                    },
+                    {
+                        "field_review_id": "field-widget-11-0",
+                        "summary": "Ambiguous checkbox context.",
+                        "confidence": "low",
+                        "suggested_action": "manual_only",
+                        "reason": "The visible context is too ambiguous.",
+                    },
+                ],
+            },
+            {"choices": [{"message": {"annotations": []}}]},
+        )
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.request_llm_json",
-        _fake_request_llm_json,
+        "app.services.intelligence_gemini_forms.request_llm_json_with_response",
+        _fake_request_llm_json_with_response,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.page_preview_parts",
-        lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": "data:image/png;base64,page"}}],
+        "app.services.intelligence_gemini_forms.pdf_file_parts",
+        lambda job, page_numbers, filename=None: [{"type": "file", "file": {"filename": filename or "sample.pdf", "file_data": "data:application/pdf;base64,page"}}],
     )
 
     result = asyncio.run(
@@ -167,6 +176,7 @@ def test_generate_form_intelligence_for_page_normalizes_batch_response(monkeypat
 
     assert captured["schema_name"] == "form_page_intelligence"
     assert captured["cache_breakpoint_index"] == 1
+    assert captured["content"][1]["type"] == "file"
     prompt = captured["content"][0]["text"]
     assert "section or group context" in prompt
     assert "Do not shorten a clearly helpful accessible label" in prompt

@@ -1,6 +1,6 @@
 # Architecture
 
-Updated: 2026-03-16
+Updated: 2026-04-08
 
 This app has two distinct layers:
 
@@ -30,7 +30,7 @@ flowchart TD
     G --> G3["native text"]
     G --> G4["OCR text"]
     G --> G5["nearby context"]
-    F --> H["Gemini structured outputs via OpenRouter"]
+    F --> H["Direct Gemini structured outputs\nFiles API + context cache"]
     H --> I["Resolved semantic decisions"]
     I --> J["Pretag rationalization\n(widgets, figures, structure)"]
     J --> K["Deterministic tagger/remediator"]
@@ -130,18 +130,20 @@ Main implementation files:
 ### Shared LLM transport
 - [backend/app/services/llm_client.py](../backend/app/services/llm_client.py)
 - [backend/app/services/intelligence_llm_utils.py](../backend/app/services/intelligence_llm_utils.py)
+- [backend/app/services/gemini_direct.py](../backend/app/services/gemini_direct.py)
 
 ## Transport choices
 
-Semantic calls use OpenRouter with Gemini structured outputs.
+The target transport is direct Gemini for PDF-understanding lanes.
 
 Important properties:
-- `json_schema` structured output requests
-- `provider.require_parameters=true`
-- retry and `Retry-After` support
-- concurrency limits
-- prompt caching breakpoints
-- real cost tracking from OpenRouter response usage fields
+- Gemini Files API / cached PDF context for reusable document slices
+- native `response_json_schema` structured output
+- candidate-ID adjudication for bookmark and navigation decisions
+- retry and timeout bounds
+- audit-grade token and cost tracking
+
+The intended semantic transport is Gemini directly. Where the chat-completions compatibility endpoint is still used, it should point at Google rather than a proxy.
 
 ## Release gate
 

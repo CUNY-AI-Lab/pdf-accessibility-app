@@ -6,7 +6,7 @@ from app.models import Job
 from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_llm_utils import (
     context_json_part,
-    page_preview_parts,
+    pdf_file_parts,
     preferred_cache_breakpoint_index,
     request_llm_json,
 )
@@ -15,7 +15,7 @@ from app.services.llm_client import LlmClient
 READING_ORDER_INTELLIGENCE_PROMPT = """You are a PDF accessibility reading-order assistant.
 
 You will receive:
-- one full-page image
+- one PDF page
 - the current block order for that page
 - nearby structure fragments
 - suspicious text interpretations when available
@@ -129,10 +129,10 @@ async def generate_reading_order_intelligence(
         {
             "type": "text",
             "text": (
-                f"{READING_ORDER_INTELLIGENCE_PROMPT}\n\nImage order: one full-page preview only."
+                f"{READING_ORDER_INTELLIGENCE_PROMPT}\n\nEvidence order: one PDF page input only."
             ),
         },
-        *page_preview_parts(job, [page_number]),
+        *pdf_file_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
         context_json_part(payload),
     ]
 
