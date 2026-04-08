@@ -185,6 +185,50 @@ def test_request_llm_json_with_response_uses_direct_gemini_for_media(monkeypatch
     assert captured["content"][1]["type"] == "file"
 
 
+def test_request_llm_json_with_response_uses_direct_gemini_for_text_only(monkeypatch):
+    captured = {}
+
+    async def _fake_direct_request(**kwargs):
+        captured.update(kwargs)
+        return (
+            {"summary": "ok"},
+            {
+                "choices": [{"message": {"content": '{"summary":"ok"}', "annotations": []}}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10, "cost": 0.0},
+            },
+        )
+
+    class _UnexpectedLlm:
+        async def chat_completion(self, messages, **kwargs):
+            raise AssertionError("text-only structured calls should route directly to Gemini")
+
+    monkeypatch.setattr(
+        "app.services.intelligence_llm_utils.direct_gemini_pdf_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_llm_utils.request_direct_gemini_content_json_with_response",
+        _fake_direct_request,
+    )
+
+    parsed, response = asyncio.run(
+        request_llm_json_with_response(
+            llm_client=_UnexpectedLlm(),
+            content=[{"type": "text", "text": "prompt"}],
+            schema_name="demo",
+            response_schema={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+        )
+    )
+
+    assert parsed == {"summary": "ok"}
+    assert response["usage"]["total_tokens"] == 10
+    assert captured["content"] == [{"type": "text", "text": "prompt"}]
+
+
 def test_preferred_cache_breakpoint_index_prefers_last_image_block():
     content = [
         {"type": "text", "text": "prompt"},
@@ -273,6 +317,39 @@ def test_request_llm_json_with_response_includes_conversation_prefix():
     llm = _ConversationPrefixLlm()
 
     parsed, response = asyncio.run(
+        request_llm_json_with_response(
+            llm_client=llm,
+            content=[{"type": "text", "text": "hello"}],
+            conversation_prefix=[
+                {
+                    "role": "assistant",
+                    "content": "Previous context is available.",
+                }
+            ],
+        )
+    )
+
+    assert parsed == {"summary": "ok"}
+    assert llm.messages[0][0]["role"] == "assistant"
+    assert llm.messages[0][1]["role"] == "user"
+
+
+def test_request_llm_json_with_response_keeps_conversation_prefix_on_chat_path_when_direct_enabled(monkeypatch):
+    llm = _ConversationPrefixLlm()
+
+    async def _unexpected_direct_request(**kwargs):
+        raise AssertionError("conversation-prefix requests should stay on the chat-completions path")
+
+    monkeypatch.setattr(
+        "app.services.intelligence_llm_utils.direct_gemini_pdf_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_llm_utils.request_direct_gemini_content_json_with_response",
+        _unexpected_direct_request,
+    )
+
+    parsed, _response = asyncio.run(
         request_llm_json_with_response(
             llm_client=llm,
             content=[{"type": "text", "text": "hello"}],

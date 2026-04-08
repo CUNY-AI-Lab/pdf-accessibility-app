@@ -249,20 +249,15 @@ async def request_llm_json_with_response(
     conversation_prefix: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if direct_gemini_pdf_enabled() and conversation_prefix is None:
-        has_media = any(
-            isinstance(item, dict) and item.get("type") in {"file", "image_url"}
-            for item in content
+        response_schema_payload = response_schema if (response_schema and schema_name) else response_schema
+        return await request_direct_gemini_content_json_with_response(
+            content=content,
+            response_schema=response_schema_payload,
+            system_instruction=(
+                "You are evaluating PDF accessibility and document semantics. "
+                "Stay grounded in the provided document and return JSON only."
+            ),
         )
-        if has_media:
-            response_schema_payload = response_schema if (response_schema and schema_name) else response_schema
-            return await request_direct_gemini_content_json_with_response(
-                content=content,
-                response_schema=response_schema_payload,
-                system_instruction=(
-                    "You are evaluating PDF accessibility and document semantics. "
-                    "Stay grounded in the provided document and return JSON only."
-                ),
-            )
     repair_note: str | None = None
 
     async def _request_once(request_content: list[dict[str, Any]]) -> Any:

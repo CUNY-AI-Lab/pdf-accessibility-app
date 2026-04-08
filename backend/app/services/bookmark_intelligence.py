@@ -9,7 +9,6 @@ from app.services.gemini_direct import (
     delete_direct_gemini_pdf_cache,
     direct_gemini_pdf_enabled,
     request_direct_gemini_cached_json,
-    request_direct_gemini_content_json,
     request_direct_gemini_pdf_json,
 )
 from app.services.intelligence_llm_utils import (
@@ -1132,20 +1131,13 @@ async def _shortlist_bookmark_chunks(
             prefix="Bookmark chunk shortlist context:\n",
         ),
     ]
-    if direct_gemini_pdf_enabled():
-        parsed = await request_direct_gemini_content_json(
-            content=content,
-            response_schema=BOOKMARK_CHUNK_SHORTLIST_SCHEMA,
-            system_instruction=BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
-        )
-    else:
-        parsed = await request_llm_json(
-            llm_client=llm_client,
-            content=content,
-            schema_name="bookmark_chunk_shortlist",
-            response_schema=BOOKMARK_CHUNK_SHORTLIST_SCHEMA,
-            cache_breakpoint_index=preferred_cache_breakpoint_index(content),
-        )
+    parsed = await request_llm_json(
+        llm_client=llm_client,
+        content=content,
+        schema_name="bookmark_chunk_shortlist",
+        response_schema=BOOKMARK_CHUNK_SHORTLIST_SCHEMA,
+        cache_breakpoint_index=preferred_cache_breakpoint_index(content),
+    )
     confidence = str(parsed.get("confidence") or "").strip().lower()
     valid_indexes = {int(item.get("chunk_index")) for item in chunk_payloads if isinstance(item.get("chunk_index"), int)}
     selected = sorted(
@@ -2019,13 +2011,7 @@ async def _generate_bookmark_outline_plan(
             ]
         try:
             parsed = await asyncio.wait_for(
-                request_direct_gemini_content_json(
-                    content=request_content,
-                    response_schema=BOOKMARK_OUTLINE_PLAN_SCHEMA,
-                    system_instruction=BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
-                )
-                if direct_gemini_pdf_enabled()
-                else request_llm_json(
+                request_llm_json(
                     llm_client=llm_client,
                     content=request_content,
                     schema_name="bookmark_outline_plan",
@@ -2524,13 +2510,7 @@ async def enhance_bookmark_structure_with_intelligence(
             ),
         ]
         return await asyncio.wait_for(
-            request_direct_gemini_content_json(
-                content=content,
-                response_schema=BOOKMARK_DECISION_SCHEMA,
-                system_instruction=BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
-            )
-            if direct_gemini_pdf_enabled()
-            else request_llm_json(
+            request_llm_json(
                 llm_client=llm_client,
                 content=content,
                 schema_name="bookmark_heading_selection",
@@ -2643,13 +2623,7 @@ async def enhance_bookmark_structure_with_intelligence(
             ),
         ]
         return await asyncio.wait_for(
-            request_direct_gemini_content_json(
-                content=content,
-                response_schema=BOOKMARK_LANDMARK_SCHEMA,
-                system_instruction=BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
-            )
-            if direct_gemini_pdf_enabled()
-            else request_llm_json(
+            request_llm_json(
                 llm_client=llm_client,
                 content=content,
                 schema_name="bookmark_landmark_selection",
