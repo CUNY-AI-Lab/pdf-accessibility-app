@@ -28,6 +28,21 @@ def _disable_direct_gemini_by_default(monkeypatch):
         lambda: False,
     )
 
+    async def _default_front_matter_request(**kwargs):
+        assert kwargs["response_schema"]["properties"]["task_type"]["enum"][0] == "bookmark_front_matter"
+        return {
+            "task_type": "bookmark_front_matter",
+            "summary": "No front-matter role bookmarks needed.",
+            "confidence": "high",
+            "reason": "The visible evidence does not justify any extra front-matter roles.",
+            "entries": [],
+        }
+
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.request_direct_gemini_pdf_json",
+        _default_front_matter_request,
+    )
+
 
 def _make_pdf(pdf_path, page_count=6):
     pdf = pikepdf.Pdf.new()
@@ -799,21 +814,23 @@ def test_bookmark_intelligence_prepends_front_matter_entries(monkeypatch, tmp_pa
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path)
 
+    async def _fake_front_matter_request(**kwargs):
+        assert kwargs["page_numbers"] == [1, 2, 3]
+        assert kwargs["context_payload"]["job_filename"] == "report.pdf"
+        assert kwargs["context_payload"]["front_matter_pages"]
+        return {
+            "task_type": "bookmark_front_matter",
+            "summary": "Identified the three pre-TOC page roles.",
+            "confidence": "high",
+            "reason": "The first three pages act as a cover, inside-cover, and series-information page.",
+            "entries": [
+                {"page_index": 0, "label": "Cover"},
+                {"page_index": 1, "label": "Inside-Cover page"},
+                {"page_index": 2, "label": "Series Information"},
+            ],
+        }
+
     async def _fake_request_llm_json(*, llm_client, content, schema_name, response_schema, cache_breakpoint_index):
-        if schema_name == "bookmark_front_matter":
-            assert sum(1 for part in content if part.get("type") == "file") == 1
-            assert not any(part.get("type") == "image_url" for part in content)
-            return {
-                "task_type": "bookmark_front_matter",
-                "summary": "Identified the three pre-TOC page roles.",
-                "confidence": "high",
-                "reason": "The first three pages act as a cover, inside-cover, and series-information page.",
-                "entries": [
-                    {"page_index": 0, "label": "Cover"},
-                    {"page_index": 1, "label": "Inside-Cover page"},
-                    {"page_index": 2, "label": "Series Information"},
-                ],
-            }
         if schema_name == "bookmark_heading_selection":
             return {
                 "task_type": "bookmark_heading_selection",
@@ -835,6 +852,10 @@ def test_bookmark_intelligence_prepends_front_matter_entries(monkeypatch, tmp_pa
             ],
         }
 
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.request_direct_gemini_pdf_json",
+        _fake_front_matter_request,
+    )
     monkeypatch.setattr(
         "app.services.bookmark_intelligence.request_llm_json",
         _fake_request_llm_json,
@@ -894,11 +915,15 @@ def test_bookmark_intelligence_uses_prefetched_front_matter_entries(monkeypatch,
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path)
     seen_schema_names: list[str] = []
+    front_matter_called = False
+
+    async def _unexpected_front_matter_request(**kwargs):
+        nonlocal front_matter_called
+        front_matter_called = True
+        raise AssertionError("prefetched front matter should skip a second front-matter PDF call")
 
     async def _fake_request_llm_json(*, llm_client, content, schema_name, response_schema, cache_breakpoint_index):
         seen_schema_names.append(schema_name)
-        if schema_name == "bookmark_front_matter":
-            raise AssertionError("prefetched front matter should skip a second front-matter LLM call")
         if schema_name == "bookmark_heading_selection":
             return {
                 "task_type": "bookmark_heading_selection",
@@ -920,6 +945,10 @@ def test_bookmark_intelligence_uses_prefetched_front_matter_entries(monkeypatch,
             ],
         }
 
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.request_direct_gemini_pdf_json",
+        _unexpected_front_matter_request,
+    )
     monkeypatch.setattr(
         "app.services.bookmark_intelligence.request_llm_json",
         _fake_request_llm_json,
@@ -971,6 +1000,7 @@ def test_bookmark_intelligence_uses_prefetched_front_matter_entries(monkeypatch,
     )
 
     assert "bookmark_front_matter" not in seen_schema_names
+    assert front_matter_called is False
     assert updated["bookmark_plan"][:2] == [
         {
             "candidate_id": "front:0",

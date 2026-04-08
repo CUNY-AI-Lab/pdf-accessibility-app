@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from types import SimpleNamespace
 from typing import Any
 
 from app.services.gemini_direct import (
@@ -15,7 +14,6 @@ from app.services.gemini_direct import (
 )
 from app.services.intelligence_llm_utils import (
     context_json_part,
-    pdf_file_parts,
     preferred_cache_breakpoint_index,
     request_llm_json,
 )
@@ -1899,42 +1897,21 @@ async def _generate_front_matter_entries(
         return [], {"attempted": False, "applied": False, "reason": "no_front_matter_pages", "entry_count": 0}
 
     preview_pages = [page["page_number"] for page in page_candidates]
-    job = SimpleNamespace(
-        original_filename=original_filename,
-        input_path=str(pdf_path),
-        output_path=str(pdf_path),
-    )
-    content = [
-        {"type": "text", "text": BOOKMARK_FRONT_MATTER_PROMPT},
-        *pdf_file_parts(job, preview_pages, filename=original_filename),
-        context_json_part(
-            context_payload := {
-                "job_filename": original_filename,
-                "front_matter_pages": page_candidates,
-            },
-            prefix="Front-matter bookmark context:\n",
+    context_payload = {
+        "job_filename": original_filename,
+        "front_matter_pages": page_candidates,
+    }
+    parsed = await request_direct_gemini_pdf_json(
+        pdf_path=pdf_path,
+        page_numbers=preview_pages,
+        prompt=BOOKMARK_FRONT_MATTER_PROMPT,
+        context_payload=context_payload,
+        response_schema=BOOKMARK_FRONT_MATTER_SCHEMA,
+        system_instruction=(
+            "You are evaluating PDF accessibility and front-matter navigation. "
+            "Stay grounded in the provided PDF pages."
         ),
-    ]
-    if direct_gemini_pdf_enabled():
-        parsed = await request_direct_gemini_pdf_json(
-            pdf_path=pdf_path,
-            page_numbers=preview_pages,
-            prompt=BOOKMARK_FRONT_MATTER_PROMPT,
-            context_payload=context_payload,
-            response_schema=BOOKMARK_FRONT_MATTER_SCHEMA,
-            system_instruction=(
-                "You are evaluating PDF accessibility and front-matter navigation. "
-                "Stay grounded in the provided PDF pages."
-            ),
-        )
-    else:
-        parsed = await request_llm_json(
-            llm_client=llm_client,
-            content=content,
-            schema_name="bookmark_front_matter",
-            response_schema=BOOKMARK_FRONT_MATTER_SCHEMA,
-            cache_breakpoint_index=preferred_cache_breakpoint_index(content),
-        )
+    )
     confidence = str(parsed.get("confidence") or "").strip().lower()
     if confidence not in FRONT_MATTER_AUTO_CONFIDENCE:
         return [], {
