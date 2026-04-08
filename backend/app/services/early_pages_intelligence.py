@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 from app.pipeline.structure import _collapse_spaced_title_caps
@@ -9,16 +8,7 @@ from app.services.bookmark_intelligence import (
     _front_matter_page_candidates,
     collect_bookmark_heading_candidates,
 )
-from app.services.gemini_direct import (
-    direct_gemini_pdf_enabled,
-    request_direct_gemini_pdf_json,
-)
-from app.services.intelligence_llm_utils import (
-    context_json_part,
-    pdf_file_parts,
-    preferred_cache_breakpoint_index,
-    request_llm_json,
-)
+from app.services.gemini_direct import request_direct_gemini_pdf_json
 from app.services.llm_client import LlmClient
 from app.services.title_intelligence import _title_candidate_elements
 
@@ -176,44 +166,23 @@ async def enhance_document_title_and_front_matter_with_intelligence(
             *(page["page_number"] for page in front_matter_pages if isinstance(page.get("page_number"), int)),
         }
     )
-    job = SimpleNamespace(
-        original_filename=original_filename,
-        input_path=str(pdf_path),
-        output_path=str(pdf_path),
-    )
-    content = [
-        {"type": "text", "text": EARLY_PAGES_INTELLIGENCE_PROMPT},
-        *pdf_file_parts(job, preview_pages, filename=original_filename),
-        context_json_part(
-            context_payload := {
-                "job_filename": original_filename,
-                "current_title": existing_title,
-                "title_candidates": title_candidates,
-                "front_matter_pages": front_matter_pages,
-            },
-            prefix="Early-pages intelligence context:\n",
+    context_payload = {
+        "job_filename": original_filename,
+        "current_title": existing_title,
+        "title_candidates": title_candidates,
+        "front_matter_pages": front_matter_pages,
+    }
+    parsed = await request_direct_gemini_pdf_json(
+        pdf_path=pdf_path,
+        page_numbers=preview_pages,
+        prompt=EARLY_PAGES_INTELLIGENCE_PROMPT,
+        context_payload=context_payload,
+        response_schema=EARLY_PAGES_INTELLIGENCE_SCHEMA,
+        system_instruction=(
+            "You are evaluating PDF accessibility and early-page document semantics. "
+            "Stay grounded in the provided PDF pages."
         ),
-    ]
-    if direct_gemini_pdf_enabled():
-        parsed = await request_direct_gemini_pdf_json(
-            pdf_path=pdf_path,
-            page_numbers=preview_pages,
-            prompt=EARLY_PAGES_INTELLIGENCE_PROMPT,
-            context_payload=context_payload,
-            response_schema=EARLY_PAGES_INTELLIGENCE_SCHEMA,
-            system_instruction=(
-                "You are evaluating PDF accessibility and early-page document semantics. "
-                "Stay grounded in the provided PDF pages."
-            ),
-        )
-    else:
-        parsed = await request_llm_json(
-            llm_client=llm_client,
-            content=content,
-            schema_name="document_early_pages_intelligence",
-            response_schema=EARLY_PAGES_INTELLIGENCE_SCHEMA,
-            cache_breakpoint_index=preferred_cache_breakpoint_index(content),
-        )
+    )
 
     title_payload = parsed.get("title") if isinstance(parsed.get("title"), dict) else {}
     title_confidence = str(title_payload.get("confidence") or "").strip().lower()

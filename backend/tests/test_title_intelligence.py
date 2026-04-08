@@ -1,17 +1,8 @@
 import asyncio
 
 import pikepdf
-import pytest
 
 from app.services.title_intelligence import enhance_document_title_with_intelligence
-
-
-@pytest.fixture(autouse=True)
-def _disable_direct_gemini_by_default(monkeypatch):
-    monkeypatch.setattr(
-        "app.services.title_intelligence.direct_gemini_pdf_enabled",
-        lambda: False,
-    )
 
 
 def _make_pdf(pdf_path, page_count=2):
@@ -25,13 +16,11 @@ def test_title_intelligence_applies_visible_title_when_missing(monkeypatch, tmp_
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path)
 
-    async def _fake_request_llm_json(*, llm_client, content, schema_name, response_schema, cache_breakpoint_index):
-        assert schema_name == "document_title_extraction"
-        assert cache_breakpoint_index == 1
-        assert sum(1 for part in content if part.get("type") == "file") == 1
-        assert not any(part.get("type") == "image_url" for part in content)
-        context = next(part for part in content if part.get("type") == "text" and "Title extraction context:" in part.get("text", ""))
-        assert "title_candidates" in context["text"]
+    async def _fake_direct_request(**kwargs):
+        assert kwargs["page_numbers"] == [1, 2]
+        assert kwargs["context_payload"]["job_filename"] == "chapter.pdf"
+        assert kwargs["context_payload"]["current_title"] == ""
+        assert kwargs["context_payload"]["title_candidates"]
         return {
             "task_type": "document_title_extraction",
             "summary": "Recovered the visible title from the first-page heading run.",
@@ -41,8 +30,8 @@ def test_title_intelligence_applies_visible_title_when_missing(monkeypatch, tmp_
         }
 
     monkeypatch.setattr(
-        "app.services.title_intelligence.request_llm_json",
-        _fake_request_llm_json,
+        "app.services.title_intelligence.request_direct_gemini_pdf_json",
+        _fake_direct_request,
     )
 
     structure_json = {
@@ -77,13 +66,9 @@ def test_title_intelligence_keeps_existing_title_when_model_declines(monkeypatch
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path)
 
-    async def _fake_request_llm_json(*, llm_client, content, schema_name, response_schema, cache_breakpoint_index):
-        assert schema_name == "document_title_extraction"
-        assert cache_breakpoint_index == 1
-        assert sum(1 for part in content if part.get("type") == "file") == 1
-        assert not any(part.get("type") == "image_url" for part in content)
-        context = next(part for part in content if part.get("type") == "text" and "Title extraction context:" in part.get("text", ""))
-        assert "Existing Title" in context["text"]
+    async def _fake_direct_request(**kwargs):
+        assert kwargs["page_numbers"] == [1, 2]
+        assert kwargs["context_payload"]["current_title"] == "Existing Title"
         return {
             "task_type": "document_title_extraction",
             "summary": "The current title already appears to be the best visible title.",
@@ -93,8 +78,8 @@ def test_title_intelligence_keeps_existing_title_when_model_declines(monkeypatch
         }
 
     monkeypatch.setattr(
-        "app.services.title_intelligence.request_llm_json",
-        _fake_request_llm_json,
+        "app.services.title_intelligence.request_direct_gemini_pdf_json",
+        _fake_direct_request,
     )
 
     structure_json = {
@@ -118,45 +103,3 @@ def test_title_intelligence_keeps_existing_title_when_model_declines(monkeypatch
     assert audit["applied"] is False
     assert audit["retained_existing_title"] is True
     assert audit["title"] == "Existing Title"
-
-
-def test_title_intelligence_can_use_direct_gemini(monkeypatch, tmp_path):
-    pdf_path = tmp_path / "sample.pdf"
-    _make_pdf(pdf_path)
-
-    async def _fake_direct_request(**kwargs):
-        assert kwargs["page_numbers"] == [1, 2]
-        assert kwargs["context_payload"]["current_title"] == "Existing Title"
-        return {
-            "task_type": "document_title_extraction",
-            "summary": "Recovered the title with direct Gemini.",
-            "confidence": "high",
-            "reason": "The visible title is clear.",
-            "title": "Recovered Title",
-        }
-
-    monkeypatch.setattr("app.services.title_intelligence.direct_gemini_pdf_enabled", lambda: True)
-    monkeypatch.setattr(
-        "app.services.title_intelligence.request_direct_gemini_pdf_json",
-        _fake_direct_request,
-    )
-
-    structure_json = {
-        "title": "Existing Title",
-        "elements": [
-            {"type": "heading", "text": "Recovered Title", "page": 0},
-        ],
-    }
-
-    updated, audit = asyncio.run(
-        enhance_document_title_with_intelligence(
-            pdf_path=pdf_path,
-            structure_json=structure_json,
-            original_filename="doc.pdf",
-            llm_client=object(),
-        )
-    )
-
-    assert updated["title"] == "Recovered Title"
-    assert audit["applied"] is True
-    assert audit["title"] == "Recovered Title"

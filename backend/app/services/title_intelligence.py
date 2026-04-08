@@ -1,19 +1,9 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 from app.pipeline.structure import _collapse_spaced_title_caps
-from app.services.gemini_direct import (
-    direct_gemini_pdf_enabled,
-    request_direct_gemini_pdf_json,
-)
-from app.services.intelligence_llm_utils import (
-    context_json_part,
-    pdf_file_parts,
-    preferred_cache_breakpoint_index,
-    request_llm_json,
-)
+from app.services.gemini_direct import request_direct_gemini_pdf_json
 from app.services.llm_client import LlmClient
 
 TITLE_DECISION_SCHEMA: dict[str, Any] = {
@@ -106,50 +96,22 @@ async def enhance_document_title_with_intelligence(
             "reason": "no_candidates",
         }
 
-    job = SimpleNamespace(
-        original_filename=original_filename,
-        input_path=str(pdf_path),
-        output_path=str(pdf_path),
+    context_payload = {
+        "job_filename": original_filename,
+        "title_candidates": candidates,
+        "current_title": existing_title,
+    }
+    parsed = await request_direct_gemini_pdf_json(
+        pdf_path=pdf_path,
+        page_numbers=list(range(1, TITLE_MAX_PAGES + 1)),
+        prompt=TITLE_INTELLIGENCE_PROMPT,
+        context_payload=context_payload,
+        response_schema=TITLE_DECISION_SCHEMA,
+        system_instruction=(
+            "You are evaluating PDF accessibility and document title metadata. "
+            "Stay grounded in the provided PDF pages."
+        ),
     )
-    content = [
-        {
-            "type": "text",
-            "text": TITLE_INTELLIGENCE_PROMPT,
-        },
-        *pdf_file_parts(
-            job,
-            list(range(1, TITLE_MAX_PAGES + 1)),
-            filename=original_filename,
-        ),
-        context_json_part(
-            context_payload := {
-                "job_filename": original_filename,
-                "title_candidates": candidates,
-                "current_title": existing_title,
-            },
-            prefix="Title extraction context:\n",
-        ),
-    ]
-    if direct_gemini_pdf_enabled():
-        parsed = await request_direct_gemini_pdf_json(
-            pdf_path=pdf_path,
-            page_numbers=list(range(1, TITLE_MAX_PAGES + 1)),
-            prompt=TITLE_INTELLIGENCE_PROMPT,
-            context_payload=context_payload,
-            response_schema=TITLE_DECISION_SCHEMA,
-            system_instruction=(
-                "You are evaluating PDF accessibility and document title metadata. "
-                "Stay grounded in the provided PDF pages."
-            ),
-        )
-    else:
-        parsed = await request_llm_json(
-            llm_client=llm_client,
-            content=content,
-            schema_name="document_title_extraction",
-            response_schema=TITLE_DECISION_SCHEMA,
-            cache_breakpoint_index=preferred_cache_breakpoint_index(content),
-        )
     confidence = str(parsed.get("confidence") or "").strip().lower()
     title = _collapse_spaced_title_caps(parsed.get("title"))
     applied = confidence in {"high", "medium"} and bool(title)

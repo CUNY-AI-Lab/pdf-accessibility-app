@@ -1,14 +1,8 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
-from app.services.gemini_direct import (
-    direct_gemini_pdf_enabled,
-    request_direct_gemini_pdf_json,
-)
-from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
-from app.services.semantic_units import SemanticUnit
+from app.services.gemini_direct import request_direct_gemini_pdf_json
 
 TOC_GROUP_DIRECT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -94,105 +88,54 @@ async def generate_toc_group_intelligence(
     llm_client,
 ) -> dict[str, Any]:
     pages = [page for page in candidate_group.get("pages", []) if isinstance(page, int) and page > 0]
-    primary_page = pages[0] if pages else 1
     candidate_elements = candidate_group.get("candidate_elements") if isinstance(candidate_group.get("candidate_elements"), list) else []
-    if direct_gemini_pdf_enabled():
-        parsed = await request_direct_gemini_pdf_json(
-            pdf_path=pdf_path,
-            page_numbers=pages,
-            prompt=TOC_GROUP_DIRECT_PROMPT,
-            context_payload={
-                "original_filename": original_filename,
-                "semantic_unit": {
-                    "unit_id": f"toc-group-{candidate_group.get('caption_index')}",
-                    "caption_index": candidate_group.get("caption_index"),
-                    "caption_text": candidate_group.get("caption_text"),
-                    "candidate_elements": candidate_elements,
-                },
+    parsed = await request_direct_gemini_pdf_json(
+        pdf_path=pdf_path,
+        page_numbers=pages,
+        prompt=TOC_GROUP_DIRECT_PROMPT,
+        context_payload={
+            "original_filename": original_filename,
+            "semantic_unit": {
+                "unit_id": f"toc-group-{candidate_group.get('caption_index')}",
+                "caption_index": candidate_group.get("caption_index"),
+                "caption_text": candidate_group.get("caption_text"),
+                "candidate_elements": candidate_elements,
             },
-            response_schema=TOC_GROUP_DIRECT_SCHEMA,
-            system_instruction=(
-                "You are evaluating PDF accessibility and TOC semantics. "
-                "Stay grounded in the provided PDF pages."
-            ),
-        )
-        entry_indexes = [
-            int(item)
-            for item in (parsed.get("entry_indexes") or [])
-            if isinstance(item, int)
-        ]
-        entry_types = {
-            str(key).strip(): str(value).strip()
-            for key, value in (parsed.get("entry_types") or {}).items()
-            if str(key).strip() and str(value).strip()
-        }
-        entry_text_overrides = _filter_entry_text_overrides(
-            {
-                str(key).strip(): str(value).strip()
-                for key, value in (parsed.get("entry_text_overrides") or {}).items()
-                if str(key).strip() and str(value).strip()
-            },
-            entry_indexes,
-        )
-        if entry_indexes and not entry_types:
-            entry_types = _default_entry_types(candidate_elements, entry_indexes)
-        return {
-            "caption_index": int(candidate_group.get("caption_index")) if isinstance(candidate_group.get("caption_index"), int) else -1,
-            "is_toc": bool(parsed.get("is_toc")),
-            "confidence": str(parsed.get("confidence") or "").strip().lower() or "low",
-            "reason": str(parsed.get("reason") or "").strip(),
-            "entry_indexes": entry_indexes,
-            "entry_types": entry_types,
-            "caption_text_override": str(parsed.get("caption_text_override") or "").strip(),
-            "entry_text_overrides": entry_text_overrides,
-        }
-    unit = SemanticUnit(
-        unit_id=f"toc-group-{candidate_group.get('caption_index')}",
-        unit_type="toc_group",
-        page=primary_page,
-        accessibility_goal="Decide whether this candidate group is a real table of contents and which candidate elements should become TOC entries.",
-        current_semantics={
-            "caption_index": candidate_group.get("caption_index"),
-            "caption_text": candidate_group.get("caption_text"),
         },
-        metadata={
-            "caption_index": candidate_group.get("caption_index"),
-            "caption_text": candidate_group.get("caption_text"),
-            "candidate_elements": candidate_elements,
-            "extra_page_numbers": pages[1:],
-        },
+        response_schema=TOC_GROUP_DIRECT_SCHEMA,
+        system_instruction=(
+            "You are evaluating PDF accessibility and TOC semantics. "
+            "Stay grounded in the provided PDF pages."
+        ),
     )
-    job = SimpleNamespace(
-        original_filename=original_filename,
-        input_path=str(pdf_path),
-        output_path=str(pdf_path),
-    )
-    decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)
-
-    entry_indexes = decision.entry_indexes
-    entry_types = decision.entry_types
-    if (decision.is_toc or decision.suggested_action in {"confirm_toc", "set_toc_entries"}) and not entry_indexes:
-        entry_indexes = [
-            int(item["index"])
-            for item in candidate_elements
-            if isinstance(item, dict)
-            and isinstance(item.get("index"), int)
-            and str(item.get("type") or "") in {"paragraph", "list_item", "heading", "table", "toc_item", "toc_item_table"}
-        ]
-    if entry_indexes and not entry_types:
-        entry_types = _default_entry_types(candidate_elements, entry_indexes)
+    entry_indexes = [
+        int(item)
+        for item in (parsed.get("entry_indexes") or [])
+        if isinstance(item, int)
+    ]
+    entry_types = {
+        str(key).strip(): str(value).strip()
+        for key, value in (parsed.get("entry_types") or {}).items()
+        if str(key).strip() and str(value).strip()
+    }
     entry_text_overrides = _filter_entry_text_overrides(
-        decision.entry_text_overrides,
+        {
+            str(key).strip(): str(value).strip()
+            for key, value in (parsed.get("entry_text_overrides") or {}).items()
+            if str(key).strip() and str(value).strip()
+        },
         entry_indexes,
     )
+    if entry_indexes and not entry_types:
+        entry_types = _default_entry_types(candidate_elements, entry_indexes)
 
     return {
         "caption_index": int(candidate_group.get("caption_index")) if isinstance(candidate_group.get("caption_index"), int) else -1,
-        "is_toc": bool(decision.is_toc or decision.suggested_action in {"confirm_toc", "set_toc_entries"}),
-        "confidence": decision.confidence,
-        "reason": decision.reason,
+        "is_toc": bool(parsed.get("is_toc")),
+        "confidence": str(parsed.get("confidence") or "").strip().lower() or "low",
+        "reason": str(parsed.get("reason") or "").strip(),
         "entry_indexes": entry_indexes,
         "entry_types": entry_types,
-        "caption_text_override": decision.caption_text_override,
+        "caption_text_override": str(parsed.get("caption_text_override") or "").strip(),
         "entry_text_overrides": entry_text_overrides,
     }

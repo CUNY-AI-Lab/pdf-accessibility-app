@@ -246,7 +246,6 @@ def test_generate_toc_group_intelligence_can_use_direct_gemini(monkeypatch, tmp_
             "entry_text_overrides": {"1": "Introduction"},
         }
 
-    monkeypatch.setattr("app.services.intelligence_gemini_toc.direct_gemini_pdf_enabled", lambda: True)
     monkeypatch.setattr(
         "app.services.intelligence_gemini_toc.request_direct_gemini_pdf_json",
         _fake_direct_request,

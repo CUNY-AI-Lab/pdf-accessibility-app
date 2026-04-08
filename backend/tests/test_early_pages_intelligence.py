@@ -1,19 +1,10 @@
 import asyncio
 
 import pikepdf
-import pytest
 
 from app.services.early_pages_intelligence import (
     enhance_document_title_and_front_matter_with_intelligence,
 )
-
-
-@pytest.fixture(autouse=True)
-def _disable_direct_gemini_by_default(monkeypatch):
-    monkeypatch.setattr(
-        "app.services.early_pages_intelligence.direct_gemini_pdf_enabled",
-        lambda: False,
-    )
 
 
 def _make_pdf(pdf_path, page_count=4):
@@ -26,12 +17,12 @@ def _make_pdf(pdf_path, page_count=4):
 def test_early_pages_intelligence_combines_title_and_front_matter(monkeypatch, tmp_path):
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path, page_count=4)
-    captured = {}
 
-    async def _fake_request_llm_json(*, llm_client, content, schema_name, response_schema, cache_breakpoint_index):
-        captured["content"] = content
-        captured["schema_name"] = schema_name
-        captured["cache_breakpoint_index"] = cache_breakpoint_index
+    async def _fake_direct_request(**kwargs):
+        assert kwargs["page_numbers"] == [1, 2, 3]
+        assert kwargs["context_payload"]["job_filename"] == "report.pdf"
+        assert kwargs["context_payload"]["title_candidates"]
+        assert kwargs["context_payload"]["front_matter_pages"]
         return {
             "task_type": "document_early_pages_intelligence",
             "summary": "Recovered the title and pre-TOC page roles from the same early pages.",
@@ -52,8 +43,8 @@ def test_early_pages_intelligence_combines_title_and_front_matter(monkeypatch, t
         }
 
     monkeypatch.setattr(
-        "app.services.early_pages_intelligence.request_llm_json",
-        _fake_request_llm_json,
+        "app.services.early_pages_intelligence.request_direct_gemini_pdf_json",
+        _fake_direct_request,
     )
 
     structure_json = {
@@ -77,16 +68,6 @@ def test_early_pages_intelligence_combines_title_and_front_matter(monkeypatch, t
         )
     )
 
-    assert captured["schema_name"] == "document_early_pages_intelligence"
-    assert captured["cache_breakpoint_index"] == 1
-    assert sum(1 for part in captured["content"] if part.get("type") == "file") == 1
-    context = next(
-        part
-        for part in captured["content"]
-        if part.get("type") == "text" and "Early-pages intelligence context:" in part.get("text", "")
-    )
-    assert "title_candidates" in context["text"]
-    assert "front_matter_pages" in context["text"]
     assert updated["title"] == "Management Track Assessments Spring 2023"
     assert title_audit["applied"] is True
     assert front_matter_audit["applied"] is True
@@ -96,8 +77,7 @@ def test_early_pages_intelligence_combines_title_and_front_matter(monkeypatch, t
         "Series Information",
     ]
 
-
-def test_early_pages_intelligence_can_use_direct_gemini(monkeypatch, tmp_path):
+def test_early_pages_intelligence_uses_direct_gemini(monkeypatch, tmp_path):
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path, page_count=4)
 
@@ -120,7 +100,6 @@ def test_early_pages_intelligence_can_use_direct_gemini(monkeypatch, tmp_path):
             },
         }
 
-    monkeypatch.setattr("app.services.early_pages_intelligence.direct_gemini_pdf_enabled", lambda: True)
     monkeypatch.setattr(
         "app.services.early_pages_intelligence.request_direct_gemini_pdf_json",
         _fake_direct_request,
