@@ -185,6 +185,7 @@ MAX_BOOKMARK_TOC_ITEMS = 80
 BOOKMARK_HEADING_TYPES = {"heading"}
 BOOKMARK_LANDMARK_TYPES = {"paragraph", "list_item", "note"}
 BOOKMARK_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+FRONT_MATTER_AUTO_CONFIDENCE = {"high", "medium"}
 TOC_TRAILING_PAGE_RE = re.compile(
     r"(?:\.{2,}\s*|(?:\.\s*){2,}|\s{2,}|\t+)(?:\d+|[ivxlcdm]+)\s*$|(?:\s+)(?:\d+)\s*$",
     re.IGNORECASE,
