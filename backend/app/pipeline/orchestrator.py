@@ -247,6 +247,39 @@ def _accumulate_llm_usage(
         delta.get("cost_usd", 0.0) or 0.0
     )
     return total
+
+
+def _alt_text_step_result(
+    *,
+    count: int,
+    approved: int,
+    rejected: int,
+    reviewable_changes: int,
+    reclassified: int,
+    auto_approve_enabled: bool,
+    llm_usage: dict[str, float | int] | None = None,
+    reason: str | None = None,
+    skipped_figure_count: int | None = None,
+    figure_reclassification: dict[str, object] | None = None,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "count": count,
+        "approved": approved,
+        "rejected": rejected,
+        "reviewable_changes": reviewable_changes,
+        "reclassified": reclassified,
+        "auto_approve_enabled": auto_approve_enabled,
+        "llm_usage": dict(llm_usage or _empty_llm_usage()),
+    }
+    if reason is not None:
+        result["reason"] = reason
+    if skipped_figure_count is not None:
+        result["skipped_figure_count"] = skipped_figure_count
+    if figure_reclassification is not None:
+        result["figure_reclassification"] = figure_reclassification
+    return result
+
+
 SAFE_IMPLICIT_STANDARD_BASEFONTS = frozenset(
     {
         "TimesRoman",
@@ -5254,16 +5287,17 @@ async def run_pipeline(
             current_step = "alt_text"
             if structure.figures:
                 if settings.skip_alt_text_generation:
-                    skip_result = {
-                        "count": 0,
-                        "approved": 0,
-                        "rejected": 0,
-                        "reviewable_changes": 0,
-                        "reclassified": 0,
-                        "auto_approve_enabled": settings.auto_approve_generated_alt_text,
-                        "reason": "disabled_by_settings",
-                        "skipped_figure_count": len(structure.figures),
-                    }
+                    skip_result = _alt_text_step_result(
+                        count=0,
+                        approved=0,
+                        rejected=0,
+                        reviewable_changes=0,
+                        reclassified=0,
+                        auto_approve_enabled=settings.auto_approve_generated_alt_text,
+                        llm_usage=_empty_llm_usage(),
+                        reason="disabled_by_settings",
+                        skipped_figure_count=len(structure.figures),
+                    )
                     await _update_step(
                         db,
                         job_id,
@@ -5286,14 +5320,17 @@ async def run_pipeline(
                 job_manager.emit_progress(job_id, step="alt_text", status="running")
 
                 llm_client = make_llm_client(settings)
+                alt_text_llm_usage = _empty_llm_usage()
 
                 try:
-                    alt_texts = await generate_alt_text(
-                        structure.figures,
-                        llm_client,
-                        job=job,
-                        original_filename=job.original_filename,
-                    )
+                    with track_llm_usage() as usage:
+                        alt_texts = await generate_alt_text(
+                            structure.figures,
+                            llm_client,
+                            job=job,
+                            original_filename=job.original_filename,
+                        )
+                    alt_text_llm_usage = _llm_usage_snapshot(usage)
                 finally:
                     await llm_client.close()
 
@@ -5359,28 +5396,30 @@ async def run_pipeline(
                     job_id,
                     "alt_text",
                     "complete",
-                    result={
-                        "count": len(alt_texts),
-                        "approved": approved_count,
-                        "rejected": rejected_count,
-                        "reviewable_changes": len(figure_change_specs),
-                        "reclassified": reclassified_count,
-                        "figure_reclassification": figure_reclassification,
-                        "auto_approve_enabled": settings.auto_approve_generated_alt_text,
-                    },
+                    result=_alt_text_step_result(
+                        count=len(alt_texts),
+                        approved=approved_count,
+                        rejected=rejected_count,
+                        reviewable_changes=len(figure_change_specs),
+                        reclassified=reclassified_count,
+                        auto_approve_enabled=settings.auto_approve_generated_alt_text,
+                        llm_usage=alt_text_llm_usage,
+                        figure_reclassification=figure_reclassification,
+                    ),
                 )
                 job_manager.emit_progress(
                     job_id,
                     step="alt_text",
                     status="complete",
-                    result={
-                        "count": len(alt_texts),
-                        "approved": approved_count,
-                        "rejected": rejected_count,
-                        "reviewable_changes": len(figure_change_specs),
-                        "reclassified": reclassified_count,
-                        "auto_approve_enabled": settings.auto_approve_generated_alt_text,
-                    },
+                    result=_alt_text_step_result(
+                        count=len(alt_texts),
+                        approved=approved_count,
+                        rejected=rejected_count,
+                        reviewable_changes=len(figure_change_specs),
+                        reclassified=reclassified_count,
+                        auto_approve_enabled=settings.auto_approve_generated_alt_text,
+                        llm_usage=alt_text_llm_usage,
+                    ),
                 )
 
                 # All generated alt entries are actionable (approved/rejected), continue directly.
@@ -5396,8 +5435,18 @@ async def run_pipeline(
                 return
 
             else:
-                await _update_step(db, job_id, "alt_text", "skipped")
-                job_manager.emit_progress(job_id, step="alt_text", status="skipped")
+                skip_result = _alt_text_step_result(
+                    count=0,
+                    approved=0,
+                    rejected=0,
+                    reviewable_changes=0,
+                    reclassified=0,
+                    auto_approve_enabled=settings.auto_approve_generated_alt_text,
+                    llm_usage=_empty_llm_usage(),
+                    reason="no_figures",
+                )
+                await _update_step(db, job_id, "alt_text", "skipped", result=skip_result)
+                job_manager.emit_progress(job_id, step="alt_text", status="skipped", result=skip_result)
 
             # No figures = skip review, go straight to tagging
             await run_tagging_and_validation(
