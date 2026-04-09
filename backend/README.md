@@ -63,6 +63,14 @@ Main files:
 
 The same backend settings drive both the real app and the benchmark scripts. If `DOCLING_SERVE_URL` is set, the structure step uses that server; otherwise it falls back to local Docling. Semantic adjudication uses Gemini directly for PDF-native lanes and the configured Gemini chat-completions endpoint for the remaining JSON-only lanes.
 
+For Gemini-first deployments, prefer:
+- `GEMINI_API_KEY=<key>`
+- `LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`
+- `LLM_API_KEY=` blank, unless you intentionally want a separate credential for the chat-completions path
+- `LLM_MODEL=google/gemini-3-flash-preview`
+- `GEMINI_MODEL=gemini-3-flash-preview`
+- `USE_DIRECT_GEMINI_PDF=true`
+
 On Apple Silicon, the recommended local setup is `docling-serve` with `DOCLING_DEVICE=mps`. That accelerates structure extraction, but the tagging/writer step in [app/pipeline/tagger.py](app/pipeline/tagger.py) remains CPU-bound.
 
 Runtime check:

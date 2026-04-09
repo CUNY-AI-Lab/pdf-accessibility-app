@@ -112,7 +112,9 @@ A single-container deployment bundles all dependencies (Ghostscript, OCRmyPDF, T
 
 ```bash
 cp .env.example .env
-# Edit .env with your LLM_API_KEY
+# Edit .env with your GEMINI_API_KEY
+# Leave LLM_API_KEY empty unless you intentionally want a different
+# chat-completions credential than the Gemini Developer API key.
 
 docker compose up -d --build
 ```
@@ -136,6 +138,13 @@ docker run -d \
 
 Notes:
 - The image preloads Docling models so there are no first-run downloads.
+- The intended Gemini-first deployment shape is:
+  `GEMINI_API_KEY=<key>`,
+  `LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`,
+  `LLM_API_KEY=` blank,
+  `LLM_MODEL=google/gemini-3-flash-preview`,
+  `GEMINI_MODEL=gemini-3-flash-preview`,
+  `USE_DIRECT_GEMINI_PDF=true`.
 - For subpath deployments, set `VITE_APP_BASE_PATH` before building (e.g., `/pdf-accessibility/`).
 - Tesseract language packs included: English, Spanish, French, German, Chinese (Simplified + Traditional), Russian, Arabic, Korean, Bengali, Polish, Hebrew, Yiddish, Haitian Creole, Hindi, Italian, Portuguese, Japanese. Add others by extending the Dockerfile.
 
