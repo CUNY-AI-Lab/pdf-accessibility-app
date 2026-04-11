@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import re
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from app.config import get_settings
 from app.models import Job
 from app.pipeline.structure import FigureInfo
 from app.services.gemini_direct import (
     create_direct_gemini_pdf_cache,
     delete_direct_gemini_pdf_cache,
     direct_gemini_pdf_enabled,
+    direct_gemini_thinking_override,
     request_direct_gemini_cached_json,
 )
 from app.services.intelligence_gemini import confidence_label, confidence_score
@@ -255,6 +259,25 @@ def _requires_single_figure_followup(result: dict[str, object]) -> bool:
     return False
 
 
+def _alt_text_max_concurrency() -> int:
+    settings = get_settings()
+    try:
+        value = int(getattr(settings, "alt_text_max_concurrency", 2))
+    except (TypeError, ValueError):
+        value = 2
+    return max(1, value)
+
+
+@contextmanager
+def _figure_semantics_thinking_override():
+    settings = get_settings()
+    with direct_gemini_thinking_override(
+        level=getattr(settings, "gemini_direct_alt_text_thinking_level", None),
+        budget=getattr(settings, "gemini_direct_alt_text_thinking_budget", None),
+    ):
+        yield
+
+
 async def generate_figure_intelligence(
     *,
     figure: FigureInfo,
@@ -291,13 +314,14 @@ async def generate_figure_intelligence(
         from types import SimpleNamespace
 
         job = SimpleNamespace(original_filename=original_filename)
-    try:
-        decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)
-    except Exception as exc:
-        return _manual_only_figure_result(
-            figure_index=figure.index,
-            reason=f"Figure semantics fallback: {exc}",
-        )
+    with _figure_semantics_thinking_override():
+        try:
+            decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)
+        except Exception as exc:
+            return _manual_only_figure_result(
+                figure_index=figure.index,
+                reason=f"Figure semantics fallback: {exc}",
+            )
     return _finalize_figure_result(
         figure_index=figure.index,
         figure_context=figure_context,
@@ -323,127 +347,145 @@ async def generate_figures_intelligence(
     if not figures:
         return []
 
-    grouped: dict[int, list[FigureInfo]] = defaultdict(list)
-    for figure in figures:
-        page = int(figure.page) + 1 if isinstance(figure.page, int) and figure.page >= 0 else 1
-        grouped[page].append(figure)
+    with _figure_semantics_thinking_override():
+        grouped: dict[int, list[FigureInfo]] = defaultdict(list)
+        for figure in figures:
+            page = int(figure.page) + 1 if isinstance(figure.page, int) and figure.page >= 0 else 1
+            grouped[page].append(figure)
 
-    results: dict[int, dict[str, object]] = {}
-    for page in sorted(grouped):
-        page_figures = sorted(grouped[page], key=lambda fig: fig.index)
-        page_context = _figure_page_context(page_figures)
-        pdf_page_cache = None
-        if direct_gemini_pdf_enabled() and not local_semantic_enabled() and job is not None:
-            try:
-                pdf_path = job_pdf_path(job)
-                pdf_page_cache = await create_direct_gemini_pdf_cache(
-                    pdf_path=pdf_path,
-                    page_numbers=[page],
-                    system_instruction=FIGURE_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
-                    ttl="900s",
-                )
-            except Exception:
-                pdf_page_cache = None
+        semaphore = asyncio.Semaphore(_alt_text_max_concurrency())
 
-        try:
-            for start in range(0, len(page_figures), MAX_FIGURES_PER_BATCH):
-                chunk = page_figures[start : start + MAX_FIGURES_PER_BATCH]
-                payload_candidates = [
-                    {
-                        "figure_index": figure.index,
-                        "caption": str(figure.caption or "").strip(),
-                        "page": page,
-                        "bbox": figure.bbox,
-                        **page_context.get(figure.index, {}),
-                    }
-                    for figure in chunk
-                ]
+        async def _generate_page_results(page: int) -> dict[int, dict[str, object]]:
+            async with semaphore:
+                page_results: dict[int, dict[str, object]] = {}
+                await _generate_page_results_inner(page, page_results)
+                return page_results
 
-                parsed: dict[str, Any] | None = None
-                if pdf_page_cache is not None:
-                    try:
-                        parsed = await request_direct_gemini_cached_json(
-                            cache_handle=pdf_page_cache,
-                            prompt=FIGURE_BATCH_PROMPT,
-                            context_payload={
-                                "job_filename": getattr(job, "original_filename", original_filename)
-                                if job is not None
-                                else original_filename,
-                                "page": page,
-                                "candidates": payload_candidates,
-                            },
-                            response_schema=FIGURE_BATCH_SCHEMA,
-                        )
-                    except Exception:
-                        parsed = None
-                if parsed is None:
-                    page_images: list[dict[str, Any]] = page_preview_parts(job, [page])
-                    content: list[dict[str, Any]] = [
-                        {"type": "text", "text": FIGURE_BATCH_PROMPT},
-                        *page_images,
-                        context_json_part(
-                            {
-                                "job_filename": getattr(job, "original_filename", original_filename)
-                                if job is not None
-                                else original_filename,
-                                "page": page,
-                                "candidates": payload_candidates,
-                            }
-                        ),
-                    ]
-                    for figure in chunk:
-                        if figure.path.exists():
-                            content.extend(
-                                [
-                                    {"type": "text", "text": f"Figure candidate {figure.index} crop:"},
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {"url": _image_data_url(figure.path)},
-                                    },
-                                ]
-                            )
-                    try:
-                        parsed = await request_llm_json(
-                            llm_client=llm_client,
-                            content=content,
-                            schema_name="figure_batch_intelligence",
-                            response_schema=FIGURE_BATCH_SCHEMA,
-                            cache_breakpoint_index=len(page_images) if page_images else 0,
-                        )
-                    except Exception:
-                        parsed = None
-
-                chunk_index_set = {figure.index for figure in chunk}
-                seen: set[int] = set()
-                if parsed is not None:
-                    for item in parsed.get("decisions") or []:
-                        if not isinstance(item, dict):
-                            continue
-                        figure_index = item.get("figure_index")
-                        if not isinstance(figure_index, int) or figure_index not in chunk_index_set:
-                            continue
-                        finalized = _finalize_figure_result(
-                            figure_index=figure_index,
-                            figure_context=page_context.get(figure_index),
-                            raw=item,
-                        )
-                        if _requires_single_figure_followup(finalized):
-                            continue
-                        results[figure_index] = finalized
-                        seen.add(figure_index)
-
-                for figure in chunk:
-                    if figure.index in seen:
-                        continue
-                    results[figure.index] = await generate_figure_intelligence(
-                        figure=figure,
-                        llm_client=llm_client,
-                        job=job,
-                        original_filename=original_filename,
-                        figure_context=page_context.get(figure.index),
+        async def _generate_page_results_inner(
+            page: int,
+            page_results: dict[int, dict[str, object]],
+        ) -> None:
+            page_figures = sorted(grouped[page], key=lambda fig: fig.index)
+            page_context = _figure_page_context(page_figures)
+            pdf_page_cache = None
+            if direct_gemini_pdf_enabled() and not local_semantic_enabled() and job is not None:
+                try:
+                    pdf_path = job_pdf_path(job)
+                    pdf_page_cache = await create_direct_gemini_pdf_cache(
+                        pdf_path=pdf_path,
+                        page_numbers=[page],
+                        system_instruction=FIGURE_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
+                        ttl="900s",
                     )
-        finally:
-            if pdf_page_cache is not None:
-                await delete_direct_gemini_pdf_cache(pdf_page_cache)
+                except Exception:
+                    pdf_page_cache = None
 
-    return [results[figure.index] for figure in sorted(figures, key=lambda fig: fig.index)]
+            try:
+                for start in range(0, len(page_figures), MAX_FIGURES_PER_BATCH):
+                    chunk = page_figures[start : start + MAX_FIGURES_PER_BATCH]
+                    payload_candidates = [
+                        {
+                            "figure_index": figure.index,
+                            "caption": str(figure.caption or "").strip(),
+                            "page": page,
+                            "bbox": figure.bbox,
+                            **page_context.get(figure.index, {}),
+                        }
+                        for figure in chunk
+                    ]
+
+                    parsed: dict[str, Any] | None = None
+                    if pdf_page_cache is not None:
+                        try:
+                            parsed = await request_direct_gemini_cached_json(
+                                cache_handle=pdf_page_cache,
+                                prompt=FIGURE_BATCH_PROMPT,
+                                context_payload={
+                                    "job_filename": getattr(job, "original_filename", original_filename)
+                                    if job is not None
+                                    else original_filename,
+                                    "page": page,
+                                    "candidates": payload_candidates,
+                                },
+                                response_schema=FIGURE_BATCH_SCHEMA,
+                            )
+                        except Exception:
+                            parsed = None
+                    if parsed is None:
+                        page_images: list[dict[str, Any]] = page_preview_parts(job, [page])
+                        content: list[dict[str, Any]] = [
+                            {"type": "text", "text": FIGURE_BATCH_PROMPT},
+                            *page_images,
+                            context_json_part(
+                                {
+                                    "job_filename": getattr(job, "original_filename", original_filename)
+                                    if job is not None
+                                    else original_filename,
+                                    "page": page,
+                                    "candidates": payload_candidates,
+                                }
+                            ),
+                        ]
+                        for figure in chunk:
+                            if figure.path.exists():
+                                content.extend(
+                                    [
+                                        {"type": "text", "text": f"Figure candidate {figure.index} crop:"},
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {"url": _image_data_url(figure.path)},
+                                        },
+                                    ]
+                                )
+                        try:
+                            parsed = await request_llm_json(
+                                llm_client=llm_client,
+                                content=content,
+                                schema_name="figure_batch_intelligence",
+                                response_schema=FIGURE_BATCH_SCHEMA,
+                                cache_breakpoint_index=len(page_images) if page_images else 0,
+                            )
+                        except Exception:
+                            parsed = None
+
+                    chunk_index_set = {figure.index for figure in chunk}
+                    seen: set[int] = set()
+                    if parsed is not None:
+                        for item in parsed.get("decisions") or []:
+                            if not isinstance(item, dict):
+                                continue
+                            figure_index = item.get("figure_index")
+                            if not isinstance(figure_index, int) or figure_index not in chunk_index_set:
+                                continue
+                            finalized = _finalize_figure_result(
+                                figure_index=figure_index,
+                                figure_context=page_context.get(figure_index),
+                                raw=item,
+                            )
+                            if _requires_single_figure_followup(finalized):
+                                continue
+                            page_results[figure_index] = finalized
+                            seen.add(figure_index)
+
+                    for figure in chunk:
+                        if figure.index in seen:
+                            continue
+                        page_results[figure.index] = await generate_figure_intelligence(
+                            figure=figure,
+                            llm_client=llm_client,
+                            job=job,
+                            original_filename=original_filename,
+                            figure_context=page_context.get(figure.index),
+                        )
+            finally:
+                if pdf_page_cache is not None:
+                    await delete_direct_gemini_pdf_cache(pdf_page_cache)
+
+        results: dict[int, dict[str, object]] = {}
+        page_result_items = await asyncio.gather(
+            *[_generate_page_results(page) for page in sorted(grouped)]
+        )
+        for page_results in page_result_items:
+            results.update(page_results)
+
+        return [results[figure.index] for figure in sorted(figures, key=lambda fig: fig.index)]

@@ -277,12 +277,16 @@ def _rect_array_to_bbox(rect: Any) -> dict[str, float] | None:
     if not isinstance(rect, pikepdf.Array) or len(rect) < 4:
         return None
     try:
-        left = float(rect[0])
-        bottom = float(rect[1])
-        right = float(rect[2])
-        top = float(rect[3])
+        x0 = float(rect[0])
+        y0 = float(rect[1])
+        x1 = float(rect[2])
+        y1 = float(rect[3])
     except Exception:
         return None
+    left = min(x0, x1)
+    bottom = min(y0, y1)
+    right = max(x0, x1)
+    top = max(y0, y1)
     if right <= left or top <= bottom:
         return None
     return {
@@ -291,6 +295,25 @@ def _rect_array_to_bbox(rect: Any) -> dict[str, float] | None:
         "r": right,
         "t": top,
     }
+
+
+def _normalize_annotation_rect(annotation: pikepdf.Object) -> bool:
+    """Canonicalize annotation /Rect coordinates when producers wrote them reversed."""
+    try:
+        bbox = _rect_array_to_bbox(annotation.get("/Rect"))
+    except Exception:
+        return False
+    if not bbox:
+        return False
+    normalized = [bbox["l"], bbox["b"], bbox["r"], bbox["t"]]
+    try:
+        current = [float(annotation["/Rect"][idx]) for idx in range(4)]
+    except Exception:
+        current = []
+    if current == normalized:
+        return False
+    annotation["/Rect"] = pikepdf.Array(normalized)
+    return True
 
 
 def _region_bbox(region: "ContentRegion") -> dict[str, float] | None:
@@ -688,12 +711,13 @@ def _is_safe_inferred_link_label(
     ann_area = ann_width * ann_height
     src_area = src_width * src_height
 
+    if source_type in {"paragraph", "word"} and (
+        src_width > ann_width * 2.5 or src_area > ann_area * 4.0
+    ):
+        return False
+
     if source_type == "paragraph":
         if normalized.endswith((".", "!", "?")) and len(words) > 6:
-            return False
-        if len(words) > 12 and src_width > ann_width * 2.5:
-            return False
-        if len(words) > 12 and src_area > ann_area * 6.0:
             return False
     return True
 
@@ -763,6 +787,8 @@ def _infer_link_contents(
         or (has_dest and existing.startswith("Link to "))
     )
     if visible_text and existing_is_generated:
+        if uri and existing == f"Link to {uri}" and visible_type != "hyperlink":
+            return existing
         return visible_text
     if existing:
         return existing
@@ -802,6 +828,31 @@ def _infer_widget_accessible_name(
         if value and len(value) <= 200:
             return value
     return ""
+
+
+def _best_annotation_source_element(
+    annotation: pikepdf.Object,
+    page_elements: list[dict[str, Any]] | None,
+    *,
+    allowed_types: frozenset[str],
+    margin: float = 6.0,
+) -> dict[str, Any] | None:
+    """Find the visible structure-json element that contains an annotation."""
+    if not page_elements:
+        return None
+    try:
+        annotation_bbox = _rect_array_to_bbox(annotation.get("/Rect"))
+    except Exception:
+        annotation_bbox = None
+    if not annotation_bbox:
+        return None
+
+    candidates = [
+        element
+        for element in page_elements
+        if isinstance(element, dict) and str(element.get("type") or "") in allowed_types
+    ]
+    return _best_bbox_match(annotation_bbox, candidates, margin=margin)
 
 
 def _clean_bookmark_label(text: Any) -> str:
@@ -2017,7 +2068,8 @@ class StructTreeBuilder:
         ] = {}
         self._content_owner_order = 0
         self._struct_parents_counter = 0
-        self._object_parent_entries: list[tuple[int, pikepdf.Object]] = []
+        self._object_parent_entries: list[tuple[pikepdf.Object, pikepdf.Object]] = []
+        self._source_element_structs: dict[int, pikepdf.Object] = {}
         self._headings: list[dict] = []
         self._struct_elems_created = 0
         self._list_cache: dict[str, tuple[pikepdf.Object, pikepdf.Object | None]] = {}
@@ -2107,8 +2159,36 @@ class StructTreeBuilder:
         parent_k = parent.get("/K")
         if isinstance(parent_k, pikepdf.Array):
             parent_k.append(child)
+        elif parent_k is not None:
+            parent["/K"] = pikepdf.Array([parent_k, child])
         else:
             parent["/K"] = pikepdf.Array([child])
+
+    def _struct_elem_for_mcid(self, owner: pikepdf.Object, mcid: int) -> pikepdf.Object | None:
+        owner_key = self._content_owner_key(owner)
+        entry = self._content_owner_entries.get(owner_key)
+        if not entry:
+            return None
+        for registered_mcid, elem in entry["mcids"]:
+            if registered_mcid == mcid:
+                return elem
+        return None
+
+    def remember_source_element(
+        self,
+        source_element: dict[str, Any],
+        owner: pikepdf.Object,
+        mcid: int,
+    ) -> None:
+        """Remember which StructElem represents a structure-json element."""
+        elem = self._struct_elem_for_mcid(owner, mcid)
+        if elem is not None:
+            self._source_element_structs[id(source_element)] = elem
+
+    def source_element_struct(self, source_element: dict[str, Any] | None) -> pikepdf.Object | None:
+        if source_element is None:
+            return None
+        return self._source_element_structs.get(id(source_element))
 
     def _add_struct_elem(
         self,
@@ -2498,7 +2578,12 @@ class StructTreeBuilder:
 
         return mcid
 
-    def add_link_annotation(self, page_ref: pikepdf.Object, annotation: pikepdf.Object) -> bool:
+    def add_link_annotation(
+        self,
+        page_ref: pikepdf.Object,
+        annotation: pikepdf.Object,
+        parent: pikepdf.Object | None = None,
+    ) -> bool:
         """Attach a /Link StructElem to an existing link annotation via OBJR."""
         try:
             if annotation.get("/Subtype") != pikepdf.Name("/Link"):
@@ -2508,23 +2593,25 @@ class StructTreeBuilder:
         except Exception:
             return False
 
-        struct_parent_key = self._alloc_struct_parent_key()
-        annotation["/StructParent"] = struct_parent_key
+        if parent is None:
+            parent = self.doc_elem
+        annotation["/P"] = page_ref
         if not str(annotation.get("/Contents", "")).strip():
             annotation["/Contents"] = pikepdf.String(_infer_link_contents(annotation))
 
         link_elem = self.pdf.make_indirect(pikepdf.Dictionary({
             "/Type": pikepdf.Name("/StructElem"),
             "/S": pikepdf.Name("/Link"),
-            "/P": self.doc_elem,
+            "/P": parent,
+            "/Pg": page_ref,
             "/K": pikepdf.Dictionary({
                 "/Type": pikepdf.Name("/OBJR"),
                 "/Obj": annotation,
                 "/Pg": page_ref,
             }),
         }))
-        self._append_child(self.doc_elem, link_elem)
-        self._object_parent_entries.append((struct_parent_key, link_elem))
+        self._append_child(parent, link_elem)
+        self._object_parent_entries.append((annotation, link_elem))
         self._struct_elems_created += 1
         return True
 
@@ -2538,13 +2625,13 @@ class StructTreeBuilder:
         except Exception:
             return False
 
-        struct_parent_key = self._alloc_struct_parent_key()
-        annotation["/StructParent"] = struct_parent_key
+        annotation["/P"] = page_ref
 
         form_elem = self.pdf.make_indirect(pikepdf.Dictionary({
             "/Type": pikepdf.Name("/StructElem"),
             "/S": pikepdf.Name("/Form"),
             "/P": self.doc_elem,
+            "/Pg": page_ref,
             "/K": pikepdf.Dictionary({
                 "/Type": pikepdf.Name("/OBJR"),
                 "/Obj": annotation,
@@ -2552,7 +2639,7 @@ class StructTreeBuilder:
             }),
         }))
         self._append_child(self.doc_elem, form_elem)
-        self._object_parent_entries.append((struct_parent_key, form_elem))
+        self._object_parent_entries.append((annotation, form_elem))
         self._struct_elems_created += 1
         return True
 
@@ -2567,13 +2654,13 @@ class StructTreeBuilder:
         except Exception:
             return False
 
-        struct_parent_key = self._alloc_struct_parent_key()
-        annotation["/StructParent"] = struct_parent_key
+        annotation["/P"] = page_ref
 
         annot_elem = self.pdf.make_indirect(pikepdf.Dictionary({
             "/Type": pikepdf.Name("/StructElem"),
             "/S": pikepdf.Name("/Annot"),
             "/P": self.doc_elem,
+            "/Pg": page_ref,
             "/K": pikepdf.Dictionary({
                 "/Type": pikepdf.Name("/OBJR"),
                 "/Obj": annotation,
@@ -2581,7 +2668,7 @@ class StructTreeBuilder:
             }),
         }))
         self._append_child(self.doc_elem, annot_elem)
-        self._object_parent_entries.append((struct_parent_key, annot_elem))
+        self._object_parent_entries.append((annotation, annot_elem))
         self._struct_elems_created += 1
         return True
 
@@ -2606,7 +2693,9 @@ class StructTreeBuilder:
             parent_tree_nums.append(struct_parents_idx)
             parent_tree_nums.append(self.pdf.make_indirect(elem_array))
 
-        for struct_parent_key, elem in sorted(self._object_parent_entries, key=lambda x: x[0]):
+        for annotation, elem in self._object_parent_entries:
+            struct_parent_key = self._alloc_struct_parent_key()
+            annotation["/StructParent"] = struct_parent_key
             parent_tree_nums.append(struct_parent_key)
             parent_tree_nums.append(elem)
 
@@ -2763,6 +2852,8 @@ def _emit_tagged_region(
             parent_list_group_ref=elem.get("parent_list_group_ref"),
             stream_owner=stream_owner,
         )
+        if hasattr(builder, "remember_source_element"):
+            builder.remember_source_element(elem, stream_owner or page_ref, mcid)
         new_instructions.append(_make_bdc("LBody", mcid, actual_text=actual_text))
         new_instructions.extend(region.instructions)
         new_instructions.append(_make_emc())
@@ -2841,6 +2932,8 @@ def _emit_tagged_region(
         mcid = builder.add_paragraph(page_index, page_ref, lang=elem_lang, stream_owner=stream_owner)
         tag = "P"
 
+    if hasattr(builder, "remember_source_element"):
+        builder.remember_source_element(elem, stream_owner or page_ref, mcid)
     new_instructions.append(_make_bdc(tag, mcid, actual_text=actual_text))
     new_instructions.extend(region.instructions)
     new_instructions.append(_make_emc())
@@ -3757,6 +3850,7 @@ def _tag_link_annotations(
         except Exception:
             continue
         has_link_annotation = True
+        _normalize_annotation_rect(annotation)
         current_contents = str(annotation.get("/Contents", "")).strip()
         inferred_contents = _infer_link_contents(
             annotation,
@@ -3775,7 +3869,13 @@ def _tag_link_annotations(
             except Exception:
                 continue
 
-        if builder.add_link_annotation(page_ref, annotation):
+        parent_element = _best_annotation_source_element(
+            annotation,
+            page_elements,
+            allowed_types=LINK_TEXT_ELEMENT_TYPES,
+        )
+        parent_struct = builder.source_element_struct(parent_element)
+        if builder.add_link_annotation(page_ref, annotation, parent=parent_struct):
             tagged += 1
 
     if has_link_annotation:
@@ -3803,6 +3903,7 @@ def _tag_widget_annotations(
         except Exception:
             continue
 
+        _normalize_annotation_rect(annotation)
         if not str(annotation.get("/TU", "")).strip():
             inferred_name = _infer_widget_accessible_name(annotation, docling_page_widgets)
             if inferred_name:
@@ -3845,6 +3946,7 @@ def _tag_generic_annotations(
         except Exception:
             continue
 
+        _normalize_annotation_rect(annotation)
         if not getattr(annotation, "is_indirect", False):
             try:
                 annotation = builder.pdf.make_indirect(pikepdf.Dictionary(annotation))
@@ -3978,6 +4080,7 @@ def _ensure_annotation_baseline(page: pikepdf.Page):
 
     for annotation in annots:
         try:
+            _normalize_annotation_rect(annotation)
             subtype = annotation.get("/Subtype")
             if subtype == pikepdf.Name("/Widget"):
                 continue

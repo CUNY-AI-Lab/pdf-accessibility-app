@@ -5,17 +5,34 @@ import textwrap
 import pikepdf
 
 from app.pipeline.tagger import (
+    ContentRegion,
     StructTreeBuilder,
     _add_bookmarks,
     _clean_bookmark_label,
+    _emit_tagged_region,
     _ensure_annotation_baseline,
     _infer_link_contents,
+    _normalize_annotation_rect,
     _prune_incidental_annotations,
     _resolve_document_language,
     _tag_generic_annotations,
     _tag_link_annotations,
     _tag_widget_annotations,
 )
+
+
+def test_normalize_annotation_rect_canonicalizes_reversed_coordinates():
+    pdf = pikepdf.new()
+    annotation = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Link"),
+        "/Rect": pikepdf.Array([433.143, 47.6855, 278.443, 37.6016]),
+    }))
+
+    changed = _normalize_annotation_rect(annotation)
+
+    assert changed is True
+    assert [float(value) for value in annotation["/Rect"]] == [278.443, 37.6016, 433.143, 47.6855]
 
 
 def test_generic_annotations_are_tagged_as_annot_struct_elems():
@@ -234,6 +251,65 @@ def test_tag_link_annotations_replaces_generic_baseline_contents_with_visible_te
     assert page.get("/Tabs") == pikepdf.Name("/S")
 
 
+def test_link_annotation_nests_under_matched_text_struct_element():
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    annotation = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Link"),
+        "/Rect": pikepdf.Array([20, 20, 80, 32]),
+        "/A": pikepdf.Dictionary({
+            "/Type": pikepdf.Name("/Action"),
+            "/S": pikepdf.Name("/URI"),
+            "/URI": pikepdf.String("https://example.test"),
+        }),
+    }))
+    page["/Annots"] = pikepdf.Array([annotation])
+    source_element = {
+        "type": "paragraph",
+        "text": "Read the example link for details.",
+        "bbox": {"l": 10, "b": 15, "r": 180, "t": 40},
+    }
+
+    builder = StructTreeBuilder(pdf)
+    builder.setup()
+    _emit_tagged_region(
+        [],
+        ContentRegion(
+            kind="text",
+            start_idx=0,
+            end_idx=0,
+            instructions=[],
+            bbox=source_element["bbox"],
+            text="read the example link for details",
+        ),
+        source_element,
+        builder,
+        0,
+        page.obj,
+        {},
+        set(),
+    )
+
+    tagged = _tag_link_annotations(page, page.obj, builder, page_elements=[source_element])
+    builder.finalize()
+
+    assert tagged == 1
+    assert annotation.get("/StructParent") == 1
+    assert annotation.get("/P") == page.obj
+    paragraph = builder.doc_elem["/K"][0]
+    assert paragraph.get("/S") == pikepdf.Name("/P")
+    paragraph_k = paragraph.get("/K")
+    assert isinstance(paragraph_k, pikepdf.Array)
+    assert paragraph_k[0].get("/Type") == pikepdf.Name("/MCR")
+    link_elem = paragraph_k[1]
+    assert link_elem.get("/S") == pikepdf.Name("/Link")
+    assert link_elem.get("/P") == paragraph
+    assert link_elem.get("/Pg") == page.obj
+    assert builder.doc_elem["/K"][0] == paragraph
+    assert len(builder.doc_elem["/K"]) == 1
+
+
 def test_tag_link_annotations_keeps_generic_contents_when_row_context_is_weak():
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(600, 800))
@@ -334,6 +410,59 @@ def test_infer_link_contents_rejects_sentence_length_paragraph_overlap():
     ]
 
     assert _infer_link_contents(annotation, page_elements, page_lines=None) == "Link to destination"
+
+
+def test_infer_link_contents_rejects_short_broad_paragraph_overlap():
+    pdf = pikepdf.new()
+    annotation = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Link"),
+        "/Rect": pikepdf.Array([350, 690, 405, 700]),
+        "/A": pikepdf.Dictionary({
+            "/Type": pikepdf.Name("/Action"),
+            "/S": pikepdf.Name("/URI"),
+            "/URI": pikepdf.String("https://example.test/instructions"),
+        }),
+    }))
+
+    page_elements = [
+        {
+            "type": "paragraph",
+            "text": "Employers must ensure the form instructions are available.",
+            "bbox": {"l": 35, "b": 688, "r": 575, "t": 708},
+        }
+    ]
+
+    assert _infer_link_contents(annotation, page_elements, page_lines=None) == (
+        "Link to https://example.test/instructions"
+    )
+
+
+def test_infer_link_contents_keeps_generated_uri_without_hyperlink_metadata():
+    pdf = pikepdf.new()
+    annotation = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Link"),
+        "/Rect": pikepdf.Array([20, 20, 80, 32]),
+        "/Contents": pikepdf.String("Link to https://example.test/details"),
+        "/A": pikepdf.Dictionary({
+            "/Type": pikepdf.Name("/Action"),
+            "/S": pikepdf.Name("/URI"),
+            "/URI": pikepdf.String("https://example.test/details"),
+        }),
+    }))
+
+    page_words = [
+        {
+            "bbox": {"l": 20, "b": 20, "r": 80, "t": 32},
+            "display_text": "Example details",
+            "text": "example details",
+        }
+    ]
+
+    assert _infer_link_contents(annotation, page_words=page_words) == (
+        "Link to https://example.test/details"
+    )
 
 
 def test_resolve_document_language_prefers_structure_language_and_normalizes_tesseract_code():

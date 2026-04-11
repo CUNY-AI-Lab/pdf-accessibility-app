@@ -1,8 +1,10 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 from app.pipeline.alt_text import generate_alt_text
 from app.pipeline.structure import FigureInfo
+from app.services.gemini_direct import _direct_gemini_thinking_override_values
 from app.services.intelligence_gemini_figures import (
     _figure_page_context,
     _should_suppress_child_ui_alt,
@@ -19,6 +21,7 @@ def test_generate_figure_intelligence_normalizes_alt_text(monkeypatch, tmp_path)
 
     async def _fake_adjudicate(*, job, unit, llm_client):
         captured["unit"] = unit
+        captured["thinking_override"] = _direct_gemini_thinking_override_values()
         assert job.original_filename == "doc.pdf"
         return SemanticDecision(
             unit_id="figure-2",
@@ -57,6 +60,7 @@ def test_generate_figure_intelligence_normalizes_alt_text(monkeypatch, tmp_path)
     assert unit.bbox is None
     assert unit.metadata["figure_index"] == 2
     assert unit.metadata["extra_image_data_urls"]
+    assert captured["thinking_override"] == ("medium", 0)
 
 
 def test_generate_figure_intelligence_fails_soft_to_manual_only(monkeypatch, tmp_path):
@@ -213,6 +217,82 @@ def test_generate_figures_intelligence_batches_by_page_and_falls_back(monkeypatc
     assert fallback_calls == [3]
 
 
+def test_generate_figures_intelligence_parallelizes_page_batches_with_bound(monkeypatch, tmp_path):
+    image_paths = []
+    for index in range(4):
+        path = tmp_path / f"figure-{index}.png"
+        path.write_bytes(b"fake-image")
+        image_paths.append(path)
+
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.get_settings",
+        lambda: SimpleNamespace(
+            gemini_direct_alt_text_thinking_level="medium",
+            gemini_direct_alt_text_thinking_budget=0,
+            alt_text_max_concurrency=2,
+        ),
+    )
+
+    active_requests = 0
+    max_active_requests = 0
+    requested_pages = set()
+
+    def _context_payload(content):
+        for item in content:
+            text = item.get("text", "") if isinstance(item, dict) else ""
+            if text.startswith("Context JSON:\n"):
+                return json.loads(text.removeprefix("Context JSON:\n"))
+        raise AssertionError("Context JSON part missing")
+
+    async def _fake_request_llm_json(*, llm_client, content, schema_name, response_schema, cache_breakpoint_index=None):
+        nonlocal active_requests, max_active_requests
+        payload = _context_payload(content)
+        requested_pages.add(payload["page"])
+        active_requests += 1
+        max_active_requests = max(max_active_requests, active_requests)
+        try:
+            await asyncio.sleep(0.02)
+        finally:
+            active_requests -= 1
+        return {
+            "task_type": "figure_batch_intelligence",
+            "decisions": [
+                {
+                    "figure_index": candidate["figure_index"],
+                    "summary": f"Figure {candidate['figure_index']}",
+                    "confidence": "high",
+                    "suggested_action": "set_alt_text",
+                    "reason": "Visible figure on the page.",
+                    "alt_text": f"Figure {candidate['figure_index']}",
+                }
+                for candidate in payload["candidates"]
+            ],
+        }
+
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.request_llm_json",
+        _fake_request_llm_json,
+    )
+
+    figures = [
+        FigureInfo(index=4, path=image_paths[0], caption="D", page=3),
+        FigureInfo(index=1, path=image_paths[1], caption="A", page=0),
+        FigureInfo(index=3, path=image_paths[2], caption="C", page=2),
+        FigureInfo(index=2, path=image_paths[3], caption="B", page=1),
+    ]
+
+    results = asyncio.run(
+        generate_figures_intelligence(
+            figures=figures,
+            llm_client=object(),
+        )
+    )
+
+    assert max_active_requests == 2
+    assert requested_pages == {1, 2, 3, 4}
+    assert [result["figure_index"] for result in results] == [1, 2, 3, 4]
+
+
 def test_figure_page_context_marks_tiny_child_ui_figures(tmp_path):
     image_a = tmp_path / "a.png"
     image_b = tmp_path / "b.png"
@@ -361,7 +441,7 @@ def test_generate_figures_intelligence_uses_cached_pdf_page_with_direct_gemini(m
 
     fake_pdf_path = tmp_path / "doc.pdf"
     fake_pdf_path.write_bytes(b"%PDF-1.7 fake")
-    calls = {"cached": [], "created": [], "deleted": [], "fallback": []}
+    calls = {"cached": [], "created": [], "deleted": [], "fallback": [], "thinking": []}
 
     async def _fake_create_cache(*, pdf_path, page_numbers=None, system_instruction=None, ttl="3600s", settings=None):
         calls["created"].append(
@@ -377,6 +457,7 @@ def test_generate_figures_intelligence_uses_cached_pdf_page_with_direct_gemini(m
     async def _fake_cached_json(*, cache_handle, prompt, context_payload=None, response_schema=None, settings=None):
         candidate_indexes = [item["figure_index"] for item in context_payload["candidates"]]
         calls["cached"].append(candidate_indexes)
+        calls["thinking"].append(_direct_gemini_thinking_override_values())
         return {
             "task_type": "figure_batch_intelligence",
             "decisions": [
@@ -459,6 +540,7 @@ def test_generate_figures_intelligence_uses_cached_pdf_page_with_direct_gemini(m
     assert calls["cached"] == [[1, 2, 3, 4], [5]]
     assert calls["deleted"] == ["cache-1"]
     assert calls["fallback"] == []
+    assert calls["thinking"] == [("medium", 0), ("medium", 0)]
 
 
 def test_generate_figures_intelligence_direct_gemini_retries_unresolved_batch_items(monkeypatch, tmp_path):

@@ -24,6 +24,14 @@ _DIRECT_GEMINI_TIMEOUT_OVERRIDE_SECONDS: ContextVar[float | None] = ContextVar(
     "direct_gemini_timeout_override_seconds",
     default=None,
 )
+_DIRECT_GEMINI_THINKING_LEVEL_OVERRIDE: ContextVar[str | None] = ContextVar(
+    "direct_gemini_thinking_level_override",
+    default=None,
+)
+_DIRECT_GEMINI_THINKING_BUDGET_OVERRIDE: ContextVar[int | None] = ContextVar(
+    "direct_gemini_thinking_budget_override",
+    default=None,
+)
 
 
 @dataclass(slots=True)
@@ -188,6 +196,40 @@ def direct_gemini_timeout_override(timeout_seconds: float | None):
         _DIRECT_GEMINI_TIMEOUT_OVERRIDE_SECONDS.reset(token)
 
 
+@contextmanager
+def direct_gemini_thinking_override(
+    *,
+    level: str | None = None,
+    budget: int | None = None,
+):
+    level_token = None
+    budget_token = None
+    normalized_level = str(level or "").strip().lower()
+    if normalized_level:
+        level_token = _DIRECT_GEMINI_THINKING_LEVEL_OVERRIDE.set(normalized_level)
+    if budget is not None:
+        try:
+            normalized_budget = int(budget)
+        except (TypeError, ValueError):
+            normalized_budget = None
+        if normalized_budget is not None:
+            budget_token = _DIRECT_GEMINI_THINKING_BUDGET_OVERRIDE.set(normalized_budget)
+    try:
+        yield
+    finally:
+        if budget_token is not None:
+            _DIRECT_GEMINI_THINKING_BUDGET_OVERRIDE.reset(budget_token)
+        if level_token is not None:
+            _DIRECT_GEMINI_THINKING_LEVEL_OVERRIDE.reset(level_token)
+
+
+def _direct_gemini_thinking_override_values() -> tuple[str | None, int | None]:
+    return (
+        _DIRECT_GEMINI_THINKING_LEVEL_OVERRIDE.get(),
+        _DIRECT_GEMINI_THINKING_BUDGET_OVERRIDE.get(),
+    )
+
+
 def _gemini_timeout_milliseconds(settings: Settings) -> int:
     override = _DIRECT_GEMINI_TIMEOUT_OVERRIDE_SECONDS.get()
     raw_timeout = override if override is not None else getattr(settings, "gemini_direct_timeout", 45)
@@ -205,13 +247,22 @@ def _gemini_http_options(types_module: Any, *, settings: Settings) -> Any:
 def _gemini_thinking_config(types_module: Any, *, settings: Settings) -> Any | None:
     model_name = str(getattr(settings, "gemini_model", "") or "").lower()
     if "gemini-3" in model_name:
-        raw_level = str(getattr(settings, "gemini_direct_thinking_level", "minimal") or "minimal")
+        override_level = _DIRECT_GEMINI_THINKING_LEVEL_OVERRIDE.get()
+        raw_level = str(
+            override_level
+            if override_level is not None
+            else getattr(settings, "gemini_direct_thinking_level", "minimal")
+            or "minimal"
+        )
         level_name = raw_level.strip().upper().replace("-", "_")
         thinking_level = getattr(types_module.ThinkingLevel, level_name, types_module.ThinkingLevel.MINIMAL)
         return types_module.ThinkingConfig(include_thoughts=False, thinking_level=thinking_level)
     if "gemini-2.5" in model_name:
+        override_budget = _DIRECT_GEMINI_THINKING_BUDGET_OVERRIDE.get()
         budget = _positive_int(
-            getattr(settings, "gemini_direct_thinking_budget", 0),
+            override_budget
+            if override_budget is not None
+            else getattr(settings, "gemini_direct_thinking_budget", 0),
             default=0,
             minimum=0,
         )

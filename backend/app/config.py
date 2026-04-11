@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     gemini_direct_max_output_tokens: int = 8192
     gemini_direct_thinking_level: str = "low"
     gemini_direct_thinking_budget: int = 0
+    gemini_direct_alt_text_thinking_level: str = "medium"
+    gemini_direct_alt_text_thinking_budget: int = 0
     semantic_media_backend: str = "gemini"
     local_semantic_base_url: str = "http://127.0.0.1:8000/v1"
     local_semantic_api_key: str = ""
@@ -53,6 +55,7 @@ class Settings(BaseSettings):
     llm_strict_validation: bool = True
     auto_approve_generated_alt_text: bool = True
     skip_alt_text_generation: bool = False
+    alt_text_max_concurrency: int = 2
     auto_apply_llm_font_map: bool = True
     auto_apply_grounded_text: bool = True
     auto_apply_table_intelligence: bool = True

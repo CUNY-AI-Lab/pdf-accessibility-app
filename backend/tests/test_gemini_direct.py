@@ -1,7 +1,12 @@
 from google.genai import types
 
 from app.config import Settings
-from app.services.gemini_direct import _build_prompt_text, _gemini_json_config, direct_gemini_timeout_override
+from app.services.gemini_direct import (
+    _build_prompt_text,
+    _gemini_json_config,
+    direct_gemini_thinking_override,
+    direct_gemini_timeout_override,
+)
 
 
 def _settings(**overrides):
@@ -41,6 +46,21 @@ def test_gemini_json_config_uses_response_json_schema():
     assert config.thinking_config.thinking_budget is None
 
 
+def test_gemini_json_config_uses_thinking_level_override():
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    with direct_gemini_thinking_override(level="medium"):
+        config = _gemini_json_config(
+            types,
+            settings=_settings(),
+            system_instruction="Stay grounded.",
+            response_schema=schema,
+        )
+
+    assert config.thinking_config.include_thoughts is False
+    assert config.thinking_config.thinking_level == types.ThinkingLevel.MEDIUM
+    assert config.thinking_config.thinking_budget is None
+
+
 def test_gemini_json_config_uses_2_5_thinking_budget():
     config = _gemini_json_config(
         types,
@@ -51,6 +71,20 @@ def test_gemini_json_config_uses_2_5_thinking_budget():
 
     assert config.thinking_config.include_thoughts is False
     assert config.thinking_config.thinking_budget == 0
+    assert config.thinking_config.thinking_level is None
+
+
+def test_gemini_json_config_uses_2_5_thinking_budget_override():
+    with direct_gemini_thinking_override(budget=256):
+        config = _gemini_json_config(
+            types,
+            settings=_settings(gemini_model="gemini-2.5-flash", gemini_direct_thinking_budget=0),
+            system_instruction=None,
+            response_schema=None,
+        )
+
+    assert config.thinking_config.include_thoughts is False
+    assert config.thinking_config.thinking_budget == 256
     assert config.thinking_config.thinking_level is None
 
 
