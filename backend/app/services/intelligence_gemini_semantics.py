@@ -8,9 +8,11 @@ from app.models import Job
 from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_llm_utils import (
     context_json_part,
-    pdf_file_parts,
     preferred_cache_breakpoint_index,
     request_llm_json,
+)
+from app.services.intelligence_llm_utils import (
+    semantic_page_parts as pdf_file_parts,
 )
 from app.services.llm_client import LlmClient
 from app.services.pdf_preview import render_bbox_preview_png_data_url

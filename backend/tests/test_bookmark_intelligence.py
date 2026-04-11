@@ -338,6 +338,132 @@ def test_bookmark_intelligence_uses_direct_gemini_cached_path(monkeypatch, tmp_p
     assert audit["front_matter_applied"] is True
 
 
+def test_bookmark_intelligence_uses_local_semantic_preview_path(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "sample.pdf"
+    _make_pdf(pdf_path, page_count=5)
+    seen_calls: list[tuple[str, list[dict[str, object]]]] = []
+
+    async def _should_not_create_cache(**kwargs):
+        raise AssertionError("local bookmark path should not create a Gemini cache")
+
+    async def _should_not_delete_cache(*args, **kwargs):
+        raise AssertionError("local bookmark path should not delete a Gemini cache")
+
+    async def _should_not_request_cached(**kwargs):
+        raise AssertionError("local bookmark path should not use cached Gemini requests")
+
+    async def _fake_request_llm_json(
+        *,
+        llm_client,
+        content,
+        schema_name=None,
+        response_schema=None,
+        cache_breakpoint_index=None,
+        conversation_prefix=None,
+    ):
+        seen_calls.append((schema_name, content))
+        if schema_name == "bookmark_document_candidate_plan":
+            return {
+                "task_type": "bookmark_document_candidate_plan",
+                "summary": "Built the bookmark skeleton.",
+                "confidence": "high",
+                "reason": "Grounded visible outline.",
+                "front_matter_entries": [{"page": 1, "label": "Cover"}],
+                "outline_entries": [
+                    {"candidate_id": "toc:0", "supported_label": "TABLE OF CONTENTS", "level": 1},
+                    {"candidate_id": "toc:1", "supported_label": "1 Intro", "level": 2},
+                ],
+            }
+        if schema_name == "bookmark_document_heading_supplement":
+            return {
+                "task_type": "bookmark_document_heading_supplement",
+                "summary": "Added one useful visible subsection heading.",
+                "confidence": "high",
+                "reason": "The heading is visibly navigational.",
+                "outline_entries": [
+                    {"candidate_id": "heading:4", "supported_label": "Adding IDs", "level": 2},
+                ],
+            }
+        return {
+            "task_type": "bookmark_document_landmark_plan",
+            "summary": "Added one useful visible landmark.",
+            "confidence": "high",
+            "reason": "The paragraph behaves like a visible subsection title.",
+            "selected_landmarks": [
+                {
+                    "page": 4,
+                    "label": "Link texts and the Contents key",
+                    "anchor_candidate_id": "heading:4",
+                    "level": 3,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.local_semantic_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.create_direct_gemini_pdf_cache",
+        _should_not_create_cache,
+    )
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.delete_direct_gemini_pdf_cache",
+        _should_not_delete_cache,
+    )
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.request_direct_gemini_cached_json",
+        _should_not_request_cached,
+    )
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.page_preview_parts",
+        lambda job, page_numbers: [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,page-{page_numbers[0]}"}}  # noqa: E501
+        ],
+    )
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.request_llm_json",
+        _fake_request_llm_json,
+    )
+
+    structure_json = {
+        "elements": [
+            {"type": "heading", "text": "Manual Title", "page": 0, "level": 1},
+            {"type": "toc_caption", "text": "TABLE OF CONTENTS", "page": 1, "toc_group_ref": "toc-0"},
+            {"type": "toc_item", "text": "1 Intro", "page": 1, "toc_group_ref": "toc-0"},
+            {"type": "heading", "text": "1 Intro", "page": 2, "level": 1},
+            {"type": "heading", "text": "Adding IDs", "page": 3, "level": 2},
+            {"type": "paragraph", "text": "Link texts and the Contents key", "page": 3},
+        ],
+    }
+
+    updated, audit = asyncio.run(
+        enhance_bookmark_structure_with_intelligence(
+            pdf_path=pdf_path,
+            structure_json=structure_json,
+            original_filename="report.pdf",
+            llm_client=object(),
+        )
+    )
+
+    assert [schema_name for schema_name, _content in seen_calls] == [
+        "bookmark_document_candidate_plan",
+        "bookmark_document_heading_supplement",
+        "bookmark_document_landmark_plan",
+    ]
+    assert all(any(item.get("type") == "image_url" for item in content) for _schema_name, content in seen_calls)
+    assert [entry["text"] for entry in updated["bookmark_plan"]] == [
+        "Cover",
+        "TABLE OF CONTENTS",
+        "1 Intro",
+        "Adding IDs",
+        "Link texts and the Contents key",
+    ]
+    assert audit["applied"] is True
+    assert audit["selected_heading_count"] == 1
+    assert audit["selected_landmark_count"] == 1
+
+
 def test_bookmark_intelligence_uses_prefetched_front_matter_entries(monkeypatch, tmp_path):
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path, page_count=4)

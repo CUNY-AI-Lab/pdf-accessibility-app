@@ -29,6 +29,10 @@ from app.pipeline.validator import validate_pdf
 from app.services.applied_changes import add_applied_change
 from app.services.auto_structure_apply import auto_apply_structure_tasks
 from app.services.bookmark_intelligence import enhance_bookmark_structure_with_intelligence
+from app.services.docling_escalation import (
+    docling_pretag_ambiguity_router,
+    docling_structure_escalation_plan,
+)
 from app.services.early_pages_intelligence import (
     enhance_document_title_and_front_matter_with_intelligence,
 )
@@ -803,6 +807,7 @@ async def _apply_pretag_table_intelligence(
     job: Job,
     settings: Settings,
     structure_json: dict[str, object],
+    targets: list[dict[str, object]] | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     audit: dict[str, object] = {
         "enabled": bool(settings.auto_apply_table_intelligence),
@@ -830,19 +835,30 @@ async def _apply_pretag_table_intelligence(
         audit["reason"] = "missing_structure"
         return structure_json, audit
 
-    table_risk = _table_semantics_risk(structure_json)
-    targets = table_risk.get("targets")
+    precomputed_targets = targets
+    if precomputed_targets is None:
+        table_risk = _table_semantics_risk(structure_json)
+        targets = table_risk.get("targets")
+    else:
+        targets = precomputed_targets
     if not isinstance(targets, list) or not targets:
         audit["reason"] = "no_candidates"
         return structure_json, audit
-    detailed_targets = _table_targets_with_cells(
-        structure_json,
-        {
-            str(target.get("table_review_id") or "").strip()
+    if precomputed_targets is None:
+        detailed_targets = _table_targets_with_cells(
+            structure_json,
+            {
+                str(target.get("table_review_id") or "").strip()
+                for target in targets
+                if isinstance(target, dict)
+            },
+        )
+    else:
+        detailed_targets = {
+            str(target.get("table_review_id") or "").strip(): dict(target)
             for target in targets
-            if isinstance(target, dict)
-        },
-    )
+            if isinstance(target, dict) and str(target.get("table_review_id") or "").strip()
+        }
     audit["attempted"] = True
     audit["candidate_count"] = len(targets)
 
@@ -1084,6 +1100,7 @@ async def _apply_pretag_widget_rationalization(
     settings: Settings,
     working_pdf: Path,
     structure_json: dict[str, object],
+    targets: list[dict[str, object]] | None = None,
 ) -> tuple[Path, dict[str, object]]:
     audit: dict[str, object] = {
         "enabled": bool(settings.auto_apply_form_intelligence),
@@ -1110,10 +1127,11 @@ async def _apply_pretag_widget_rationalization(
         audit["reason"] = "missing_structure"
         return working_pdf, audit
 
-    targets = _widget_targets_for_rationalization(
-        working_pdf=working_pdf,
-        structure_json=structure_json,
-    )
+    if targets is None:
+        targets = _widget_targets_for_rationalization(
+            working_pdf=working_pdf,
+            structure_json=structure_json,
+        )
     if not targets:
         audit["reason"] = "no_candidates"
         return working_pdf, audit
@@ -1266,6 +1284,7 @@ async def _apply_pretag_form_intelligence(
     settings: Settings,
     working_pdf: Path,
     structure_json: dict[str, object],
+    targets: list[dict[str, object]] | None = None,
 ) -> tuple[Path, dict[str, object]]:
     audit: dict[str, object] = {
         "enabled": bool(settings.auto_apply_form_intelligence),
@@ -1292,10 +1311,11 @@ async def _apply_pretag_form_intelligence(
         audit["reason"] = "missing_structure"
         return working_pdf, audit
 
-    targets = _form_targets_for_intelligence(
-        working_pdf=working_pdf,
-        structure_json=structure_json,
-    )
+    if targets is None:
+        targets = _form_targets_for_intelligence(
+            working_pdf=working_pdf,
+            structure_json=structure_json,
+        )
     if not targets:
         audit["reason"] = "no_candidates"
         return working_pdf, audit
@@ -5070,6 +5090,9 @@ async def run_pipeline(
             structure = await extract_structure(working_pdf, job_dir)
             if structure.processed_pdf_path:
                 working_pdf = structure.processed_pdf_path
+            docling_escalation_plan = docling_structure_escalation_plan(
+                structure.document_json
+            )
 
             toc_intelligence_assist = {
                 "attempted": False,
@@ -5128,7 +5151,33 @@ async def run_pipeline(
                                 structure_intelligence_llm_usage,
                                 toc_intelligence_assist.get("llm_usage"),
                             )
-                    if settings.assist_title_with_llm and settings.assist_bookmarks_with_llm:
+                    title_needs_llm = (
+                        docling_escalation_plan.get("title", {}).get("decision") != "docling"
+                    )
+                    bookmarks_need_llm = (
+                        docling_escalation_plan.get("bookmarks", {}).get("decision") != "docling"
+                    )
+                    if settings.assist_title_with_llm and not title_needs_llm:
+                        title_intelligence_assist = {
+                            "attempted": False,
+                            "applied": False,
+                            "reason": docling_escalation_plan.get("title", {}).get("reason", "docling"),
+                            "llm_usage": _empty_llm_usage(),
+                        }
+                    if settings.assist_bookmarks_with_llm and not bookmarks_need_llm:
+                        bookmark_intelligence_assist = {
+                            "attempted": False,
+                            "applied": False,
+                            "reason": docling_escalation_plan.get("bookmarks", {}).get("reason", "docling"),
+                            "selected_heading_count": 0,
+                            "llm_usage": _empty_llm_usage(),
+                        }
+                    if (
+                        settings.assist_title_with_llm
+                        and settings.assist_bookmarks_with_llm
+                        and title_needs_llm
+                        and bookmarks_need_llm
+                    ):
                         with track_llm_usage() as usage:
                             try:
                                 (
@@ -5163,7 +5212,7 @@ async def run_pipeline(
                                     title_intelligence_assist.get("llm_usage"),
                                 )
                     if settings.assist_title_with_llm:
-                        if not combined_early_pages_used:
+                        if title_needs_llm and not combined_early_pages_used:
                             with track_llm_usage() as usage:
                                 try:
                                     structure.document_json, title_intelligence_assist = await enhance_document_title_with_intelligence(
@@ -5186,7 +5235,7 @@ async def run_pipeline(
                                     structure_intelligence_llm_usage,
                                     title_intelligence_assist.get("llm_usage"),
                                 )
-                    if settings.assist_bookmarks_with_llm:
+                    if settings.assist_bookmarks_with_llm and bookmarks_need_llm:
                         with track_llm_usage() as usage:
                             try:
                                 structure.document_json, bookmark_intelligence_assist = await enhance_bookmark_structure_with_intelligence(
@@ -5258,6 +5307,7 @@ async def run_pipeline(
                     "title_intelligence_assist": title_intelligence_assist,
                     "bookmark_intelligence_assist": bookmark_intelligence_assist,
                     "structure_intelligence_llm_usage": structure_intelligence_llm_usage,
+                    "docling_escalation_plan": docling_escalation_plan,
                     "synthetic_figure_rationalization": synthetic_figure_rationalization,
                 },
             )
@@ -5545,22 +5595,37 @@ async def run_tagging_and_validation(
             working_pdf=working_pdf,
             structure_json=structure_json,
         )
+        docling_pretag_router = docling_pretag_ambiguity_router(
+            working_pdf=working_pdf,
+            structure_json=structure_json,
+        )
         structure_json, pretag_table_intelligence = await _apply_pretag_table_intelligence(
             job=job,
             settings=settings,
             structure_json=structure_json,
+            targets=list(docling_pretag_router.get("table_targets") or []),
         )
         working_pdf, pretag_widget_rationalization = await _apply_pretag_widget_rationalization(
             job=job,
             settings=settings,
             working_pdf=working_pdf,
             structure_json=structure_json,
+            targets=list(docling_pretag_router.get("widget_targets") or []),
+        )
+        docling_form_router = docling_pretag_ambiguity_router(
+            working_pdf=working_pdf,
+            structure_json=structure_json,
+        )
+        docling_pretag_plan = dict(docling_pretag_router.get("plan") or {})
+        docling_pretag_plan["forms"] = (
+            dict((docling_form_router.get("plan") or {}).get("forms") or {})
         )
         working_pdf, pretag_form_intelligence = await _apply_pretag_form_intelligence(
             job=job,
             settings=settings,
             working_pdf=working_pdf,
             structure_json=structure_json,
+            targets=list(docling_form_router.get("form_targets") or []),
         )
         job.structure_json = json.dumps(structure_json)
 
@@ -5627,6 +5692,7 @@ async def run_tagging_and_validation(
                     pretag_form_intelligence.get("applied_count", 0) or 0
                 ),
                 "pretag_llm_usage": pretag_llm_usage,
+                "docling_pretag_ambiguity_plan": docling_pretag_plan,
                 "grounded_text_audit": pretag_grounded_text,
                 "table_intelligence_audit": pretag_table_intelligence,
                 "widget_rationalization_audit": pretag_widget_rationalization,

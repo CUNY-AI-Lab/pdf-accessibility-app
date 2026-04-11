@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
+from app.config import get_settings
 from app.models import Job
 from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
 from app.services.intelligence_llm_utils import (
     context_json_part,
-    pdf_file_parts,
     preferred_cache_breakpoint_index,
     request_llm_json_with_response,
+    semantic_page_parts,
 )
 from app.services.llm_client import LlmClient
+from app.services.local_semantic import local_semantic_enabled
 from app.services.semantic_units import SemanticUnit
 
 FORM_BATCH_PROMPT = """You are a PDF accessibility form-label assistant.
@@ -143,6 +146,53 @@ def _batch_prompt_target(target: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _local_page_target_batches(targets: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    if not targets:
+        return []
+    if not local_semantic_enabled():
+        return [targets]
+    batch_size = max(1, int(get_settings().local_semantic_page_candidate_batch_size or 12))
+    return [targets[index : index + batch_size] for index in range(0, len(targets), batch_size)]
+
+
+async def _request_form_intelligence_batch(
+    *,
+    job: Job,
+    page_number: int,
+    batch: list[dict[str, Any]],
+    llm_client: LlmClient,
+) -> dict[str, dict[str, Any]]:
+    payload = {
+        "job_filename": getattr(job, "original_filename", ""),
+        "page": page_number,
+        "fields": [_batch_prompt_target(target) for target in batch],
+    }
+    content = [
+        {"type": "text", "text": FORM_BATCH_PROMPT},
+        *semantic_page_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
+        context_json_part(payload),
+    ]
+    parsed, _response = await request_llm_json_with_response(
+        llm_client=llm_client,
+        content=content,
+        schema_name="form_page_intelligence",
+        response_schema=FORM_BATCH_SCHEMA,
+        cache_breakpoint_index=preferred_cache_breakpoint_index(content),
+    )
+    decision_map: dict[str, dict[str, Any]] = {}
+    decisions = parsed.get("decisions")
+    if not isinstance(decisions, list):
+        return decision_map
+    for item in decisions:
+        if not isinstance(item, dict):
+            continue
+        field_review_id = str(item.get("field_review_id") or "").strip()
+        if not field_review_id:
+            continue
+        decision_map[field_review_id] = item
+    return decision_map
+
+
 async def generate_form_intelligence(
     *,
     job: Job,
@@ -204,35 +254,34 @@ async def generate_form_intelligence_for_page(
 ) -> list[dict[str, Any]]:
     if not targets:
         return []
-
-    payload = {
-        "job_filename": getattr(job, "original_filename", ""),
-        "page": page_number,
-        "fields": [_batch_prompt_target(target) for target in targets],
-    }
-    content = [
-        {"type": "text", "text": FORM_BATCH_PROMPT},
-        *pdf_file_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
-        context_json_part(payload),
-    ]
-    parsed, _response = await request_llm_json_with_response(
-        llm_client=llm_client,
-        content=content,
-        schema_name="form_page_intelligence",
-        response_schema=FORM_BATCH_SCHEMA,
-        cache_breakpoint_index=preferred_cache_breakpoint_index(content),
-    )
-
     decision_map: dict[str, dict[str, Any]] = {}
-    decisions = parsed.get("decisions")
-    if isinstance(decisions, list):
-        for item in decisions:
-            if not isinstance(item, dict):
-                continue
-            field_review_id = str(item.get("field_review_id") or "").strip()
-            if not field_review_id:
-                continue
-            decision_map[field_review_id] = item
+    batches = _local_page_target_batches(targets)
+    if local_semantic_enabled() and len(batches) > 1:
+        settings = get_settings()
+        semaphore = asyncio.Semaphore(max(1, int(settings.local_semantic_max_concurrency or 2)))
+
+        async def _run_batch(batch: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+            async with semaphore:
+                return await _request_form_intelligence_batch(
+                    job=job,
+                    page_number=page_number,
+                    batch=batch,
+                    llm_client=llm_client,
+                )
+
+        batch_results = await asyncio.gather(*[_run_batch(batch) for batch in batches])
+        for batch_result in batch_results:
+            decision_map.update(batch_result)
+    else:
+        for batch in batches:
+            decision_map.update(
+                await _request_form_intelligence_batch(
+                    job=job,
+                    page_number=page_number,
+                    batch=batch,
+                    llm_client=llm_client,
+                )
+            )
 
     results = [
         _normalize_form_intelligence_result(

@@ -13,6 +13,56 @@ This is the current direction for the app's semantic pipeline and bookmark/navig
 - Split long-document work by coherent slices or candidate groups when recall depends on many specific items; use caching to preserve economics across those follow-up calls.
 - Keep deterministic code limited to evidence gathering, candidate IDs, schema validation, dedupe, safety bounds, audit logging, and PDF writing.
 
+## Docling-first escalation matrix
+
+This is the intended default posture for the app.
+
+- Title
+  - Default to Docling when the extracted structure already contains a non-empty Docling-native title.
+  - Escalate to Gemini only when Docling title is missing or empty.
+
+- Document language
+  - Default to Docling element-language metadata aggregation.
+  - Do not escalate to Gemini for ordinary document-language detection.
+
+- Native outline / bookmark skeleton
+  - Default to Docling when the parser-native TOC tree is present.
+  - Escalate to Gemini only when the PDF does not expose a native TOC and bookmark usefulness/hierarchy must be reconstructed from visible evidence.
+
+- Visible TOC page semantics
+  - Do not treat this as Docling-authoritative today.
+  - Escalate to Gemini when visible TOC tagging or TOC row repair is needed, because the current visible TOC lane still depends on page-level semantic interpretation.
+
+- Links
+  - Default to Docling hyperlink metadata plus geometric correlation.
+  - Escalate only if the link label remains missing or clearly wrong after Docling grounding.
+
+- Widget accessible names
+  - Default to Docling widget metadata when `/TU` or matched widget text/description is already good.
+  - Escalate only for missing or weak labels.
+
+- Forms
+  - Default to deterministic Docling-first gating.
+  - Build a Docling-derived unresolved-unit list from fields whose current accessible label is missing or weak.
+  - Escalate only those unresolved field units to Gemini.
+
+- Tables
+  - Default to deterministic Docling-first gating.
+  - Build a Docling-derived unresolved-unit list from tables whose current simple header interpretation is missing or whose visible structure contains merged cells/spans.
+  - Escalate only those unresolved table units to Gemini.
+
+- Figures / alt text
+  - Do not treat as Docling-decidable except for obvious structural reclassification inputs.
+  - Escalate to Gemini for meaningful/decorative/reclassified figure semantics and substantive alt text.
+
+- Reading order
+  - Default to Docling for ordinary page order.
+  - Escalate only for pages already flagged as reading-order risks.
+
+- Grounded text repair
+  - Default to local candidate agreement only for safe, high-confidence spacing/encoding fixes.
+  - Escalate to Gemini for ambiguous or meaning-affecting repairs.
+
 This means the app should not drift back toward:
 
 - prompt language that encodes benchmark-shaped navigation policy

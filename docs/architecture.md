@@ -136,6 +136,11 @@ Main implementation files:
 
 The target transport is direct Gemini for PDF-understanding lanes.
 
+The decision rule is Docling-first:
+- trust Docling-native title, language, hyperlink/widget metadata, and native TOC when present
+- escalate to Gemini only when the extracted document evidence is missing, weak, or semantically ambiguous
+- build Docling-derived ambiguity plans first so Gemini sees only unresolved units, not whole lanes
+
 Important properties:
 - Gemini Files API / cached PDF context for reusable document slices
 - native `response_json_schema` structured output

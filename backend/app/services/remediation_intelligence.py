@@ -997,6 +997,7 @@ async def generate_remediation_intelligence(
             llm_client=llm_client,
             content=content,
             cache_breakpoint_index=preferred_cache_breakpoint_index(content),
+            conversation_prefix=[],
         )
     elif task.task_type == "reading_order":
         metadata = _parse_metadata(task)

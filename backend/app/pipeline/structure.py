@@ -12,6 +12,9 @@ from typing import TYPE_CHECKING, Any
 
 from app.config import get_settings
 from app.pipeline.language import (
+    detect_language as _detect_language,
+)
+from app.pipeline.language import (
     normalize_lang_tag as _normalize_lang_tag,
 )
 from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
@@ -60,6 +63,7 @@ FORMULA_ALLOWED_LONG_WORDS = {
     "limit",
 }
 TITLE_SPACED_CAPS_RE = re.compile(r"\b(?:[A-Z]\s+){2,}[A-Z](?:\s+\d+)*\b")
+TITLE_TABLE_CAPTION_RE = re.compile(r"^(?:table|figure)\s+\d+\s*[:.]", re.IGNORECASE)
 TOC_GROUP_HEADING_EXCLUDE = {
     "page",
     "lists",
@@ -1014,23 +1018,101 @@ def _collapse_spaced_title_caps(value: Any) -> str:
     return TITLE_SPACED_CAPS_RE.sub(repl, text)
 
 
+def _extract_first_page_lines(pdf_path: Path) -> list[str]:
+    """Best-effort visible first-page text lines for repairing Docling title artifacts."""
+    try:
+        import pypdfium2 as pdfium
+
+        document = pdfium.PdfDocument(str(pdf_path))
+        try:
+            if len(document) < 1:
+                return []
+            page = document[0]
+            text_page = page.get_textpage()
+            text = text_page.get_text_range() or ""
+        finally:
+            document.close()
+    except Exception:
+        return []
+    return [_clean_title_candidate_text(line) for line in text.splitlines() if line.strip()]
+
+
+def _title_fingerprint(value: Any) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "", str(value or "")).lower()
+
+
+def _repair_title_from_first_page_lines(text: str, pdf_path: Path | None) -> str:
+    if not pdf_path:
+        return text
+    expected = _title_fingerprint(text)
+    if not expected:
+        return text
+    lines = _extract_first_page_lines(pdf_path)
+    for line_count in range(1, min(len(lines), 4) + 1):
+        candidate = _collapse_spaced_title_caps(" ".join(lines[:line_count]))
+        if _title_fingerprint(candidate) == expected:
+            return candidate
+    return text
+
+
+def _docling_title_page_index(item: dict) -> int | None:
+    prov = item.get("prov")
+    if not isinstance(prov, list) or not prov:
+        return None
+    first = prov[0]
+    if not isinstance(first, dict):
+        return None
+    page_no = first.get("page_no")
+    if isinstance(page_no, int):
+        return max(page_no - 1, 0)
+    return None
+
+
+def _first_heading_title(elements: list[dict] | None) -> str | None:
+    headings = [
+        element
+        for element in (elements or [])
+        if isinstance(element, dict) and element.get("type") == "heading"
+    ]
+    if not headings:
+        return None
+    for element in headings:
+        if element.get("level") == 1 and int(element.get("page") or 0) <= 1:
+            text = _collapse_spaced_title_caps(element.get("text"))
+            if text:
+                return text
+    for element in headings:
+        text = _collapse_spaced_title_caps(element.get("text"))
+        if text:
+            return text
+    return None
+
+
+def _looks_like_late_caption_title(text: str, page_index: int | None) -> bool:
+    return page_index is not None and page_index > 2 and bool(TITLE_TABLE_CAPTION_RE.match(text))
+
+
 def _extract_title_from_docling(
     doc_dict: dict,
     elements: list[dict] | None = None,
     *,
     pdf_path: Path | None = None,
 ) -> str | None:
-    """Extract a document title only from Docling-native title signals."""
+    """Extract a document title from Docling, rejecting common caption false positives."""
     for item in doc_dict.get("texts", []):
         if not isinstance(item, dict) or item.get("label") != "title":
             continue
         text = _collapse_spaced_title_caps(item.get("text"))
         if not text:
             continue
-        return text
+        if _looks_like_late_caption_title(text, _docling_title_page_index(item)):
+            continue
+        return _repair_title_from_first_page_lines(text, pdf_path)
 
     metadata_title = _collapse_spaced_title_caps(doc_dict.get("title"))
-    return metadata_title or None
+    if metadata_title:
+        return _repair_title_from_first_page_lines(metadata_title, pdf_path)
+    return _first_heading_title(elements)
 
 
 def _infer_document_language(elements: list[dict], title: str | None = None) -> str | None:
@@ -1055,7 +1137,19 @@ def _infer_document_language(elements: list[dict], title: str | None = None) -> 
                 item[0],
             ),
         )[0]
-    return None
+    visible_text = " ".join(
+        text
+        for text in [
+            _clean_title_candidate_text(title),
+            *[
+                _clean_title_candidate_text(element.get("text"))
+                for element in elements
+                if isinstance(element, dict)
+            ],
+        ]
+        if text
+    )
+    return _normalize_lang_tag(_detect_language(visible_text))
 
 
 def _repair_pdf_with_ghostscript(

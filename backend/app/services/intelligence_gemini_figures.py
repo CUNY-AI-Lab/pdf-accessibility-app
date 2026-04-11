@@ -23,6 +23,7 @@ from app.services.intelligence_llm_utils import (
     request_llm_json,
 )
 from app.services.llm_client import LlmClient
+from app.services.local_semantic import local_semantic_enabled
 from app.services.semantic_units import SemanticUnit
 
 MAX_FIGURES_PER_BATCH = 4
@@ -332,7 +333,7 @@ async def generate_figures_intelligence(
         page_figures = sorted(grouped[page], key=lambda fig: fig.index)
         page_context = _figure_page_context(page_figures)
         pdf_page_cache = None
-        if direct_gemini_pdf_enabled() and job is not None:
+        if direct_gemini_pdf_enabled() and not local_semantic_enabled() and job is not None:
             try:
                 pdf_path = job_pdf_path(job)
                 pdf_page_cache = await create_direct_gemini_pdf_cache(

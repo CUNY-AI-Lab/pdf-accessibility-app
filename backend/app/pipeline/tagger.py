@@ -70,6 +70,10 @@ TOC_TRAILING_PAGE_RE = re.compile(
 APPENDIX_BOOKMARK_KEY_RE = re.compile(r"^(appendix\s+[a-z0-9]+(?:\.\d+)*)\b", re.IGNORECASE)
 NUMERIC_BOOKMARK_KEY_RE = re.compile(r"^(\d+(?:\.\d+)*)\b")
 BOOKMARK_SPACED_CAPS_RE = re.compile(r"\b(?:[A-Z]\s+){2,}[A-Z](?:\s+\d+)*\b")
+WEAK_FIGURE_ALT_RE = re.compile(
+    r"^(?:element\s+\d+|figure\s*\d*|image\s*\d*|graphic\s*\d*|picture\s*\d*|illustration\s*\d*|decorative)$",
+    re.IGNORECASE,
+)
 @dataclass
 class TaggingResult:
     output_path: Path
@@ -1268,7 +1272,7 @@ def _table_has_consistent_column_count(cells: list[dict]) -> bool:
 @dataclass
 class ContentRegion:
     """A region in the content stream with its computed page position."""
-    kind: str  # "text" or "image"
+    kind: str  # "text", "image", or "passthrough"
     start_idx: int  # index into instructions list
     end_idx: int  # exclusive end index
     instructions: list  # the actual instructions
@@ -1281,6 +1285,18 @@ class ContentRegion:
     text: str = ""
 
 
+@dataclass
+class OcrFormInvocation:
+    """An OCR form XObject invocation preserved at page level and tagged inside the form."""
+
+    xobject_name: str
+    stream: pikepdf.Object
+    start_idx: int
+    end_idx: int
+    instructions: list
+    initial_ctm: tuple[float, float, float, float, float, float] = IDENTITY
+
+
 def _update_text_pos(pos, first_text_pos, last_text_pos):
     """Track first and last text positions in a block."""
     if first_text_pos is None:
@@ -1289,7 +1305,12 @@ def _update_text_pos(pos, first_text_pos, last_text_pos):
     return first_text_pos, last_text_pos
 
 
-def _extract_content_regions(instructions: list, page) -> list[ContentRegion]:
+def _extract_content_regions(
+    instructions: list,
+    content_owner,
+    *,
+    initial_ctm: tuple[float, float, float, float, float, float] = IDENTITY,
+) -> list[ContentRegion]:
     """Walk a content stream tracking graphics state to extract positioned regions.
 
     Returns a list of ContentRegion objects, each representing either a text
@@ -1297,7 +1318,7 @@ def _extract_content_regions(instructions: list, page) -> list[ContentRegion]:
     computed from the CTM and text matrix.
     """
     regions = []
-    ctm = IDENTITY
+    ctm = initial_ctm
     ctm_stack = []
     font_size = 12.0
 
@@ -1438,7 +1459,7 @@ def _extract_content_regions(instructions: list, page) -> list[ContentRegion]:
                 name = str(operands[0])
                 is_image = False
                 try:
-                    resources = page.get("/Resources", {})
+                    resources = content_owner.get("/Resources", {})
                     xobjects = resources.get("/XObject", {})
                     xobj = xobjects.get(name)
                     if xobj is not None and hasattr(xobj, "get"):
@@ -1471,6 +1492,162 @@ def _extract_content_regions(instructions: list, page) -> list[ContentRegion]:
         i += 1
 
     return regions
+
+
+def _matrix_tuple(value: Any) -> tuple[float, float, float, float, float, float]:
+    if isinstance(value, pikepdf.Array) and len(value) >= 6:
+        return tuple(_safe_float(item) for item in value[:6])
+    if isinstance(value, (list, tuple)) and len(value) >= 6:
+        return tuple(_safe_float(item) for item in value[:6])
+    return IDENTITY
+
+
+def _lookup_xobject(resources, name: str) -> pikepdf.Object | None:
+    if resources is None or not hasattr(resources, "get"):
+        return None
+    xobjects = resources.get("/XObject")
+    if xobjects is None or not hasattr(xobjects, "get"):
+        return None
+    try:
+        return xobjects.get(name) or xobjects.get(pikepdf.Name(name))
+    except Exception:
+        return None
+
+
+def _is_ocr_form_xobject(name: str, xobject: Any) -> bool:
+    if not name.startswith("/OCR"):
+        return False
+    try:
+        return xobject is not None and xobject.get("/Subtype") == pikepdf.Name("/Form")
+    except Exception:
+        return False
+
+
+def _try_extract_ocr_form_invocation(
+    instructions: list,
+    start_idx: int,
+    resources,
+    current_ctm: tuple[float, float, float, float, float, float],
+) -> OcrFormInvocation | None:
+    if start_idx < 0 or start_idx >= len(instructions):
+        return None
+
+    instr = instructions[start_idx]
+    op = str(instr.operator)
+
+    if op == "Do":
+        operands = list(instr.operands) if hasattr(instr, "operands") else []
+        if not operands:
+            return None
+        name = str(operands[0])
+        xobject = _lookup_xobject(resources, name)
+        if not _is_ocr_form_xobject(name, xobject):
+            return None
+        form_matrix = _matrix_tuple(xobject.get("/Matrix")) if hasattr(xobject, "get") else IDENTITY
+        return OcrFormInvocation(
+            xobject_name=name,
+            stream=xobject,
+            start_idx=start_idx,
+            end_idx=start_idx + 1,
+            instructions=[instr],
+            initial_ctm=_mat_multiply(form_matrix, current_ctm),
+        )
+
+    if op != "q":
+        return None
+
+    depth = 0
+    j = start_idx
+    temp_ctm = current_ctm
+    form_name = ""
+    form_stream = None
+    do_count = 0
+    do_ctm = current_ctm
+    allowed_ops = {"q", "Q", "cm", "Do"}
+
+    while j < len(instructions):
+        inner = instructions[j]
+        inner_op = str(inner.operator)
+        if inner_op not in allowed_ops:
+            return None
+
+        if inner_op == "q":
+            depth += 1
+        elif inner_op == "Q":
+            depth -= 1
+            if depth == 0:
+                break
+            if depth < 0:
+                return None
+        elif inner_op == "cm":
+            inner_ops = list(inner.operands) if hasattr(inner, "operands") else []
+            if len(inner_ops) >= 6:
+                temp_ctm = _mat_multiply(tuple(_safe_float(x) for x in inner_ops[:6]), temp_ctm)
+        elif inner_op == "Do":
+            operands = list(inner.operands) if hasattr(inner, "operands") else []
+            if not operands:
+                return None
+            name = str(operands[0])
+            xobject = _lookup_xobject(resources, name)
+            if not _is_ocr_form_xobject(name, xobject):
+                return None
+            do_count += 1
+            if do_count > 1:
+                return None
+            form_name = name
+            form_stream = xobject
+            do_ctm = temp_ctm
+
+        j += 1
+
+    if depth != 0 or do_count != 1 or form_stream is None:
+        return None
+
+    form_matrix = _matrix_tuple(form_stream.get("/Matrix")) if hasattr(form_stream, "get") else IDENTITY
+    return OcrFormInvocation(
+        xobject_name=form_name,
+        stream=form_stream,
+        start_idx=start_idx,
+        end_idx=j + 1,
+        instructions=instructions[start_idx : j + 1],
+        initial_ctm=_mat_multiply(form_matrix, do_ctm),
+    )
+
+
+def _extract_ocr_form_invocations(page: pikepdf.Page, instructions: list) -> list[OcrFormInvocation]:
+    resources = page.get("/Resources", {}) if hasattr(page, "get") else {}
+    invocations: list[OcrFormInvocation] = []
+    seen_streams: set[tuple[int, int] | tuple[str, int]] = set()
+    ctm = IDENTITY
+    ctm_stack: list[tuple[float, float, float, float, float, float]] = []
+
+    i = 0
+    while i < len(instructions):
+        invocation = _try_extract_ocr_form_invocation(instructions, i, resources, ctm)
+        if invocation is not None:
+            key = _obj_key(invocation.stream)
+            normalized_key: tuple[int, int] | tuple[str, int]
+            normalized_key = key if key is not None else ("direct", id(invocation.stream))
+            if normalized_key not in seen_streams:
+                invocations.append(invocation)
+                seen_streams.add(normalized_key)
+            i = invocation.end_idx
+            continue
+
+        instr = instructions[i]
+        op = str(instr.operator)
+        if op == "q":
+            ctm_stack.append(ctm)
+        elif op == "Q":
+            if ctm_stack:
+                ctm = ctm_stack.pop()
+        elif op == "cm":
+            operands = list(instr.operands) if hasattr(instr, "operands") else []
+            if len(operands) >= 6:
+                ctm = _mat_multiply(tuple(_safe_float(x) for x in operands[:6]), ctm)
+        i += 1
+
+    return invocations
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1833,8 +2010,12 @@ class StructTreeBuilder:
         self.doc_lang = doc_lang.lower().strip()
         self.struct_tree_root = None
         self.doc_elem = None
-        self._page_mcid_counter: dict[int, int] = {}
-        self._page_mcids: dict[int, list[tuple[int, pikepdf.Object]]] = {}
+        self._content_owner_mcid_counter: dict[tuple[Any, ...], int] = {}
+        self._content_owner_entries: dict[
+            tuple[Any, ...],
+            dict[str, Any],
+        ] = {}
+        self._content_owner_order = 0
         self._struct_parents_counter = 0
         self._object_parent_entries: list[tuple[int, pikepdf.Object]] = []
         self._headings: list[dict] = []
@@ -1863,10 +2044,17 @@ class StructTreeBuilder:
         }))
         self.struct_tree_root["/K"] = pikepdf.Array([self.doc_elem])
 
-    def _alloc_mcid(self, page_index: int) -> int:
-        """Allocate a new MCID for the given page."""
-        mcid = self._page_mcid_counter.get(page_index, 0)
-        self._page_mcid_counter[page_index] = mcid + 1
+    def _content_owner_key(self, owner: pikepdf.Object) -> tuple[Any, ...]:
+        key = _obj_key(owner)
+        if key is not None:
+            return ("obj", *key)
+        return ("direct", id(owner))
+
+    def _alloc_mcid(self, owner: pikepdf.Object) -> int:
+        """Allocate a new MCID for one content stream owner."""
+        owner_key = self._content_owner_key(owner)
+        mcid = self._content_owner_mcid_counter.get(owner_key, 0)
+        self._content_owner_mcid_counter[owner_key] = mcid + 1
         return mcid
 
     def _alloc_struct_parent_key(self) -> int:
@@ -1875,19 +2063,44 @@ class StructTreeBuilder:
         self._struct_parents_counter += 1
         return key
 
-    def _register_mcid(self, page_index: int, mcid: int, elem: pikepdf.Object):
-        """Register an MCID-to-StructElem mapping for ParentTree construction."""
-        if page_index not in self._page_mcids:
-            self._page_mcids[page_index] = []
-        self._page_mcids[page_index].append((mcid, elem))
+    def _register_mcid(
+        self,
+        *,
+        owner: pikepdf.Object,
+        page_index: int,
+        mcid: int,
+        elem: pikepdf.Object,
+    ) -> None:
+        """Register an MCID-to-StructElem mapping for one page or form stream owner."""
+        owner_key = self._content_owner_key(owner)
+        entry = self._content_owner_entries.get(owner_key)
+        if entry is None:
+            entry = {
+                "owner": owner,
+                "page_index": page_index,
+                "mcids": [],
+                "order": self._content_owner_order,
+            }
+            self._content_owner_entries[owner_key] = entry
+            self._content_owner_order += 1
+        entry["mcids"].append((mcid, elem))
 
-    def _make_mcr(self, mcid: int, page_ref: pikepdf.Object) -> pikepdf.Dictionary:
+    def _make_mcr(
+        self,
+        mcid: int,
+        page_ref: pikepdf.Object,
+        *,
+        stream_owner: pikepdf.Object | None = None,
+    ) -> pikepdf.Dictionary:
         """Create a Marked Content Reference (MCR) dictionary."""
-        return pikepdf.Dictionary({
+        mcr = pikepdf.Dictionary({
             "/Type": pikepdf.Name("/MCR"),
             "/Pg": page_ref,
             "/MCID": mcid,
         })
+        if stream_owner is not None and _obj_key(stream_owner) != _obj_key(page_ref):
+            mcr["/Stm"] = stream_owner
+        return mcr
 
     def _append_child(self, parent: pikepdf.Object, child: pikepdf.Object):
         """Append a child element to a parent's /K array."""
@@ -1905,18 +2118,20 @@ class StructTreeBuilder:
         parent: pikepdf.Object | None = None,
         alt_text: str | None = None,
         lang: str | None = None,
+        stream_owner: pikepdf.Object | None = None,
     ) -> int:
         """Create a StructElem and return its MCID."""
         if parent is None:
             parent = self.doc_elem
 
-        mcid = self._alloc_mcid(page_index)
+        owner = stream_owner or page_ref
+        mcid = self._alloc_mcid(owner)
 
         elem_dict = {
             "/Type": pikepdf.Name("/StructElem"),
             "/S": pikepdf.Name(f"/{struct_type}"),
             "/P": parent,
-            "/K": self._make_mcr(mcid, page_ref),
+            "/K": self._make_mcr(mcid, page_ref, stream_owner=stream_owner),
         }
         if alt_text:
             elem_dict["/Alt"] = pikepdf.String(alt_text)
@@ -1924,51 +2139,90 @@ class StructTreeBuilder:
             elem_dict["/Lang"] = pikepdf.String(lang)
 
         elem = self.pdf.make_indirect(pikepdf.Dictionary(elem_dict))
-        self._register_mcid(page_index, mcid, elem)
+        self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=elem)
         self._append_child(parent, elem)
         self._struct_elems_created += 1
         return mcid
 
     def add_heading(
         self, level: int, page_index: int, page_ref: pikepdf.Object,
-        text: str, lang: str | None = None,
+        text: str, lang: str | None = None, stream_owner: pikepdf.Object | None = None,
     ) -> int:
         level = max(1, min(6, level))
-        mcid = self._add_struct_elem(f"H{level}", page_index, page_ref, lang=lang)
+        mcid = self._add_struct_elem(
+            f"H{level}",
+            page_index,
+            page_ref,
+            lang=lang,
+            stream_owner=stream_owner,
+        )
         self._headings.append({"level": level, "text": text, "page_index": page_index})
         return mcid
 
     def add_paragraph(
         self, page_index: int, page_ref: pikepdf.Object,
         lang: str | None = None,
+        stream_owner: pikepdf.Object | None = None,
     ) -> int:
-        return self._add_struct_elem("P", page_index, page_ref, lang=lang)
+        return self._add_struct_elem("P", page_index, page_ref, lang=lang, stream_owner=stream_owner)
 
-    def add_figure(self, page_index: int, page_ref: pikepdf.Object, alt_text: str | None = None) -> int:
-        return self._add_struct_elem("Figure", page_index, page_ref, alt_text=alt_text)
+    def add_figure(
+        self,
+        page_index: int,
+        page_ref: pikepdf.Object,
+        alt_text: str | None = None,
+        stream_owner: pikepdf.Object | None = None,
+    ) -> int:
+        return self._add_struct_elem(
+            "Figure",
+            page_index,
+            page_ref,
+            alt_text=alt_text,
+            stream_owner=stream_owner,
+        )
 
-    def add_code(self, page_index: int, page_ref: pikepdf.Object, lang: str | None = None) -> int:
-        return self._add_struct_elem("Code", page_index, page_ref, lang=lang)
+    def add_code(
+        self,
+        page_index: int,
+        page_ref: pikepdf.Object,
+        lang: str | None = None,
+        stream_owner: pikepdf.Object | None = None,
+    ) -> int:
+        return self._add_struct_elem("Code", page_index, page_ref, lang=lang, stream_owner=stream_owner)
 
     def add_formula(
         self,
         page_index: int,
         page_ref: pikepdf.Object,
         alt_text: str | None = None,
+        stream_owner: pikepdf.Object | None = None,
     ) -> int:
-        return self._add_struct_elem("Formula", page_index, page_ref, alt_text=alt_text)
+        return self._add_struct_elem(
+            "Formula",
+            page_index,
+            page_ref,
+            alt_text=alt_text,
+            stream_owner=stream_owner,
+        )
 
-    def add_note(self, page_index: int, page_ref: pikepdf.Object) -> int:
-        mcid = self._alloc_mcid(page_index)
+    def add_note(
+        self,
+        page_index: int,
+        page_ref: pikepdf.Object,
+        *,
+        stream_owner: pikepdf.Object | None = None,
+    ) -> int:
+        owner = stream_owner or page_ref
+        mcid = self._alloc_mcid(owner)
         self._note_counter += 1
         note_elem = self.pdf.make_indirect(pikepdf.Dictionary({
             "/Type": pikepdf.Name("/StructElem"),
             "/S": pikepdf.Name("/Note"),
             "/P": self.doc_elem,
             "/ID": pikepdf.String(f"note-{self._note_counter}"),
-            "/K": self._make_mcr(mcid, page_ref),
+            "/K": self._make_mcr(mcid, page_ref, stream_owner=stream_owner),
         }))
-        self._register_mcid(page_index, mcid, note_elem)
+        self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=note_elem)
         self._append_child(self.doc_elem, note_elem)
         self._struct_elems_created += 1
         return mcid
@@ -1994,21 +2248,24 @@ class StructTreeBuilder:
         page_index: int,
         page_ref: pikepdf.Object,
         toc_group_ref: str | None,
+        *,
+        stream_owner: pikepdf.Object | None = None,
     ) -> int:
         toc_elem = self._get_or_create_toc(toc_group_ref)
-        mcid = self._alloc_mcid(page_index)
+        owner = stream_owner or page_ref
+        mcid = self._alloc_mcid(owner)
         caption_elem = self.pdf.make_indirect(pikepdf.Dictionary({
             "/Type": pikepdf.Name("/StructElem"),
             "/S": pikepdf.Name("/Caption"),
             "/P": toc_elem,
-            "/K": self._make_mcr(mcid, page_ref),
+            "/K": self._make_mcr(mcid, page_ref, stream_owner=stream_owner),
         }))
         toc_k = toc_elem.get("/K")
         if isinstance(toc_k, pikepdf.Array):
             toc_elem["/K"] = pikepdf.Array([caption_elem, *list(toc_k)])
         else:
             toc_elem["/K"] = pikepdf.Array([caption_elem])
-        self._register_mcid(page_index, mcid, caption_elem)
+        self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=caption_elem)
         self._struct_elems_created += 1
         return mcid
 
@@ -2017,24 +2274,35 @@ class StructTreeBuilder:
         page_index: int,
         page_ref: pikepdf.Object,
         toc_group_ref: str | None,
+        *,
+        stream_owner: pikepdf.Object | None = None,
     ) -> int:
         toc_elem = self._get_or_create_toc(toc_group_ref)
-        mcid = self._alloc_mcid(page_index)
+        owner = stream_owner or page_ref
+        mcid = self._alloc_mcid(owner)
         toci_elem = self.pdf.make_indirect(pikepdf.Dictionary({
             "/Type": pikepdf.Name("/StructElem"),
             "/S": pikepdf.Name("/TOCI"),
             "/P": toc_elem,
-            "/K": self._make_mcr(mcid, page_ref),
+            "/K": self._make_mcr(mcid, page_ref, stream_owner=stream_owner),
         }))
         self._append_child(toc_elem, toci_elem)
-        self._register_mcid(page_index, mcid, toci_elem)
+        self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=toci_elem)
         self._struct_elems_created += 1
         return mcid
 
-    def add_table(self, page_index: int, page_ref: pikepdf.Object, table_data: dict) -> int:
+    def add_table(
+        self,
+        page_index: int,
+        page_ref: pikepdf.Object,
+        table_data: dict,
+        *,
+        stream_owner: pikepdf.Object | None = None,
+    ) -> int:
         """Add a Table StructElem with rows, cells, /ID on THs, and /Headers on TDs."""
         self._table_counter += 1
         table_n = self._table_counter
+        owner = stream_owner or page_ref
 
         table_elem = self.pdf.make_indirect(pikepdf.Dictionary({
             "/Type": pikepdf.Name("/StructElem"),
@@ -2049,9 +2317,9 @@ class StructTreeBuilder:
         num_rows = table_data.get("num_rows", 0)
 
         if not cells or num_rows == 0 or not _table_has_consistent_column_count(cells):
-            mcid = self._alloc_mcid(page_index)
-            table_elem["/K"] = self._make_mcr(mcid, page_ref)
-            self._register_mcid(page_index, mcid, table_elem)
+            mcid = self._alloc_mcid(owner)
+            table_elem["/K"] = self._make_mcr(mcid, page_ref, stream_owner=stream_owner)
+            self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=table_elem)
             return mcid
 
         rows: dict[int, list[dict]] = {}
@@ -2082,14 +2350,14 @@ class StructTreeBuilder:
             for cell in sorted(rows[row_idx], key=lambda c: c.get("col", 0)):
                 cell_type = "TH" if cell.get("is_header", False) else "TD"
                 col_idx = _as_positive_int(cell.get("col", 0), default=0)
-                mcid = self._alloc_mcid(page_index)
+                mcid = self._alloc_mcid(owner)
                 if first_mcid is None:
                     first_mcid = mcid
                 cell_elem_dict: dict = {
                     "/Type": pikepdf.Name("/StructElem"),
                     "/S": pikepdf.Name(f"/{cell_type}"),
                     "/P": row_elem,
-                    "/K": self._make_mcr(mcid, page_ref),
+                    "/K": self._make_mcr(mcid, page_ref, stream_owner=stream_owner),
                 }
                 attrs = pikepdf.Dictionary({
                     "/O": pikepdf.Name("/Table"),
@@ -2122,7 +2390,7 @@ class StructTreeBuilder:
 
                 cell_elem = self.pdf.make_indirect(pikepdf.Dictionary(cell_elem_dict))
                 row_elem["/K"].append(cell_elem)
-                self._register_mcid(page_index, mcid, cell_elem)
+                self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=cell_elem)
                 self._struct_elems_created += 1
 
                 if cell_type == "TD":
@@ -2156,6 +2424,8 @@ class StructTreeBuilder:
         page_ref: pikepdf.Object,
         list_group_ref: str | None,
         parent_list_group_ref: str | None = None,
+        *,
+        stream_owner: pikepdf.Object | None = None,
     ) -> int:
         """Add a single list item to a list group, creating the list on first use.
 
@@ -2214,15 +2484,16 @@ class StructTreeBuilder:
                 li_elem,
             )
 
-        mcid = self._alloc_mcid(page_index)
+        owner = stream_owner or page_ref
+        mcid = self._alloc_mcid(owner)
         lbody_elem = self.pdf.make_indirect(pikepdf.Dictionary({
             "/Type": pikepdf.Name("/StructElem"),
             "/S": pikepdf.Name("/LBody"),
             "/P": li_elem,
-            "/K": self._make_mcr(mcid, page_ref),
+            "/K": self._make_mcr(mcid, page_ref, stream_owner=stream_owner),
         }))
         li_elem["/K"].append(lbody_elem)
-        self._register_mcid(page_index, mcid, lbody_elem)
+        self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=lbody_elem)
         self._struct_elems_created += 1
 
         return mcid
@@ -2315,18 +2586,19 @@ class StructTreeBuilder:
         return True
 
     def finalize(self):
-        """Build the ParentTree NumberTree and set StructParents on pages."""
+        """Build the ParentTree NumberTree and set StructParents on content owners."""
         parent_tree_nums = pikepdf.Array([])
 
-        for page_index in sorted(self._page_mcids.keys()):
-            if page_index >= len(self.pdf.pages):
-                continue
-
-            page = self.pdf.pages[page_index]
+        owner_entries = sorted(
+            self._content_owner_entries.values(),
+            key=lambda entry: (int(entry["page_index"]), int(entry["order"])),
+        )
+        for entry in owner_entries:
+            owner = entry["owner"]
             struct_parents_idx = self._alloc_struct_parent_key()
-            page["/StructParents"] = struct_parents_idx
+            owner["/StructParents"] = struct_parents_idx
 
-            mcid_entries = self._page_mcids[page_index]
+            mcid_entries = entry["mcids"]
             elem_array = pikepdf.Array([])
             for _mcid, elem in sorted(mcid_entries, key=lambda x: x[0]):
                 elem_array.append(elem if elem is not None else pikepdf.Null())
@@ -2367,7 +2639,7 @@ def _strip_existing_markers(instructions: list) -> list:
 
 def _rewrite_content_stream(
     pdf: pikepdf.Pdf,
-    page: pikepdf.Page,
+    content_owner,
     page_index: int,
     elements: list[dict],
     builder: StructTreeBuilder,
@@ -2375,24 +2647,31 @@ def _rewrite_content_stream(
     alt_lookup: dict[int, str],
     decorative_figures: set[int] | None = None,
     docling_page_lines: list[dict] | None = None,
-):
+    *,
+    initial_ctm: tuple[float, float, float, float, float, float] = IDENTITY,
+    stream_owner: pikepdf.Object | None = None,
+    passthrough_regions: list[ContentRegion] | None = None,
+) -> set[int]:
     """Insert BDC/EMC markers into the page's content stream using position-based matching."""
     try:
-        instructions = list(pikepdf.parse_content_stream(page))
+        instructions = list(pikepdf.parse_content_stream(content_owner))
     except Exception as e:
         logger.warning(f"Could not parse content stream for page {page_index}: {e}")
-        return
+        return set()
 
     instructions = _strip_existing_markers(instructions)
     if not instructions:
-        return
+        return set()
 
-    regions = _extract_content_regions(instructions, page)
+    regions = _extract_content_regions(instructions, content_owner, initial_ctm=initial_ctm)
+    regions.extend(passthrough_regions or [])
+    regions.sort(key=lambda region: region.start_idx)
     matches = _match_regions_to_elements(
         regions,
         elements,
         docling_page_lines=docling_page_lines,
     )
+    matched_element_indices = set(matches.values())
 
     # Map instruction start indices to region indices
     region_by_start: dict[int, int] = {
@@ -2408,10 +2687,13 @@ def _rewrite_content_stream(
             region = regions[ri]
             elem_idx = matches.get(ri)
 
-            if elem_idx is not None:
+            if region.kind == "passthrough":
+                new_instructions.extend(region.instructions)
+            elif elem_idx is not None:
                 _emit_tagged_region(
                     new_instructions, region, elements[elem_idx],
                     builder, page_index, page_ref, alt_lookup, decorative_figures or set(),
+                    stream_owner=stream_owner,
                 )
             else:
                 new_instructions.append(_make_bmc_artifact())
@@ -2431,9 +2713,15 @@ def _rewrite_content_stream(
 
     try:
         new_stream = pikepdf.unparse_content_stream(new_instructions)
-        page["/Contents"] = pdf.make_stream(new_stream)
+        if isinstance(content_owner, pikepdf.Page):
+            content_owner["/Contents"] = pdf.make_stream(new_stream)
+        else:
+            content_owner.write(new_stream)
     except Exception as e:
         logger.error(f"Failed to write content stream for page {page_index}: {e}")
+        return set()
+
+    return matched_element_indices
 
 
 def _emit_tagged_region(
@@ -2445,6 +2733,8 @@ def _emit_tagged_region(
     page_ref: pikepdf.Object,
     alt_lookup: dict[int, str],
     decorative_figures: set[int],
+    *,
+    stream_owner: pikepdf.Object | None = None,
 ):
     """Emit a tagged content region based on the matched element type."""
     elem_type = elem.get("type", "")
@@ -2460,7 +2750,7 @@ def _emit_tagged_region(
 
     # Tables: struct tree built separately, content stream wrapped as artifact
     if elem_type == "table":
-        builder.add_table(page_index, page_ref, elem)
+        builder.add_table(page_index, page_ref, elem, stream_owner=stream_owner)
         new_instructions.append(_make_bmc_artifact())
         new_instructions.extend(region.instructions)
         new_instructions.append(_make_emc())
@@ -2471,6 +2761,7 @@ def _emit_tagged_region(
         mcid = builder.add_list_item(
             page_index, page_ref, elem.get("list_group_ref"),
             parent_list_group_ref=elem.get("parent_list_group_ref"),
+            stream_owner=stream_owner,
         )
         new_instructions.append(_make_bdc("LBody", mcid, actual_text=actual_text))
         new_instructions.extend(region.instructions)
@@ -2482,7 +2773,14 @@ def _emit_tagged_region(
 
     if elem_type == "heading":
         level = elem.get("level", 1)
-        mcid = builder.add_heading(level, page_index, page_ref, accessible_text, lang=elem_lang)
+        mcid = builder.add_heading(
+            level,
+            page_index,
+            page_ref,
+            accessible_text,
+            lang=elem_lang,
+            stream_owner=stream_owner,
+        )
         tag = f"H{level}"
     elif elem_type == "figure":
         fig_idx = elem.get("figure_index")
@@ -2498,29 +2796,49 @@ def _emit_tagged_region(
         )
         if isinstance(alt, str):
             alt = alt.strip()
-        mcid = builder.add_figure(page_index, page_ref, alt_text=alt or None)
+        mcid = builder.add_figure(
+            page_index,
+            page_ref,
+            alt_text=alt or None,
+            stream_owner=stream_owner,
+        )
         tag = "Figure"
     elif elem_type == "code":
-        mcid = builder.add_code(page_index, page_ref, lang=elem_lang)
+        mcid = builder.add_code(page_index, page_ref, lang=elem_lang, stream_owner=stream_owner)
         tag = "Code"
     elif elem_type == "formula":
         alt = _formula_alt_text(actual_text or accessible_text)
         if isinstance(alt, str):
             alt = alt.strip()
-        mcid = builder.add_formula(page_index, page_ref, alt_text=alt or None)
+        mcid = builder.add_formula(
+            page_index,
+            page_ref,
+            alt_text=alt or None,
+            stream_owner=stream_owner,
+        )
         tag = "Formula"
     elif elem_type == "note":
-        mcid = builder.add_note(page_index, page_ref)
+        mcid = builder.add_note(page_index, page_ref, stream_owner=stream_owner)
         tag = "Note"
     elif elem_type == "toc_caption":
-        mcid = builder.add_toc_caption(page_index, page_ref, elem.get("toc_group_ref"))
+        mcid = builder.add_toc_caption(
+            page_index,
+            page_ref,
+            elem.get("toc_group_ref"),
+            stream_owner=stream_owner,
+        )
         tag = "Caption"
     elif elem_type in {"toc_item", "toc_item_table"}:
-        mcid = builder.add_toc_item(page_index, page_ref, elem.get("toc_group_ref"))
+        mcid = builder.add_toc_item(
+            page_index,
+            page_ref,
+            elem.get("toc_group_ref"),
+            stream_owner=stream_owner,
+        )
         tag = "TOCI"
     else:
         # paragraph or unknown → /P
-        mcid = builder.add_paragraph(page_index, page_ref, lang=elem_lang)
+        mcid = builder.add_paragraph(page_index, page_ref, lang=elem_lang, stream_owner=stream_owner)
         tag = "P"
 
     new_instructions.append(_make_bdc(tag, mcid, actual_text=actual_text))
@@ -2757,6 +3075,92 @@ def _make_bmc_artifact() -> pikepdf.ContentStreamInstruction:
     )
 
 
+def _is_weak_figure_alt_text(text: Any) -> bool:
+    normalized = " ".join(str(text or "").split()).strip()
+    if not normalized:
+        return True
+    if normalized.startswith("[") and normalized.endswith("]"):
+        return True
+    return bool(WEAK_FIGURE_ALT_RE.fullmatch(normalized))
+
+
+def _mcr_page_index(
+    node: Any,
+    page_index_by_key: dict[tuple[int, int], int],
+) -> int | None:
+    if isinstance(node, pikepdf.Dictionary):
+        page_ref = node.get("/Pg")
+        page_key = _obj_key(page_ref)
+        if page_key is not None and page_key in page_index_by_key:
+            return page_index_by_key[page_key]
+        kids = node.get("/K")
+        if kids is not None:
+            return _mcr_page_index(kids, page_index_by_key)
+        return None
+    if isinstance(node, pikepdf.Array):
+        for child in node:
+            page_index = _mcr_page_index(child, page_index_by_key)
+            if page_index is not None:
+                return page_index
+    return None
+
+
+def _source_figure_alt_texts_by_page(pdf: pikepdf.Pdf) -> dict[int, list[str]]:
+    """Collect existing meaningful Figure /Alt text by page order."""
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    if not isinstance(struct_root, pikepdf.Dictionary):
+        return {}
+
+    page_index_by_key = {
+        key: page_index
+        for page_index, page in enumerate(pdf.pages)
+        if (key := _obj_key(page.obj)) is not None
+    }
+    alts_by_page: dict[int, list[str]] = {}
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, pikepdf.Dictionary):
+            if node.get("/S") == pikepdf.Name("/Figure"):
+                alt = " ".join(str(node.get("/Alt") or "").split()).strip()
+                if alt and not _is_weak_figure_alt_text(alt):
+                    page_index = _mcr_page_index(node, page_index_by_key)
+                    if page_index is not None:
+                        alts_by_page.setdefault(page_index, []).append(alt)
+            kids = node.get("/K")
+            if kids is not None:
+                _walk(kids)
+        elif isinstance(node, pikepdf.Array):
+            for child in node:
+                _walk(child)
+
+    _walk(struct_root.get("/K"))
+    return alts_by_page
+
+
+def _source_figure_alt_lookup(pdf: pikepdf.Pdf, elements: list[dict]) -> dict[int, str]:
+    """Map source tagged figure alt text to current Docling figures by page-local order."""
+    alts_by_page = _source_figure_alt_texts_by_page(pdf)
+    if not alts_by_page:
+        return {}
+
+    assigned_by_page: dict[int, int] = {}
+    lookup: dict[int, str] = {}
+    for elem in elements:
+        if elem.get("type") != "figure":
+            continue
+        fig_idx = elem.get("figure_index")
+        page_index = elem.get("page")
+        if not isinstance(fig_idx, int) or not isinstance(page_index, int):
+            continue
+        source_alts = alts_by_page.get(page_index, [])
+        offset = assigned_by_page.get(page_index, 0)
+        if offset >= len(source_alts):
+            continue
+        lookup[fig_idx] = source_alts[offset]
+        assigned_by_page[page_index] = offset + 1
+    return lookup
+
+
 def _render_page_ink_ratio(pdf_path: Path, page_number: int) -> float | None:
     from app.services.pdf_preview import render_page_png_bytes
 
@@ -2823,7 +3227,7 @@ def _should_artifact_nonsemantic_page_content(
         subtype = xobject.get("/Subtype")
         if subtype == pikepdf.Name("/Image"):
             has_image_xobject = True
-        elif subtype == pikepdf.Name("/Form") and str(name).startswith("/OCR-"):
+        elif _is_ocr_form_xobject(str(name), xobject):
             has_ocr_form = True
 
     ink_ratio = None
@@ -3196,13 +3600,29 @@ def _normalize_media_clip_data_dicts(pdf: pikepdf.Pdf) -> int:
 
         return "application/octet-stream"
 
-    active_direct_ids: set[int] = set()
-    stack: list[tuple[object | None, str | int | None]] = [(pdf.Root, None)]
+    active_direct_refs: list[tuple[int, object]] = []
+    stack: list[tuple[object | None, tuple[int, object] | None]] = [(pdf.Root, None)]
+
+    def _is_active_direct_ref(candidate: object, candidate_id: int) -> bool:
+        for active_id, active_obj in active_direct_refs:
+            if candidate_id == active_id:
+                return True
+            try:
+                if candidate == active_obj:
+                    return True
+            except Exception:
+                continue
+        return False
 
     while stack:
         obj, exit_mode = stack.pop()
-        if isinstance(exit_mode, int):
-            active_direct_ids.discard(exit_mode)
+        if exit_mode is not None:
+            direct_id, _direct_ref = exit_mode
+            active_direct_refs = [
+                (active_id, active_obj)
+                for active_id, active_obj in active_direct_refs
+                if active_id != direct_id
+            ]
             continue
         if obj is None:
             continue
@@ -3214,10 +3634,10 @@ def _normalize_media_clip_data_dicts(pdf: pikepdf.Pdf) -> int:
             seen_indirect.add(indirect_key)
         elif isinstance(obj, (pikepdf.Array, pikepdf.Dictionary, pikepdf.Stream)):
             direct_id = id(obj)
-            if direct_id in active_direct_ids:
+            if _is_active_direct_ref(obj, direct_id):
                 continue
-            active_direct_ids.add(direct_id)
-            stack.append((None, direct_id))
+            active_direct_refs.append((direct_id, obj))
+            stack.append((None, (direct_id, obj)))
 
         if isinstance(obj, pikepdf.Array):
             for item in reversed(list(obj)):
@@ -3605,6 +4025,9 @@ async def tag_pdf(
             logger.warning(f"docling-parse unavailable for {input_path.name}: {e}")
 
         with pikepdf.open(str(input_path)) as pdf:
+            elements = structure_json.get("elements", [])
+            source_figure_alt_lookup = _source_figure_alt_lookup(pdf, elements)
+
             # 1. Mark PDF as tagged
             if "/MarkInfo" not in pdf.Root:
                 pdf.Root["/MarkInfo"] = pikepdf.Dictionary({
@@ -3651,8 +4074,14 @@ async def tag_pdf(
                 if isinstance(text, str) and text.strip():
                     alt_lookup[fig_idx] = text.strip()
 
+            for fig_idx, source_alt in source_figure_alt_lookup.items():
+                if _is_weak_figure_alt_text(source_alt):
+                    continue
+                if fig_idx in decorative_figures or _is_weak_figure_alt_text(alt_lookup.get(fig_idx)):
+                    decorative_figures.discard(fig_idx)
+                    alt_lookup[fig_idx] = source_alt
+
             # Group elements by page
-            elements = structure_json.get("elements", [])
             _normalize_heading_hierarchy(elements)
             pages_elements: dict[int, list[dict]] = {}
             for elem in elements:
@@ -3691,15 +4120,78 @@ async def tag_pdf(
                     page_index,
                     docling_parse_widget_cache,
                 )
+                page["/Tabs"] = pikepdf.Name("/S")
+                page_tagged_elements: list[dict] = []
                 if page_elems:
-                    _rewrite_content_stream(
+                    try:
+                        raw_page_instructions = list(pikepdf.parse_content_stream(page))
+                    except Exception:
+                        raw_page_instructions = []
+                    ocr_form_invocations = _extract_ocr_form_invocations(
+                        page,
+                        _strip_existing_markers(raw_page_instructions),
+                    )
+                    ocr_passthrough_regions = [
+                        ContentRegion(
+                            kind="passthrough",
+                            start_idx=invocation.start_idx,
+                            end_idx=invocation.end_idx,
+                            instructions=invocation.instructions,
+                            xobject_name=invocation.xobject_name,
+                        )
+                        for invocation in ocr_form_invocations
+                    ]
+                    matched_page_indices = _rewrite_content_stream(
                         pdf, page, page_index, page_elems,
                         builder, page.obj, alt_lookup,
                         decorative_figures=decorative_figures,
                         docling_page_lines=page_lines,
+                        passthrough_regions=ocr_passthrough_regions,
+                    )
+                    page_tagged_elements.extend(
+                        page_elems[idx]
+                        for idx in sorted(matched_page_indices)
+                        if 0 <= idx < len(page_elems)
                     )
 
-                    for elem in page_elems:
+                    remaining_elems = [
+                        elem
+                        for idx, elem in enumerate(page_elems)
+                        if idx not in matched_page_indices
+                    ]
+                    for invocation in ocr_form_invocations:
+                        if not remaining_elems:
+                            break
+                        matched_form_indices = _rewrite_content_stream(
+                            pdf,
+                            invocation.stream,
+                            page_index,
+                            remaining_elems,
+                            builder,
+                            page.obj,
+                            alt_lookup,
+                            decorative_figures=decorative_figures,
+                            docling_page_lines=page_lines,
+                            initial_ctm=invocation.initial_ctm,
+                            stream_owner=invocation.stream,
+                        )
+                        page_tagged_elements.extend(
+                            remaining_elems[idx]
+                            for idx in sorted(matched_form_indices)
+                            if 0 <= idx < len(remaining_elems)
+                        )
+                        remaining_elems = [
+                            elem
+                            for idx, elem in enumerate(remaining_elems)
+                            if idx not in matched_form_indices
+                        ]
+
+                    seen_page_element_ids: set[int] = set()
+                    for elem in page_tagged_elements:
+                        elem_key = id(elem)
+                        if elem_key in seen_page_element_ids:
+                            continue
+                        seen_page_element_ids.add(elem_key)
                         t = elem.get("type", "")
                         if t == "figure":
                             if elem.get("figure_index") in decorative_figures:

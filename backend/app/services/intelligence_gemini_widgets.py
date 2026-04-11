@@ -6,10 +6,10 @@ from app.models import Job
 from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_llm_utils import (
     context_json_part,
-    pdf_file_parts,
     preferred_cache_breakpoint_index,
     request_llm_json,
     request_llm_json_with_response,
+    semantic_page_parts,
 )
 from app.services.llm_client import LlmClient
 
@@ -142,7 +142,7 @@ async def generate_widget_intelligence(
     }
     content = [
         {"type": "text", "text": WIDGET_BATCH_PROMPT},
-        *pdf_file_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
+        *semantic_page_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
         context_json_part(payload),
     ]
     parsed = await request_llm_json(
@@ -187,7 +187,7 @@ async def generate_widget_intelligence_for_page(
     }
     content = [
         {"type": "text", "text": WIDGET_BATCH_PROMPT},
-        *pdf_file_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
+        *semantic_page_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
         context_json_part(payload),
     ]
     parsed, _response = await request_llm_json_with_response(

@@ -25,6 +25,293 @@ async def test_tag_pdf_sets_markinfo_suspects_false(tmp_path):
         mark_info = pdf.Root["/MarkInfo"]
         assert mark_info["/Marked"] is True
         assert mark_info["/Suspects"] is False
+        assert all(page.get("/Tabs") == pikepdf.Name("/S") for page in pdf.pages)
+
+
+def _build_ocr_form_text_pdf(
+    path: Path,
+    *,
+    invocation_cm: tuple[int, int, int, int, int, int] | None = None,
+) -> None:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    font = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Font"),
+                "/Subtype": pikepdf.Name("/Type1"),
+                "/BaseFont": pikepdf.Name("/Helvetica"),
+            }
+        )
+    )
+    font_name = pikepdf.Name("/F1")
+    form = pdf.make_stream(
+        pikepdf.unparse_content_stream(
+            [
+                pikepdf.ContentStreamInstruction([], pikepdf.Operator("BT")),
+                pikepdf.ContentStreamInstruction([font_name, 12], pikepdf.Operator("Tf")),
+                pikepdf.ContentStreamInstruction([20, 160], pikepdf.Operator("Td")),
+                pikepdf.ContentStreamInstruction([pikepdf.String("Accessible Heading")], pikepdf.Operator("Tj")),
+                pikepdf.ContentStreamInstruction([], pikepdf.Operator("ET")),
+                pikepdf.ContentStreamInstruction([], pikepdf.Operator("BT")),
+                pikepdf.ContentStreamInstruction([font_name, 12], pikepdf.Operator("Tf")),
+                pikepdf.ContentStreamInstruction([20, 120], pikepdf.Operator("Td")),
+                pikepdf.ContentStreamInstruction([pikepdf.String("Body text")], pikepdf.Operator("Tj")),
+                pikepdf.ContentStreamInstruction([], pikepdf.Operator("ET")),
+            ]
+        )
+    )
+    form["/Type"] = pikepdf.Name("/XObject")
+    form["/Subtype"] = pikepdf.Name("/Form")
+    form["/BBox"] = pikepdf.Array([0, 0, 200, 200])
+    form["/Resources"] = pikepdf.Dictionary({"/Font": pikepdf.Dictionary({"/F1": font})})
+
+    page["/Resources"] = pikepdf.Dictionary({"/XObject": pikepdf.Dictionary({"/OCR0": form})})
+    page_instructions = [pikepdf.ContentStreamInstruction([], pikepdf.Operator("q"))]
+    if invocation_cm is not None:
+        page_instructions.append(
+            pikepdf.ContentStreamInstruction(list(invocation_cm), pikepdf.Operator("cm"))
+        )
+    page_instructions.extend(
+        [
+            pikepdf.ContentStreamInstruction([pikepdf.Name("/OCR0")], pikepdf.Operator("Do")),
+            pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q")),
+        ]
+    )
+    page["/Contents"] = pdf.make_stream(pikepdf.unparse_content_stream(page_instructions))
+    pdf.save(path)
+
+
+def _build_source_alt_figure_pdf(path: Path) -> None:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+
+    image = pdf.make_stream(bytes([128]))
+    image["/Type"] = pikepdf.Name("/XObject")
+    image["/Subtype"] = pikepdf.Name("/Image")
+    image["/Width"] = 1
+    image["/Height"] = 1
+    image["/ColorSpace"] = pikepdf.Name("/DeviceGray")
+    image["/BitsPerComponent"] = 8
+
+    page["/Resources"] = pikepdf.Dictionary({"/XObject": pikepdf.Dictionary({"/Im0": image})})
+    page["/Contents"] = pdf.make_stream(
+        pikepdf.unparse_content_stream(
+            [
+                pikepdf.ContentStreamInstruction([], pikepdf.Operator("q")),
+                pikepdf.ContentStreamInstruction([50, 0, 0, 50, 20, 20], pikepdf.Operator("cm")),
+                pikepdf.ContentStreamInstruction([pikepdf.Name("/Im0")], pikepdf.Operator("Do")),
+                pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q")),
+            ]
+        )
+    )
+
+    struct_root = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([]),
+                "/ParentTree": pdf.make_indirect(pikepdf.Dictionary({"/Nums": pikepdf.Array([])})),
+            }
+        )
+    )
+    doc_elem = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/Document"),
+                "/P": struct_root,
+                "/K": pikepdf.Array([]),
+            }
+        )
+    )
+    fig_elem = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/Figure"),
+                "/P": doc_elem,
+                "/Alt": pikepdf.String("Detailed source alt text"),
+                "/K": pikepdf.Dictionary(
+                    {
+                        "/Type": pikepdf.Name("/MCR"),
+                        "/Pg": page.obj,
+                        "/MCID": 0,
+                    }
+                ),
+            }
+        )
+    )
+    doc_elem["/K"].append(fig_elem)
+    struct_root["/K"] = pikepdf.Array([doc_elem])
+    pdf.Root["/StructTreeRoot"] = struct_root
+    pdf.Root["/MarkInfo"] = pikepdf.Dictionary({"/Marked": True})
+    pdf.save(path)
+
+
+def _collect_struct_types(root) -> list[str]:
+    types: list[str] = []
+
+    def _walk(node) -> None:
+        if isinstance(node, pikepdf.Dictionary):
+            struct_type = node.get("/S")
+            if struct_type:
+                types.append(str(struct_type))
+            kids = node.get("/K")
+            if isinstance(kids, pikepdf.Array):
+                for child in kids:
+                    _walk(child)
+            elif isinstance(kids, pikepdf.Dictionary):
+                _walk(kids)
+        elif isinstance(node, pikepdf.Array):
+            for child in node:
+                _walk(child)
+
+    _walk(root)
+    return types
+
+
+def _first_struct_elem(root, struct_type: str):
+    if isinstance(root, pikepdf.Dictionary):
+        if root.get("/S") == pikepdf.Name(f"/{struct_type}"):
+            return root
+        kids = root.get("/K")
+        if isinstance(kids, pikepdf.Array):
+            for child in kids:
+                found = _first_struct_elem(child, struct_type)
+                if found is not None:
+                    return found
+        elif isinstance(kids, pikepdf.Dictionary):
+            return _first_struct_elem(kids, struct_type)
+    elif isinstance(root, pikepdf.Array):
+        for child in root:
+            found = _first_struct_elem(child, struct_type)
+            if found is not None:
+                return found
+    return None
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_tags_ocr_form_xobject_text(tmp_path):
+    input_pdf = tmp_path / "ocr_form_text.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_ocr_form_text_pdf(input_pdf)
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "type": "heading",
+                    "level": 1,
+                    "text": "Accessible Heading",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 154, "r": 150, "t": 176},
+                },
+                {
+                    "type": "paragraph",
+                    "text": "Body text",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 114, "r": 100, "t": 136},
+                },
+            ],
+            "title": "OCR Form Text",
+        },
+        alt_texts=[],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        page = pdf.pages[0]
+        form = page["/Resources"]["/XObject"]["/OCR0"]
+        struct_types = _collect_struct_types(pdf.Root["/StructTreeRoot"])
+        page_stream = bytes(page.Contents.read_bytes())
+        form_stream = bytes(form.read_bytes())
+
+        assert "/H1" in struct_types
+        assert "/P" in struct_types
+        assert form.get("/StructParents") is not None
+        assert page.get("/Tabs") == pikepdf.Name("/S")
+        assert b"/Artifact" not in page_stream
+        assert b"/H1" in form_stream
+        assert b"/P" in form_stream
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_tags_transformed_ocr_form_xobject_text(tmp_path):
+    input_pdf = tmp_path / "transformed_ocr_form_text.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_ocr_form_text_pdf(input_pdf, invocation_cm=(1, 0, 0, 1, 30, -20))
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "type": "heading",
+                    "level": 1,
+                    "text": "Accessible Heading",
+                    "page": 0,
+                    "bbox": {"l": 48, "b": 134, "r": 180, "t": 156},
+                },
+                {
+                    "type": "paragraph",
+                    "text": "Body text",
+                    "page": 0,
+                    "bbox": {"l": 48, "b": 94, "r": 130, "t": 116},
+                },
+            ],
+            "title": "Transformed OCR Form Text",
+        },
+        alt_texts=[],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        form = pdf.pages[0]["/Resources"]["/XObject"]["/OCR0"]
+        struct_types = _collect_struct_types(pdf.Root["/StructTreeRoot"])
+        form_stream = bytes(form.read_bytes())
+
+        assert "/H1" in struct_types
+        assert "/P" in struct_types
+        assert form.get("/StructParents") is not None
+        assert b"/H1" in form_stream
+        assert b"/P" in form_stream
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_preserves_source_alt_when_generated_alt_is_generic(tmp_path):
+    input_pdf = tmp_path / "source_alt_figure.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_source_alt_figure_pdf(input_pdf)
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "type": "figure",
+                    "figure_index": 0,
+                    "page": 0,
+                    "bbox": {"l": 20, "b": 20, "r": 70, "t": 70},
+                }
+            ],
+            "title": "Source Alt Figure",
+        },
+        alt_texts=[{"figure_index": 0, "text": "Element 2", "status": "approved"}],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        figure_elem = _first_struct_elem(pdf.Root["/StructTreeRoot"], "Figure")
+        assert figure_elem is not None
+        assert str(figure_elem.get("/Alt")) == "Detailed source alt text"
 
 
 def _build_blank_image_only_pdf(path: Path) -> None:
@@ -58,7 +345,7 @@ def _build_blank_image_only_pdf(path: Path) -> None:
     pdf.save(path)
 
 
-def _build_ocr_noise_only_pdf(path: Path) -> None:
+def _build_ocr_noise_only_pdf(path: Path, *, ocr_name: str = "/OCR-noise") -> None:
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(200, 200))
 
@@ -79,12 +366,13 @@ def _build_ocr_noise_only_pdf(path: Path) -> None:
 
     page["/Resources"] = pikepdf.Dictionary({
         "/XObject": pikepdf.Dictionary({
-            "/OCR-noise": empty_form,
+            ocr_name: empty_form,
             "/Im0": white_image,
         }),
     })
     page["/Contents"] = pdf.make_stream(
-        b"q 1 0 0 1 0 0 cm\n/OCR-noise Do\nQ\n"
+        f"q 1 0 0 1 0 0 cm\n{ocr_name} Do\nQ\n".encode()
+        +
         b"q 200 0 0 200 0 0 cm\n/Im0 Do\nQ\n"
         b"q\n0 0 200 200 re\n0 0 200 200 re\nW*\nn\n"
         b"0.239 w\nq\n1 0 0 1 10 10 cm\n0 0 m\n0 25 l\nS\nQ\nQ\n"
@@ -123,7 +411,7 @@ async def test_tag_pdf_artifacts_visually_blank_image_only_pages(monkeypatch, tm
 async def test_tag_pdf_artifacts_ocr_noise_only_pages(monkeypatch, tmp_path):
     input_pdf = tmp_path / "ocr_noise_only.pdf"
     output_pdf = tmp_path / "tagged.pdf"
-    _build_ocr_noise_only_pdf(input_pdf)
+    _build_ocr_noise_only_pdf(input_pdf, ocr_name="/OCR0")
 
     monkeypatch.setattr(
         "app.pipeline.tagger._render_page_ink_ratio",
@@ -172,7 +460,7 @@ async def test_tag_pdf_does_not_artifact_nonblank_ocr_noise_only_pages(monkeypat
 
 def test_emit_tagged_region_includes_actualtext_for_resolved_heading():
     class _Builder:
-        def add_heading(self, level, page_index, page_ref, text, lang=None):
+        def add_heading(self, level, page_index, page_ref, text, lang=None, stream_owner=None):
             assert level == 2
             assert text == "ABSTRACT"
             return 7

@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 from typing import Any
 
+from app.config import get_settings
 from app.services.gemini_direct import (
     create_direct_gemini_pdf_cache,
     delete_direct_gemini_pdf_cache,
     request_direct_gemini_cached_json,
 )
+from app.services.intelligence_llm_utils import (
+    context_json_part,
+    page_preview_parts,
+    preferred_cache_breakpoint_index,
+    request_llm_json,
+)
 from app.services.llm_client import LlmClient
+from app.services.local_semantic import local_semantic_enabled
 
 BOOKMARK_DOCUMENT_CANDIDATE_PLAN_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -322,6 +331,97 @@ def _sample_preview_pages(pages: list[int], *, limit: int = 4) -> list[int]:
         if page not in sampled:
             sampled.append(page)
     return sampled
+
+
+def _bookmark_prompt_for_local(preview_prompt: str) -> str:
+    return preview_prompt.replace("cached PDF", "page preview images").replace(
+        "cached pdf", "page preview images"
+    )
+
+
+def _bookmark_job_for_preview(pdf_path, original_filename: str) -> Any:
+    return SimpleNamespace(
+        original_filename=original_filename,
+        input_path=str(pdf_path),
+        output_path=str(pdf_path),
+    )
+
+
+def _pages_from_outline_entries(entries: list[dict[str, Any]]) -> list[int]:
+    pages: list[int] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        page_index = _int_or_default(entry.get("page_index"), -1)
+        if page_index >= 0:
+            pages.append(page_index + 1)
+    return pages
+
+
+def _pages_from_outline_candidates(entries: list[dict[str, Any]]) -> list[int]:
+    pages: list[int] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        source_page = _int_or_default(entry.get("source_page"), -1)
+        if source_page > 0:
+            pages.append(source_page)
+            continue
+        page_index = _int_or_default(entry.get("target_page_index"), -1)
+        if page_index >= 0:
+            pages.append(page_index + 1)
+    return pages
+
+
+def _local_bookmark_preview_pages(
+    *,
+    base_pages: list[int],
+    extra_pages: list[int] | None = None,
+) -> list[int]:
+    pages = list(base_pages or [])
+    if extra_pages:
+        pages.extend(extra_pages)
+    sampled = _sample_preview_pages(
+        pages,
+        limit=max(1, int(get_settings().local_semantic_bookmark_preview_pages or 4)),
+    )
+    return sampled or [1]
+
+
+async def _request_bookmark_json(
+    *,
+    pdf_path,
+    original_filename: str,
+    llm_client: LlmClient,
+    prompt: str,
+    context_payload: dict[str, Any],
+    response_schema: dict[str, Any],
+    preview_pages: list[int] | None = None,
+    cache_handle: Any | None = None,
+) -> dict[str, Any]:
+    if local_semantic_enabled():
+        job = _bookmark_job_for_preview(pdf_path, original_filename)
+        content = [
+            {"type": "text", "text": _bookmark_prompt_for_local(prompt)},
+            *page_preview_parts(job, preview_pages or [1]),
+            context_json_part(context_payload),
+        ]
+        return await request_llm_json(
+            llm_client=llm_client,
+            content=content,
+            schema_name=response_schema["properties"]["task_type"]["enum"][0],
+            response_schema=response_schema,
+            cache_breakpoint_index=preferred_cache_breakpoint_index(content),
+        )
+
+    if cache_handle is None:
+        raise RuntimeError("Gemini bookmark request requires a cache handle")
+    return await request_direct_gemini_cached_json(
+        cache_handle=cache_handle,
+        prompt=prompt,
+        context_payload=context_payload,
+        response_schema=response_schema,
+    )
 
 
 def _compact_llm_mapping(mapping: dict[str, Any]) -> dict[str, Any]:
@@ -1290,11 +1390,14 @@ async def enhance_bookmark_structure_with_intelligence(
         candidate_payload,
         structure_json.get("elements") or [],
     )
-    cache_handle = await create_direct_gemini_pdf_cache(
-        pdf_path=pdf_path,
-        system_instruction=BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
-        ttl="1800s",
-    )
+    use_local_bookmark_backend = local_semantic_enabled()
+    cache_handle = None
+    if not use_local_bookmark_backend:
+        cache_handle = await create_direct_gemini_pdf_cache(
+            pdf_path=pdf_path,
+            system_instruction=BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
+            ttl="1800s",
+        )
     try:
         candidate_context = {
             "job_filename": original_filename,
@@ -1303,11 +1406,17 @@ async def enhance_bookmark_structure_with_intelligence(
         if prefetched_front_matter_entries is None and prefetched_front_matter_audit is None:
             candidate_context["front_matter_page_candidates"] = front_matter_page_candidates
 
-        parsed = await request_direct_gemini_cached_json(
+        parsed = await _request_bookmark_json(
+            pdf_path=pdf_path,
+            original_filename=original_filename,
+            llm_client=llm_client,
             cache_handle=cache_handle,
             prompt=BOOKMARK_DOCUMENT_CANDIDATE_PLAN_PROMPT,
             context_payload=candidate_context,
             response_schema=BOOKMARK_DOCUMENT_CANDIDATE_PLAN_SCHEMA,
+            preview_pages=_local_bookmark_preview_pages(
+                base_pages=list(candidate_payload.get("pages") or []),
+            ),
         )
         confidence = str(parsed.get("confidence") or "").strip().lower()
         candidate_plan_reason = str(parsed.get("reason") or "").strip()
@@ -1355,7 +1464,10 @@ async def enhance_bookmark_structure_with_intelligence(
                 and str(candidate.get("candidate_id") or "").strip() not in selected_outline_ids
             ]
             if remaining_heading_candidates:
-                heading_supplement_parsed = await request_direct_gemini_cached_json(
+                heading_supplement_parsed = await _request_bookmark_json(
+                    pdf_path=pdf_path,
+                    original_filename=original_filename,
+                    llm_client=llm_client,
                     cache_handle=cache_handle,
                     prompt=BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_PROMPT,
                     context_payload={
@@ -1367,6 +1479,10 @@ async def enhance_bookmark_structure_with_intelligence(
                         ),
                     },
                     response_schema=BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_SCHEMA,
+                    preview_pages=_local_bookmark_preview_pages(
+                        base_pages=_pages_from_outline_entries(outline_entries),
+                        extra_pages=_pages_from_outline_candidates(remaining_heading_candidates),
+                    ),
                 )
                 supplement_confidence = (
                     str(heading_supplement_parsed.get("confidence") or "").strip().lower() or "low"
@@ -1390,7 +1506,10 @@ async def enhance_bookmark_structure_with_intelligence(
         landmark_confidence = "low"
         landmark_reason = ""
         if outline_entries and candidate_payload.get("landmark_candidates"):
-            landmark_parsed = await request_direct_gemini_cached_json(
+            landmark_parsed = await _request_bookmark_json(
+                pdf_path=pdf_path,
+                original_filename=original_filename,
+                llm_client=llm_client,
                 cache_handle=cache_handle,
                 prompt=BOOKMARK_DOCUMENT_LANDMARK_PLAN_PROMPT,
                 context_payload={
@@ -1398,6 +1517,14 @@ async def enhance_bookmark_structure_with_intelligence(
                     "selected_outline_entries": _serialize_selected_outline_for_landmark_llm(outline_entries),
                 },
                 response_schema=BOOKMARK_DOCUMENT_LANDMARK_PLAN_SCHEMA,
+                preview_pages=_local_bookmark_preview_pages(
+                    base_pages=_pages_from_outline_entries(outline_entries),
+                    extra_pages=[
+                        _int_or_default(entry.get("page"), -1)
+                        for entry in (candidate_payload.get("landmark_candidates") or [])
+                        if isinstance(entry, dict)
+                    ],
+                ),
             )
             landmark_confidence = str(landmark_parsed.get("confidence") or "").strip().lower() or "low"
             landmark_reason = str(landmark_parsed.get("reason") or "").strip()
@@ -1412,7 +1539,8 @@ async def enhance_bookmark_structure_with_intelligence(
                     },
                 )
     finally:
-        await delete_direct_gemini_pdf_cache(cache_handle)
+        if cache_handle is not None:
+            await delete_direct_gemini_pdf_cache(cache_handle)
 
     overall_confidence = _best_confidence_label([confidence, supplement_confidence, landmark_confidence])
     merged_outline_entries = _merge_outline_with_landmarks(outline_entries, landmark_entries)

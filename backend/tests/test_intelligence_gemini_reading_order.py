@@ -20,7 +20,7 @@ def _job(tmp_path):
     )
 
 
-def test_generate_reading_order_intelligence_uses_pdf_file_input(monkeypatch, tmp_path):
+def test_generate_reading_order_intelligence_uses_backend_aware_page_input(monkeypatch, tmp_path):
     captured = {}
 
     async def _fake_request_llm_json(
@@ -50,7 +50,7 @@ def test_generate_reading_order_intelligence_uses_pdf_file_input(monkeypatch, tm
         _fake_request_llm_json,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_reading_order.pdf_file_parts",
+        "app.services.intelligence_gemini_reading_order.semantic_page_parts",
         lambda job, page_numbers, filename=None: [
             {
                 "type": "file",

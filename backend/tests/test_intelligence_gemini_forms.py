@@ -136,7 +136,7 @@ def test_generate_form_intelligence_for_page_normalizes_batch_response(monkeypat
         _fake_request_llm_json_with_response,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.pdf_file_parts",
+        "app.services.intelligence_gemini_forms.semantic_page_parts",
         lambda job, page_numbers, filename=None: [{"type": "file", "file": {"filename": filename or "sample.pdf", "file_data": "data:application/pdf;base64,page"}}],
     )
 
@@ -189,3 +189,78 @@ def test_generate_form_intelligence_for_page_normalizes_batch_response(monkeypat
     assert result[1]["field_review_id"] == "field-widget-11-0"
     assert result[1]["suggested_action"] == "manual_only"
     assert result[1]["confidence_score"] == 0.4
+
+
+def test_generate_form_intelligence_for_page_chunks_local_batches(monkeypatch, tmp_path):
+    call_sizes = []
+
+    async def _fake_request_llm_json_with_response(
+        *,
+        llm_client,
+        content,
+        schema_name=None,
+        response_schema=None,
+        cache_breakpoint_index=None,
+        conversation_prefix=None,
+    ):
+        payload = content[2]["text"]
+        assert schema_name == "form_page_intelligence"
+        call_sizes.append(payload.count('"field_review_id"'))
+        return (
+            {
+                "task_type": "form_page_intelligence",
+                "page": 1,
+                "summary": "Chunked local batch.",
+                "decisions": [],
+            },
+            {"choices": [{"message": {"annotations": []}}]},
+        )
+
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_forms.request_llm_json_with_response",
+        _fake_request_llm_json_with_response,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_forms.semantic_page_parts",
+        lambda job, page_numbers, filename=None: [{"type": "image_url", "image_url": {"url": "data:image/png;base64,page"}}],
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_forms.local_semantic_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_forms.get_settings",
+        lambda: SimpleNamespace(
+            local_semantic_page_candidate_batch_size=2,
+            local_semantic_max_concurrency=2,
+        ),
+    )
+
+    targets = []
+    for index in range(5):
+        targets.append(
+            {
+                "field_review_id": f"field-{index}",
+                "page": 1,
+                "field_type": "text",
+                "field_name": f"field_{index}",
+                "accessible_name": "",
+                "label_quality": "missing",
+                "bbox": {"l": 10, "t": 28, "r": 80, "b": 10},
+                "nearby_blocks": [],
+                "nearby_fields": [],
+            }
+        )
+
+    result = asyncio.run(
+        generate_form_intelligence_for_page(
+            job=_job(tmp_path),
+            page_number=1,
+            targets=targets,
+            llm_client=object(),
+        )
+    )
+
+    assert call_sizes == [2, 2, 1]
+    assert len(result) == 5
+    assert all(item["suggested_action"] == "manual_only" for item in result)

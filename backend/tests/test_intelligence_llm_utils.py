@@ -14,6 +14,7 @@ from app.services.intelligence_llm_utils import (
     preferred_cache_breakpoint_index,
     request_llm_json,
     request_llm_json_with_response,
+    semantic_page_parts,
 )
 
 
@@ -229,6 +230,96 @@ def test_request_llm_json_with_response_uses_direct_gemini_for_text_only(monkeyp
     assert captured["content"] == [{"type": "text", "text": "prompt"}]
 
 
+def test_request_llm_json_with_response_uses_local_semantic_for_image_only(monkeypatch):
+    captured = {}
+
+    async def _fake_local_request(**kwargs):
+        captured.update(kwargs)
+        return (
+            {"summary": "ok"},
+            {
+                "choices": [{"message": {"content": '{"summary":"ok"}'}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9},
+            },
+        )
+
+    monkeypatch.setattr(
+        "app.services.intelligence_llm_utils.local_semantic_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_llm_utils.request_local_semantic_content_json_with_response",
+        _fake_local_request,
+    )
+
+    parsed, response = asyncio.run(
+        request_llm_json_with_response(
+            llm_client=object(),
+            content=[
+                {"type": "text", "text": "prompt"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ],
+            schema_name="demo",
+            response_schema={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+        )
+    )
+
+    assert parsed == {"summary": "ok"}
+    assert response["usage"]["total_tokens"] == 9
+    assert captured["content"][1]["type"] == "image_url"
+
+
+def test_request_llm_json_with_response_prefers_gemini_for_file_content_even_when_local_enabled(monkeypatch):
+    captured = {}
+
+    async def _fake_gemini_request(**kwargs):
+        captured.update(kwargs)
+        return (
+            {"summary": "ok"},
+            {
+                "choices": [{"message": {"content": '{"summary":"ok"}'}}],
+                "usage": {"prompt_tokens": 9, "completion_tokens": 2, "total_tokens": 11},
+            },
+        )
+
+    monkeypatch.setattr(
+        "app.services.intelligence_llm_utils.local_semantic_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_llm_utils.direct_gemini_pdf_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_llm_utils.request_direct_gemini_content_json_with_response",
+        _fake_gemini_request,
+    )
+
+    parsed, response = asyncio.run(
+        request_llm_json_with_response(
+            llm_client=object(),
+            content=[
+                {"type": "text", "text": "prompt"},
+                {"type": "file", "file": {"filename": "doc.pdf", "file_data": "data:application/pdf;base64,AA=="}},
+            ],
+            schema_name="demo",
+            response_schema={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+        )
+    )
+
+    assert parsed == {"summary": "ok"}
+    assert response["usage"]["total_tokens"] == 11
+    assert captured["content"][1]["type"] == "file"
+
+
 def test_preferred_cache_breakpoint_index_prefers_last_image_block():
     content = [
         {"type": "text", "text": "prompt"},
@@ -248,6 +339,36 @@ def test_preferred_cache_breakpoint_index_prefers_last_file_block():
     ]
 
     assert preferred_cache_breakpoint_index(content) == 1
+
+
+def test_semantic_page_parts_use_page_preview_when_local_backend_enabled(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.intelligence_llm_utils.local_semantic_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_llm_utils.page_preview_parts",
+        lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}],
+    )
+
+    parts = semantic_page_parts(object(), [1], filename="demo.pdf")
+
+    assert parts[0]["type"] == "image_url"
+
+
+def test_semantic_page_parts_use_pdf_input_when_local_backend_disabled(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.intelligence_llm_utils.local_semantic_enabled",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence_llm_utils.pdf_file_parts",
+        lambda job, page_numbers, filename=None: [{"type": "file", "file": {"filename": filename or "demo.pdf", "file_data": "data:application/pdf;base64,AA=="}}],
+    )
+
+    parts = semantic_page_parts(object(), [1], filename="demo.pdf")
+
+    assert parts[0]["type"] == "file"
 
 
 def test_preferred_cache_breakpoint_index_uses_last_block_when_no_images():

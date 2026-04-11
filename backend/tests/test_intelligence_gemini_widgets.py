@@ -22,7 +22,7 @@ def _job(tmp_path):
     )
 
 
-def test_generate_widget_intelligence_uses_pdf_file_input(monkeypatch, tmp_path):
+def test_generate_widget_intelligence_uses_backend_aware_page_input(monkeypatch, tmp_path):
     captured = {}
 
     async def _fake_request_llm_json(
@@ -57,7 +57,7 @@ def test_generate_widget_intelligence_uses_pdf_file_input(monkeypatch, tmp_path)
         _fake_request_llm_json,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_widgets.pdf_file_parts",
+        "app.services.intelligence_gemini_widgets.semantic_page_parts",
         lambda job, page_numbers, filename=None: [
             {
                 "type": "file",
@@ -92,7 +92,7 @@ def test_generate_widget_intelligence_uses_pdf_file_input(monkeypatch, tmp_path)
     assert result["confidence"] == "high"
 
 
-def test_generate_widget_intelligence_for_page_uses_pdf_file_input(monkeypatch, tmp_path):
+def test_generate_widget_intelligence_for_page_uses_backend_aware_page_input(monkeypatch, tmp_path):
     captured = {}
 
     async def _fake_request_llm_json_with_response(
@@ -130,7 +130,7 @@ def test_generate_widget_intelligence_for_page_uses_pdf_file_input(monkeypatch, 
         _fake_request_llm_json_with_response,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_widgets.pdf_file_parts",
+        "app.services.intelligence_gemini_widgets.semantic_page_parts",
         lambda job, page_numbers, filename=None: [
             {
                 "type": "file",

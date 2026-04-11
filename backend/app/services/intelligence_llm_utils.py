@@ -15,6 +15,10 @@ from app.services.gemini_direct import (
     request_direct_gemini_content_json_with_response,
 )
 from app.services.llm_client import LlmClient, is_retryable_llm_exception
+from app.services.local_semantic import (
+    local_semantic_enabled,
+    request_local_semantic_content_json_with_response,
+)
 from app.services.path_safety import validate_path_within_allowed_roots
 from app.services.pdf_preview import render_page_jpeg_data_url
 
@@ -163,6 +167,17 @@ def page_preview_parts(job: Job | Any | None, page_numbers: Iterable[int]) -> li
     return parts
 
 
+def semantic_page_parts(
+    job: Job | Any | None,
+    page_numbers: Iterable[int],
+    *,
+    filename: str | None = None,
+) -> list[dict[str, Any]]:
+    if local_semantic_enabled():
+        return page_preview_parts(job, page_numbers)
+    return pdf_file_parts(job, page_numbers, filename=filename)
+
+
 def extract_json_object(raw_text: str) -> dict[str, Any]:
     text = (raw_text or "").strip()
     if not text:
@@ -248,6 +263,27 @@ async def request_llm_json_with_response(
     cache_breakpoint_index: int | None = None,
     conversation_prefix: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if (
+        conversation_prefix is None
+        and local_semantic_enabled()
+        and any(
+            isinstance(item, dict) and item.get("type") == "image_url"
+            for item in content
+        )
+        and not any(
+            isinstance(item, dict) and item.get("type") == "file"
+            for item in content
+        )
+    ):
+        response_schema_payload = response_schema if (response_schema and schema_name) else response_schema
+        return await request_local_semantic_content_json_with_response(
+            content=content,
+            response_schema=response_schema_payload,
+            system_instruction=(
+                "You are evaluating PDF accessibility and document semantics. "
+                "Stay grounded in the provided page evidence and return JSON only."
+            ),
+        )
     if direct_gemini_pdf_enabled() and conversation_prefix is None:
         response_schema_payload = response_schema if (response_schema and schema_name) else response_schema
         return await request_direct_gemini_content_json_with_response(
