@@ -69,6 +69,7 @@ def _settings(**overrides) -> Settings:
     values = {
         "llm_base_url": "http://localhost:11434/v1",
         "llm_model": "gemini-test",
+        "use_direct_gemini_pdf": False,
     }
     values.update(overrides)
     return Settings(**values)
@@ -164,6 +165,32 @@ def _pdf_with_real_widget(output_path: Path) -> None:
     page["/Annots"] = pikepdf.Array([widget])
     pdf.Root["/AcroForm"] = pikepdf.Dictionary({
         "/Fields": pikepdf.Array([widget]),
+        "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
+        "/DR": pikepdf.Dictionary(),
+    })
+    pdf.save(str(output_path))
+
+
+def _pdf_with_two_real_widgets(output_path: Path) -> None:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    widget_one = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Widget"),
+        "/Rect": pikepdf.Array([10, 40, 80, 55]),
+        "/FT": pikepdf.Name("/Tx"),
+        "/T": pikepdf.String("field1"),
+    }))
+    widget_two = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Widget"),
+        "/Rect": pikepdf.Array([10, 10, 80, 25]),
+        "/FT": pikepdf.Name("/Tx"),
+        "/T": pikepdf.String("field2"),
+    }))
+    page["/Annots"] = pikepdf.Array([widget_one, widget_two])
+    pdf.Root["/AcroForm"] = pikepdf.Dictionary({
+        "/Fields": pikepdf.Array([widget_one, widget_two]),
         "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
         "/DR": pikepdf.Dictionary(),
     })
@@ -1099,6 +1126,83 @@ async def test_pretag_form_intelligence_sets_accessible_label(monkeypatch, tmp_p
     with pikepdf.Pdf.open(updated_pdf) as pdf:
         widget = pdf.pages[0]["/Annots"][0]
         assert str(widget["/TU"]) == "First name and middle initial"
+
+
+@pytest.mark.asyncio
+async def test_pretag_form_intelligence_applies_safe_page_results_when_fallback_times_out(
+    monkeypatch, tmp_path
+):
+    pdf_path = tmp_path / "form.pdf"
+    _pdf_with_two_real_widgets(pdf_path)
+    fields = _extract_widget_fields(pdf_path)
+    targets = [{**field, "nearby_blocks": [], "context_blocks": []} for field in fields]
+
+    class _FakeLlmClient:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    async def _fake_generate_page(**kwargs):
+        page_targets = kwargs["targets"]
+        return [
+            {
+                "field_review_id": page_targets[0]["field_review_id"],
+                "page": page_targets[0]["page"],
+                "confidence": "high",
+                "confidence_score": 1.0,
+                "suggested_action": "set_field_label",
+                "reason": "Visible page evidence supports this label.",
+                "accessible_label": "First field label",
+                "current_accessible_name": page_targets[0]["accessible_name"],
+                "current_field_name": page_targets[0]["field_name"],
+            },
+            {
+                "field_review_id": page_targets[1]["field_review_id"],
+                "page": page_targets[1]["page"],
+                "confidence": "medium",
+                "confidence_score": 0.6,
+                "suggested_action": "manual_only",
+                "reason": "Needs individual fallback.",
+                "accessible_label": "",
+                "current_accessible_name": page_targets[1]["accessible_name"],
+                "current_field_name": page_targets[1]["field_name"],
+            },
+        ]
+
+    async def _fake_generate(**kwargs):
+        raise TimeoutError("form_intelligence[field2] timed out")
+
+    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
+    monkeypatch.setattr(orchestrator, "generate_form_intelligence_for_page", _fake_generate_page)
+    monkeypatch.setattr(orchestrator, "generate_form_intelligence", _fake_generate)
+
+    updated_pdf, audit = await _apply_pretag_form_intelligence(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="form.pdf",
+            input_path=str(pdf_path),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_form_intelligence=True),
+        working_pdf=pdf_path,
+        structure_json={"elements": []},
+        targets=targets,
+    )
+
+    assert audit["applied"] is True
+    assert audit["applied_count"] == 1
+    assert audit["page_batch_resolved_count"] == 1
+    assert audit["individual_fallback_count"] == 1
+    assert audit["individual_fallback_failed_count"] == 1
+    assert audit["reason"] == "applied_with_fallback_failures"
+    assert updated_pdf != pdf_path
+
+    with pikepdf.Pdf.open(updated_pdf) as pdf:
+        widget_one, widget_two = pdf.pages[0]["/Annots"]
+        assert str(widget_one["/TU"]) == "First field label"
+        assert "/TU" not in widget_two
 
 
 def test_widget_targets_for_rationalization_is_disabled_without_stronger_evidence(tmp_path):
@@ -2357,8 +2461,15 @@ def test_form_targets_for_intelligence_prefers_local_nearby_fields(monkeypatch, 
         value_text="",
         bbox=SimpleNamespace(to_dict=lambda: {"l": 500.0, "t": 700.0, "r": 508.0, "b": 692.0}),
     )
-    page = SimpleNamespace(page_number=1, fields=[field, far_same_type, close_other_type, close_same_type])
-    document = SimpleNamespace(pages=[page])
+    page = SimpleNamespace(
+        page_number=1,
+        fields=[field, far_same_type, close_other_type, close_same_type],
+        blocks=[],
+    )
+    document = SimpleNamespace(
+        pages=[page],
+        page=lambda page_number: page if page_number == 1 else None,
+    )
 
     monkeypatch.setattr(semantic_pretag_policy, "build_document_model", lambda **kwargs: document)
     monkeypatch.setattr(
@@ -2375,6 +2486,75 @@ def test_form_targets_for_intelligence_prefers_local_nearby_fields(monkeypatch, 
     assert len(targets) == 1
     nearby_ids = [item["field_review_id"] for item in targets[0]["nearby_fields"]]
     assert nearby_ids == ["field-2", "field-3"]
+
+
+def test_form_targets_for_intelligence_includes_enclosing_context(monkeypatch, tmp_path):
+    class _Box(SimpleNamespace):
+        def to_dict(self):
+            return {
+                "l": self.l,
+                "t": self.t,
+                "r": self.r,
+                "b": self.b,
+            }
+
+    field = SimpleNamespace(
+        field_review_id="field-1",
+        page_number=1,
+        order=10,
+        field_type="text",
+        field_name="ZIP Code",
+        accessible_name="",
+        label_quality="missing",
+        value_text="",
+        bbox=_Box(l=500.0, t=590.0, r=575.0, b=575.0),
+    )
+    local_label = SimpleNamespace(
+        review_id="label-1",
+        role="paragraph",
+        text="ZIP Code",
+        bbox=_Box(l=500.0, t=605.0, r=545.0, b=595.0),
+        order=2,
+    )
+    enclosing_context = SimpleNamespace(
+        review_id="section-1",
+        role="paragraph",
+        text="Section 1. Employee Information and Attestation",
+        bbox=_Box(l=40.0, t=650.0, r=575.0, b=635.0),
+        order=1,
+    )
+    far_context = SimpleNamespace(
+        review_id="far-1",
+        role="paragraph",
+        text="Unrelated footer text",
+        bbox=_Box(l=40.0, t=200.0, r=575.0, b=185.0),
+        order=99,
+    )
+    page = SimpleNamespace(
+        page_number=1,
+        fields=[field],
+        blocks=[enclosing_context, local_label, far_context],
+    )
+    document = SimpleNamespace(
+        pages=[page],
+        page=lambda page_number: page if page_number == 1 else None,
+    )
+
+    monkeypatch.setattr(semantic_pretag_policy, "build_document_model", lambda **kwargs: document)
+
+    targets = semantic_pretag_policy.form_targets_for_intelligence(
+        working_pdf=tmp_path / "dummy.pdf",
+        structure_json={"elements": []},
+    )
+
+    assert len(targets) == 1
+    assert [block["text"] for block in targets[0]["nearby_blocks"][:2]] == [
+        "ZIP Code",
+        "Section 1. Employee Information and Attestation",
+    ]
+    assert [block["text"] for block in targets[0]["context_blocks"]] == [
+        "Section 1. Employee Information and Attestation",
+    ]
 
 
 @pytest.mark.asyncio

@@ -42,9 +42,9 @@ Rules:
 - Use each candidate's bbox, caption, and page-local context to locate it on the page.
 - Preserve visible meaning.
 - Prefer reclassification when the crop is clearly not a standalone figure.
-- When the same page also contains a much larger screenshot or interface image, tiny icon or button crops are usually child UI details, not standalone figures.
-- In those cases, prefer `mark_decorative` unless the small crop has clear standalone instructional meaning that would be lost if it were hidden.
-- Do not create separate alt text like "magnifying glass icon" or "printer icon" for child UI details when the larger screenshot already conveys the workflow.
+- When the same page also contains a much larger parent image that appears to contain the same visual context, treat a small crop as a standalone figure only when the crop has independent meaning not already conveyed by surrounding content.
+- Prefer `mark_decorative` for redundant child image details only when hiding them would not remove meaning.
+- Do not create separate alt text for child image details when the larger parent image already conveys the same content.
 - Use `resolved_kind` only when `suggested_action` is `reclassify_region`.
 - `resolved_kind` must be one of: `table`, `form_region`, `artifact`.
 - Use `set_alt_text` only when one concise factual description is clearly supported.
@@ -194,8 +194,8 @@ def _figure_page_context(page_figures: list[FigureInfo]) -> dict[int, dict[str, 
     return context
 
 
-_GENERIC_CHILD_UI_ALT_RE = re.compile(
-    r"\b(icon|button|symbol|triangle|arrow|magnifying glass|printer|paper icon|pencil icon|star)\b",
+_GENERIC_CHILD_DETAIL_ALT_RE = re.compile(
+    r"\b(icon|button|symbol|glyph|marker|control|arrow)\b",
     re.IGNORECASE,
 )
 
@@ -217,7 +217,7 @@ def _should_suppress_child_ui_alt(
         return False
     if normalized.lower().startswith("dialog showing"):
         return False
-    if _GENERIC_CHILD_UI_ALT_RE.search(normalized) is None:
+    if _GENERIC_CHILD_DETAIL_ALT_RE.search(normalized) is None:
         return False
     return True
 
@@ -232,10 +232,10 @@ def _finalize_figure_result(
         raw = {
             **raw,
             "summary": str(raw.get("summary") or "").strip()
-            or "Redundant child UI detail inside a larger screenshot.",
+            or "Redundant child image detail inside a larger parent image.",
             "suggested_action": "mark_decorative",
             "reason": str(raw.get("reason") or "").strip()
-            or "Tiny child UI figure is redundant with the larger screenshot on the page.",
+            or "Small child image detail is redundant with the larger parent image on the page.",
             "alt_text": "",
             "is_decorative": True,
         }

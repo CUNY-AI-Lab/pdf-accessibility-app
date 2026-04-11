@@ -28,6 +28,25 @@ def test_docling_structure_escalation_prefers_docling_title_and_native_toc():
     assert plan["language"]["decision"] == "docling"
 
 
+def test_docling_structure_escalation_routes_title_when_early_evidence_extends_it():
+    plan = docling_structure_escalation_plan(
+        {
+            "title": "Part 1",
+            "language": "en",
+            "elements": [
+                {"type": "heading", "text": "Part 1", "page": 0},
+                {"type": "heading", "text": "Visible Main Title", "page": 0},
+                {"type": "heading", "text": "Visible Subtitle", "page": 0},
+            ],
+        }
+    )
+
+    assert plan["title"]["decision"] == "gemini"
+    assert plan["title"]["reason"] == "early_title_evidence_requires_adjudication"
+    assert plan["title"]["signal"] == "Part 1"
+    assert plan["title"]["evidence"] == ["Part 1", "Visible Main Title", "Visible Subtitle"]
+
+
 def test_docling_structure_escalation_uses_gemini_when_docling_signals_are_missing():
     plan = docling_structure_escalation_plan(
         {

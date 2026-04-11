@@ -231,6 +231,38 @@ def test_materialize_outline_entries_accepts_supported_label_field():
     ]
 
 
+def test_materialize_outline_entries_preserves_toc_preferred_label():
+    outline_entries, seen_ids = _materialize_outline_entries_from_plan(
+        [
+            {
+                "candidate_id": "toc:8",
+                "level": 1,
+                "supported_label": "1. 2023 MANAGEMENT TRACK PEER REVIEW PANEL REPORT",
+            }
+        ],
+        outline_candidates=[
+            {
+                "candidate_id": "toc:8",
+                "source_kind": "toc",
+                "source_index": 26,
+                "preferred_label": "1. Panel Report",
+                "supported_labels": [
+                    "1. Panel Report",
+                    "1. 2023 MANAGEMENT TRACK PEER REVIEW PANEL REPORT",
+                ],
+                "raw_text": "1. Panel Report",
+                "text": "1. Panel Report",
+                "target_page_index": 13,
+                "source_page": 3,
+                "default_level": 1,
+            }
+        ],
+    )
+
+    assert seen_ids == {"toc:8"}
+    assert outline_entries[0]["text"] == "1. Panel Report"
+
+
 def test_bookmark_intelligence_uses_direct_gemini_cached_path(monkeypatch, tmp_path):
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path, page_count=5)

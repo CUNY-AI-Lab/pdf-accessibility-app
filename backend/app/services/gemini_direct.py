@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -18,6 +20,10 @@ DIRECT_GEMINI_JSON_PROMPT_SUFFIX = """
 Return exactly one JSON object and nothing else.
 Do not wrap the JSON in markdown fences.
 """
+_DIRECT_GEMINI_TIMEOUT_OVERRIDE_SECONDS: ContextVar[float | None] = ContextVar(
+    "direct_gemini_timeout_override_seconds",
+    default=None,
+)
 
 
 @dataclass(slots=True)
@@ -155,11 +161,90 @@ def _build_prompt_text(
     return "\n\n".join(chunk for chunk in chunks if chunk)
 
 
-def _gemini_json_config(types_module: Any, *, system_instruction: str | None, response_schema: dict[str, Any] | None, cached_content: str | None = None) -> Any:
+def _positive_int(value: Any, *, default: int, minimum: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if parsed < minimum:
+        return minimum
+    return parsed
+
+
+@contextmanager
+def direct_gemini_timeout_override(timeout_seconds: float | None):
+    if timeout_seconds is None:
+        yield
+        return
+    try:
+        parsed = float(timeout_seconds)
+    except (TypeError, ValueError):
+        yield
+        return
+    token = _DIRECT_GEMINI_TIMEOUT_OVERRIDE_SECONDS.set(max(1.0, parsed))
+    try:
+        yield
+    finally:
+        _DIRECT_GEMINI_TIMEOUT_OVERRIDE_SECONDS.reset(token)
+
+
+def _gemini_timeout_milliseconds(settings: Settings) -> int:
+    override = _DIRECT_GEMINI_TIMEOUT_OVERRIDE_SECONDS.get()
+    raw_timeout = override if override is not None else getattr(settings, "gemini_direct_timeout", 45)
+    try:
+        timeout_seconds = float(raw_timeout)
+    except (TypeError, ValueError):
+        timeout_seconds = 45.0
+    return max(1000, int(max(1.0, timeout_seconds) * 1000))
+
+
+def _gemini_http_options(types_module: Any, *, settings: Settings) -> Any:
+    return types_module.HttpOptions(timeout=_gemini_timeout_milliseconds(settings))
+
+
+def _gemini_thinking_config(types_module: Any, *, settings: Settings) -> Any | None:
+    model_name = str(getattr(settings, "gemini_model", "") or "").lower()
+    if "gemini-3" in model_name:
+        raw_level = str(getattr(settings, "gemini_direct_thinking_level", "minimal") or "minimal")
+        level_name = raw_level.strip().upper().replace("-", "_")
+        thinking_level = getattr(types_module.ThinkingLevel, level_name, types_module.ThinkingLevel.MINIMAL)
+        return types_module.ThinkingConfig(include_thoughts=False, thinking_level=thinking_level)
+    if "gemini-2.5" in model_name:
+        budget = _positive_int(
+            getattr(settings, "gemini_direct_thinking_budget", 0),
+            default=0,
+            minimum=0,
+        )
+        return types_module.ThinkingConfig(include_thoughts=False, thinking_budget=budget)
+    return None
+
+
+def _gemini_client(genai_module: Any, types_module: Any, *, settings: Settings) -> Any:
+    return genai_module.Client(
+        api_key=_gemini_api_key(settings),
+        http_options=_gemini_http_options(types_module, settings=settings),
+    )
+
+
+def _gemini_json_config(
+    types_module: Any,
+    *,
+    settings: Settings,
+    system_instruction: str | None,
+    response_schema: dict[str, Any] | None,
+    cached_content: str | None = None,
+) -> Any:
     return types_module.GenerateContentConfig(
+        http_options=_gemini_http_options(types_module, settings=settings),
         system_instruction=system_instruction,
         cached_content=cached_content,
         temperature=0,
+        max_output_tokens=_positive_int(
+            getattr(settings, "gemini_direct_max_output_tokens", 8192),
+            default=8192,
+            minimum=256,
+        ),
+        thinking_config=_gemini_thinking_config(types_module, settings=settings),
         response_mime_type="application/json",
         response_json_schema=response_schema if response_schema else None,
     )
@@ -285,7 +370,7 @@ def _request_direct_gemini_pdf_json_sync(
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=_gemini_api_key(settings))
+    client = _gemini_client(genai, types, settings=settings)
     uploaded_file = None
     try:
         subset_stream = _make_pdf_subset_io(pdf_path, page_numbers=page_numbers)
@@ -303,6 +388,7 @@ def _request_direct_gemini_pdf_json_sync(
             contents=[uploaded_file, prompt_text],
             config=_gemini_json_config(
                 types,
+                settings=settings,
                 system_instruction=system_instruction,
                 response_schema=response_schema,
             ),
@@ -329,7 +415,7 @@ def _create_direct_gemini_pdf_cache_sync(
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=_gemini_api_key(settings))
+    client = _gemini_client(genai, types, settings=settings)
     subset_stream = _make_pdf_subset_io(pdf_path, page_numbers=page_numbers)
     uploaded_file = client.files.upload(
         file=subset_stream,
@@ -339,6 +425,7 @@ def _create_direct_gemini_pdf_cache_sync(
         cache = client.caches.create(
             model=settings.gemini_model.strip(),
             config=types.CreateCachedContentConfig(
+                http_options=_gemini_http_options(types, settings=settings),
                 contents=[uploaded_file],
                 system_instruction=system_instruction,
                 ttl=ttl,
@@ -385,8 +472,9 @@ def _delete_direct_gemini_pdf_cache_sync(
     cache_handle: DirectGeminiPdfCacheHandle,
 ) -> None:
     from google import genai
+    from google.genai import types
 
-    client = genai.Client(api_key=_gemini_api_key(settings))
+    client = _gemini_client(genai, types, settings=settings)
     try:
         client.caches.delete(name=cache_handle.cache_name)
     finally:
@@ -447,7 +535,7 @@ def _request_direct_gemini_content_json_sync(
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=_gemini_api_key(settings))
+    client = _gemini_client(genai, types, settings=settings)
     uploaded_files: list[Any] = []
     try:
         contents, uploaded_files = _prepare_uploaded_parts(client, content)
@@ -468,6 +556,7 @@ def _request_direct_gemini_content_json_sync(
             contents=contents,
             config=_gemini_json_config(
                 types,
+                settings=settings,
                 system_instruction=system_instruction,
                 response_schema=response_schema,
             ),
@@ -507,7 +596,7 @@ def _request_direct_gemini_cached_json_sync(
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=_gemini_api_key(settings))
+    client = _gemini_client(genai, types, settings=settings)
     prompt_text = _build_prompt_text(
         prompt=prompt,
         context_payload=context_payload,
@@ -518,6 +607,7 @@ def _request_direct_gemini_cached_json_sync(
         contents=prompt_text,
         config=_gemini_json_config(
             types,
+            settings=settings,
             system_instruction=None,
             response_schema=response_schema,
             cached_content=cache_name,

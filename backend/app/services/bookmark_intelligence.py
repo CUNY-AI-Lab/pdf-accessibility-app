@@ -82,7 +82,8 @@ Rules:
 - Repeated visible labels on different pages are distinct candidates and may each be kept when they mark different visible sections.
 - Only suppress a candidate as redundant when the cached PDF shows it points to the same visible section as another kept candidate.
 - Use supported_label only when choosing one of that candidate's supported_labels.
-- Choose the label variant that best matches the visible document evidence.
+- For TOC candidates, preserve preferred_label because it is the TOC-visible label; use heading variants as separate heading evidence, not as rewrites of the TOC label.
+- For non-TOC candidates, choose the label variant that best matches the visible document evidence.
 - For higher-order pre-TOC roles, use front_matter_entries with a 1-based page and one of these exact labels:
   - Cover
   - Inside-Cover page
@@ -665,11 +666,14 @@ def _materialize_outline_entries_from_plan(
             level = int(item.get("level", candidate.get("default_level", 1)) or 1)
         except (TypeError, ValueError):
             level = int(candidate.get("default_level", 1) or 1)
-        label = _resolve_supported_label(
-            list(candidate.get("supported_labels") or []),
-            item.get("supported_label", item.get("label_override")),
-            fallback=str(candidate.get("preferred_label") or candidate["text"]),
-        )
+        if str(candidate.get("source_kind") or "").strip() == "toc":
+            label = _clean_bookmark_label(candidate.get("preferred_label") or candidate.get("text"))
+        else:
+            label = _resolve_supported_label(
+                list(candidate.get("supported_labels") or []),
+                item.get("supported_label", item.get("label_override")),
+                fallback=str(candidate.get("preferred_label") or candidate["text"]),
+            )
         if not label:
             continue
         outline_entries.append({

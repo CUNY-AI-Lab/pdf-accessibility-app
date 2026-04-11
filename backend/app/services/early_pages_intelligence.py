@@ -74,7 +74,8 @@ Rules for title:
 - Use only visible evidence from the provided PDF pages and the structural candidates.
 - Prefer the document's main title, not author lines, institutional boilerplate, dates, running headers, or filenames.
 - When the visible title is split across adjacent heading fragments, combine them into one natural title.
-- Preserve numbering only when it is visibly part of the title, such as a chapter number.
+- When adjacent title-block fragments together identify the document, include the identity-bearing fragments; do not drop a visible identifier solely because a descriptive phrase is more prominent.
+- Preserve numbering or other identifiers only when they are visibly part of the document title block.
 - Do not invent words that are not visible.
 - A current_title may already be present from Docling or metadata. Keep it when it is already the best visible title, but replace it when the broader visible evidence shows a better title.
 - If the visible title is too ambiguous to recover faithfully, return an empty title with confidence=low.

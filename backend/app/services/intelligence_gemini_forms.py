@@ -29,9 +29,11 @@ Goal:
 Rules:
 - Return one decision per provided field_review_id when possible.
 - Prefer labels that preserve the same meaning a screen reader user needs, even when that means including short section or group context.
+- Treat context_blocks as candidate governing section or group evidence. Use a context block only when it genuinely applies to the field; ignore merely adjacent labels or unrelated page text.
+- When a governing context block clearly identifies the field's section, group, party, or question, include that context in accessible_label instead of returning a bare short label.
 - When a short visible label would be ambiguous on its own, include the nearby section, group, or question text that disambiguates it.
 - For checkbox and radio controls, combine nearby group text and option text when that is what a screen reader should hear.
-- Preserve short action cues like "Enter" or "Select" when they are clearly supported by the control type and nearby text.
+- Preserve short visible action cues when they are clearly supported by the control type and nearby text.
 - Do not shorten a clearly helpful accessible label just because a shorter visible label exists.
 - Do not copy long instruction paragraphs verbatim when a shorter faithful label is visible.
 - Use confirm_current_label only when the current accessible label is already good.
@@ -142,6 +144,16 @@ def _batch_prompt_target(target: dict[str, Any]) -> dict[str, Any]:
         "label_quality": str(target.get("label_quality") or "").strip(),
         "value_text": str(target.get("value_text") or "").strip()[:120],
         "nearby_blocks": nearby_blocks,
+        "context_blocks": [
+            {
+                "review_id": str(block.get("review_id") or "").strip(),
+                "type": str(block.get("type") or "").strip(),
+                "text": str(block.get("text") or "").strip()[:180],
+                "context_role": str(block.get("context_role") or "").strip(),
+            }
+            for block in list(target.get("context_blocks") or [])[:4]
+            if isinstance(block, dict) and str(block.get("text") or "").strip()
+        ],
         "nearby_fields": nearby_fields,
     }
 
@@ -212,6 +224,7 @@ async def generate_form_intelligence(
         ),
         bbox=target.get("bbox") if isinstance(target.get("bbox"), dict) else None,
         nearby_context=nearby_blocks,
+        structure_context=list(target.get("context_blocks") or []),
         current_semantics={
             "accessible_label": str(target.get("accessible_name") or "").strip(),
             "field_name": str(target.get("field_name") or "").strip(),
@@ -220,6 +233,7 @@ async def generate_form_intelligence(
         },
         metadata={
             "field_review_target": target,
+            "context_blocks": list(target.get("context_blocks") or []),
             "nearby_fields": list(target.get("nearby_fields") or []),
             "reviewer_feedback": reviewer_feedback or "",
             "previous_intelligence": previous_intelligence or {},

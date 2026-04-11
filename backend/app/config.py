@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3-flash-preview"
     use_direct_gemini_pdf: bool = True
+    gemini_direct_timeout: int = 120
+    gemini_direct_max_output_tokens: int = 8192
+    gemini_direct_thinking_level: str = "low"
+    gemini_direct_thinking_budget: int = 0
     semantic_media_backend: str = "gemini"
     local_semantic_base_url: str = "http://127.0.0.1:8000/v1"
     local_semantic_api_key: str = ""
@@ -45,6 +49,7 @@ class Settings(BaseSettings):
     local_semantic_bookmark_preview_pages: int = 4
     llm_timeout: int = 120
     llm_pretag_timeout: int = 45
+    llm_pretag_fallback_timeout: int = 15
     llm_strict_validation: bool = True
     auto_approve_generated_alt_text: bool = True
     skip_alt_text_generation: bool = False

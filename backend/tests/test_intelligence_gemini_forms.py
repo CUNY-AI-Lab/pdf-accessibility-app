@@ -179,6 +179,7 @@ def test_generate_form_intelligence_for_page_normalizes_batch_response(monkeypat
     assert captured["content"][1]["type"] == "file"
     prompt = captured["content"][0]["text"]
     assert "section or group context" in prompt
+    assert "instead of returning a bare short label" in prompt
     assert "Do not shorten a clearly helpful accessible label" in prompt
     assert len(result) == 2
     assert result[0]["field_review_id"] == "field-widget-10-0"

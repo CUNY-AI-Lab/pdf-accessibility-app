@@ -53,7 +53,7 @@ Rules:
 - Use toc_item_table only for candidate elements whose source type is table.
 - Use toc_item for heading, paragraph, or list-style entries.
 - When visible TOC text is clear, provide entry_text_overrides using short visible labels without leader dots or trailing page numbers.
-- Use caption_text_override only when the visible caption should be normalized, such as TABLE OF CONTENTS.
+- Use caption_text_override only when the visible caption should be normalized without changing its meaning.
 - If the group is not clearly a TOC, return is_toc=false and empty entry_indexes.
 """
 

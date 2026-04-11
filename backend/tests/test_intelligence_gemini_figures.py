@@ -248,6 +248,14 @@ def test_suppress_child_ui_alt_for_generic_icon_label():
         figure_context={"likely_child_ui_figure": True},
     )
 
+    assert not _should_suppress_child_ui_alt(
+        raw={
+            "suggested_action": "set_alt_text",
+            "alt_text": "Magnifying glass",
+        },
+        figure_context={"likely_child_ui_figure": True},
+    )
+
 
 def test_generate_figure_intelligence_suppresses_generic_child_ui_alt(monkeypatch, tmp_path):
     image_path = tmp_path / "figure.png"

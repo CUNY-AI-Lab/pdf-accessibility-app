@@ -306,3 +306,65 @@ def collect_nearby_blocks(
         }
         for _, block in ranked[:limit]
     ]
+
+
+def collect_enclosing_context_blocks(
+    document: DocumentModel,
+    *,
+    page_number: int,
+    bbox: dict[str, Any] | None,
+    limit: int = 4,
+) -> list[dict[str, Any]]:
+    page = document.page(page_number)
+    if page is None or not isinstance(bbox, dict):
+        return []
+    try:
+        field_left = float(bbox["l"])
+        field_top = float(bbox["t"])
+        field_right = float(bbox["r"])
+    except Exception:
+        return []
+
+    ranked: list[tuple[float, float, int, BlockModel]] = []
+    for block in page.blocks:
+        if not block.text or block.bbox is None:
+            continue
+        # Prefer blocks that visually span the field and sit above it; these
+        # are the strongest generic candidates for section/group context.
+        if block.bbox.b < field_top - 4.0:
+            continue
+        vertical_gap = max(0.0, block.bbox.b - field_top)
+        if vertical_gap > 180.0:
+            continue
+        block_width = max(0.0, block.bbox.r - block.bbox.l)
+        field_width = max(1.0, field_right - field_left)
+        broad_context = block_width >= max(field_width * 3.0, 120.0)
+        if not broad_context:
+            continue
+        ranked.append((
+            vertical_gap,
+            -block_width,
+            block.order,
+            block,
+        ))
+
+    ranked.sort(key=lambda item: (item[0], item[1], item[2], item[3].review_id))
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for _, _, _, block in ranked:
+        text = block.text[:240]
+        if not text or text in seen:
+            continue
+        results.append(
+            {
+                "review_id": block.review_id,
+                "type": block.role,
+                "text": text,
+                "bbox": block.bbox.to_dict() if block.bbox else None,
+                "context_role": "enclosing_or_group_context",
+            }
+        )
+        seen.add(text)
+        if len(results) >= limit:
+            break
+    return results

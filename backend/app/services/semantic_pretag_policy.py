@@ -8,6 +8,7 @@ from pathlib import Path
 
 from app.services.document_intelligence import (
     build_document_model,
+    collect_enclosing_context_blocks,
     collect_nearby_blocks,
     collect_structure_fragments,
 )
@@ -277,6 +278,12 @@ def form_targets_for_intelligence(
                         page_number=page.page_number,
                         bbox=field_bbox,
                         limit=6,
+                    ),
+                    "context_blocks": collect_enclosing_context_blocks(
+                        document,
+                        page_number=page.page_number,
+                        bbox=field_bbox,
+                        limit=4,
                     ),
                     "nearby_fields": [
                         {

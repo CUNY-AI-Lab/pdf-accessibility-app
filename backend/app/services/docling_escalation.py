@@ -9,9 +9,20 @@ from app.services.semantic_pretag_policy import (
     widget_targets_for_rationalization,
 )
 
+EARLY_TITLE_EVIDENCE_TYPES = frozenset({"heading", "title", "subtitle"})
+
 
 def _normalize_text(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
+
+
+def _normalize_for_match(value: Any) -> str:
+    text = _normalize_text(value).lower()
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def _word_count(value: Any) -> int:
+    return len([token for token in _normalize_text(value).split(" ") if token])
 
 
 def _has_native_toc_children(native_toc: Any) -> bool:
@@ -21,22 +32,71 @@ def _has_native_toc_children(native_toc: Any) -> bool:
     return isinstance(children, list) and any(isinstance(child, dict) for child in children)
 
 
+def _early_title_evidence(structure: dict[str, Any], *, max_candidates: int = 8) -> list[str]:
+    elements = structure.get("elements")
+    if not isinstance(elements, list):
+        return []
+    candidates: list[str] = []
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        page = element.get("page")
+        if not isinstance(page, int) or page < 0 or page > 1:
+            continue
+        element_type = str(element.get("type") or "").strip()
+        if element_type not in EARLY_TITLE_EVIDENCE_TYPES:
+            continue
+        text = _normalize_text(element.get("text"))
+        if not text:
+            continue
+        candidates.append(text[:240])
+        if len(candidates) >= max_candidates:
+            break
+    return candidates
+
+
+def _title_decision(structure: dict[str, Any]) -> dict[str, Any]:
+    title = _normalize_text(structure.get("title"))
+    if not title:
+        return {
+            "decision": "gemini",
+            "reason": "missing_docling_title",
+            "signal": "",
+        }
+
+    title_key = _normalize_for_match(title)
+    evidence = _early_title_evidence(structure)
+    evidence_keys = [_normalize_for_match(candidate) for candidate in evidence]
+    title_matches_evidence = any(
+        key and title_key and (key == title_key or key in title_key or title_key in key)
+        for key in evidence_keys
+    )
+    extra_title_evidence = any(
+        key and title_key and key != title_key and key not in title_key
+        for key in evidence_keys
+    )
+    short_or_fragment_like = _word_count(title) <= 4
+    if short_or_fragment_like and title_matches_evidence and extra_title_evidence:
+        return {
+            "decision": "gemini",
+            "reason": "early_title_evidence_requires_adjudication",
+            "signal": title,
+            "evidence": evidence,
+        }
+
+    return {
+        "decision": "docling",
+        "reason": "docling_title_present",
+        "signal": title,
+    }
+
+
 def docling_structure_escalation_plan(structure_json: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
     structure = structure_json if isinstance(structure_json, dict) else {}
-    title = _normalize_text(structure.get("title"))
-    has_title = bool(title)
     has_native_toc = _has_native_toc_children(structure.get("native_toc"))
 
     return {
-        "title": {
-            "decision": "docling" if has_title else "gemini",
-            "reason": (
-                "docling_title_present"
-                if has_title
-                else "missing_docling_title"
-            ),
-            "signal": title,
-        },
+        "title": _title_decision(structure),
         "toc": {
             "decision": "gemini",
             "reason": "visible_toc_page_semantics_not_docling_authoritative",

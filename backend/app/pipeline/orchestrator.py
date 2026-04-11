@@ -44,6 +44,7 @@ from app.services.font_intelligence_auto import (
     fidelity_not_worse as _fidelity_not_worse,
 )
 from app.services.form_fields import apply_field_accessible_names, remove_widget_fields
+from app.services.gemini_direct import direct_gemini_pdf_enabled, direct_gemini_timeout_override
 from app.services.grounded_text_apply import (
     PRETAG_GROUNDED_TEXT_TARGET_LIMIT,
 )
@@ -183,6 +184,26 @@ def _pretag_llm_operation_timeout_seconds(settings: Settings) -> float:
     )
 
 
+def _pretag_llm_fallback_operation_timeout_seconds(settings: Settings) -> float:
+    """Use a shorter bound for per-item fallbacks after page-batch evidence was tried."""
+    primary_per_attempt = max(
+        1.0,
+        float(getattr(settings, "llm_pretag_timeout", getattr(settings, "llm_timeout", 120)) or 120),
+    )
+    fallback_per_attempt = max(
+        1.0,
+        float(getattr(settings, "llm_pretag_fallback_timeout", primary_per_attempt) or primary_per_attempt),
+    )
+    return _llm_operation_timeout_seconds_from_values(
+        per_attempt=min(primary_per_attempt, fallback_per_attempt),
+        retries=0,
+        retry_backoff_cap=max(
+            0.0,
+            float(getattr(settings, "llm_retry_max_backoff_seconds", 0.0) or 0.0),
+        ),
+    )
+
+
 def _make_pretag_llm_client(settings: Settings) -> _LlmClient:
     return make_llm_client_with_overrides(
         settings,
@@ -201,8 +222,25 @@ async def _await_llm_operation(
     timeout_seconds: float | None = None,
 ):
     timeout = timeout_seconds if timeout_seconds is not None else _llm_operation_timeout_seconds(settings)
+    timeout_guard = direct_gemini_timeout_override(None)
+    if direct_gemini_pdf_enabled(settings):
+        # Direct Gemini requests run through the sync SDK in a worker thread.
+        # Bound them with the SDK timeout instead of clipping them with pretag's
+        # shorter wrapper timeout; otherwise a page-batch timeout can cascade
+        # into many lower-quality individual fallback calls.
+        configured_direct_timeout = max(
+            1.0,
+            float(getattr(settings, "gemini_direct_timeout", 45) or 45),
+        )
+        timeout = max(
+            timeout,
+            configured_direct_timeout + min(5.0, max(1.0, configured_direct_timeout * 0.1)),
+        )
+        timeout_guard = direct_gemini_timeout_override(configured_direct_timeout)
     try:
-        return await asyncio.wait_for(awaitable, timeout=timeout)
+        with timeout_guard:
+            operation = asyncio.ensure_future(awaitable)
+            return await asyncio.wait_for(operation, timeout=timeout)
     except TimeoutError as exc:
         raise RuntimeError(f"{label} timed out after {timeout:.1f}s") from exc
 
@@ -864,6 +902,7 @@ async def _apply_pretag_table_intelligence(
 
     llm_client = _make_pretag_llm_client(settings)
     pretag_timeout = _pretag_llm_operation_timeout_seconds(settings)
+    fallback_timeout = _pretag_llm_fallback_operation_timeout_seconds(settings)
     with track_llm_usage() as usage:
         try:
             intelligence_items: list[dict[str, object]] = []
@@ -945,7 +984,7 @@ async def _apply_pretag_table_intelligence(
                 intelligence = await _await_llm_operation(
                     settings=settings,
                     label=f"table_intelligence[{review_id or '?'}]",
-                    timeout_seconds=pretag_timeout,
+                    timeout_seconds=fallback_timeout,
                     awaitable=generate_table_intelligence(
                         job=job,
                         target=target,
@@ -972,7 +1011,7 @@ async def _apply_pretag_table_intelligence(
                 retried_item = await _await_llm_operation(
                     settings=settings,
                     label=f"table_intelligence[{review_id or '?'}].aggressive",
-                    timeout_seconds=pretag_timeout,
+                    timeout_seconds=fallback_timeout,
                     awaitable=generate_table_intelligence(
                         job=job,
                         target=detailed_target,
@@ -1000,7 +1039,7 @@ async def _apply_pretag_table_intelligence(
                 retried_item = await _await_llm_operation(
                     settings=settings,
                     label=f"table_intelligence[{review_id or '?'}].confirm_existing",
-                    timeout_seconds=pretag_timeout,
+                    timeout_seconds=fallback_timeout,
                     awaitable=generate_table_intelligence(
                         job=job,
                         target=detailed_target,
@@ -1113,6 +1152,7 @@ async def _apply_pretag_widget_rationalization(
         "page_batch_resolved_count": 0,
         "page_batch_failed_count": 0,
         "individual_fallback_count": 0,
+        "individual_fallback_failed_count": 0,
         "pages": [],
         "review_ids": [],
         "llm_usage": _empty_llm_usage(),
@@ -1141,6 +1181,7 @@ async def _apply_pretag_widget_rationalization(
     preview_job = _preview_job_for_pdf(job, working_pdf)
     llm_client = _make_pretag_llm_client(settings)
     pretag_timeout = _pretag_llm_operation_timeout_seconds(settings)
+    fallback_timeout = _pretag_llm_fallback_operation_timeout_seconds(settings)
     with track_llm_usage() as usage:
         try:
             semaphore = asyncio.Semaphore(max(1, settings.llm_max_concurrency))
@@ -1163,7 +1204,7 @@ async def _apply_pretag_widget_rationalization(
                     return await _await_llm_operation(
                         settings=settings,
                         label=f"widget_intelligence[{review_id}]",
-                        timeout_seconds=pretag_timeout,
+                        timeout_seconds=fallback_timeout,
                         awaitable=generate_widget_intelligence(
                             job=preview_job,
                             target=target,
@@ -1221,9 +1262,15 @@ async def _apply_pretag_widget_rationalization(
             audit["individual_fallback_count"] = len(unresolved_targets)
             if unresolved_targets:
                 fallback_items = await asyncio.gather(
-                    *[_generate(target) for target in unresolved_targets]
+                    *[_generate(target) for target in unresolved_targets],
+                    return_exceptions=True,
                 )
                 for item in fallback_items:
+                    if isinstance(item, Exception):
+                        audit["individual_fallback_failed_count"] = (
+                            int(audit.get("individual_fallback_failed_count", 0)) + 1
+                        )
+                        continue
                     if not isinstance(item, dict):
                         continue
                     review_id = str(item.get("field_review_id") or "").strip()
@@ -1297,6 +1344,7 @@ async def _apply_pretag_form_intelligence(
         "page_batch_resolved_count": 0,
         "page_batch_failed_count": 0,
         "individual_fallback_count": 0,
+        "individual_fallback_failed_count": 0,
         "pages": [],
         "review_ids": [],
         "llm_usage": _empty_llm_usage(),
@@ -1325,6 +1373,7 @@ async def _apply_pretag_form_intelligence(
     preview_job = _preview_job_for_pdf(job, working_pdf)
     llm_client = _make_pretag_llm_client(settings)
     pretag_timeout = _pretag_llm_operation_timeout_seconds(settings)
+    fallback_timeout = _pretag_llm_fallback_operation_timeout_seconds(settings)
     with track_llm_usage() as usage:
         try:
             semaphore = asyncio.Semaphore(max(1, settings.llm_max_concurrency))
@@ -1348,7 +1397,7 @@ async def _apply_pretag_form_intelligence(
                     return await _await_llm_operation(
                         settings=settings,
                         label=f"form_intelligence[{review_id}]",
-                        timeout_seconds=pretag_timeout,
+                        timeout_seconds=fallback_timeout,
                         awaitable=generate_form_intelligence(
                             job=preview_job,
                             target={key: value for key, value in target.items() if key != "nearby_blocks"},
@@ -1402,9 +1451,15 @@ async def _apply_pretag_form_intelligence(
             audit["individual_fallback_count"] = len(unresolved_targets)
             if unresolved_targets:
                 fallback_items = await asyncio.gather(
-                    *[_generate(target) for target in unresolved_targets]
+                    *[_generate(target) for target in unresolved_targets],
+                    return_exceptions=True,
                 )
                 for item in fallback_items:
+                    if isinstance(item, Exception):
+                        audit["individual_fallback_failed_count"] = (
+                            int(audit.get("individual_fallback_failed_count", 0)) + 1
+                        )
+                        continue
                     if not isinstance(item, dict):
                         continue
                     review_id = str(item.get("field_review_id") or "").strip()
@@ -1457,7 +1512,11 @@ async def _apply_pretag_form_intelligence(
     audit["applied_count"] = len(applied_review_ids)
     audit["pages"] = sorted(approved_pages)
     audit["review_ids"] = applied_review_ids
-    audit["reason"] = "applied"
+    audit["reason"] = (
+        "applied_with_fallback_failures"
+        if int(audit.get("individual_fallback_failed_count", 0)) > 0
+        else "applied"
+    )
     return patched_pdf, audit
 
 

@@ -89,10 +89,12 @@ Form-field rules:
 - Use confirm_current_label when the current accessible label is already good.
 - Use set_field_label when one faithful accessible label is clearly supported by the visible label and nearby context.
 - If the current accessible label is missing, cryptic, or technical, prefer set_field_label when the visible nearby text supports a better label.
+- Treat structure_context entries as candidate governing section or group evidence. Use them only when they genuinely apply to the field; ignore merely adjacent labels or unrelated page text.
+- When governing structure_context clearly identifies the field's section, group, party, or question, include that context in the accessible label instead of returning a bare short label.
 - When a short visible label would be ambiguous on its own, include nearby section, group, or question context so assistive technology preserves the same meaning.
 - For checkbox and radio controls, use nearby group labels and option text together when they clearly identify what assistive technology should announce.
 - When a checkbox or radio button is paired with a long instruction paragraph, prefer a short label that preserves the control's meaning instead of copying the full paragraph verbatim.
-- Preserve short action cues like "Enter" or "Select" when they are clearly supported by the control type and nearby text.
+- Preserve short visible action cues when they are clearly supported by the control type and nearby text.
 - Use manual_only when the field is ambiguous or depends on context you cannot infer confidently.
 - Keep form labels concise and factual, but not at the cost of losing disambiguating context or meaning. Do not add help text unless it is part of the visible label.
 
@@ -117,7 +119,7 @@ TOC-group rules:
 - Use toc_item for heading, paragraph, or list-style entries.
 - When the visible TOC text is clear, provide entry_text_overrides for affected candidate indexes using short visible entry labels.
 - entry_text_overrides should remove leader dots and trailing page numbers, preserve visible numbering or appendix labels, and avoid paragraph spill.
-- Use caption_text_override only when the visible caption text should be normalized, such as "TABLE OF CONTENTS".
+- Use caption_text_override only when the visible caption text should be normalized without changing its meaning.
 """
 
 SEMANTIC_DECISION_SCHEMA: dict[str, Any] = {
