@@ -129,7 +129,7 @@ def test_infer_link_contents_prefers_overlapping_visible_text():
     assert _infer_link_contents(annotation, page_elements) == "1 Introduction 6"
 
 
-def test_infer_link_contents_does_not_reconstruct_row_context_for_numeric_page_links():
+def test_infer_link_contents_keeps_generic_destination_for_numeric_page_links():
     pdf = pikepdf.new()
     annotation = pdf.make_indirect(pikepdf.Dictionary({
         "/Type": pikepdf.Name("/Annot"),
@@ -145,17 +145,7 @@ def test_infer_link_contents_does_not_reconstruct_row_context_for_numeric_page_l
             "bbox": {"l": 552.0, "b": 657.0, "r": 558.0, "t": 674.0},
         }
     ]
-    page_lines = [
-        {"bbox": {"l": 74.9, "b": 658.2, "r": 80.9, "t": 668.5}, "display_text": "1", "text": "1"},
-        {
-            "bbox": {"l": 99.4, "b": 658.2, "r": 530.1, "t": 668.5},
-            "display_text": "Stocks reviewed at September 2022 Management Track Assessment Peer Review meeting",
-            "text": "stocks reviewed at september 2022 management track assessment peer review meeting",
-        },
-        {"bbox": {"l": 552.1, "b": 657.4, "r": 558.0, "t": 674.2}, "display_text": "3", "text": "3"},
-    ]
-
-    assert _infer_link_contents(annotation, page_elements, page_lines) == "Link to destination"
+    assert _infer_link_contents(annotation, page_elements) == "Link to destination"
 
 
 def test_infer_link_contents_prefers_exact_word_boxes_for_small_anchor_links():
@@ -207,7 +197,7 @@ def test_infer_link_contents_rejects_nearby_paragraph_spill_for_wrapped_numeric_
         },
     ]
 
-    assert _infer_link_contents(annotation, page_elements, page_lines=None) == "Link to destination"
+    assert _infer_link_contents(annotation, page_elements) == "Link to destination"
 
 
 def test_tag_link_annotations_replaces_generic_baseline_contents_with_visible_text():
@@ -310,7 +300,7 @@ def test_link_annotation_nests_under_matched_text_struct_element():
     assert len(builder.doc_elem["/K"]) == 1
 
 
-def test_tag_link_annotations_keeps_generic_contents_when_row_context_is_weak():
+def test_tag_link_annotations_keeps_generic_contents_when_paragraph_context_is_weak():
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(600, 800))
     annotation = pdf.make_indirect(pikepdf.Dictionary({
@@ -340,15 +330,6 @@ def test_tag_link_annotations_keeps_generic_contents_when_row_context_is_weak():
                 "text": "3",
                 "bbox": {"l": 552.0, "b": 657.0, "r": 558.0, "t": 674.0},
             }
-        ],
-        docling_page_lines=[
-            {"bbox": {"l": 74.9, "b": 658.2, "r": 80.9, "t": 668.5}, "display_text": "1", "text": "1"},
-            {
-                "bbox": {"l": 99.4, "b": 658.2, "r": 530.1, "t": 668.5},
-                "display_text": "Stocks reviewed at September 2022 Management Track Assessment Peer Review meeting",
-                "text": "stocks reviewed at september 2022 management track assessment peer review meeting",
-            },
-            {"bbox": {"l": 552.1, "b": 657.4, "r": 558.0, "t": 674.2}, "display_text": "3", "text": "3"},
         ],
     )
     builder.finalize()
@@ -409,7 +390,7 @@ def test_infer_link_contents_rejects_sentence_length_paragraph_overlap():
         }
     ]
 
-    assert _infer_link_contents(annotation, page_elements, page_lines=None) == "Link to destination"
+    assert _infer_link_contents(annotation, page_elements) == "Link to destination"
 
 
 def test_infer_link_contents_rejects_short_broad_paragraph_overlap():
@@ -433,7 +414,7 @@ def test_infer_link_contents_rejects_short_broad_paragraph_overlap():
         }
     ]
 
-    assert _infer_link_contents(annotation, page_elements, page_lines=None) == (
+    assert _infer_link_contents(annotation, page_elements) == (
         "Link to https://example.test/instructions"
     )
 

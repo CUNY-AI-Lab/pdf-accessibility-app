@@ -8,12 +8,12 @@ import pytest
 from app.services import remediation_intelligence
 from app.services.intelligence_llm_utils import extract_json_object, job_pdf_path
 from app.services.remediation_intelligence import (
+    _document_model,
     _font_task_payload,
-    _page_blocks_for_review,
-    _suspicious_reading_blocks,
-    _table_targets_for_review,
+    _page_blocks_for_review_from_document,
+    _suspicious_reading_blocks_from_page_blocks,
+    _table_targets_for_review_from_document,
     generate_remediation_intelligence,
-    select_auto_font_override,
     select_auto_font_resolution,
 )
 
@@ -179,28 +179,26 @@ def test_font_task_payload_includes_reviewer_feedback_context(monkeypatch, tmp_p
 
 
 def test_page_blocks_for_review_collects_structure_fragments(tmp_path):
-    page_blocks = _page_blocks_for_review(
-        _job(
-            tmp_path,
-            structure={
-                "elements": [
-                    {"type": "heading", "page": 0, "text": "Library AI Discovery Guide"},
-                    {
-                        "type": "paragraph",
-                        "page": 0,
-                        "text": "D a t a  B o o k",
-                        "bbox": {"l": 72, "t": 700, "r": 250, "b": 660},
-                    },
-                    {
-                        "type": "paragraph",
-                        "page": 1,
-                        "text": "A sidebar note appears before the main content.",
-                    },
-                ]
-            },
-        ),
-        [1, 2],
+    job = _job(
+        tmp_path,
+        structure={
+            "elements": [
+                {"type": "heading", "page": 0, "text": "Library AI Discovery Guide"},
+                {
+                    "type": "paragraph",
+                    "page": 0,
+                    "text": "D a t a  B o o k",
+                    "bbox": {"l": 72, "t": 700, "r": 250, "b": 660},
+                },
+                {
+                    "type": "paragraph",
+                    "page": 1,
+                    "text": "A sidebar note appears before the main content.",
+                },
+            ]
+        },
     )
+    page_blocks = _page_blocks_for_review_from_document(_document_model(job), [1, 2])
 
     assert [item["page"] for item in page_blocks] == [1, 2]
     assert page_blocks[0]["blocks"][0]["review_id"] == "review-0"
@@ -216,28 +214,27 @@ def test_suspicious_reading_blocks_collects_grounding(monkeypatch, tmp_path):
         lambda pdf_path, page_number, bbox: "Data Book",
     )
 
-    suspicious_blocks = _suspicious_reading_blocks(
-        _job(
-            tmp_path,
-            structure={
-                "elements": [
-                    {"type": "heading", "page": 0, "text": "Library AI Discovery Guide"},
-                    {
-                        "type": "paragraph",
-                        "page": 0,
-                        "text": "D a t a  B o o k",
-                        "bbox": {"l": 72, "t": 700, "r": 250, "b": 660},
-                    },
-                    {
-                        "type": "paragraph",
-                        "page": 1,
-                        "text": "A sidebar note appears before the main content.",
-                    },
-                ]
-            },
-        ),
-        [1, 2],
+    job = _job(
+        tmp_path,
+        structure={
+            "elements": [
+                {"type": "heading", "page": 0, "text": "Library AI Discovery Guide"},
+                {
+                    "type": "paragraph",
+                    "page": 0,
+                    "text": "D a t a  B o o k",
+                    "bbox": {"l": 72, "t": 700, "r": 250, "b": 660},
+                },
+                {
+                    "type": "paragraph",
+                    "page": 1,
+                    "text": "A sidebar note appears before the main content.",
+                },
+            ]
+        },
     )
+    page_blocks = _page_blocks_for_review_from_document(_document_model(job), [1, 2])
+    suspicious_blocks = _suspicious_reading_blocks_from_page_blocks(job, page_blocks)
 
     assert len(suspicious_blocks) == 1
     assert suspicious_blocks[0]["page"] == 1
@@ -537,8 +534,8 @@ def test_table_targets_for_review_collects_table_targets(tmp_path):
             ]
         },
     )
-    targets = _table_targets_for_review(
-        job,
+    targets = _table_targets_for_review_from_document(
+        _document_model(job),
         {"table_review_targets": [{"table_review_id": "review-0", "page": 1}]},
     )
 
@@ -661,7 +658,7 @@ def test_generate_remediation_intelligence_rejects_unsupported_task(tmp_path):
         )
 
 
-def test_select_auto_font_override_accepts_high_confidence_single_glyph(monkeypatch, tmp_path):
+def test_select_auto_font_resolution_accepts_high_confidence_single_glyph(monkeypatch, tmp_path):
     monkeypatch.setattr(
         remediation_intelligence,
         "inspect_context_font_target",
@@ -673,7 +670,7 @@ def test_select_auto_font_override_accepts_high_confidence_single_glyph(monkeypa
         },
     )
 
-    selected = select_auto_font_override(
+    selected = select_auto_font_resolution(
         job=_job(tmp_path),
         task=_task(
             "font_text_fidelity",
@@ -719,6 +716,7 @@ def test_select_auto_font_override_accepts_high_confidence_single_glyph(monkeypa
     )
 
     assert selected == {
+        "resolution_type": "font_map",
         "page_number": 2,
         "operator_index": 132,
         "unicode_text": "►",
@@ -729,7 +727,7 @@ def test_select_auto_font_override_accepts_high_confidence_single_glyph(monkeypa
     }
 
 
-def test_select_auto_font_override_rejects_divergent_or_low_confidence_candidates(
+def test_select_auto_font_resolution_rejects_divergent_or_low_confidence_candidates(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(
@@ -758,7 +756,7 @@ def test_select_auto_font_override_rejects_divergent_or_low_confidence_candidate
         },
     )
 
-    low_confidence = select_auto_font_override(
+    low_confidence = select_auto_font_resolution(
         job=_job(tmp_path),
         task=task,
         intelligence={
@@ -778,7 +776,7 @@ def test_select_auto_font_override_rejects_divergent_or_low_confidence_candidate
     )
     assert low_confidence is None
 
-    divergent = select_auto_font_override(
+    divergent = select_auto_font_resolution(
         job=_job(tmp_path),
         task=_task(
             "font_text_fidelity",
@@ -825,7 +823,7 @@ def test_select_auto_font_override_rejects_divergent_or_low_confidence_candidate
     assert divergent is None
 
 
-def test_select_auto_font_override_accepts_actualtext_action_when_candidates_are_safe(
+def test_select_auto_font_resolution_accepts_actualtext_action_when_candidates_are_safe(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(
@@ -839,7 +837,7 @@ def test_select_auto_font_override_accepts_actualtext_action_when_candidates_are
         },
     )
 
-    selected = select_auto_font_override(
+    selected = select_auto_font_resolution(
         job=_job(tmp_path),
         task=_task(
             "font_text_fidelity",
@@ -879,6 +877,7 @@ def test_select_auto_font_override_accepts_actualtext_action_when_candidates_are
     )
 
     assert selected == {
+        "resolution_type": "font_map",
         "page_number": 2,
         "operator_index": 132,
         "unicode_text": "►",
@@ -889,7 +888,7 @@ def test_select_auto_font_override_accepts_actualtext_action_when_candidates_are
     }
 
 
-def test_select_auto_font_override_rejects_decorative_actualtext_action(monkeypatch, tmp_path):
+def test_select_auto_font_resolution_rejects_decorative_actualtext_action(monkeypatch, tmp_path):
     monkeypatch.setattr(
         remediation_intelligence,
         "inspect_context_font_target",
@@ -901,7 +900,7 @@ def test_select_auto_font_override_rejects_decorative_actualtext_action(monkeypa
         },
     )
 
-    selected = select_auto_font_override(
+    selected = select_auto_font_resolution(
         job=_job(tmp_path),
         task=_task(
             "font_text_fidelity",

@@ -70,6 +70,13 @@ For Gemini-first deployments, prefer:
 - `LLM_MODEL=google/gemini-3-flash-preview`
 - `GEMINI_MODEL=gemini-3-flash-preview`
 - `USE_DIRECT_GEMINI_PDF=true`
+- `GEMINI_DIRECT_THINKING_LEVEL=low`
+- `GEMINI_DIRECT_ALT_TEXT_THINKING_LEVEL=medium`
+- `ALT_TEXT_MAX_CONCURRENCY=8`
+- `ALT_TEXT_GLOBAL_MAX_CONCURRENCY=12`
+
+The default direct-Gemini lanes use `low` thinking for bounded structured analysis. Figure semantics and alt text use `medium` because they are the highest-risk vision path. Alt-text concurrency is page-level and bounded per PDF by `ALT_TEXT_MAX_CONCURRENCY`.
+The global alt-text cap, `ALT_TEXT_GLOBAL_MAX_CONCURRENCY`, prevents batch uploads from multiplying per-PDF concurrency into unbounded provider work.
 
 On Apple Silicon, the recommended local setup is `docling-serve` with `DOCLING_DEVICE=mps`. That accelerates structure extraction, but the tagging/writer step in [app/pipeline/tagger.py](app/pipeline/tagger.py) remains CPU-bound.
 
@@ -178,6 +185,19 @@ The round-trip corpus runner defaults to the `assistive-core` profile. That prof
 cd backend
 PYTHONPATH=. uv run python scripts/roundtrip_corpus_benchmark.py --workflow-profile full
 ```
+
+Adobe Accessibility Checker is available as a local benchmark-only check. It uploads the candidate PDF to Adobe and consumes one Adobe PDF Services transaction, so it is intentionally not wired into the app runtime:
+
+```bash
+cd backend
+uv run --with pdfservices-sdk python scripts/adobe_accessibility_check.py \
+  /path/to/candidate.pdf \
+  --credentials /path/to/PDFServicesAPI-Credentials.zip \
+  --output-dir data/adobe-accessibility-checks \
+  --confirm-spend
+```
+
+The script keeps a local monthly usage ledger under `~/.cache/pdf-accessibility-app/` and defaults to a conservative local cap of 100 transactions per month.
 
 The round-trip comparison reports form field presence and field-type recovery separately from exact accessible-name replay. Use manifest assertions to encode the assistive requirement you actually care about: field existence, control type, required label terms, and disambiguating context.
 

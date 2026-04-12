@@ -58,6 +58,10 @@ Key environment variables:
 | `LLM_API_KEY` | Optional override for the chat-completions client; falls back to `GEMINI_API_KEY` when unset | — |
 | `LLM_MODEL` | Model identifier | `google/gemini-3-flash-preview` |
 | `GEMINI_MODEL` | Direct Gemini model identifier for native PDF lanes | `gemini-3-flash-preview` |
+| `GEMINI_DIRECT_THINKING_LEVEL` | Default Gemini thinking level for direct PDF semantic lanes | `low` |
+| `GEMINI_DIRECT_ALT_TEXT_THINKING_LEVEL` | Gemini thinking level override for figure semantics and alt text | `medium` |
+| `ALT_TEXT_MAX_CONCURRENCY` | Maximum concurrent page-level figure/alt-text LLM requests per PDF | `8` |
+| `ALT_TEXT_GLOBAL_MAX_CONCURRENCY` | Process-wide cap for concurrent figure/alt-text provider work across PDFs | `12` |
 | `DOCLING_SERVE_URL` | Local or remote `docling-serve` URL for structure extraction | — |
 | `DOCLING_SERVE_TOKEN` | Optional bearer token for a protected `docling-serve` proxy | — |
 | `OCR_LANGUAGE` | Default Tesseract language code | `eng` |
@@ -144,7 +148,11 @@ Notes:
   `LLM_API_KEY=` blank,
   `LLM_MODEL=google/gemini-3-flash-preview`,
   `GEMINI_MODEL=gemini-3-flash-preview`,
-  `USE_DIRECT_GEMINI_PDF=true`.
+  `USE_DIRECT_GEMINI_PDF=true`,
+  `GEMINI_DIRECT_THINKING_LEVEL=low`,
+  `GEMINI_DIRECT_ALT_TEXT_THINKING_LEVEL=medium`,
+  `ALT_TEXT_MAX_CONCURRENCY=8`, and
+  `ALT_TEXT_GLOBAL_MAX_CONCURRENCY=12`.
 - For subpath deployments, set `VITE_APP_BASE_PATH` before building (e.g., `/pdf-accessibility/`).
 - Tesseract language packs included: English, Spanish, French, German, Chinese (Simplified + Traditional), Russian, Arabic, Korean, Bengali, Polish, Hebrew, Yiddish, Haitian Creole, Hindi, Italian, Portuguese, Japanese. Add others by extending the Dockerfile.
 

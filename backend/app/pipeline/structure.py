@@ -32,36 +32,6 @@ TOC_TRAILING_PAGE_RE = re.compile(
     r"(?:\.{2,}\s*|(?:\.\s*){2,}|\s{2,}|\t+)(?:\d+|[ivxlcdm]+)\s*$|(?:\s+)(?:\d+)\s*$",
     re.IGNORECASE,
 )
-FORMULA_SHORT_TEXT_LIMIT = 160
-FORMULA_LONG_WORD_RE = re.compile(r"\b[A-Za-z]{4,}\b")
-FORMULA_SENTENCE_PUNCTUATION_RE = re.compile(r"[!?]|(?<!\d)\.(?!\d)|\.(?=\s|$)")
-FORMULA_OPERATOR_RE = re.compile(r"[=±×÷≈≠≤≥∑∫√^_]|(?<!\w)/(?!/)")
-FORMULA_SUPERSUB_RE = re.compile(r"[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎]")
-FORMULA_GREEK_RE = re.compile(r"[Α-Ωα-ωϐ-ϖ]")
-FORMULA_FUNCTION_RE = re.compile(
-    r"\b(?:sin|cos|tan|cot|sec|csc|log|ln|exp|lim|max|min|sup|inf|det|mod|gcd|lcm)\s*\(",
-    re.IGNORECASE,
-)
-FORMULA_EQUATION_RE = re.compile(r"\S\s*=\s*\S")
-FORMULA_SHORT_SYMBOL_RE = re.compile(r"\b[A-Za-zΑ-Ωα-ω]\d*\b")
-FORMULA_ALLOWED_LONG_WORDS = {
-    "alpha",
-    "beta",
-    "gamma",
-    "delta",
-    "epsilon",
-    "zeta",
-    "eta",
-    "theta",
-    "iota",
-    "kappa",
-    "lambda",
-    "integral",
-    "summation",
-    "square",
-    "root",
-    "limit",
-}
 TITLE_SPACED_CAPS_RE = re.compile(r"\b(?:[A-Z]\s+){2,}[A-Z](?:\s+\d+)*\b")
 TITLE_TABLE_CAPTION_RE = re.compile(r"^(?:table|figure)\s+\d+\s*[:.]", re.IGNORECASE)
 TOC_GROUP_HEADING_EXCLUDE = {
@@ -223,42 +193,6 @@ def _extract_bbox(prov: list[dict]) -> dict | None:
         "r": right,
         "t": top,
     }
-
-
-def _looks_like_formula_text(text: str) -> bool:
-    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
-    if not normalized or len(normalized) > FORMULA_SHORT_TEXT_LIMIT:
-        return False
-
-    long_words = [
-        word.lower()
-        for word in FORMULA_LONG_WORD_RE.findall(normalized)
-        if word.lower() not in FORMULA_ALLOWED_LONG_WORDS
-    ]
-    if len(long_words) >= 2:
-        return False
-
-    if FORMULA_SENTENCE_PUNCTUATION_RE.search(normalized) and long_words:
-        return False
-
-    operator_count = len(FORMULA_OPERATOR_RE.findall(normalized))
-    has_supsub = bool(FORMULA_SUPERSUB_RE.search(normalized))
-    has_greek = bool(FORMULA_GREEK_RE.search(normalized))
-    has_function = bool(FORMULA_FUNCTION_RE.search(normalized))
-    has_equation = bool(FORMULA_EQUATION_RE.search(normalized))
-    short_symbol_count = len(FORMULA_SHORT_SYMBOL_RE.findall(normalized))
-
-    if has_equation and (operator_count >= 1 or has_supsub or has_function or has_greek):
-        return True
-    if operator_count >= 2 and (short_symbol_count >= 2 or has_supsub or has_function or has_greek):
-        return True
-    if has_supsub and (short_symbol_count >= 1 or operator_count >= 1):
-        return True
-    if has_function and operator_count >= 1:
-        return True
-    if has_greek and operator_count >= 1 and not long_words:
-        return True
-    return False
 
 
 def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
@@ -939,62 +873,6 @@ def _normalize_table_cells(table_data: dict) -> list[dict]:
         }
         for cell in table_data.get("table_cells", [])
     ]
-
-
-def _infer_heading_levels(elements: list[dict]):
-    """Infer heading levels from bounding box heights when Docling doesn't provide them.
-
-    Docling's PDF pipeline always outputs level=1 for all section_header elements.
-    This function uses bbox height (a proxy for font size) to cluster headings into
-    levels dynamically.
-
-    Title elements (already level=1) are preserved. Section headers get levels
-    assigned based on their relative bbox heights: tallest = highest level after
-    title, descending from there.
-
-    Modifies elements in place.
-    """
-    headings = [el for el in elements if el.get("type") == "heading"]
-    if not headings:
-        return
-
-    # Check if levels are already meaningful (not all the same)
-    levels = {h.get("level", 1) for h in headings}
-    if len(levels) > 1:
-        # Clean up internal flags and return — Docling provided real hierarchy
-        for h in headings:
-            h.pop("_is_title", None)
-        return
-
-    # Collect bbox heights for non-title headings
-    section_headings = []
-    for h in headings:
-        if h.get("_is_title"):
-            continue
-        bbox = h.get("bbox")
-        height = abs(bbox["t"] - bbox["b"]) if bbox else 0.0
-        section_headings.append((h, height))
-
-    if not section_headings:
-        for h in headings:
-            h.pop("_is_title", None)
-        return
-
-    # Cluster unique heights (rounded to nearest point) and sort descending
-    heights = sorted({round(ht) for _, ht in section_headings}, reverse=True)
-
-    # Build height -> level mapping
-    has_title = any(h.get("_is_title") for h in headings)
-    start_level = 2 if has_title else 1
-    height_to_level = {ht: min(start_level + i, 6) for i, ht in enumerate(heights)}
-
-    # Apply inferred levels
-    for heading, ht in section_headings:
-        heading["level"] = height_to_level.get(round(ht), start_level)
-
-    # Clean up internal flag
-    for h in headings:
-        h.pop("_is_title", None)
 
 
 def _clean_title_candidate_text(value: Any) -> str:

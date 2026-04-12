@@ -143,3 +143,16 @@ PYTHONPATH=. uv run python scripts/roundtrip_corpus_benchmark.py
 The round-trip runner defaults to the `assistive-core` workflow profile. That profile keeps the full downstream validation/fidelity/review loop and skips only the figure alt-text branch. Use `--workflow-profile full` when you want figure/alt-text behavior included as well.
 
 The round-trip comparison now reports form field presence and field-type recovery separately from exact accessible-name replay, so assistive-core form checks can be written against name/role/value semantics rather than a single gold `/TU` string.
+
+Adobe Accessibility Checker can be run locally against benchmark outputs when Acrobat-style evidence is needed. This is intentionally not part of app validation because it uploads PDFs to Adobe and spends one PDF Services transaction per document:
+
+```bash
+cd backend
+uv run --with pdfservices-sdk python scripts/adobe_accessibility_check.py \
+  /path/to/candidate.pdf \
+  --credentials /path/to/PDFServicesAPI-Credentials.zip \
+  --output-dir data/adobe-accessibility-checks \
+  --confirm-spend
+```
+
+The helper records local usage in `~/.cache/pdf-accessibility-app/adobe_accessibility_usage.json` and defaults to a local cap of 100 transactions per month.

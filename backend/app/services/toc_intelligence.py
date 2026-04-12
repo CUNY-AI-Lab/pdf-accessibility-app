@@ -14,7 +14,6 @@ MAX_TOC_GROUPS = 3
 MAX_TOC_PAGES = 3
 TOC_CHUNK_SIZE = 18
 TOC_AUTO_CONFIDENCE = {"high", "medium"}
-TOC_ALLOWED_ENTRY_TYPES = {"paragraph", "list_item", "heading", "table", "toc_item", "toc_item_table"}
 TOC_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
 
 

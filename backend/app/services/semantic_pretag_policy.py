@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections import Counter
 from pathlib import Path
 
@@ -23,20 +22,6 @@ PRETAG_FORM_ALLOWED_TYPES = frozenset({
     "combo_box",
     "list_box",
 })
-PRETAG_WIDGET_RATIONALIZATION_ALLOWED_TYPES = frozenset({"text"})
-PAGE_CHROME_RE = re.compile(r"^\d+\s*\|?\s*p\s*a\s*g\s*e$", re.IGNORECASE)
-
-
-def _normalize_widget_text(value: object) -> str:
-    return " ".join(str(value or "").split())
-
-
-def _looks_like_page_chrome(value: str) -> bool:
-    text = _normalize_widget_text(value)
-    if not text:
-        return False
-    return bool(PAGE_CHROME_RE.match(text))
-
 
 def suspicious_widget_candidates(fields: list[dict[str, object]]) -> list[dict[str, object]]:
     # Disable heuristic auto-rationalization of widgets. Static text widgets now

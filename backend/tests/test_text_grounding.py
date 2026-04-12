@@ -18,6 +18,7 @@ def test_extract_ocr_text_from_bbox_returns_normalized_tesseract_output(monkeypa
 
     def _fake_run(cmd, capture_output, check, timeout, text, env):
         assert cmd[:3] == ["/usr/bin/tesseract", cmd[1], "stdout"]
+        assert capture_output is True
         assert "--psm" in cmd
         assert "-l" in cmd
         assert "/opt/homebrew/bin" in env["PATH"]

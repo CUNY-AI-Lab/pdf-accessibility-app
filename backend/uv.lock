@@ -11,7 +11,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-04-04T00:09:00Z"
+exclude-newer = "2026-04-05T00:33:48Z"
 
 [[package]]
 name = "accelerate"

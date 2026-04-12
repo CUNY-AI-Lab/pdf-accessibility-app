@@ -552,6 +552,13 @@ def _build_validation_payload(
     auto_remediated = len([c for c in changes if c["remediation_status"] == "auto_remediated"])
     manual_remediated = len([c for c in changes if c["remediation_status"] == "manual_remediated"])
 
+    error_changes = [c for c in changes if c.get("severity") == "error"]
+    baseline_error_rules = len([c for c in error_changes if c["baseline_count"] > 0])
+    post_error_rules = len([c for c in error_changes if c["post_count"] > 0])
+    auto_remediated_errors = len(
+        [c for c in error_changes if c["remediation_status"] == "auto_remediated"]
+    )
+
     remediation_payload: dict[str, object] = {
         "needs_remediation": needs_remediation,
         "auto_remediated": auto_remediated,
@@ -562,6 +569,9 @@ def _build_validation_payload(
         "post_warnings": post_warnings,
         "errors_reduced": baseline_errors - post_errors,
         "warnings_reduced": baseline_warnings - post_warnings,
+        "baseline_error_rules": baseline_error_rules,
+        "post_error_rules": post_error_rules,
+        "auto_remediated_errors": auto_remediated_errors,
         "font_remediation": font_remediation,
     }
     if isinstance(llm_font_map_auto, dict):
@@ -629,6 +639,47 @@ def _build_validation_payload(
 
 def _blocking_task_count(review_tasks: list[dict[str, object]]) -> int:
     return len([task for task in review_tasks if bool(task.get("blocking"))])
+
+
+def _grounded_text_confirmed_block_count(
+    review_tasks: list[dict[str, object]],
+) -> int:
+    confirmed_count = 0
+    for task in review_tasks:
+        if not bool(task.get("blocking")):
+            continue
+        if str(task.get("task_type") or "") != "content_fidelity":
+            continue
+        if str(task.get("source") or "fidelity") != "fidelity":
+            continue
+        metadata = task.get("metadata")
+        if not isinstance(metadata, dict) or not bool(metadata.get("grounded_text_candidate")):
+            continue
+        grounded_target_count = metadata.get("grounded_target_count")
+        if isinstance(grounded_target_count, int):
+            confirmed_count += max(0, grounded_target_count)
+            continue
+        flagged_blocks = metadata.get("flagged_blocks")
+        if isinstance(flagged_blocks, list):
+            confirmed_count += len(flagged_blocks)
+            continue
+        confirmed_count += 1
+    return confirmed_count
+
+
+def _grounded_text_retry_improved(
+    current_review_tasks: list[dict[str, object]],
+    retry_review_tasks: list[dict[str, object]],
+) -> bool:
+    current_blocking_count = _blocking_task_count(current_review_tasks)
+    retry_blocking_count = _blocking_task_count(retry_review_tasks)
+    if retry_blocking_count < current_blocking_count:
+        return True
+    if retry_blocking_count > current_blocking_count:
+        return False
+    return _grounded_text_confirmed_block_count(
+        retry_review_tasks
+    ) < _grounded_text_confirmed_block_count(current_review_tasks)
 
 
 def _prepare_user_review_surface(
@@ -1520,13 +1571,6 @@ async def _apply_pretag_form_intelligence(
     return patched_pdf, audit
 
 
-def _font_only_errors(violations) -> bool:
-    errors = [v for v in violations if v.severity == "error"]
-    if not errors:
-        return False
-    return all(FONT_RULE_FRAGMENT in str(v.rule_id) for v in errors)
-
-
 def _has_font_errors(violations) -> bool:
     return any(v.severity == "error" and FONT_RULE_FRAGMENT in str(v.rule_id) for v in violations)
 
@@ -2035,16 +2079,6 @@ def _unicode_repair_gate_from_diagnostics(
     else:
         profile["reason"] = "no deterministic ToUnicode candidates found"
     return profile
-
-
-def _inspect_unicode_repair_gate(pdf_path: Path, violations=None) -> dict[str, object]:
-    diagnostics = _inspect_font_diagnostics(
-        pdf_path,
-        violations,
-        profile_limit=512,
-        include_used_code_analysis=True,
-    )
-    return _unicode_repair_gate_from_diagnostics(diagnostics, violations=violations)
 
 
 def _font_name_metadata(ttfont) -> dict[str, str]:
@@ -6114,9 +6148,10 @@ async def run_tagging_and_validation(
                         review_tasks=retry_review_tasks,
                         fidelity_report=retry_fidelity_report,
                     )
-                    if retry_validation.compliant and _blocking_task_count(
-                        retry_review_tasks
-                    ) < _blocking_task_count(review_tasks):
+                    if retry_validation.compliant and _grounded_text_retry_improved(
+                        review_tasks,
+                        retry_review_tasks,
+                    ):
                         structure_json = retry_structure_json
                         job.structure_json = json.dumps(retry_structure_json)
                         job.output_path = str(retry_tagging_result.output_path)

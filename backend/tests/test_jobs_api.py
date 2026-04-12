@@ -444,7 +444,7 @@ async def test_job_progress_sse_releases_db_session_before_stream(monkeypatch):
         async def __aenter__(self):
             return self
 
-        async def __aexit__(self, exc_type, exc, tb):
+        async def __aexit__(self, _exc_type, _exc, _tb):
             nonlocal closed
             closed = True
 

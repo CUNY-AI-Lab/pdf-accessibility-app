@@ -438,69 +438,6 @@ def _compact_llm_mapping(mapping: dict[str, Any]) -> dict[str, Any]:
     return compacted
 
 
-def _serialize_toc_entries_for_llm(toc_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    serialized: list[dict[str, Any]] = []
-    for entry in toc_entries:
-        if not isinstance(entry, dict):
-            continue
-        serialized.append(
-            _compact_llm_mapping({
-                "index": entry.get("index"),
-                "type": entry.get("type"),
-                "toc_page": entry.get("page"),
-                "target_page": entry.get("target_page"),
-                "text": entry.get("text"),
-            })
-        )
-    return serialized
-
-
-def _serialize_heading_candidates_minimal_for_llm(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    serialized: list[dict[str, Any]] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        serialized.append(
-            _compact_llm_mapping({
-                "index": entry.get("index"),
-                "page": entry.get("page"),
-                "level": entry.get("level"),
-                "text": entry.get("text"),
-            })
-        )
-    return serialized
-
-
-def _serialize_landmark_candidates_minimal_for_llm(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    serialized: list[dict[str, Any]] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        serialized.append(
-            _compact_llm_mapping({
-                "index": entry.get("index"),
-                "page": entry.get("page"),
-                "type": entry.get("type"),
-                "text": entry.get("text"),
-            })
-        )
-    return serialized
-
-
-def _serialize_toc_entries_minimal_for_llm(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    serialized: list[dict[str, Any]] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        serialized.append(
-            _compact_llm_mapping({
-                "target_page": entry.get("target_page"),
-                "text": entry.get("text"),
-            })
-        )
-    return serialized
-
-
 def _serialize_outline_candidates_for_direct_llm(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     serialized: list[dict[str, Any]] = []
     for entry in entries:

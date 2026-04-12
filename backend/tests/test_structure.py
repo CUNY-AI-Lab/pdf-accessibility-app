@@ -4,7 +4,6 @@ from app.pipeline.structure import (
     _expand_toc_item_tables,
     _extract_bbox,
     _extract_title_from_docling,
-    _looks_like_formula_text,
     _mark_toc_sequences,
     _normalize_docling_elements,
     _normalize_lang_tag,
@@ -165,17 +164,6 @@ def test_normalize_docling_elements_keeps_toc_like_tables_as_tables():
     assert elements[1]["cells"][0]["text"] == "1"
     assert elements[1]["cells"][1]["text"] == "Introduction"
     assert elements[2]["text"] == "PDFlib GmbH ........ 7"
-
-
-def test_looks_like_formula_text_detects_short_equation_blocks():
-    assert _looks_like_formula_text("E = mc^2") is True
-    assert _looks_like_formula_text("f(x) = x^2 + 1") is True
-
-
-def test_looks_like_formula_text_rejects_prose_with_embedded_math():
-    assert _looks_like_formula_text(
-        "Distributions differed significantly (χ²(2, N = 663) = 13.30, p = .0013)."
-    ) is False
 
 
 def test_normalize_docling_elements_keeps_formula_like_paragraphs_as_paragraphs():

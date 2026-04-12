@@ -8,10 +8,9 @@ import sys
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
 
 DEFAULT_MONTHLY_LIMIT = 100
 DEFAULT_LEDGER_PATH = (
@@ -26,7 +25,7 @@ class AdobeCredentials:
 
 
 def _current_month(now: datetime | None = None) -> str:
-    value = now or datetime.now(timezone.utc)
+    value = now or datetime.now(UTC)
     return f"{value.year:04d}-{value.month:02d}"
 
 
@@ -114,7 +113,7 @@ def _record_usage(
     entry["transactions"] = int(entry.get("transactions", 0) or 0) + 1
     runs.append(
         {
-            "timestamp": (now or datetime.now(timezone.utc)).isoformat(),
+            "timestamp": (now or datetime.now(UTC)).isoformat(),
             "pdf": str(pdf_path),
             "report": str(report_path),
             "result_pdf": str(result_path),

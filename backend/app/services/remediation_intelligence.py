@@ -145,7 +145,6 @@ def _reviewer_correction_context(
         },
     }
 
-
 def _previous_remediation_intelligence(task: ReviewTask) -> dict[str, Any]:
     metadata = _parse_metadata(task)
     previous = metadata.get("remediation_intelligence")
@@ -267,10 +266,6 @@ def _collect_structure_fragments_from_document(document) -> list[dict[str, Any]]
     return collect_structure_fragments(document, max_fragments=MAX_STRUCTURE_FRAGMENTS)
 
 
-def _collect_structure_fragments(job: Job) -> list[dict[str, Any]]:
-    return _collect_structure_fragments_from_document(_document_model(job))
-
-
 def _page_structure_fragments_from_document(
     document, page_numbers: list[int]
 ) -> list[dict[str, Any]]:
@@ -331,10 +326,6 @@ def _page_blocks_for_review_from_document(
             }
         )
     return page_blocks
-
-
-def _page_blocks_for_review(job: Job, page_numbers: list[int]) -> list[dict[str, Any]]:
-    return _page_blocks_for_review_from_document(_document_model(job), page_numbers)
 
 
 def _suspicious_reading_blocks_from_page_blocks(
@@ -412,11 +403,6 @@ def _suspicious_reading_blocks_from_page_blocks(
     return suspicious_blocks
 
 
-def _suspicious_reading_blocks(job: Job, page_numbers: list[int]) -> list[dict[str, Any]]:
-    page_blocks = _page_blocks_for_review(job, page_numbers)
-    return _suspicious_reading_blocks_from_page_blocks(job, page_blocks)
-
-
 def _table_targets_for_review_from_document(
     document, metadata: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -469,10 +455,6 @@ def _table_targets_for_review_from_document(
             key=lambda item: (int(item["page"]), str(item["table_review_id"])),
         )
     return ordered_targets[:MAX_TABLE_TARGETS]
-
-
-def _table_targets_for_review(job: Job, metadata: dict[str, Any]) -> list[dict[str, Any]]:
-    return _table_targets_for_review_from_document(_document_model(job), metadata)
 
 
 def _dedupe_preserving_order(values: list[str]) -> list[str]:
@@ -931,52 +913,6 @@ def _aggregate_reading_order_intelligence(
     }
 
 
-def _ground_readable_text_hints(
-    hints: list[dict[str, Any]] | Any,
-    page_intelligence: dict[str, Any],
-) -> list[dict[str, Any]]:
-    if not isinstance(hints, list):
-        return list(page_intelligence.get("blocks", []))
-
-    evidence_by_key: dict[tuple[int, str], dict[str, Any]] = {}
-    for item in page_intelligence.get("blocks", []):
-        if not isinstance(item, dict):
-            continue
-        page = item.get("page")
-        review_id = str(item.get("review_id") or "").strip()
-        if isinstance(page, int) and page > 0 and review_id:
-            evidence_by_key[(page, review_id)] = item
-
-    grounded: list[dict[str, Any]] = []
-    for raw_hint in hints:
-        if not isinstance(raw_hint, dict):
-            continue
-        page = raw_hint.get("page")
-        review_id = str(raw_hint.get("review_id") or "").strip()
-        evidence = evidence_by_key.get((page, review_id), {})
-        grounded.append(
-            {
-                **evidence,
-                **raw_hint,
-                "extracted_text": str(
-                    raw_hint.get("extracted_text") or evidence.get("extracted_text") or ""
-                ).strip(),
-                "native_text_candidate": str(
-                    raw_hint.get("native_text_candidate")
-                    or evidence.get("native_text_candidate")
-                    or ""
-                ).strip(),
-                "ocr_text_candidate": str(
-                    raw_hint.get("ocr_text_candidate") or evidence.get("ocr_text_candidate") or ""
-                ).strip(),
-                "chosen_source": str(
-                    raw_hint.get("chosen_source") or evidence.get("chosen_source") or ""
-                ).strip(),
-            }
-        )
-    return grounded
-
-
 async def generate_remediation_intelligence(
     *,
     job: Job,
@@ -1311,28 +1247,4 @@ def select_auto_font_resolution(
         "font_base_name": str(selected.get("font_base_name") or ""),
         "font_code_hex": str(selected.get("font_code_hex") or ""),
         "target_count": len(normalized_candidates),
-    }
-
-
-def select_auto_font_override(
-    *,
-    job: Job,
-    task: ReviewTask,
-    intelligence: dict[str, Any],
-) -> dict[str, Any] | None:
-    selected = select_auto_font_resolution(
-        job=job,
-        task=task,
-        intelligence=intelligence,
-    )
-    if not isinstance(selected, dict) or str(selected.get("resolution_type") or "") != "font_map":
-        return None
-    return {
-        "page_number": int(selected["page_number"]),
-        "operator_index": int(selected["operator_index"]),
-        "unicode_text": str(selected["unicode_text"]),
-        "font": str(selected.get("font") or ""),
-        "font_base_name": str(selected.get("font_base_name") or ""),
-        "font_code_hex": str(selected.get("font_code_hex") or ""),
-        "target_count": int(selected.get("target_count", 1) or 1),
     }

@@ -230,6 +230,7 @@ def test_generate_figures_intelligence_parallelizes_page_batches_with_bound(monk
             gemini_direct_alt_text_thinking_level="medium",
             gemini_direct_alt_text_thinking_budget=0,
             alt_text_max_concurrency=2,
+            alt_text_global_max_concurrency=8,
         ),
     )
 
@@ -291,6 +292,92 @@ def test_generate_figures_intelligence_parallelizes_page_batches_with_bound(monk
     assert max_active_requests == 2
     assert requested_pages == {1, 2, 3, 4}
     assert [result["figure_index"] for result in results] == [1, 2, 3, 4]
+
+
+def test_generate_figures_intelligence_global_bound_limits_parallel_jobs(monkeypatch, tmp_path):
+    image_paths = []
+    for index in range(8):
+        path = tmp_path / f"figure-{index}.png"
+        path.write_bytes(b"fake-image")
+        image_paths.append(path)
+
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.get_settings",
+        lambda: SimpleNamespace(
+            gemini_direct_alt_text_thinking_level="medium",
+            gemini_direct_alt_text_thinking_budget=0,
+            alt_text_max_concurrency=4,
+            alt_text_global_max_concurrency=3,
+        ),
+    )
+
+    active_requests = 0
+    max_active_requests = 0
+
+    def _context_payload(content):
+        for item in content:
+            text = item.get("text", "") if isinstance(item, dict) else ""
+            if text.startswith("Context JSON:\n"):
+                return json.loads(text.removeprefix("Context JSON:\n"))
+        raise AssertionError("Context JSON part missing")
+
+    async def _fake_request_llm_json(*, llm_client, content, schema_name, response_schema, cache_breakpoint_index=None):
+        nonlocal active_requests, max_active_requests
+        payload = _context_payload(content)
+        active_requests += 1
+        max_active_requests = max(max_active_requests, active_requests)
+        try:
+            await asyncio.sleep(0.02)
+        finally:
+            active_requests -= 1
+        return {
+            "task_type": "figure_batch_intelligence",
+            "decisions": [
+                {
+                    "figure_index": candidate["figure_index"],
+                    "summary": f"Figure {candidate['figure_index']}",
+                    "confidence": "high",
+                    "suggested_action": "set_alt_text",
+                    "reason": "Visible figure on the page.",
+                    "alt_text": f"Figure {candidate['figure_index']}",
+                }
+                for candidate in payload["candidates"]
+            ],
+        }
+
+    monkeypatch.setattr(
+        "app.services.intelligence_gemini_figures.request_llm_json",
+        _fake_request_llm_json,
+    )
+
+    first_pdf_figures = [
+        FigureInfo(index=index, path=image_paths[index], caption=f"A{index}", page=index)
+        for index in range(4)
+    ]
+    second_pdf_figures = [
+        FigureInfo(index=index, path=image_paths[index + 4], caption=f"B{index}", page=index)
+        for index in range(4)
+    ]
+
+    async def _run_parallel_jobs():
+        return await asyncio.gather(
+            generate_figures_intelligence(
+                figures=first_pdf_figures,
+                llm_client=object(),
+            ),
+            generate_figures_intelligence(
+                figures=second_pdf_figures,
+                llm_client=object(),
+            ),
+        )
+
+    results = asyncio.run(_run_parallel_jobs())
+
+    assert max_active_requests == 3
+    assert [[result["figure_index"] for result in job_results] for job_results in results] == [
+        [0, 1, 2, 3],
+        [0, 1, 2, 3],
+    ]
 
 
 def test_figure_page_context_marks_tiny_child_ui_figures(tmp_path):

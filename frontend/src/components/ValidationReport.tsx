@@ -20,14 +20,6 @@ function statusTone(status: ValidationChange["remediation_status"]): string {
 }
 
 export default function ValidationReport({ report }: ValidationReportProps) {
-  const baseline =
-    report.baseline && typeof report.baseline === "object"
-      ? (report.baseline as Record<string, unknown>)
-      : {};
-  const baselineSummary =
-    baseline.summary && typeof baseline.summary === "object"
-      ? (baseline.summary as Record<string, unknown>)
-      : {};
   const remediation =
     report.remediation && typeof report.remediation === "object"
       ? (report.remediation as Record<string, unknown>)
@@ -51,13 +43,16 @@ export default function ValidationReport({ report }: ValidationReportProps) {
   const blockingTasks = asNumber(fidelitySummary.blocking_tasks);
   const advisoryTasks = asNumber(fidelitySummary.advisory_tasks);
 
-  const baselineErrors = asNumber(baselineSummary.errors);
-  const baselineWarnings = asNumber(baselineSummary.warnings);
-  const postErrors = asNumber(remediation.post_errors) ?? asNumber(report.summary.errors);
-  const postWarnings = asNumber(remediation.post_warnings) ?? asNumber(report.summary.warnings);
+  // Rule-level issue counts (distinct accessibility problems), not raw
+  // occurrence sums. veraPDF's per-rule counts can reach the thousands and
+  // are not meaningful to users as a single number.
+  const baselineIssues = asNumber(remediation.baseline_error_rules);
+  const postIssues = asNumber(remediation.post_error_rules);
+  const autoFixedIssues = asNumber(remediation.auto_remediated_errors);
   const autoRemediated = asNumber(remediation.auto_remediated);
   const needsRemediation = asNumber(remediation.needs_remediation);
-  const errorsReduced = asNumber(remediation.errors_reduced);
+  const issuesReduced =
+    baselineIssues !== null && postIssues !== null ? baselineIssues - postIssues : null;
   const fontAttempted = asBool(fontRemediation.attempted);
   const fontApplied = asBool(fontRemediation.applied);
   const selectedLane = asString(fontRemediation.selected_lane);
@@ -114,7 +109,7 @@ export default function ValidationReport({ report }: ValidationReportProps) {
         </div>
       </div>
 
-      {(baselineErrors !== null || postErrors !== null) && (
+      {(baselineIssues !== null || postIssues !== null) && (
         <div className="rounded-xl border border-ink/6 bg-cream p-4">
           <h4 className="text-sm font-semibold text-ink mb-3">
             Before/After Validation
@@ -123,21 +118,23 @@ export default function ValidationReport({ report }: ValidationReportProps) {
             <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
               <p className="text-ink-muted text-xs">Baseline</p>
               <p className="text-ink mt-0.5">
-                {baselineErrors ?? "n/a"} errors
-                {baselineWarnings !== null ? `, ${baselineWarnings} warnings` : ""}
+                {baselineIssues ?? "n/a"} {pluralize(baselineIssues ?? 0, "issue")}
               </p>
             </div>
             <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
               <p className="text-ink-muted text-xs">Remediated Output</p>
               <p className="text-ink mt-0.5">
-                {postErrors ?? "n/a"} errors
-                {postWarnings !== null ? `, ${postWarnings} warnings` : ""}
+                {postIssues ?? "n/a"} {pluralize(postIssues ?? 0, "issue")}
               </p>
             </div>
             <div className="rounded-lg bg-paper-warm/60 px-3 py-2">
               <p className="text-ink-muted text-xs">Delta</p>
               <p className="text-ink mt-0.5">
-                {errorsReduced !== null ? `${errorsReduced >= 0 ? "+" : ""}${errorsReduced} errors reduced` : "n/a"}
+                {autoFixedIssues !== null
+                  ? `${autoFixedIssues} fixed automatically`
+                  : issuesReduced !== null
+                    ? `${issuesReduced >= 0 ? "+" : ""}${issuesReduced} ${pluralize(Math.abs(issuesReduced), "issue")} reduced`
+                    : "n/a"}
               </p>
               {(autoRemediated !== null || needsRemediation !== null) && (
                 <p className="text-xs text-ink-muted mt-0.5">

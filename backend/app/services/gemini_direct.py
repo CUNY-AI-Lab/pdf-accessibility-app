@@ -360,15 +360,6 @@ def _extract_text_parts(content: list[dict[str, Any]]) -> list[str]:
     return [str(item.get("text") or "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
 
 
-def _has_media_parts(content: list[dict[str, Any]]) -> bool:
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") in {"file", "image_url"}:
-            return True
-    return False
-
-
 def _prepare_uploaded_parts(client: Any, content: list[dict[str, Any]]) -> tuple[list[Any], list[Any]]:
     uploaded: list[Any] = []
     contents: list[Any] = []
@@ -704,22 +695,6 @@ async def request_direct_gemini_content_json_with_response(
     )
     _record_usage(model_name=resolved_settings.gemini_model.strip(), usage=usage)
     return parsed, response_json
-
-
-async def request_direct_gemini_content_json(
-    *,
-    content: list[dict[str, Any]],
-    response_schema: dict[str, Any] | None = None,
-    system_instruction: str | None = None,
-    settings: Settings | None = None,
-) -> dict[str, Any]:
-    parsed, _response = await request_direct_gemini_content_json_with_response(
-        content=content,
-        response_schema=response_schema,
-        system_instruction=system_instruction,
-        settings=settings,
-    )
-    return parsed
 
 
 async def request_direct_gemini_cached_json(

@@ -101,10 +101,6 @@ def suspicious_text_signals(text: Any) -> list[str]:
     return signals
 
 
-def looks_suspicious_text(text: Any) -> bool:
-    return len(suspicious_text_signals(text)) > 0
-
-
 def collect_grounded_text_candidates(
     pdf_path: Path,
     structure_json: dict[str, Any],

@@ -55,7 +55,8 @@ class Settings(BaseSettings):
     llm_strict_validation: bool = True
     auto_approve_generated_alt_text: bool = True
     skip_alt_text_generation: bool = False
-    alt_text_max_concurrency: int = 2
+    alt_text_max_concurrency: int = 8
+    alt_text_global_max_concurrency: int = 12
     auto_apply_llm_font_map: bool = True
     auto_apply_grounded_text: bool = True
     auto_apply_table_intelligence: bool = True

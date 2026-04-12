@@ -789,6 +789,56 @@ def test_should_auto_artifact_grounded_text_block_accepts_nonlegacy_role_with_st
     assert _should_auto_artifact_grounded_text_block(block) is True
 
 
+def test_should_auto_artifact_grounded_text_block_accepts_bounded_mark_decorative_stream():
+    block = {
+        "role": "paragraph",
+        "readable_text_hint": "objstream-fragment" * 7,
+        "chosen_source": "llm_inferred",
+        "suggested_action": "mark_decorative",
+        "issue_type": "uncertain",
+        "confidence": "high",
+        "should_block_accessibility": True,
+        "original_text_candidate": "objstream-fragment" * 7,
+    }
+    too_long_block = {
+        **block,
+        "original_text_candidate": "objstream-fragment" * 20,
+    }
+
+    assert _should_auto_artifact_grounded_text_block(block) is True
+    assert _should_auto_artifact_grounded_text_block(too_long_block) is False
+
+
+def test_grounded_text_retry_improved_when_confirmed_blocks_drop_inside_same_task():
+    current_review_tasks = [
+        {
+            "task_type": "content_fidelity",
+            "source": "fidelity",
+            "blocking": True,
+            "metadata": {
+                "grounded_text_candidate": True,
+                "grounded_target_count": 2,
+            },
+        }
+    ]
+    retry_review_tasks = [
+        {
+            "task_type": "content_fidelity",
+            "source": "fidelity",
+            "blocking": True,
+            "metadata": {
+                "grounded_text_candidate": True,
+                "grounded_target_count": 1,
+            },
+        }
+    ]
+
+    assert orchestrator._grounded_text_retry_improved(
+        current_review_tasks,
+        retry_review_tasks,
+    )
+
+
 @pytest.mark.asyncio
 async def test_pretag_grounded_text_resolutions_apply_grounded_code_fix(monkeypatch, tmp_path):
     class _FakeLlmClient:

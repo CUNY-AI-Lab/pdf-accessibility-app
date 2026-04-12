@@ -86,11 +86,6 @@ def render_page_png_bytes(
             return output_bytes.read()
 
 
-def render_page_png_data_url(pdf_path: Path, page_number: int) -> str:
-    encoded = base64.b64encode(render_page_png_bytes(pdf_path, page_number)).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
-
-
 def render_page_jpeg_bytes(
     pdf_path: Path,
     page_number: int,

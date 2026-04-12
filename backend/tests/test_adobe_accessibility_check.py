@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -55,7 +55,7 @@ def test_record_usage_tracks_monthly_transaction_without_repo_state(tmp_path: Pa
         pdf_path=Path("/tmp/input.pdf"),
         report_path=Path("/tmp/report.json"),
         result_path=Path("/tmp/result.pdf"),
-        now=datetime(2026, 4, 11, tzinfo=timezone.utc),
+        now=datetime(2026, 4, 11, tzinfo=UTC),
     )
 
     data = json.loads(ledger.read_text())

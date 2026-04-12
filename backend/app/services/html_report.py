@@ -253,28 +253,30 @@ def _render_job_section(
         parts.append("</div>")
 
     # --- Remediation results ---
+    # Rule-level issue counts (distinct accessibility problems), not raw
+    # occurrence sums. veraPDF per-rule counts can reach the thousands and
+    # are misleading as a single headline number.
     remediation: dict[str, Any] = validation.get("remediation", {})
-    baseline_errors = remediation.get("baseline_errors", 0)
-    post_errors = remediation.get("post_errors", 0)
-    baseline_warnings = remediation.get("baseline_warnings", 0)
-    post_warnings = remediation.get("post_warnings", 0)
+    baseline_issues = remediation.get("baseline_error_rules", 0)
+    post_issues = remediation.get("post_error_rules", 0)
+    auto_fixed_issues = remediation.get("auto_remediated_errors", 0)
     auto_fixed = remediation.get("auto_remediated", 0)
 
-    if baseline_errors or post_errors or auto_fixed:
+    if baseline_issues or post_issues or auto_fixed:
         parts.append(f"<{h_sub}>Remediation results</{h_sub}>")
         parts.append('<div class="stats">')
         parts.append(f"""
         <div class="stat">
-          <div class="stat-value">{baseline_errors} &rarr; {post_errors}</div>
-          <div class="stat-label">Errors</div>
+          <div class="stat-value">{baseline_issues} &rarr; {post_issues}</div>
+          <div class="stat-label">Accessibility issues</div>
         </div>
         <div class="stat">
-          <div class="stat-value">{baseline_warnings} &rarr; {post_warnings}</div>
-          <div class="stat-label">Warnings</div>
+          <div class="stat-value">{auto_fixed_issues}</div>
+          <div class="stat-label">Fixed automatically</div>
         </div>
         <div class="stat">
           <div class="stat-value">{auto_fixed}</div>
-          <div class="stat-label">Auto-remediated</div>
+          <div class="stat-label">Total rules auto-remediated</div>
         </div>
         """)
         parts.append("</div>")
@@ -436,8 +438,8 @@ def render_batch_html_report(
           <td>{_e(job.original_filename)}</td>
           <td>{_status_badge(job.status)}</td>
           <td>{job.page_count or "?"}</td>
-          <td>{remediation.get("post_errors", 0)}</td>
-          <td>{remediation.get("post_warnings", 0)}</td>
+          <td>{remediation.get("post_error_rules", 0)}</td>
+          <td>{remediation.get("auto_remediated_errors", 0)}</td>
         </tr>
         """)
 
@@ -445,7 +447,7 @@ def render_batch_html_report(
     <table class="batch-summary">
       <thead>
         <tr>
-          <th>File</th><th>Status</th><th>Pages</th><th>Errors</th><th>Warnings</th>
+          <th>File</th><th>Status</th><th>Pages</th><th>Remaining issues</th><th>Auto-fixed</th>
         </tr>
       </thead>
       <tbody>

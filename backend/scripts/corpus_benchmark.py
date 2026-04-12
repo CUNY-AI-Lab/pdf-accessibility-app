@@ -229,13 +229,6 @@ def _violation_count(validation, severity: str) -> int:
     return total
 
 
-def _font_only_errors(validation) -> bool:
-    errors = [v for v in validation.violations if v.severity == "error"]
-    if not errors:
-        return False
-    return all("-7.21." in str(v.rule_id) for v in errors)
-
-
 def _has_font_errors(validation) -> bool:
     return any(v.severity == "error" and "-7.21." in str(v.rule_id) for v in validation.violations)
 
@@ -1892,15 +1885,6 @@ async def benchmark_one(
         table_coverage=round(_safe_ratio(tables_tagged, elements_tables), 3),
         list_coverage=round(_safe_ratio(lists_tagged, elements_list_items), 3),
         link_coverage=round(_safe_ratio(links_tagged, source_links), 3),
-    )
-
-
-async def benchmark_one_assistive_core(pdf_path: Path, run_dir: Path, settings) -> DocMetrics:
-    return await benchmark_one(
-        pdf_path,
-        run_dir,
-        settings,
-        assistive_core=True,
     )
 
 

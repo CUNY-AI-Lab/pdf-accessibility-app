@@ -12,6 +12,7 @@ PRETAG_GROUNDED_TEXT_MAX_CHARS = 64
 PRETAG_GROUNDED_TEXT_ENCODING_MAX_CHARS = 128
 PRETAG_GROUNDED_TEXT_ENCODING_MIN_SIMILARITY = 0.94
 PRETAG_GROUNDED_TEXT_ARTIFACT_MAX_CHARS = 96
+PRETAG_GROUNDED_TEXT_MARK_DECORATIVE_MAX_CHARS = 240
 PRETAG_GROUNDED_TEXT_ALLOWED_DUPLICATE_ROLES = frozenset({
     "heading",
     "paragraph",
@@ -312,7 +313,7 @@ def _should_auto_artifact_grounded_text_block(block: dict[str, object]) -> bool:
         ).strip()
         if not original_text or "\n" in original_text:
             return False
-        return len(original_text) <= PRETAG_GROUNDED_TEXT_ARTIFACT_MAX_CHARS
+        return len(original_text) <= PRETAG_GROUNDED_TEXT_MARK_DECORATIVE_MAX_CHARS
     if not readable_text:
         return False
     if str(block.get("issue_type") or "").strip() != "encoding_problem":

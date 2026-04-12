@@ -21,24 +21,23 @@ export default function RemediationSummary({
     report.tagging && typeof report.tagging === "object"
       ? (report.tagging as Record<string, unknown>)
       : {};
-  const baseline =
-    report.baseline && typeof report.baseline === "object"
-      ? (report.baseline as Record<string, unknown>)
-      : {};
-  const baselineSummary =
-    baseline.summary && typeof baseline.summary === "object"
-      ? (baseline.summary as Record<string, unknown>)
-      : {};
 
   const lines: { icon: IconName; text: string }[] = [];
 
-  // Error remediation summary
-  const errorsReduced = asNumber(remediation.errors_reduced);
-  const baselineErrors = asNumber(baselineSummary.errors);
-  if (errorsReduced !== null && errorsReduced > 0 && baselineErrors !== null) {
+  // Error remediation summary — count distinct rule-level issues, not raw
+  // occurrence totals. veraPDF reports per-rule occurrence counts that can
+  // easily reach the thousands, which reads as alarming noise.
+  const autoRemediatedErrors = asNumber(remediation.auto_remediated_errors);
+  const baselineErrorRules = asNumber(remediation.baseline_error_rules);
+  if (
+    autoRemediatedErrors !== null &&
+    autoRemediatedErrors > 0 &&
+    baselineErrorRules !== null &&
+    baselineErrorRules > 0
+  ) {
     lines.push({
       icon: "wrench",
-      text: `Fixed ${errorsReduced} of ${baselineErrors} accessibility ${pluralize(baselineErrors, "error")} automatically`,
+      text: `Fixed ${autoRemediatedErrors} of ${baselineErrorRules} accessibility ${pluralize(baselineErrorRules, "issue")} automatically`,
     });
   }
 
