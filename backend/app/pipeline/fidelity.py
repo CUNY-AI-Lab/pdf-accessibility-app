@@ -1419,18 +1419,102 @@ def assess_fidelity(
     elements = structure_json.get("elements", [])
     figure_captions: dict[int, str] = {}
     figure_pages: dict[int, int] = {}
+    figure_targets: list[dict[str, Any]] = []
     table_count = 0
     if isinstance(elements, list):
         for element in elements:
             if not isinstance(element, dict):
                 continue
             if element.get("type") == "figure" and isinstance(element.get("figure_index"), int):
-                figure_captions[element["figure_index"]] = _normalize_text(element.get("caption"))
+                figure_index = element["figure_index"]
+                figure_captions[figure_index] = _normalize_text(element.get("caption"))
                 page_raw = element.get("page")
                 if isinstance(page_raw, int) and page_raw >= 0:
-                    figure_pages[element["figure_index"]] = page_raw + 1
+                    figure_pages[figure_index] = page_raw + 1
+                target = {
+                    "figure_index": figure_index,
+                    "page": page_raw + 1 if isinstance(page_raw, int) and page_raw >= 0 else None,
+                }
+                bbox = element.get("bbox")
+                if isinstance(bbox, dict):
+                    target["bbox"] = bbox
+                review_id = element.get("review_id")
+                if isinstance(review_id, str) and review_id.strip():
+                    target["figure_review_id"] = review_id.strip()
+                caption = str(element.get("caption") or element.get("text") or "").strip()
+                if caption:
+                    target["caption"] = caption[:240]
+                figure_targets.append(target)
             elif element.get("type") == "table":
                 table_count += 1
+
+    figure_count = len(figure_captions)
+    tagged_figures_raw = tagging_metrics.get("figures_tagged", 0)
+    decorative_figures_raw = tagging_metrics.get("decorative_figures_artifacted", 0)
+    tagged_figure_count = (
+        tagged_figures_raw if isinstance(tagged_figures_raw, int) and tagged_figures_raw >= 0 else 0
+    )
+    decorative_figure_count = (
+        decorative_figures_raw
+        if isinstance(decorative_figures_raw, int) and decorative_figures_raw >= 0
+        else 0
+    )
+    covered_figure_count = min(figure_count, tagged_figure_count + decorative_figure_count)
+    if figure_count > 0:
+        coverage = covered_figure_count / figure_count
+        status = "pass" if covered_figure_count >= figure_count else "warning"
+        if covered_figure_count < figure_count:
+            add_task(
+                "review:figure_semantics",
+                task_type="figure_semantics",
+                title="Verify figure semantics",
+                detail=(
+                    "Not all detected figures were exposed as figure structure in the final PDF. "
+                    "Manual review is required for figure tags and descriptions."
+                ),
+                severity="high" if coverage < 0.75 else "medium",
+                blocking=True,
+                metadata={
+                    "detected_figures": figure_count,
+                    "tagged_figures": tagged_figure_count,
+                    "decorative_figures": decorative_figure_count,
+                    "coverage": round(coverage, 4),
+                    "pages_to_check": sorted(
+                        {
+                            int(target["page"])
+                            for target in figure_targets
+                            if isinstance(target.get("page"), int)
+                        }
+                    ),
+                    "figure_review_targets": figure_targets[:20],
+                },
+            )
+        checks.append(
+            {
+                "check": "figure_coverage",
+                "status": status,
+                "message": "Compared detected figures against tagged or artifacted figures.",
+                "metrics": {
+                    "detected_figures": figure_count,
+                    "tagged_figures": tagged_figure_count,
+                    "decorative_figures": decorative_figure_count,
+                    "coverage": round(coverage, 4),
+                },
+            }
+        )
+    else:
+        checks.append(
+            {
+                "check": "figure_coverage",
+                "status": "skip",
+                "message": "No figures detected in structure extraction.",
+                "metrics": {
+                    "detected_figures": 0,
+                    "tagged_figures": tagged_figure_count,
+                    "decorative_figures": decorative_figure_count,
+                },
+            }
+        )
 
     tagged_tables = tagging_metrics.get("tables_tagged", 0)
     tagged_table_count = (

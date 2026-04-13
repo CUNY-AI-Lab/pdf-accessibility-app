@@ -782,7 +782,7 @@ def test_fidelity_allows_advisory_machine_alt_without_blocking(monkeypatch):
             }
         ],
         validation_report=_validation_report(compliant=True, violations=[]),
-        tagging_metrics={"tables_tagged": 0},
+        tagging_metrics={"figures_tagged": 1, "tables_tagged": 0},
         classification="digital",
     )
 
@@ -1251,6 +1251,84 @@ def test_fidelity_flags_high_risk_complex_tables(monkeypatch):
     assert task["metadata"]["high_risk_tables"] == 1
     assert task["metadata"]["pages_to_check"] == [1]
     assert task["metadata"]["table_review_targets"][0]["table_review_id"] == "review-0"
+
+
+def test_fidelity_blocks_when_detected_figures_are_not_tagged(monkeypatch):
+    monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
+    monkeypatch.setattr(fidelity, "_sample_visual_ink", lambda path: {
+        "sampled_pages": 1,
+        "pages_with_visible_ink": 1,
+        "mean_ink_ratio": 0.01,
+        "max_ink_ratio": 0.01,
+        "visually_blank": False,
+    })
+
+    report, tasks = assess_fidelity(
+        input_pdf=Path("in.pdf"),
+        output_pdf=Path("out.pdf"),
+        structure_json={
+            "elements": [
+                {
+                    "type": "figure",
+                    "figure_index": 0,
+                    "page": 0,
+                    "review_id": "fig-0",
+                    "bbox": {"l": 72, "t": 700, "r": 240, "b": 500},
+                    "caption": "Figure 1. Diagram",
+                },
+                {
+                    "type": "figure",
+                    "figure_index": 1,
+                    "page": 2,
+                    "bbox": {"l": 72, "t": 400, "r": 240, "b": 200},
+                },
+            ],
+        },
+        alt_entries=[],
+        validation_report=_validation_report(compliant=True, violations=[]),
+        tagging_metrics={
+            "figures_tagged": 0,
+            "decorative_figures_artifacted": 0,
+            "tables_tagged": 0,
+        },
+        classification="digital",
+    )
+
+    assert report["passed"] is False
+    figure_check = next(check for check in report["checks"] if check["check"] == "figure_coverage")
+    assert figure_check["status"] == "warning"
+    assert figure_check["metrics"]["coverage"] == 0.0
+    task = next(task for task in tasks if task["task_type"] == "figure_semantics")
+    assert task["blocking"] is True
+    assert task["metadata"]["detected_figures"] == 2
+    assert task["metadata"]["tagged_figures"] == 0
+    assert task["metadata"]["pages_to_check"] == [1, 3]
+    assert task["metadata"]["figure_review_targets"][0]["figure_review_id"] == "fig-0"
+
+
+def test_fidelity_counts_decorative_figures_as_covered():
+    report, tasks = assess_fidelity(
+        input_pdf=Path("in.pdf"),
+        output_pdf=Path("out.pdf"),
+        structure_json={
+            "elements": [
+                {"type": "figure", "figure_index": 0, "page": 0},
+                {"type": "figure", "figure_index": 1, "page": 0},
+            ],
+        },
+        alt_entries=[],
+        validation_report=_validation_report(compliant=True, violations=[]),
+        tagging_metrics={
+            "figures_tagged": 1,
+            "decorative_figures_artifacted": 1,
+            "tables_tagged": 0,
+        },
+        classification="digital",
+    )
+
+    figure_check = next(check for check in report["checks"] if check["check"] == "figure_coverage")
+    assert figure_check["status"] == "pass"
+    assert not any(task["task_type"] == "figure_semantics" for task in tasks)
 
 
 def test_fidelity_font_task_includes_review_targets():

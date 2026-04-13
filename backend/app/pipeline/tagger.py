@@ -59,6 +59,11 @@ LINK_TEXT_ELEMENT_TYPES = frozenset({
     "toc_item",
     "toc_item_table",
 })
+TEXT_SHOW_OPERATORS = frozenset({"Tj", "TJ", "'", '"'})
+FRAGMENTED_TEXT_MIN_ELEMENTS = 2
+FRAGMENTED_TEXT_MIN_COVERAGE_GAIN = 2
+FRAGMENTED_TEXT_MIN_ASSIGNED_RATIO = 0.40
+FRAGMENTED_TEXT_MARK_ARTIFACT = -1
 LINK_SAFE_MAX_CHARS = 160
 LINK_SAFE_MAX_WORDS = 18
 TOC_TRAILING_PAGE_RE = re.compile(
@@ -192,12 +197,22 @@ def _normalize_title_like_text(text: Any) -> str:
 def _decode_pdf_text_operand(value: Any) -> str:
     """Decode a content stream text operand into a best-effort string."""
     if isinstance(value, pikepdf.String):
-        return str(value)
-    if isinstance(value, bytes):
-        return value.decode("latin-1", errors="ignore")
-    if isinstance(value, (int, float)):
+        text = str(value)
+    elif isinstance(value, bytes):
+        text = value.decode("latin-1", errors="ignore")
+    elif isinstance(value, (int, float)):
         return ""
-    return str(value) if value is not None else ""
+    else:
+        text = str(value) if value is not None else ""
+
+    if "\x00" in text:
+        without_nuls = text.replace("\x00", "")
+        if without_nuls.strip():
+            text = without_nuls
+    return "".join(
+        char if char in "\n\r\t" or ord(char) >= 32 else " "
+        for char in text
+    )
 
 
 def _extract_text_from_operands(op: str, operands: list[Any]) -> str:
@@ -341,6 +356,22 @@ def _bbox_intersection(a: dict[str, float] | None, b: dict[str, float] | None) -
     if x1 <= x0 or y1 <= y0:
         return 0.0
     return (x1 - x0) * (y1 - y0)
+
+
+def _bbox_intersection_box(
+    a: dict[str, float] | None,
+    b: dict[str, float] | None,
+) -> dict[str, float] | None:
+    """Return the intersection bbox, if any."""
+    if not a or not b:
+        return None
+    x0 = max(a["l"], b["l"])
+    y0 = max(a["b"], b["b"])
+    x1 = min(a["r"], b["r"])
+    y1 = min(a["t"], b["t"])
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return {"l": x0, "b": y0, "r": x1, "t": y1}
 
 
 def _bbox_iou(a: dict[str, float] | None, b: dict[str, float] | None) -> float:
@@ -1158,6 +1189,21 @@ class ContentRegion:
     xobject_name: str = ""  # for image regions
     bbox: dict[str, float] | None = None  # {l,b,r,t}
     text: str = ""
+    ctm: tuple[float, float, float, float, float, float] = IDENTITY
+
+
+@dataclass
+class TextShowRun:
+    """A positioned text-showing operation inside a text object."""
+
+    instruction_idx: int
+    segment_start_idx: int
+    segment_end_idx: int
+    cx: float
+    cy: float
+    bbox: dict[str, float]
+    text: str = ""
+    render_mode: int = 0
 
 
 @dataclass
@@ -1362,11 +1408,215 @@ def _extract_content_regions(
                         height=abs(y1 - y0),
                         xobject_name=name,
                         bbox=bbox,
+                        ctm=ctm,
                     ))
 
         i += 1
 
     return regions
+
+
+def _page_content_bbox(content_owner) -> dict[str, float] | None:
+    """Return the visible content box for a page or form stream owner."""
+    for key in ("/MediaBox", "/CropBox", "/BBox"):
+        try:
+            bbox = _rect_array_to_bbox(content_owner.get(key))
+        except Exception:
+            bbox = None
+        if bbox:
+            return bbox
+    return None
+
+
+def _point_in_bbox(x: float, y: float, bbox: dict[str, float] | None, *, margin: float = 0.0) -> bool:
+    if not bbox:
+        return False
+    return (
+        bbox["l"] - margin <= x <= bbox["r"] + margin
+        and bbox["b"] - margin <= y <= bbox["t"] + margin
+    )
+
+
+def _extract_text_show_runs(
+    instructions: list,
+    *,
+    initial_ctm: tuple[float, float, float, float, float, float] = IDENTITY,
+) -> list[TextShowRun]:
+    """Extract positioned text-showing operations inside text objects.
+
+    OCRmyPDF-style pages can contain one giant BT..ET block with hundreds of
+    positioned word draws.  The coarser region extractor intentionally treats
+    that as one text block; this helper preserves the finer anchors when the
+    tag writer needs to recover semantic coverage.
+    """
+    runs: list[TextShowRun] = []
+    ctm = initial_ctm
+    ctm_stack = []
+    text_matrix = IDENTITY
+    in_text = False
+    segment_start_idx = 0
+    font_size = 12.0
+    render_mode = 0
+
+    for idx, instr in enumerate(instructions):
+        op = str(instr.operator)
+        operands = list(instr.operands) if hasattr(instr, "operands") else []
+
+        if op == "q":
+            ctm_stack.append(ctm)
+        elif op == "Q":
+            ctm = ctm_stack.pop() if ctm_stack else initial_ctm
+        elif op == "cm" and len(operands) >= 6:
+            m = tuple(_safe_float(x) for x in operands[:6])
+            ctm = _mat_multiply(m, ctm)
+
+        if op == "BT":
+            in_text = True
+            text_matrix = IDENTITY
+            segment_start_idx = idx + 1
+            continue
+        if op == "ET":
+            in_text = False
+            segment_start_idx = idx + 1
+            continue
+        if not in_text:
+            continue
+
+        if op == "Tf" and len(operands) >= 2:
+            font_size = abs(_safe_float(operands[1])) or font_size
+        elif op == "Tr" and operands:
+            render_mode = _coerce_int(operands[0], default=render_mode)
+        elif op == "Tm" and len(operands) >= 6:
+            text_matrix = tuple(_safe_float(x) for x in operands[:6])
+        elif op in ("Td", "TD") and len(operands) >= 2:
+            tx, ty = _safe_float(operands[0]), _safe_float(operands[1])
+            text_matrix = (
+                text_matrix[0], text_matrix[1],
+                text_matrix[2], text_matrix[3],
+                text_matrix[4] + tx, text_matrix[5] + ty,
+            )
+        elif op == "T*":
+            text_matrix = (
+                text_matrix[0], text_matrix[1],
+                text_matrix[2], text_matrix[3],
+                text_matrix[4], text_matrix[5] - font_size * 1.2,
+            )
+        elif op in TEXT_SHOW_OPERATORS:
+            text = _extract_text_from_operands(op, operands)
+            x, y = _transform_point(ctm, text_matrix[4], text_matrix[5])
+            width_guess = max(font_size * 0.45 * max(len(text.strip()), 1), font_size)
+            p0 = _transform_point(ctm, text_matrix[4], text_matrix[5] - font_size * 0.25)
+            p1 = _transform_point(ctm, text_matrix[4] + width_guess, text_matrix[5] + font_size * 1.05)
+            bbox = {
+                "l": min(p0[0], p1[0]),
+                "b": min(p0[1], p1[1]),
+                "r": max(p0[0], p1[0]),
+                "t": max(p0[1], p1[1]),
+            }
+            runs.append(TextShowRun(
+                instruction_idx=idx,
+                segment_start_idx=segment_start_idx,
+                segment_end_idx=idx + 1,
+                cx=x,
+                cy=y,
+                bbox=bbox,
+                text=text,
+                render_mode=render_mode,
+            ))
+            segment_start_idx = idx + 1
+
+    return runs
+
+
+def _text_runs_look_like_hidden_ocr_layer(runs: list[TextShowRun]) -> bool:
+    if not runs:
+        return False
+    hidden = sum(1 for run in runs if run.render_mode == 3)
+    return hidden / max(len(runs), 1) >= 0.8
+
+
+def _eligible_fragmented_text_elements(elements: list[dict]) -> list[tuple[int, dict]]:
+    """Return semantic text elements that can be anchored to OCR text show runs."""
+    return [
+        (idx, elem)
+        for idx, elem in enumerate(elements)
+        if elem.get("type") in LINK_TEXT_ELEMENT_TYPES and isinstance(elem.get("bbox"), dict)
+    ]
+
+
+def _assign_text_show_runs_to_elements(
+    runs: list[TextShowRun],
+    elements: list[dict],
+) -> dict[int, int]:
+    """Assign positioned text show runs to containing semantic elements."""
+    eligible = _eligible_fragmented_text_elements(elements)
+    if not runs or not eligible:
+        return {}
+
+    assignments: dict[int, int] = {}
+    for run_idx, run in enumerate(runs):
+        best_elem_idx: int | None = None
+        best_score = -1.0
+        for elem_idx, elem in eligible:
+            ebbox = elem.get("bbox")
+            if not isinstance(ebbox, dict):
+                continue
+
+            point_inside = _point_in_bbox(run.cx, run.cy, ebbox, margin=4.0)
+            relaxed_overlap = _bbox_intersection(_expand_bbox(run.bbox, 2.0), ebbox)
+            if not point_inside and relaxed_overlap <= 0:
+                continue
+
+            spatial = max(
+                _containment_ratio(run.bbox, ebbox),
+                _bbox_iou(run.bbox, ebbox),
+                _distance_score(run.bbox, ebbox),
+            )
+            text = _text_similarity(run.text, elem.get("text", ""))
+            area_penalty = min(_bbox_area(ebbox) / 2_000_000.0, 0.20)
+            score = (1.0 if point_inside else 0.0) + 0.70 * spatial + 0.10 * text - area_penalty
+            if score > best_score:
+                best_score = score
+                best_elem_idx = elem_idx
+
+        if best_elem_idx is not None:
+            assignments[run_idx] = best_elem_idx
+
+    return assignments
+
+
+def _should_use_fragmented_text_rewrite(
+    *,
+    elements: list[dict],
+    normal_matches: dict[int, int],
+    text_run_assignments: dict[int, int],
+) -> bool:
+    """Decide whether fine-grained OCR text anchors beat coarse region matching."""
+    eligible_element_indices = {
+        idx for idx, _elem in _eligible_fragmented_text_elements(elements)
+    }
+    if len(eligible_element_indices) < FRAGMENTED_TEXT_MIN_ELEMENTS:
+        return False
+
+    normally_matched = {
+        elem_idx
+        for elem_idx in normal_matches.values()
+        if elem_idx in eligible_element_indices
+    }
+    fragmented_matched = {
+        elem_idx
+        for elem_idx in text_run_assignments.values()
+        if elem_idx in eligible_element_indices
+    }
+    if len(fragmented_matched) < FRAGMENTED_TEXT_MIN_ELEMENTS:
+        return False
+
+    assigned_ratio = len(fragmented_matched) / max(len(eligible_element_indices), 1)
+    gained = len(fragmented_matched) - len(normally_matched)
+    return (
+        gained >= FRAGMENTED_TEXT_MIN_COVERAGE_GAIN
+        and assigned_ratio >= FRAGMENTED_TEXT_MIN_ASSIGNED_RATIO
+    )
 
 
 def _matrix_tuple(value: Any) -> tuple[float, float, float, float, float, float]:
@@ -2014,6 +2264,28 @@ class StructTreeBuilder:
             return None
         return self._source_element_structs.get(id(source_element))
 
+    def add_mcr_to_struct_elem(
+        self,
+        elem: pikepdf.Object,
+        page_index: int,
+        page_ref: pikepdf.Object,
+        *,
+        stream_owner: pikepdf.Object | None = None,
+    ) -> int:
+        """Append another marked-content reference to an existing StructElem."""
+        owner = stream_owner or page_ref
+        mcid = self._alloc_mcid(owner)
+        mcr = self._make_mcr(mcid, page_ref, stream_owner=stream_owner)
+        kids = elem.get("/K")
+        if isinstance(kids, pikepdf.Array):
+            kids.append(mcr)
+        elif kids is not None:
+            elem["/K"] = pikepdf.Array([kids, mcr])
+        else:
+            elem["/K"] = mcr
+        self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=elem)
+        return mcid
+
     def _add_struct_elem(
         self,
         struct_type: str,
@@ -2550,6 +2822,425 @@ def _strip_existing_markers(instructions: list) -> list:
     return stripped
 
 
+def _fragment_tag_for_element(elem: dict) -> str | None:
+    elem_type = elem.get("type", "")
+    if elem_type == "heading":
+        level = _as_positive_int(elem.get("level", 1), default=1)
+        return f"H{max(1, min(6, level))}"
+    if elem_type == "figure":
+        return "Figure"
+    if elem_type == "list_item":
+        return "LBody"
+    if elem_type == "code":
+        return "Code"
+    if elem_type == "formula":
+        return "Formula"
+    if elem_type == "note":
+        return "Note"
+    if elem_type == "toc_caption":
+        return "Caption"
+    if elem_type in {"toc_item", "toc_item_table"}:
+        return "TOCI"
+    if elem_type == "paragraph":
+        return "P"
+    return None
+
+
+def _allocate_fragment_mcid(
+    builder: StructTreeBuilder,
+    elem: dict,
+    page_index: int,
+    page_ref: pikepdf.Object,
+    alt_lookup: dict[int, str],
+    decorative_figures: set[int],
+    *,
+    stream_owner: pikepdf.Object | None = None,
+) -> tuple[str, int, str | None] | None:
+    """Allocate an MCID for one fragmented content run."""
+    tag = _fragment_tag_for_element(elem)
+    if tag is None:
+        return None
+
+    existing_elem = builder.source_element_struct(elem)
+    if existing_elem is not None:
+        mcid = builder.add_mcr_to_struct_elem(
+            existing_elem,
+            page_index,
+            page_ref,
+            stream_owner=stream_owner,
+        )
+        return tag, mcid, None
+
+    elem_type = elem.get("type", "")
+    elem_lang = elem.get("lang")
+    actual_text = _element_actual_text(elem)
+
+    if elem_type == "heading":
+        mcid = builder.add_heading(
+            _as_positive_int(elem.get("level", 1), default=1),
+            page_index,
+            page_ref,
+            _element_accessible_text(elem),
+            lang=elem_lang,
+            stream_owner=stream_owner,
+        )
+    elif elem_type == "figure":
+        fig_idx = elem.get("figure_index")
+        if fig_idx in decorative_figures:
+            return None
+        alt = (
+            alt_lookup.get(fig_idx)
+            or elem.get("caption")
+            or elem.get("text")
+        )
+        if isinstance(alt, str):
+            alt = alt.strip()
+        mcid = builder.add_figure(
+            page_index,
+            page_ref,
+            alt_text=alt or None,
+            stream_owner=stream_owner,
+        )
+        actual_text = None
+    elif elem_type == "list_item":
+        mcid = builder.add_list_item(
+            page_index,
+            page_ref,
+            elem.get("list_group_ref"),
+            parent_list_group_ref=elem.get("parent_list_group_ref"),
+            stream_owner=stream_owner,
+        )
+    elif elem_type == "code":
+        mcid = builder.add_code(
+            page_index,
+            page_ref,
+            lang=elem_lang,
+            stream_owner=stream_owner,
+        )
+    elif elem_type == "formula":
+        formula_alt = _formula_alt_text(actual_text or _element_accessible_text(elem))
+        mcid = builder.add_formula(
+            page_index,
+            page_ref,
+            alt_text=formula_alt or None,
+            stream_owner=stream_owner,
+        )
+    elif elem_type == "note":
+        mcid = builder.add_note(
+            page_index,
+            page_ref,
+            stream_owner=stream_owner,
+        )
+    elif elem_type == "toc_caption":
+        mcid = builder.add_toc_caption(
+            page_index,
+            page_ref,
+            elem.get("toc_group_ref"),
+            stream_owner=stream_owner,
+        )
+    elif elem_type in {"toc_item", "toc_item_table"}:
+        mcid = builder.add_toc_item(
+            page_index,
+            page_ref,
+            elem.get("toc_group_ref"),
+            stream_owner=stream_owner,
+        )
+    else:
+        mcid = builder.add_paragraph(
+            page_index,
+            page_ref,
+            lang=elem_lang,
+            stream_owner=stream_owner,
+        )
+
+    builder.remember_source_element(elem, stream_owner or page_ref, mcid)
+    return tag, mcid, actual_text
+
+
+def _is_full_page_scan_image_region(
+    region: ContentRegion,
+    content_owner,
+    elements: list[dict],
+) -> bool:
+    if region.kind != "image" or not region.bbox:
+        return False
+    if not _eligible_fragmented_text_elements(elements):
+        return False
+    content_bbox = _page_content_bbox(content_owner)
+    if not content_bbox:
+        return False
+    return (
+        _containment_ratio(region.bbox, content_bbox) >= 0.85
+        and _containment_ratio(content_bbox, region.bbox) >= 0.85
+    )
+
+
+def _fragmented_image_matches(
+    regions: list[ContentRegion],
+    elements: list[dict],
+    content_owner,
+) -> dict[int, int]:
+    image_regions = [
+        (region_idx, region)
+        for region_idx, region in enumerate(regions)
+        if region.kind == "image" and not _is_full_page_scan_image_region(region, content_owner, elements)
+    ]
+    figure_elements = [
+        (elem_idx, elem)
+        for elem_idx, elem in enumerate(elements)
+        if elem.get("type") == "figure"
+    ]
+    return _optimal_match(image_regions, figure_elements)
+
+
+def _resolved_figure_alt_for_tagging(elem: dict, alt_lookup: dict[int, str]) -> str:
+    fig_idx = elem.get("figure_index")
+    alt = (
+        alt_lookup.get(fig_idx)
+        or elem.get("caption")
+        or elem.get("text")
+    )
+    if not isinstance(alt, str):
+        return ""
+    alt = " ".join(alt.split()).strip()
+    if _is_weak_figure_alt_text(alt):
+        return ""
+    return alt
+
+
+def _scan_figure_overlay_targets(
+    regions: list[ContentRegion],
+    elements: list[dict],
+    content_owner,
+    alt_lookup: dict[int, str],
+    decorative_figures: set[int],
+) -> tuple[list[tuple[ContentRegion, int]], set[int]]:
+    """Find figure elements that can be represented by clipped full-page scan pixels."""
+    overlay_targets: list[tuple[ContentRegion, int]] = []
+    decorative_covered: set[int] = set()
+    figure_elements = [
+        (elem_idx, elem)
+        for elem_idx, elem in enumerate(elements)
+        if elem.get("type") == "figure" and isinstance(elem.get("bbox"), dict)
+    ]
+    if not figure_elements:
+        return overlay_targets, decorative_covered
+
+    full_page_images = [
+        region
+        for region in regions
+        if _is_full_page_scan_image_region(region, content_owner, elements)
+    ]
+    if not full_page_images:
+        return overlay_targets, decorative_covered
+
+    for elem_idx, elem in figure_elements:
+        fig_idx = elem.get("figure_index")
+        elem_bbox = elem.get("bbox")
+        if not isinstance(elem_bbox, dict):
+            continue
+
+        best_region: ContentRegion | None = None
+        best_containment = 0.0
+        for region in full_page_images:
+            containment = _containment_ratio(elem_bbox, region.bbox)
+            if containment > best_containment:
+                best_containment = containment
+                best_region = region
+        if best_region is None or best_containment < 0.95:
+            continue
+
+        if fig_idx in decorative_figures:
+            decorative_covered.add(elem_idx)
+            continue
+
+        if not _resolved_figure_alt_for_tagging(elem, alt_lookup):
+            continue
+        overlay_targets.append((best_region, elem_idx))
+
+    return overlay_targets, decorative_covered
+
+
+def _make_clipped_image_figure_instructions(
+    region: ContentRegion,
+    elem: dict,
+    builder: StructTreeBuilder,
+    page_index: int,
+    page_ref: pikepdf.Object,
+    alt_lookup: dict[int, str],
+    decorative_figures: set[int],
+    *,
+    stream_owner: pikepdf.Object | None = None,
+) -> list[pikepdf.ContentStreamInstruction]:
+    """Reuse an existing scan image with a clip path for one real figure region."""
+    elem_bbox = elem.get("bbox")
+    clip_bbox = _bbox_intersection_box(elem_bbox, region.bbox if isinstance(elem_bbox, dict) else None)
+    if not clip_bbox:
+        return []
+    if clip_bbox["r"] - clip_bbox["l"] <= 1.0 or clip_bbox["t"] - clip_bbox["b"] <= 1.0:
+        return []
+    if not _resolved_figure_alt_for_tagging(elem, alt_lookup):
+        return []
+
+    allocated = _allocate_fragment_mcid(
+        builder,
+        elem,
+        page_index,
+        page_ref,
+        alt_lookup,
+        decorative_figures,
+        stream_owner=stream_owner,
+    )
+    if allocated is None:
+        return []
+    tag, mcid, _actual_text = allocated
+    if tag != "Figure":
+        return []
+
+    return [
+        _make_bdc("Figure", mcid),
+        pikepdf.ContentStreamInstruction([], pikepdf.Operator("q")),
+        pikepdf.ContentStreamInstruction(
+            [
+                clip_bbox["l"],
+                clip_bbox["b"],
+                clip_bbox["r"] - clip_bbox["l"],
+                clip_bbox["t"] - clip_bbox["b"],
+            ],
+            pikepdf.Operator("re"),
+        ),
+        pikepdf.ContentStreamInstruction([], pikepdf.Operator("W")),
+        pikepdf.ContentStreamInstruction([], pikepdf.Operator("n")),
+        pikepdf.ContentStreamInstruction(list(region.ctm), pikepdf.Operator("cm")),
+        pikepdf.ContentStreamInstruction(
+            [pikepdf.Name(region.xobject_name)],
+            pikepdf.Operator("Do"),
+        ),
+        pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q")),
+        _make_emc(),
+    ]
+
+
+def _rewrite_content_stream_with_fragmented_text(
+    pdf: pikepdf.Pdf,
+    content_owner,
+    page_index: int,
+    elements: list[dict],
+    builder: StructTreeBuilder,
+    page_ref: pikepdf.Object,
+    alt_lookup: dict[int, str],
+    decorative_figures: set[int],
+    *,
+    instructions: list,
+    regions: list[ContentRegion],
+    text_runs: list[TextShowRun],
+    text_run_assignments: dict[int, int],
+    stream_owner: pikepdf.Object | None = None,
+) -> set[int]:
+    """Rewrite a stream using word-level OCR text anchors when BT blocks are giant."""
+    mark_by_idx: dict[int, int] = {}
+    for run_idx, run in enumerate(text_runs):
+        mark = text_run_assignments.get(run_idx, FRAGMENTED_TEXT_MARK_ARTIFACT)
+        for idx in range(run.segment_start_idx, run.segment_end_idx):
+            mark_by_idx[idx] = mark
+
+    image_matches = _fragmented_image_matches(regions, elements, content_owner)
+    for region_idx, region in enumerate(regions):
+        if region.kind != "image":
+            continue
+        mark = image_matches.get(region_idx, FRAGMENTED_TEXT_MARK_ARTIFACT)
+        for idx in range(region.start_idx, region.end_idx):
+            mark_by_idx[idx] = mark
+
+    overlay_targets: list[tuple[ContentRegion, int]] = []
+    decorative_covered: set[int] = set()
+    if stream_owner is None and _text_runs_look_like_hidden_ocr_layer(text_runs):
+        overlay_targets, decorative_covered = _scan_figure_overlay_targets(
+            regions,
+            elements,
+            content_owner,
+            alt_lookup,
+            decorative_figures,
+        )
+    matched_element_indices = {
+        elem_idx
+        for elem_idx in text_run_assignments.values()
+        if elem_idx != FRAGMENTED_TEXT_MARK_ARTIFACT
+    }
+    matched_element_indices.update(
+        elem_idx
+        for elem_idx in image_matches.values()
+        if elem_idx != FRAGMENTED_TEXT_MARK_ARTIFACT
+    )
+    matched_element_indices.update(decorative_covered)
+
+    new_instructions = []
+    active_mark: int | None = None
+
+    def close_active() -> None:
+        nonlocal active_mark
+        if active_mark is not None:
+            new_instructions.append(_make_emc())
+            active_mark = None
+
+    for idx, instr in enumerate(instructions):
+        mark = mark_by_idx.get(idx)
+        if mark != active_mark:
+            close_active()
+            if mark == FRAGMENTED_TEXT_MARK_ARTIFACT:
+                new_instructions.append(_make_bmc_artifact())
+                active_mark = mark
+            elif mark is not None and 0 <= mark < len(elements):
+                allocated = _allocate_fragment_mcid(
+                    builder,
+                    elements[mark],
+                    page_index,
+                    page_ref,
+                    alt_lookup,
+                    decorative_figures,
+                    stream_owner=stream_owner,
+                )
+                if allocated is None:
+                    new_instructions.append(_make_bmc_artifact())
+                    active_mark = FRAGMENTED_TEXT_MARK_ARTIFACT
+                else:
+                    tag, mcid, actual_text = allocated
+                    new_instructions.append(_make_bdc(tag, mcid, actual_text=actual_text))
+                    active_mark = mark
+            else:
+                active_mark = None
+
+        new_instructions.append(instr)
+
+    close_active()
+    for source_region, elem_idx in overlay_targets:
+        overlay = _make_clipped_image_figure_instructions(
+            source_region,
+            elements[elem_idx],
+            builder,
+            page_index,
+            page_ref,
+            alt_lookup,
+            decorative_figures,
+            stream_owner=stream_owner,
+        )
+        if overlay:
+            new_instructions.extend(overlay)
+            matched_element_indices.add(elem_idx)
+
+    try:
+        new_stream = pikepdf.unparse_content_stream(new_instructions)
+        if isinstance(content_owner, pikepdf.Page):
+            content_owner["/Contents"] = pdf.make_stream(new_stream)
+        else:
+            content_owner.write(new_stream)
+    except Exception as e:
+        logger.error(f"Failed to write fragmented text content stream for page {page_index}: {e}")
+        return set()
+
+    return matched_element_indices
+
+
 def _rewrite_content_stream(
     pdf: pikepdf.Pdf,
     content_owner,
@@ -2584,6 +3275,28 @@ def _rewrite_content_stream(
         elements,
         docling_page_lines=docling_page_lines,
     )
+    text_runs = _extract_text_show_runs(instructions, initial_ctm=initial_ctm)
+    text_run_assignments = _assign_text_show_runs_to_elements(text_runs, elements)
+    if _should_use_fragmented_text_rewrite(
+        elements=elements,
+        normal_matches=matches,
+        text_run_assignments=text_run_assignments,
+    ):
+        return _rewrite_content_stream_with_fragmented_text(
+            pdf,
+            content_owner,
+            page_index,
+            elements,
+            builder,
+            page_ref,
+            alt_lookup,
+            decorative_figures or set(),
+            instructions=instructions,
+            regions=regions,
+            text_runs=text_runs,
+            text_run_assignments=text_run_assignments,
+            stream_owner=stream_owner,
+        )
     matched_element_indices = set(matches.values())
 
     # Map instruction start indices to region indices

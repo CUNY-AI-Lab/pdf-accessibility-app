@@ -2,19 +2,19 @@
 
 An automated PDF remediation tool from the [CUNY AI Lab](https://ailab.gc.cuny.edu/) that converts uploaded PDFs into accessible, PDF/UA-1 compliant documents.
 
-## Overview
+Upload a PDF and the app classifies it, runs OCR if needed, extracts structure, generates alt text, writes PDF/UA tags, and validates the result against veraPDF. Documents that can't be fully remediated automatically are flagged for manual review.
 
-Upload a PDF and the app automatically remediates it through a multi-step pipeline: classification, OCR, structure extraction, semantic analysis, accessible tagging, and validation. Output is gated by [veraPDF](https://verapdf.org/) compliance checks and fidelity analysis to ensure quality. Documents that can't be fully remediated are flagged for manual review.
+## Features
 
-### Pipeline
-
-1. **Classify** — Determine whether the PDF is digital, mixed, or scanned
-2. **OCR** — Add searchable text to scanned pages ([OCRmyPDF](https://ocrmypdf.readthedocs.io/)) with automatic language detection
-3. **Structure** — Extract document structure via [Docling](https://github.com/docling-project/docling), with LLM-assisted TOC enhancement
-4. **Alt Text** — Generate alt text for figures and reclassify misidentified elements using a vision LLM
-5. **Tag** — Resolve ambiguous semantics (tables, forms, reading order, grounded text) via LLM, then write PDF/UA structure tags deterministically with [pikepdf](https://github.com/pikepdf/pikepdf)
-6. **Validate** — Check PDF/UA-1 compliance with [veraPDF](https://verapdf.org/)
-7. **Fidelity** — Verify output faithfulness (text drift, reading order, table coverage, form labels)
+- **Automatic classification** of digital, mixed, and scanned PDFs
+- **OCR with language auto-detection** via OCRmyPDF and Tesseract
+- **Structure extraction** via [Docling](https://github.com/docling-project/docling), with optional remote `docling-serve` for GPU acceleration
+- **LLM-generated alt text** for figures, with decorative-image detection
+- **LLM-assisted semantic tagging** for tables, forms, reading order, and grounded text
+- **Deterministic PDF/UA tag writing** via [pikepdf](https://github.com/pikepdf/pikepdf)
+- **Compliance gating** with [veraPDF](https://verapdf.org/) PDF/UA-1 validation
+- **Fidelity checks** for text drift, reading order, table coverage, and form labels
+- **Anonymous sessions** — no login required, jobs scoped to an HTTP-only cookie
 
 ## Tech Stack
 
@@ -23,111 +23,65 @@ Upload a PDF and the app automatically remediates it through a multi-step pipeli
 | Backend | Python 3.12, FastAPI, SQLAlchemy (async SQLite) |
 | Frontend | React, TypeScript, Vite, Tailwind CSS 4, TanStack Query |
 | PDF Processing | pikepdf, OCRmyPDF, Ghostscript, Poppler, QPDF |
-| Structure Extraction | Docling (local or docling-serve) |
-| Semantic Analysis | Gemini Developer API (`gemini-3-flash-preview`) |
-| OCR | OCRmyPDF, Tesseract |
+| Structure Extraction | Docling (local or `docling-serve`) |
+| Semantic Analysis | Gemini Developer API |
 | Validation | veraPDF |
 
-## Prerequisites
+## Requirements
 
-- **Python 3.12+** and [uv](https://docs.astral.sh/uv/)
-- **[Bun](https://bun.sh/)**
-- **[Ghostscript](https://www.ghostscript.com/)**
-- **[OCRmyPDF](https://ocrmypdf.readthedocs.io/)**
-- **[Tesseract](https://github.com/tesseract-ocr/tesseract)** (used by OCRmyPDF and for local crop OCR)
-- **[veraPDF](https://verapdf.org/)** (requires Java runtime)
-- **[Poppler](https://poppler.freedesktop.org/)** (`pdftoppm`)
+- Python 3.12+ and [uv](https://docs.astral.sh/uv/)
+- [Bun](https://bun.sh/)
+- [Ghostscript](https://www.ghostscript.com/)
+- [OCRmyPDF](https://ocrmypdf.readthedocs.io/)
+- [Tesseract](https://github.com/tesseract-ocr/tesseract)
+- [Poppler](https://poppler.freedesktop.org/) (`pdftoppm`)
+- [veraPDF](https://verapdf.org/) and a Java runtime
+- A Gemini Developer API key
 
-On macOS: install via Homebrew. On Ubuntu/Debian: `ghostscript`, `poppler-utils`, `tesseract-ocr`, plus a Java runtime for veraPDF.
+On macOS, install system dependencies via Homebrew. On Debian/Ubuntu, install `ghostscript`, `poppler-utils`, `tesseract-ocr`, and a Java runtime.
 
-## Getting Started
-
-### 1. Configure environment
+## Quick Start
 
 ```bash
+# Clone and configure
+git clone <repo-url> pdf-accessibility-app
+cd pdf-accessibility-app
 cp .env.example .env
-# Edit .env — at minimum, set GEMINI_API_KEY
-```
+# Edit .env and set GEMINI_API_KEY
 
-Key environment variables:
-
-| Variable | Description | Default |
-|---|---|---|
-| `GEMINI_API_KEY` | Google Gemini API key for direct PDF understanding and fallback chat-completions calls | — |
-| `LLM_BASE_URL` | Gemini Developer API chat-completions base URL | `https://generativelanguage.googleapis.com/v1beta/openai` |
-| `LLM_API_KEY` | Optional override for the chat-completions client; falls back to `GEMINI_API_KEY` when unset | — |
-| `LLM_MODEL` | Model identifier | `google/gemini-3-flash-preview` |
-| `GEMINI_MODEL` | Direct Gemini model identifier for native PDF lanes | `gemini-3-flash-preview` |
-| `GEMINI_DIRECT_THINKING_LEVEL` | Default Gemini thinking level for direct PDF semantic lanes | `low` |
-| `GEMINI_DIRECT_ALT_TEXT_THINKING_LEVEL` | Gemini thinking level override for figure semantics and alt text | `medium` |
-| `ALT_TEXT_MAX_CONCURRENCY` | Maximum concurrent page-level figure/alt-text LLM requests per PDF | `8` |
-| `ALT_TEXT_GLOBAL_MAX_CONCURRENCY` | Process-wide cap for concurrent figure/alt-text provider work across PDFs | `12` |
-| `DOCLING_SERVE_URL` | Local or remote `docling-serve` URL for structure extraction | — |
-| `DOCLING_SERVE_TOKEN` | Optional bearer token for a protected `docling-serve` proxy | — |
-| `OCR_LANGUAGE` | Default Tesseract language code | `eng` |
-| `JOB_TTL_HOURS` | Hours before jobs expire | `12` |
-| `VERAPDF_PATH` | Path to veraPDF binary | `verapdf` |
-| `GHOSTSCRIPT_PATH` | Path to Ghostscript binary | `gs` |
-
-### 2. Install dependencies
-
-```bash
+# Install dependencies
 cd backend && uv sync
 cd ../frontend && bun install
 ```
 
-### 3. Run locally
+Run the two services in separate terminals:
 
 ```bash
-# Terminal 1 — backend
+# Backend
 cd backend
 uv run uvicorn app.main:app --reload --port 8001
 
-# Terminal 2 — frontend
+# Frontend
 cd frontend
 bun dev
 ```
 
-- Frontend: http://localhost:5173
-- Backend API: http://localhost:8001
-
-The frontend proxies `/api` and `/health` to the backend via Vite config.
-
-### Recommended Mac Runtime
-
-For the main app on this machine, the intended setup is:
-
-- LLM semantics through the Gemini Developer API
-- structure extraction through local `docling-serve`
-- Apple GPU acceleration through MPS on the `docling-serve` process when available
-
-Set `DOCLING_SERVE_URL=http://localhost:5001` in `.env`, and start `docling-serve` with `DOCLING_DEVICE=mps`. The structure step will use that server. The later PDF tagging/writing step is still local CPU work.
-
-You can verify the effective runtime with:
-
-```bash
-cd backend
-PYTHONPATH=. uv run python scripts/runtime_diagnostics.py
-```
+Open http://localhost:5173. The frontend proxies `/api` and `/health` to the backend on port 8001.
 
 ## Docker
 
-A single-container deployment bundles all dependencies (Ghostscript, OCRmyPDF, Tesseract, Poppler, QPDF, Java, veraPDF) with the built frontend served by FastAPI.
+A single-container image bundles all system dependencies and serves the built frontend from FastAPI.
 
 ```bash
 cp .env.example .env
-# Edit .env with your GEMINI_API_KEY
-# Leave LLM_API_KEY empty unless you intentionally want a different
-# chat-completions credential than the Gemini Developer API key.
+# Set GEMINI_API_KEY
 
 docker compose up -d --build
 ```
 
-Open http://localhost:8080. Health check at `/health`.
+Open http://localhost:8080. Set `APP_PORT` in `.env` to use a different port.
 
-If port 8080 is in use, set `APP_PORT` in `.env`.
-
-You can also run the image directly without Compose:
+To run without Compose:
 
 ```bash
 docker build -t pdf-accessibility-app .
@@ -140,68 +94,101 @@ docker run -d \
   pdf-accessibility-app
 ```
 
-Notes:
-- The image preloads Docling models so there are no first-run downloads.
-- The intended Gemini-first deployment shape is:
-  `GEMINI_API_KEY=<key>`,
-  `LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`,
-  `LLM_API_KEY=` blank,
-  `LLM_MODEL=google/gemini-3-flash-preview`,
-  `GEMINI_MODEL=gemini-3-flash-preview`,
-  `USE_DIRECT_GEMINI_PDF=true`,
-  `GEMINI_DIRECT_THINKING_LEVEL=low`,
-  `GEMINI_DIRECT_ALT_TEXT_THINKING_LEVEL=medium`,
-  `ALT_TEXT_MAX_CONCURRENCY=8`, and
-  `ALT_TEXT_GLOBAL_MAX_CONCURRENCY=12`.
-- For subpath deployments, set `VITE_APP_BASE_PATH` before building (e.g., `/pdf-accessibility/`).
-- Tesseract language packs included: English, Spanish, French, German, Chinese (Simplified + Traditional), Russian, Arabic, Korean, Bengali, Polish, Hebrew, Yiddish, Haitian Creole, Hindi, Italian, Portuguese, Japanese. Add others by extending the Dockerfile.
+The image preloads Docling models so there are no first-run downloads. For subpath deployments (e.g., behind a reverse proxy), set `VITE_APP_BASE_PATH=/pdf-accessibility/` before building.
+
+Tesseract language packs included: English, Spanish, French, German, Chinese (Simplified and Traditional), Russian, Arabic, Korean, Bengali, Polish, Hebrew, Yiddish, Haitian Creole, Hindi, Italian, Portuguese, and Japanese. Add others by extending the Dockerfile.
+
+## Configuration
+
+Configure the app via `.env`. Key variables:
+
+| Variable | Description | Default |
+|---|---|---|
+| `GEMINI_API_KEY` | Google Gemini API key (required) | — |
+| `LLM_BASE_URL` | Chat-completions base URL | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| `LLM_API_KEY` | Optional chat-completions credential (falls back to `GEMINI_API_KEY`) | — |
+| `LLM_MODEL` | Chat-completions model identifier | `google/gemini-3-flash-preview` |
+| `GEMINI_MODEL` | Native Gemini model for direct PDF lanes | `gemini-3-flash-preview` |
+| `GEMINI_DIRECT_THINKING_LEVEL` | Thinking level for direct PDF semantic lanes | `low` |
+| `GEMINI_DIRECT_ALT_TEXT_THINKING_LEVEL` | Thinking level for figure semantics and alt text | `medium` |
+| `ALT_TEXT_MAX_CONCURRENCY` | Max concurrent alt-text requests per PDF | `8` |
+| `ALT_TEXT_GLOBAL_MAX_CONCURRENCY` | Process-wide cap for alt-text requests | `12` |
+| `DOCLING_SERVE_URL` | Remote `docling-serve` URL (falls back to local Docling when unset) | — |
+| `DOCLING_SERVE_TOKEN` | Bearer token for a protected `docling-serve` proxy | — |
+| `OCR_LANGUAGE` | Fallback Tesseract language code | `eng` |
+| `JOB_TTL_HOURS` | Hours before jobs expire | `12` |
+| `VERAPDF_PATH` | Path to the veraPDF binary | `verapdf` |
+| `GHOSTSCRIPT_PATH` | Path to the Ghostscript binary | `gs` |
+
+### Structure extraction with `docling-serve`
+
+Structure extraction is the slowest pipeline step. Running a persistent `docling-serve` process eliminates cold starts and enables GPU acceleration. Start it with:
+
+```bash
+DOCLING_DEVICE=mps docling-serve run --host 0.0.0.0 --port 5001
+```
+
+Then set `DOCLING_SERVE_URL=http://localhost:5001` in `.env`. Without `DOCLING_SERVE_URL`, the app falls back to local Docling on CPU.
+
+### OCR language detection
+
+The app auto-detects document language during classification and selects the matching Tesseract pack for OCR. Digital and mixed PDFs use [lingua-py](https://github.com/pemistahl/lingua-py) on the extracted text. Scanned PDFs probe OCR on page 1 with every installed language pack, then run lingua-py on the result. If no pack is installed for the detected language, the app falls back to `OCR_LANGUAGE`.
+
+On macOS, `brew install tesseract-lang` installs all packs. On Debian/Ubuntu, install individual packs with `apt install tesseract-ocr-<lang>`.
+
+## Pipeline
+
+Each upload runs through seven steps:
+
+1. **Classify** — Determine whether the PDF is digital, mixed, or scanned
+2. **OCR** — Add a searchable text layer to scanned pages
+3. **Structure** — Extract document structure via Docling, with LLM-assisted TOC enhancement
+4. **Alt Text** — Generate alt text for figures and reclassify misidentified elements
+5. **Tag** — Resolve ambiguous semantics (tables, forms, reading order) via LLM, then write PDF/UA tags deterministically
+6. **Validate** — Check PDF/UA-1 compliance with veraPDF
+7. **Fidelity** — Verify output faithfulness (text drift, reading order, table coverage, form labels)
 
 ## Project Structure
 
 ```
 backend/
   app/
-    api/              # FastAPI route handlers
-    pipeline/         # classify, ocr, structure, tag, validate, fidelity
-    services/         # semantic adjudication, storage, LLM client
-    models.py         # SQLAlchemy ORM models
-    config.py         # App settings
-  tests/              # Backend test suite
+    api/              FastAPI route handlers
+    pipeline/         Classify, OCR, structure, tag, validate, fidelity
+    services/         Semantic adjudication, storage, LLM client
+    models.py         SQLAlchemy ORM models
+    config.py         App settings
+  tests/
 
 frontend/
   src/
-    pages/            # Upload, Dashboard, JobDetail, Review
-    components/       # UI components
-    api/              # TanStack Query hooks
-    types/            # Shared TypeScript types
+    pages/            Upload, Dashboard, JobDetail, Review
+    components/
+    api/              TanStack Query hooks
+    types/
 
-data/                 # Runtime storage (git-ignored)
+data/                 Runtime storage (git-ignored)
 ```
 
-## Testing
+## Development
 
 ```bash
-# Backend
+# Backend tests
 cd backend
 PYTHONPATH=. uv run pytest tests -q
 
-# Frontend
+# Frontend lint and build
 cd frontend
 bun run lint
 bun run build
 ```
 
-## OCR Language Support
+Verify the effective runtime (LLM provider, Docling target, installed binaries) with:
 
-The app auto-detects the document language during classification and selects the appropriate Tesseract language pack for OCR. For digital/mixed PDFs, it extracts existing text and identifies the language with [lingua-py](https://github.com/pemistahl/lingua-py). For scanned PDFs, it runs a quick probe OCR on page 1 with all installed language packs, then identifies the language from the result.
-
-Language priority: **auto-detection > `OCR_LANGUAGE` env var default**.
-
-For local development, install Tesseract language packs via your package manager. On macOS, `brew install tesseract-lang` installs all languages. On Debian/Ubuntu, install individual packs (e.g., `apt install tesseract-ocr-spa`). If a language pack is missing, probe OCR falls back gracefully to the `OCR_LANGUAGE` default.
-
-## Session Model
-
-The app uses anonymous browser sessions — no login required. Each browser gets an HTTP-only session cookie, and all jobs are scoped to that session. Jobs expire after `JOB_TTL_HOURS` (default: 12 hours).
+```bash
+cd backend
+PYTHONPATH=. uv run python scripts/runtime_diagnostics.py
+```
 
 ## Documentation
 

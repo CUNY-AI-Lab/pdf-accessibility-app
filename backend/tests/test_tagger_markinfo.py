@@ -82,6 +82,53 @@ def _build_ocr_form_text_pdf(
     pdf.save(path)
 
 
+def _build_page_level_ocr_text_pdf(path: Path) -> None:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    font = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Font"),
+                "/Subtype": pikepdf.Name("/Type1"),
+                "/BaseFont": pikepdf.Name("/Helvetica"),
+            }
+        )
+    )
+    image = pdf.make_stream(bytes([255]))
+    image["/Type"] = pikepdf.Name("/XObject")
+    image["/Subtype"] = pikepdf.Name("/Image")
+    image["/Width"] = 1
+    image["/Height"] = 1
+    image["/ColorSpace"] = pikepdf.Name("/DeviceGray")
+    image["/BitsPerComponent"] = 8
+
+    page["/Resources"] = pikepdf.Dictionary({
+        "/Font": pikepdf.Dictionary({"/F1": font}),
+        "/XObject": pikepdf.Dictionary({"/Im0": image}),
+    })
+    page["/Contents"] = pdf.make_stream(
+        pikepdf.unparse_content_stream(
+            [
+                pikepdf.ContentStreamInstruction([], pikepdf.Operator("q")),
+                pikepdf.ContentStreamInstruction([200, 0, 0, 200, 0, 0], pikepdf.Operator("cm")),
+                pikepdf.ContentStreamInstruction([pikepdf.Name("/Im0")], pikepdf.Operator("Do")),
+                pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q")),
+                pikepdf.ContentStreamInstruction([], pikepdf.Operator("BT")),
+                pikepdf.ContentStreamInstruction([pikepdf.Name("/F1"), 12], pikepdf.Operator("Tf")),
+                pikepdf.ContentStreamInstruction([3], pikepdf.Operator("Tr")),
+                pikepdf.ContentStreamInstruction([1, 0, 0, 1, 20, 160], pikepdf.Operator("Tm")),
+                pikepdf.ContentStreamInstruction([pikepdf.String("Accessible Heading")], pikepdf.Operator("Tj")),
+                pikepdf.ContentStreamInstruction([1, 0, 0, 1, 20, 130], pikepdf.Operator("Tm")),
+                pikepdf.ContentStreamInstruction([pikepdf.String("First paragraph text")], pikepdf.Operator("Tj")),
+                pikepdf.ContentStreamInstruction([1, 0, 0, 1, 20, 110], pikepdf.Operator("Tm")),
+                pikepdf.ContentStreamInstruction([pikepdf.String("Second paragraph text")], pikepdf.Operator("Tj")),
+                pikepdf.ContentStreamInstruction([], pikepdf.Operator("ET")),
+            ]
+        )
+    )
+    pdf.save(path)
+
+
 def _build_source_alt_figure_pdf(path: Path) -> None:
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(200, 200))
@@ -281,6 +328,172 @@ async def test_tag_pdf_tags_transformed_ocr_form_xobject_text(tmp_path):
         assert form.get("/StructParents") is not None
         assert b"/H1" in form_stream
         assert b"/P" in form_stream
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_tags_page_level_ocr_text_object(tmp_path):
+    input_pdf = tmp_path / "page_level_ocr_text.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_page_level_ocr_text_pdf(input_pdf)
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "type": "heading",
+                    "level": 1,
+                    "text": "Accessible Heading",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 154, "r": 150, "t": 176},
+                },
+                {
+                    "type": "paragraph",
+                    "text": "First paragraph text",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 124, "r": 140, "t": 146},
+                },
+                {
+                    "type": "paragraph",
+                    "text": "Second paragraph text",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 104, "r": 150, "t": 126},
+                },
+            ],
+            "title": "Page OCR Text",
+        },
+        alt_texts=[],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        page = pdf.pages[0]
+        struct_types = _collect_struct_types(pdf.Root["/StructTreeRoot"])
+        stream = bytes(page.Contents.read_bytes())
+
+        assert "/H1" in struct_types
+        assert struct_types.count("/P") == 2
+        assert "/Figure" not in struct_types
+        assert page.get("/Tabs") == pikepdf.Name("/S")
+        assert page.get("/StructParents") is not None
+        assert b"/H1" in stream
+        assert stream.count(b"/P") >= 2
+        assert b"/Artifact" in stream
+        assert b"/Im0 Do" in stream
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_tags_clipped_scan_figure_when_alt_is_available(tmp_path):
+    input_pdf = tmp_path / "page_level_ocr_text.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_page_level_ocr_text_pdf(input_pdf)
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "type": "heading",
+                    "level": 1,
+                    "text": "Accessible Heading",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 154, "r": 150, "t": 176},
+                },
+                {
+                    "type": "paragraph",
+                    "text": "First paragraph text",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 124, "r": 140, "t": 146},
+                },
+                {
+                    "type": "paragraph",
+                    "text": "Second paragraph text",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 104, "r": 150, "t": 126},
+                },
+                {
+                    "type": "figure",
+                    "figure_index": 0,
+                    "page": 0,
+                    "bbox": {"l": 80, "b": 40, "r": 150, "t": 90},
+                },
+            ],
+            "title": "Page OCR Text",
+        },
+        alt_texts=[
+            {
+                "figure_index": 0,
+                "text": "Gray scan figure region.",
+                "status": "approved",
+            }
+        ],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        page = pdf.pages[0]
+        struct_types = _collect_struct_types(pdf.Root["/StructTreeRoot"])
+        figure = _first_struct_elem(pdf.Root["/StructTreeRoot"], "Figure")
+        stream = bytes(page.Contents.read_bytes())
+
+        assert "/Figure" in struct_types
+        assert figure is not None
+        assert str(figure.get("/Alt")) == "Gray scan figure region."
+        assert b"/Figure" in stream
+        assert b"/Im0 Do" in stream
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_does_not_create_clipped_scan_figure_without_alt_text(tmp_path):
+    input_pdf = tmp_path / "page_level_ocr_text.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_page_level_ocr_text_pdf(input_pdf)
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "type": "heading",
+                    "level": 1,
+                    "text": "Accessible Heading",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 154, "r": 150, "t": 176},
+                },
+                {
+                    "type": "paragraph",
+                    "text": "First paragraph text",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 124, "r": 140, "t": 146},
+                },
+                {
+                    "type": "paragraph",
+                    "text": "Second paragraph text",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 104, "r": 150, "t": 126},
+                },
+                {
+                    "type": "figure",
+                    "figure_index": 0,
+                    "page": 0,
+                    "bbox": {"l": 80, "b": 40, "r": 150, "t": 90},
+                },
+            ],
+            "title": "Page OCR Text",
+        },
+        alt_texts=[],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        struct_types = _collect_struct_types(pdf.Root["/StructTreeRoot"])
+        assert "/Figure" not in struct_types
 
 
 @pytest.mark.asyncio
