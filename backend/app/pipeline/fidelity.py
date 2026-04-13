@@ -118,6 +118,38 @@ def _normalize_dense_text(value: str | None) -> str:
     return _normalize_text(value).replace(" ", "")
 
 
+def _output_struct_type_counts(pdf_path: Path) -> dict[str, int] | None:
+    """Count actual StructElem types in the remediated PDF, when available."""
+    try:
+        with pikepdf.Pdf.open(pdf_path) as pdf:
+            struct_root = pdf.Root.get("/StructTreeRoot")
+            if not isinstance(struct_root, pikepdf.Dictionary):
+                return None
+
+            counts: dict[str, int] = {}
+
+            def walk(node: Any) -> None:
+                if isinstance(node, pikepdf.Dictionary):
+                    struct_type = node.get("/S")
+                    if struct_type is not None:
+                        normalized = str(struct_type)
+                        if normalized.startswith("/"):
+                            normalized = normalized[1:]
+                        counts[normalized] = counts.get(normalized, 0) + 1
+                    kids = node.get("/K")
+                    if kids is not None:
+                        walk(kids)
+                elif isinstance(node, pikepdf.Array):
+                    for child in node:
+                        walk(child)
+
+            walk(struct_root.get("/K"))
+            return counts
+    except Exception:
+        logger.debug("Could not inspect output structure tree for %s", pdf_path, exc_info=True)
+        return None
+
+
 def _strip_subset_prefix(value: str | None) -> str:
     raw = str(value or "").strip().lstrip("/")
     if FONT_SUBSET_RE.match(raw):
@@ -972,6 +1004,8 @@ def assess_fidelity(
         if metadata:
             existing.setdefault("metadata", {}).update(metadata)
 
+    output_struct_counts = _output_struct_type_counts(output_pdf)
+
     violations = validation_report.get("violations", [])
     unresolved_errors = [
         violation
@@ -1454,6 +1488,8 @@ def assess_fidelity(
     tagged_figure_count = (
         tagged_figures_raw if isinstance(tagged_figures_raw, int) and tagged_figures_raw >= 0 else 0
     )
+    if output_struct_counts is not None:
+        tagged_figure_count = max(0, output_struct_counts.get("Figure", 0))
     decorative_figure_count = (
         decorative_figures_raw
         if isinstance(decorative_figures_raw, int) and decorative_figures_raw >= 0
@@ -1520,6 +1556,8 @@ def assess_fidelity(
     tagged_table_count = (
         tagged_tables if isinstance(tagged_tables, int) and tagged_tables >= 0 else 0
     )
+    if output_struct_counts is not None:
+        tagged_table_count = max(0, output_struct_counts.get("Table", 0))
     if table_count > 0:
         coverage = tagged_table_count / table_count
         status = "pass" if tagged_table_count >= table_count else "warning"

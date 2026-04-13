@@ -19,6 +19,7 @@ def test_filter_user_visible_review_tasks_keeps_only_legible_follow_up_types():
     assert [task["task_type"] for task in filtered] == [
         "annotation_description",
         "alt_text",
+        "table_semantics",
     ]
 
 
@@ -26,7 +27,7 @@ def test_user_visible_review_task_types_match_product_surface():
     assert is_user_visible_review_task_type("annotation_description") is True
     assert is_user_visible_review_task_type("alt_text") is True
     assert is_user_visible_review_task_type("reading_order") is False
-    assert is_user_visible_review_task_type("table_semantics") is False
+    assert is_user_visible_review_task_type("table_semantics") is True
     assert is_user_visible_review_task_type("form_semantics") is False
 
 

@@ -69,10 +69,14 @@ async def test_list_review_tasks_returns_only_user_visible_follow_up_tasks():
             session=_session("session-1-token-value"),
         )
 
-        assert len(tasks) == 1
-        assert tasks[0].task_type == "annotation_description"
-        assert tasks[0].blocking is False
-        assert tasks[0].metadata["pages_to_check"] == [3]
+        assert [task.task_type for task in tasks] == [
+            "table_semantics",
+            "annotation_description",
+        ]
+        assert tasks[0].blocking is True
+        assert tasks[0].metadata["table_review_targets"] == [{"page": 8}]
+        assert tasks[1].blocking is False
+        assert tasks[1].metadata["pages_to_check"] == [3]
 
     await engine.dispose()
 

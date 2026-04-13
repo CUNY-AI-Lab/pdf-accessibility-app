@@ -1253,6 +1253,50 @@ def test_fidelity_flags_high_risk_complex_tables(monkeypatch):
     assert task["metadata"]["table_review_targets"][0]["table_review_id"] == "review-0"
 
 
+def test_fidelity_uses_output_struct_tree_for_table_coverage(monkeypatch):
+    monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
+    monkeypatch.setattr(fidelity, "_output_struct_type_counts", lambda path: {"Document": 1})
+    monkeypatch.setattr(fidelity, "_sample_visual_ink", lambda path: {
+        "sampled_pages": 1,
+        "pages_with_visible_ink": 1,
+        "mean_ink_ratio": 0.01,
+        "max_ink_ratio": 0.01,
+        "visually_blank": False,
+    })
+
+    report, tasks = assess_fidelity(
+        input_pdf=Path("in.pdf"),
+        output_pdf=Path("out.pdf"),
+        structure_json={
+            "elements": [
+                {
+                    "type": "table",
+                    "page": 0,
+                    "bbox": {"l": 72, "t": 700, "r": 520, "b": 200},
+                    "num_rows": 2,
+                    "num_cols": 2,
+                    "cells": [
+                        {"row": 0, "col": 0, "text": "Header", "is_header": True},
+                        {"row": 1, "col": 0, "text": "Value"},
+                    ],
+                }
+            ],
+        },
+        alt_entries=[],
+        validation_report=_validation_report(compliant=True, violations=[]),
+        tagging_metrics={"tables_tagged": 1},
+        classification="digital",
+    )
+
+    table_check = next(check for check in report["checks"] if check["check"] == "table_coverage")
+    assert report["passed"] is False
+    assert table_check["status"] == "warning"
+    assert table_check["metrics"]["tagged_tables"] == 0
+    task = next(task for task in tasks if task["task_type"] == "table_semantics")
+    assert task["blocking"] is True
+    assert task["metadata"]["tagged_tables"] == 0
+
+
 def test_fidelity_blocks_when_detected_figures_are_not_tagged(monkeypatch):
     monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
     monkeypatch.setattr(fidelity, "_sample_visual_ink", lambda path: {

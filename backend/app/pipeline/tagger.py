@@ -1171,6 +1171,110 @@ def _table_has_consistent_column_count(cells: list[dict]) -> bool:
     return min(widths) == max(widths)
 
 
+def _complete_table_grid_cells(
+    cells: Any,
+    *,
+    num_rows: int,
+    num_cols: int,
+) -> list[dict]:
+    """Return explicit table cells plus empty TD placeholders for uncovered slots."""
+    if not isinstance(cells, list):
+        return []
+    if num_rows <= 0 or num_cols <= 0:
+        return []
+
+    normalized: list[dict] = []
+    for cell in cells:
+        if not isinstance(cell, dict):
+            continue
+        row = _as_positive_int(cell.get("row", 0), default=0)
+        col = _as_positive_int(cell.get("col", 0), default=0)
+        row_span = _as_positive_int(cell.get("row_span", 1), default=1)
+        col_span = _as_positive_int(cell.get("col_span", 1), default=1)
+        if row >= num_rows or col >= num_cols:
+            continue
+        normalized.append(dict(cell, row=row, col=col, row_span=row_span, col_span=col_span))
+
+    rows: dict[int, list[dict]] = {}
+    covered_by_rowspans: dict[int, set[int]] = {row: set() for row in range(num_rows)}
+    for cell in normalized:
+        row = _as_positive_int(cell.get("row", 0), default=0)
+        col = _as_positive_int(cell.get("col", 0), default=0)
+        if row >= num_rows or col >= num_cols:
+            continue
+        row_span = min(_as_positive_int(cell.get("row_span", 1), default=1), num_rows - row)
+        col_span = min(_as_positive_int(cell.get("col_span", 1), default=1), num_cols - col)
+        cell["row_span"] = row_span
+        cell["col_span"] = col_span
+        rows.setdefault(row, []).append(cell)
+        for span_row in range(row + 1, row + row_span):
+            covered_by_rowspans.setdefault(span_row, set()).update(range(col, col + col_span))
+
+    completed: list[dict] = []
+    for row in range(num_rows):
+        occupied = set(covered_by_rowspans.get(row, set()))
+        row_cells = sorted(rows.get(row, []), key=lambda item: _as_positive_int(item.get("col", 0), default=0))
+        for cell in row_cells:
+            col = _as_positive_int(cell.get("col", 0), default=0)
+            col_span = min(_as_positive_int(cell.get("col_span", 1), default=1), num_cols - col)
+            occupied.update(range(col, col + col_span))
+            completed.append(cell)
+        for col in range(num_cols):
+            if col in occupied:
+                continue
+            completed.append({
+                "row": row,
+                "col": col,
+                "row_span": 1,
+                "col_span": 1,
+                "text": "",
+                "is_header": False,
+                "_generated_empty": True,
+            })
+            occupied.add(col)
+
+    return sorted(
+        completed,
+        key=lambda item: (
+            _as_positive_int(item.get("row", 0), default=0),
+            _as_positive_int(item.get("col", 0), default=0),
+        ),
+    )
+
+
+def _clean_table_summary_text(value: Any) -> str:
+    return " ".join(str(value or "").split()).strip()[:500]
+
+
+def _table_summary_text(table_data: dict, *, num_rows: int, num_cols: int) -> str:
+    """Build a factual table summary from explicit extraction metadata."""
+    candidates = [
+        table_data.get("table_summary"),
+        table_data.get("summary"),
+    ]
+    if bool(table_data.get("table_llm_confirmed")):
+        candidates.append(table_data.get("table_llm_summary"))
+    candidates.append(table_data.get("caption"))
+
+    content_summary = ""
+    for candidate in candidates:
+        content_summary = _clean_table_summary_text(candidate)
+        if content_summary:
+            break
+
+    dimensions_summary = ""
+    if num_rows > 0 and num_cols > 0:
+        row_label = "row" if num_rows == 1 else "rows"
+        col_label = "column" if num_cols == 1 else "columns"
+        dimensions_summary = f"Table with {num_rows} {row_label} and {num_cols} {col_label}."
+
+    if content_summary and dimensions_summary:
+        if content_summary.lower().startswith("table with "):
+            return content_summary
+        return f"{dimensions_summary} {content_summary}"
+    return content_summary or dimensions_summary
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Content region extraction — positions from content streams
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1204,6 +1308,16 @@ class TextShowRun:
     bbox: dict[str, float]
     text: str = ""
     render_mode: int = 0
+
+
+@dataclass(frozen=True)
+class TableCellRunAssignment:
+    """A text-showing run assigned to a detected table cell."""
+
+    table_elem_idx: int
+    row: int
+    col: int
+    cell: dict
 
 
 @dataclass
@@ -1585,16 +1699,127 @@ def _assign_text_show_runs_to_elements(
     return assignments
 
 
+def _fragmented_table_element_indices(elements: list[dict]) -> set[int]:
+    return {
+        idx
+        for idx, elem in enumerate(elements)
+        if elem.get("type") == "table"
+        and isinstance(elem.get("bbox"), dict)
+        and isinstance(elem.get("cells"), list)
+        and elem.get("cells")
+    }
+
+
+def _table_cell_bbox(table: dict, cell: dict) -> dict[str, float] | None:
+    table_bbox = table.get("bbox")
+    if not isinstance(table_bbox, dict):
+        return None
+    num_rows = _as_positive_int(table.get("num_rows", 0), default=0)
+    num_cols = _as_positive_int(table.get("num_cols", 0), default=0)
+    if num_rows <= 0 or num_cols <= 0:
+        return None
+
+    left = _safe_float(table_bbox.get("l"))
+    bottom = _safe_float(table_bbox.get("b"))
+    right = _safe_float(table_bbox.get("r"))
+    top = _safe_float(table_bbox.get("t"))
+    if right <= left or top <= bottom:
+        return None
+
+    row = _as_positive_int(cell.get("row", 0), default=0)
+    col = _as_positive_int(cell.get("col", 0), default=0)
+    row_span = _as_positive_int(cell.get("row_span", 1), default=1)
+    col_span = _as_positive_int(cell.get("col_span", 1), default=1)
+    if row >= num_rows or col >= num_cols:
+        return None
+
+    row_h = (top - bottom) / num_rows
+    col_w = (right - left) / num_cols
+    return {
+        "l": left + col * col_w,
+        "r": left + min(num_cols, col + col_span) * col_w,
+        "t": top - row * row_h,
+        "b": top - min(num_rows, row + row_span) * row_h,
+    }
+
+
+def _table_cell_text_score(run_text: str, cell_text: str) -> float:
+    run_norm = _normalize_text(run_text)
+    cell_norm = _normalize_text(cell_text)
+    if not run_norm or not cell_norm:
+        return 0.0
+    if run_norm in cell_norm:
+        return 1.0
+    return _text_similarity(run_norm, cell_norm)
+
+
+def _assign_text_show_runs_to_table_cells(
+    runs: list[TextShowRun],
+    elements: list[dict],
+) -> dict[int, TableCellRunAssignment]:
+    """Assign OCR word runs inside detected table bboxes to inferred table cells."""
+    table_element_indices = _fragmented_table_element_indices(elements)
+    table_targets: list[tuple[int, dict, dict, dict[str, float]]] = []
+    for elem_idx, table in enumerate(elements):
+        if elem_idx not in table_element_indices:
+            continue
+        for cell in table.get("cells", []):
+            if not isinstance(cell, dict):
+                continue
+            cell_bbox = _table_cell_bbox(table, cell)
+            if cell_bbox is None:
+                continue
+            table_targets.append((elem_idx, table, cell, cell_bbox))
+
+    if not runs or not table_targets:
+        return {}
+
+    assignments: dict[int, TableCellRunAssignment] = {}
+    for run_idx, run in enumerate(runs):
+        best: tuple[int, dict, dict, dict[str, float]] | None = None
+        best_score = -1.0
+        for elem_idx, table, cell, cell_bbox in table_targets:
+            point_inside = _point_in_bbox(run.cx, run.cy, cell_bbox, margin=3.0)
+            relaxed_overlap = _bbox_intersection(_expand_bbox(run.bbox, 1.0), cell_bbox)
+            if not point_inside and relaxed_overlap <= 0:
+                continue
+
+            spatial = max(
+                _containment_ratio(run.bbox, cell_bbox),
+                _bbox_iou(run.bbox, cell_bbox),
+                _distance_score(run.bbox, cell_bbox),
+            )
+            text = _table_cell_text_score(run.text, str(cell.get("text") or ""))
+            score = (1.0 if point_inside else 0.0) + 0.65 * spatial + 0.25 * text
+            if score > best_score:
+                best_score = score
+                best = (elem_idx, table, cell, cell_bbox)
+
+        if best is None:
+            continue
+        elem_idx, _table, cell, _cell_bbox = best
+        assignments[run_idx] = TableCellRunAssignment(
+            table_elem_idx=elem_idx,
+            row=_as_positive_int(cell.get("row", 0), default=0),
+            col=_as_positive_int(cell.get("col", 0), default=0),
+            cell=cell,
+        )
+
+    return assignments
+
+
 def _should_use_fragmented_text_rewrite(
     *,
     elements: list[dict],
     normal_matches: dict[int, int],
     text_run_assignments: dict[int, int],
+    table_cell_assignments: dict[int, TableCellRunAssignment] | None = None,
 ) -> bool:
     """Decide whether fine-grained OCR text anchors beat coarse region matching."""
     eligible_element_indices = {
         idx for idx, _elem in _eligible_fragmented_text_elements(elements)
     }
+    eligible_element_indices.update(_fragmented_table_element_indices(elements))
     if len(eligible_element_indices) < FRAGMENTED_TEXT_MIN_ELEMENTS:
         return False
 
@@ -1608,11 +1833,19 @@ def _should_use_fragmented_text_rewrite(
         for elem_idx in text_run_assignments.values()
         if elem_idx in eligible_element_indices
     }
+    if table_cell_assignments:
+        fragmented_matched.update(
+            assignment.table_elem_idx
+            for assignment in table_cell_assignments.values()
+            if assignment.table_elem_idx in eligible_element_indices
+        )
     if len(fragmented_matched) < FRAGMENTED_TEXT_MIN_ELEMENTS:
         return False
 
     assigned_ratio = len(fragmented_matched) / max(len(eligible_element_indices), 1)
     gained = len(fragmented_matched) - len(normally_matched)
+    if table_cell_assignments and fragmented_matched and assigned_ratio >= FRAGMENTED_TEXT_MIN_ASSIGNED_RATIO:
+        return True
     return (
         gained >= FRAGMENTED_TEXT_MIN_COVERAGE_GAIN
         and assigned_ratio >= FRAGMENTED_TEXT_MIN_ASSIGNED_RATIO
@@ -2149,6 +2382,7 @@ class StructTreeBuilder:
         self._list_cache: dict[str, tuple[pikepdf.Object, pikepdf.Object | None]] = {}
         self._note_counter = 0
         self._table_counter = 0
+        self._fragmented_table_cache: dict[int, dict[tuple[int, int], pikepdf.Object]] = {}
         self._toc_cache: dict[str, pikepdf.Object] = {}
 
     def setup(self):
@@ -2479,20 +2713,29 @@ class StructTreeBuilder:
         self._table_counter += 1
         table_n = self._table_counter
         owner = stream_owner or page_ref
+        num_rows = _as_positive_int(table_data.get("num_rows", 0), default=0)
+        num_cols = _as_positive_int(table_data.get("num_cols", 0), default=0)
 
-        table_elem = self.pdf.make_indirect(pikepdf.Dictionary({
+        table_elem_dict: dict = {
             "/Type": pikepdf.Name("/StructElem"),
             "/S": pikepdf.Name("/Table"),
             "/P": self.doc_elem,
             "/K": pikepdf.Array([]),
-        }))
+        }
+        table_summary = _table_summary_text(table_data, num_rows=num_rows, num_cols=num_cols)
+        if table_summary:
+            table_elem_dict["/A"] = pikepdf.Dictionary({
+                "/O": pikepdf.Name("/Table"),
+                "/Summary": pikepdf.String(table_summary),
+            })
+        table_elem = self.pdf.make_indirect(pikepdf.Dictionary(table_elem_dict))
         self._append_child(self.doc_elem, table_elem)
         self._struct_elems_created += 1
 
-        cells = table_data.get("cells", [])
-        num_rows = table_data.get("num_rows", 0)
+        raw_cells = table_data.get("cells", [])
+        cells = _complete_table_grid_cells(raw_cells, num_rows=num_rows, num_cols=num_cols)
 
-        if not cells or num_rows == 0 or not _table_has_consistent_column_count(cells):
+        if not cells:
             mcid = self._alloc_mcid(owner)
             table_elem["/K"] = self._make_mcr(mcid, page_ref, stream_owner=stream_owner)
             self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=table_elem)
@@ -2593,6 +2836,148 @@ class StructTreeBuilder:
                     )
 
         return first_mcid if first_mcid is not None else 0
+
+    def _ensure_fragmented_table(
+        self,
+        table_data: dict,
+    ) -> dict[tuple[int, int], pikepdf.Object]:
+        """Create a Table/TR/TH/TD skeleton for fragmented OCR cell MCRs."""
+        table_key = id(table_data)
+        cached = self._fragmented_table_cache.get(table_key)
+        if cached is not None:
+            return cached
+
+        num_rows = _as_positive_int(table_data.get("num_rows", 0), default=0)
+        num_cols = _as_positive_int(table_data.get("num_cols", 0), default=0)
+        raw_cells = table_data.get("cells", [])
+        cells = _complete_table_grid_cells(raw_cells, num_rows=num_rows, num_cols=num_cols)
+        if not cells:
+            self._fragmented_table_cache[table_key] = {}
+            return {}
+
+        self._table_counter += 1
+        table_n = self._table_counter
+        table_elem_dict: dict = {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Table"),
+            "/P": self.doc_elem,
+            "/K": pikepdf.Array([]),
+        }
+        table_summary = _table_summary_text(table_data, num_rows=num_rows, num_cols=num_cols)
+        if table_summary:
+            table_elem_dict["/A"] = pikepdf.Dictionary({
+                "/O": pikepdf.Name("/Table"),
+                "/Summary": pikepdf.String(table_summary),
+            })
+        table_elem = self.pdf.make_indirect(pikepdf.Dictionary(table_elem_dict))
+        self._append_child(self.doc_elem, table_elem)
+        self._struct_elems_created += 1
+
+        rows: dict[int, list[dict]] = {}
+        for cell in cells:
+            row_idx = _as_positive_int(cell.get("row", 0), default=0)
+            rows.setdefault(row_idx, []).append(cell)
+
+        cell_structs: dict[tuple[int, int], pikepdf.Object] = {}
+        th_info: list[tuple[int, int, int, int, str]] = []
+        td_info: list[tuple[int, int, pikepdf.Object]] = []
+
+        for row_idx in sorted(rows.keys()):
+            row_elem = self.pdf.make_indirect(pikepdf.Dictionary({
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/TR"),
+                "/P": table_elem,
+                "/K": pikepdf.Array([]),
+            }))
+            table_elem["/K"].append(row_elem)
+            self._struct_elems_created += 1
+
+            for cell in sorted(rows[row_idx], key=lambda c: c.get("col", 0)):
+                col_idx = _as_positive_int(cell.get("col", 0), default=0)
+                cell_type = "TH" if cell.get("is_header", False) else "TD"
+                cell_elem_dict: dict = {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name(f"/{cell_type}"),
+                    "/P": row_elem,
+                    "/K": pikepdf.Array([]),
+                }
+                attrs = pikepdf.Dictionary({"/O": pikepdf.Name("/Table")})
+                row_span = _as_positive_int(cell.get("row_span", 1), default=1)
+                col_span = _as_positive_int(cell.get("col_span", 1), default=1)
+                if row_span > 1:
+                    attrs["/RowSpan"] = row_span
+                if col_span > 1:
+                    attrs["/ColSpan"] = col_span
+
+                if cell_type == "TH":
+                    scope = "/Column"
+                    if bool(cell.get("row_header", False)):
+                        scope = "/Row"
+                    elif bool(cell.get("column_header", False)):
+                        scope = "/Column"
+                    elif col_idx == 0:
+                        scope = "/Row"
+                    attrs["/Scope"] = pikepdf.Name(scope)
+                    cell_id = f"t{table_n}-r{row_idx}-c{col_idx}"
+                    cell_elem_dict["/ID"] = pikepdf.String(cell_id)
+                    th_info.append((row_idx, col_idx, row_span, col_span, cell_id))
+
+                if len(attrs) > 1:
+                    cell_elem_dict["/A"] = attrs
+
+                cell_elem = self.pdf.make_indirect(pikepdf.Dictionary(cell_elem_dict))
+                row_elem["/K"].append(cell_elem)
+                cell_structs[(row_idx, col_idx)] = cell_elem
+                self._struct_elems_created += 1
+
+                if cell_type == "TD":
+                    td_info.append((row_idx, col_idx, cell_elem))
+
+        if th_info and td_info:
+            for td_row, td_col, td_elem in td_info:
+                header_ids: list[str] = []
+                for th_row, th_col, th_rspan, th_cspan, th_id in th_info:
+                    if th_col <= td_col < th_col + th_cspan and th_row + th_rspan <= td_row:
+                        header_ids.append(th_id)
+                    elif th_row <= td_row < th_row + th_rspan and th_col + th_cspan <= td_col:
+                        header_ids.append(th_id)
+                if header_ids:
+                    td_attrs = td_elem.get("/A")
+                    if td_attrs is None:
+                        td_attrs = pikepdf.Dictionary({"/O": pikepdf.Name("/Table")})
+                        td_elem["/A"] = td_attrs
+                    td_attrs["/Headers"] = pikepdf.Array(
+                        [pikepdf.String(h) for h in header_ids],
+                    )
+
+        self._fragmented_table_cache[table_key] = cell_structs
+        return cell_structs
+
+    def add_table_cell_fragment(
+        self,
+        page_index: int,
+        page_ref: pikepdf.Object,
+        table_data: dict,
+        cell: dict,
+        *,
+        stream_owner: pikepdf.Object | None = None,
+    ) -> tuple[str, int] | None:
+        """Append one fragmented OCR marked-content run to a table cell."""
+        cell_structs = self._ensure_fragmented_table(table_data)
+        row_idx = _as_positive_int(cell.get("row", 0), default=0)
+        col_idx = _as_positive_int(cell.get("col", 0), default=0)
+        cell_elem = cell_structs.get((row_idx, col_idx))
+        if cell_elem is None:
+            return None
+
+        mcid = self.add_mcr_to_struct_elem(
+            cell_elem,
+            page_index,
+            page_ref,
+            stream_owner=stream_owner,
+        )
+        tag = "TH" if cell.get("is_header", False) else "TD"
+        return tag, mcid
 
     def add_list_item(
         self,
@@ -3135,12 +3520,24 @@ def _rewrite_content_stream_with_fragmented_text(
     regions: list[ContentRegion],
     text_runs: list[TextShowRun],
     text_run_assignments: dict[int, int],
+    table_cell_assignments: dict[int, TableCellRunAssignment],
     stream_owner: pikepdf.Object | None = None,
 ) -> set[int]:
     """Rewrite a stream using word-level OCR text anchors when BT blocks are giant."""
-    mark_by_idx: dict[int, int] = {}
+    table_cell_mark_lookup: dict[tuple[str, int, int, int], TableCellRunAssignment] = {}
+    mark_by_idx: dict[int, int | tuple[str, int, int, int]] = {}
     for run_idx, run in enumerate(text_runs):
-        mark = text_run_assignments.get(run_idx, FRAGMENTED_TEXT_MARK_ARTIFACT)
+        table_assignment = table_cell_assignments.get(run_idx)
+        if table_assignment is not None:
+            mark = (
+                "table_cell",
+                table_assignment.table_elem_idx,
+                table_assignment.row,
+                table_assignment.col,
+            )
+            table_cell_mark_lookup[mark] = table_assignment
+        else:
+            mark = text_run_assignments.get(run_idx, FRAGMENTED_TEXT_MARK_ARTIFACT)
         for idx in range(run.segment_start_idx, run.segment_end_idx):
             mark_by_idx[idx] = mark
 
@@ -3175,7 +3572,7 @@ def _rewrite_content_stream_with_fragmented_text(
     matched_element_indices.update(decorative_covered)
 
     new_instructions = []
-    active_mark: int | None = None
+    active_mark: int | tuple[str, int, int, int] | None = None
 
     def close_active() -> None:
         nonlocal active_mark
@@ -3190,6 +3587,25 @@ def _rewrite_content_stream_with_fragmented_text(
             if mark == FRAGMENTED_TEXT_MARK_ARTIFACT:
                 new_instructions.append(_make_bmc_artifact())
                 active_mark = mark
+            elif isinstance(mark, tuple) and mark[0] == "table_cell":
+                assignment = table_cell_mark_lookup.get(mark)
+                allocated = None
+                if assignment is not None and 0 <= assignment.table_elem_idx < len(elements):
+                    allocated = builder.add_table_cell_fragment(
+                        page_index,
+                        page_ref,
+                        elements[assignment.table_elem_idx],
+                        assignment.cell,
+                        stream_owner=stream_owner,
+                    )
+                if allocated is None:
+                    new_instructions.append(_make_bmc_artifact())
+                    active_mark = FRAGMENTED_TEXT_MARK_ARTIFACT
+                else:
+                    tag, mcid = allocated
+                    new_instructions.append(_make_bdc(tag, mcid))
+                    matched_element_indices.add(assignment.table_elem_idx)
+                    active_mark = mark
             elif mark is not None and 0 <= mark < len(elements):
                 allocated = _allocate_fragment_mcid(
                     builder,
@@ -3277,10 +3693,12 @@ def _rewrite_content_stream(
     )
     text_runs = _extract_text_show_runs(instructions, initial_ctm=initial_ctm)
     text_run_assignments = _assign_text_show_runs_to_elements(text_runs, elements)
+    table_cell_assignments = _assign_text_show_runs_to_table_cells(text_runs, elements)
     if _should_use_fragmented_text_rewrite(
         elements=elements,
         normal_matches=matches,
         text_run_assignments=text_run_assignments,
+        table_cell_assignments=table_cell_assignments,
     ):
         return _rewrite_content_stream_with_fragmented_text(
             pdf,
@@ -3295,6 +3713,7 @@ def _rewrite_content_stream(
             regions=regions,
             text_runs=text_runs,
             text_run_assignments=text_run_assignments,
+            table_cell_assignments=table_cell_assignments,
             stream_owner=stream_owner,
         )
     matched_element_indices = set(matches.values())

@@ -3,7 +3,13 @@ from pathlib import Path
 import pikepdf
 import pytest
 
-from app.pipeline.tagger import ContentRegion, _emit_tagged_region, tag_pdf
+from app.pipeline.tagger import (
+    ContentRegion,
+    _complete_table_grid_cells,
+    _emit_tagged_region,
+    _table_summary_text,
+    tag_pdf,
+)
 from tests.fixtures import TEST_SAMPLE_PDF
 
 
@@ -127,6 +133,47 @@ def _build_page_level_ocr_text_pdf(path: Path) -> None:
         )
     )
     pdf.save(path)
+
+
+def test_complete_table_grid_cells_requires_explicit_dimensions():
+    cells = [{"row": 0, "col": 0, "text": "Header", "is_header": True}]
+
+    assert _complete_table_grid_cells(cells, num_rows=0, num_cols=1) == []
+    assert _complete_table_grid_cells(cells, num_rows=1, num_cols=0) == []
+
+
+def test_complete_table_grid_cells_adds_empty_placeholders_only():
+    cells = [
+        {"row": 0, "col": 0, "text": "Header", "is_header": True},
+        {"row": 1, "col": 1, "text": "Value"},
+    ]
+
+    completed = _complete_table_grid_cells(cells, num_rows=2, num_cols=2)
+
+    assert len(completed) == 4
+    placeholders = [cell for cell in completed if cell.get("_generated_empty")]
+    assert placeholders == [
+        {"row": 0, "col": 1, "row_span": 1, "col_span": 1, "text": "", "is_header": False, "_generated_empty": True},
+        {"row": 1, "col": 0, "row_span": 1, "col_span": 1, "text": "", "is_header": False, "_generated_empty": True},
+    ]
+    assert any(cell["text"] == "Header" and cell["is_header"] is True for cell in completed)
+    assert any(cell["text"] == "Value" for cell in completed)
+
+
+def test_table_summary_uses_confirmed_summary_then_dimension_fallback():
+    assert (
+        _table_summary_text(
+            {
+                "caption": "Ignored caption",
+                "table_llm_confirmed": True,
+                "table_llm_summary": "Confirmed table purpose.",
+            },
+            num_rows=2,
+            num_cols=3,
+        )
+        == "Table with 2 rows and 3 columns. Confirmed table purpose."
+    )
+    assert _table_summary_text({}, num_rows=1, num_cols=1) == "Table with 1 row and 1 column."
 
 
 def _build_source_alt_figure_pdf(path: Path) -> None:
@@ -382,6 +429,86 @@ async def test_tag_pdf_tags_page_level_ocr_text_object(tmp_path):
         assert stream.count(b"/P") >= 2
         assert b"/Artifact" in stream
         assert b"/Im0 Do" in stream
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_tags_page_level_ocr_table_cells(tmp_path):
+    input_pdf = tmp_path / "page_level_ocr_table.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_page_level_ocr_text_pdf(input_pdf)
+
+    result = await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "type": "heading",
+                    "level": 1,
+                    "text": "Accessible Heading",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 154, "r": 150, "t": 176},
+                },
+                {
+                    "type": "table",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 100, "r": 190, "t": 150},
+                    "num_rows": 2,
+                    "num_cols": 2,
+                    "cells": [
+                        {
+                            "row": 0,
+                            "col": 0,
+                            "text": "First paragraph text",
+                            "is_header": True,
+                            "column_header": True,
+                            "row_span": 1,
+                            "col_span": 1,
+                        },
+                        {
+                            "row": 0,
+                            "col": 1,
+                            "text": "Sparse header",
+                            "is_header": True,
+                            "column_header": True,
+                            "row_span": 1,
+                            "col_span": 1,
+                        },
+                        {
+                            "row": 1,
+                            "col": 0,
+                            "text": "Second paragraph text",
+                            "is_header": False,
+                            "row_span": 1,
+                            "col_span": 1,
+                        },
+                    ],
+                },
+            ],
+            "title": "Page OCR Table",
+        },
+        alt_texts=[],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        page = pdf.pages[0]
+        struct_root = pdf.Root["/StructTreeRoot"]
+        struct_types = _collect_struct_types(struct_root)
+        table = _first_struct_elem(struct_root, "Table")
+        stream = bytes(page.Contents.read_bytes())
+
+        assert result.tables_tagged == 1
+        assert table is not None
+        assert str(table["/A"]["/Summary"]) == "Table with 2 rows and 2 columns."
+        assert "/Table" in struct_types
+        assert "/TR" in struct_types
+        assert "/TH" in struct_types
+        assert "/TD" in struct_types
+        assert b"/TH" in stream
+        assert b"/TD" in stream
+        assert page.get("/Tabs") == pikepdf.Name("/S")
 
 
 @pytest.mark.asyncio
