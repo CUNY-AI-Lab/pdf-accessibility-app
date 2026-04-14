@@ -94,7 +94,10 @@ def _extract_native_toc_from_pdf(pdf_path: Path) -> dict[str, Any] | None:
     """Read the parser-native TOC tree when the source PDF exposes one."""
     try:
         from docling_parse.pdf_parser import DoclingPdfParser
-    except Exception:
+    except ImportError as exc:
+        # docling-parse is an optional dependency; absence is expected in some
+        # deployments (e.g. slim images without the native parser).
+        logger.debug("docling-parse unavailable; skipping native TOC extraction: %s", exc)
         return None
 
     try:

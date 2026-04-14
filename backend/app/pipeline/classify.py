@@ -19,6 +19,20 @@ _PROBE_OCR_LANGUAGES = (
     "+ben+pol+heb+yid+hat+hin+ita+por+jpn"
 )
 
+# Text-based language detection sampling. We try progressively more pages
+# before giving up and falling back to expensive multi-language probe-OCR.
+# Tuples of (max_pages, max_chars) — stop as soon as lingua returns a hit.
+_TEXT_DETECT_SAMPLE_TIERS = (
+    (3, 3000),  # Fast path: first 3 pages (covers ~80% of docs).
+    (10, 8000),  # Broader sample for mixed PDFs where text starts mid-doc.
+)
+
+# Hard timeouts protect the orchestrator from hanging on pathological PDFs.
+# pdfminer has no internal timeout and can stall on malformed streams; probe-OCR
+# is bounded internally at 30s but OCRmyPDF itself can exceed that in rare cases.
+_TEXT_DETECT_TIMEOUT_SECONDS = 20.0
+_PROBE_OCR_TIMEOUT_SECONDS = 90.0
+
 
 @dataclass
 class ClassificationResult:
@@ -44,19 +58,49 @@ def _page_has_text(page: pikepdf.Page) -> bool:
         import re
 
         return bool(re.search(rb"(?:Tj|TJ)\b", raw))
-    except Exception:
+    except Exception as exc:
+        logger.debug("Could not inspect page contents: %s", exc)
         return False
 
 
 def _detect_language_from_text(pdf_path: Path) -> str | None:
-    """Extract existing text from the first few pages and detect with lingua."""
+    """Extract existing text and detect language with lingua.
+
+    Samples progressively more pages to handle mixed PDFs where the first few
+    pages are covers/blanks with no extractable text. Returns as soon as lingua
+    is confident enough to classify a sample; falls through to probe-OCR only
+    when every sample tier fails to produce a lingua-confident result.
+    """
     try:
         from pdfminer.high_level import extract_text as pdfminer_extract
-
-        text = pdfminer_extract(str(pdf_path), page_numbers=[0, 1, 2], maxpages=3)
-        return detect_language(text[:3000]) if text else None
-    except Exception:
+    except ImportError as exc:
+        logger.warning("pdfminer is not available for language detection: %s", exc)
         return None
+
+    for max_pages, max_chars in _TEXT_DETECT_SAMPLE_TIERS:
+        try:
+            text = pdfminer_extract(
+                str(pdf_path),
+                page_numbers=list(range(max_pages)),
+                maxpages=max_pages,
+            )
+        except Exception as exc:
+            logger.debug(
+                "pdfminer text extraction failed for %s (tier=%s pages): %s",
+                pdf_path.name,
+                max_pages,
+                exc,
+            )
+            return None
+
+        if not text or not text.strip():
+            continue
+
+        detected = detect_language(text[:max_chars])
+        if detected:
+            return detected
+
+    return None
 
 
 async def _probe_ocr_detect(pdf_path: Path) -> str | None:
@@ -110,7 +154,7 @@ async def _probe_ocr_detect(pdf_path: Path) -> str | None:
 async def classify_pdf(pdf_path: Path) -> ClassificationResult:
     """Classify whether a PDF is scanned (image-only), digital, or mixed."""
 
-    def _classify():
+    def _classify_structure() -> ClassificationResult:
         with pikepdf.open(str(pdf_path)) as pdf:
             total = len(pdf.pages)
             if total == 0:
@@ -131,29 +175,59 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
                 classification = "mixed"
                 confidence = 0.5
 
-            # Try detecting language from existing text (digital/mixed).
-            detected_lang: str | None = None
-            if pages_with_text > 0:
-                detected_lang = _detect_language_from_text(pdf_path)
-
-            logger.info(
-                f"Classified {pdf_path.name}: {classification} "
-                f"({pages_with_text}/{total} pages with text, lang={detected_lang})"
-            )
-
             return ClassificationResult(
                 type=classification,
                 confidence=confidence,
                 pages_with_text=pages_with_text,
                 total_pages=total,
-                detected_language=detected_lang,
             )
 
-    result = await asyncio.to_thread(_classify)
+    result = await asyncio.to_thread(_classify_structure)
+
+    # Try detecting language from existing text (digital/mixed) with a timeout.
+    # pdfminer has no internal timeout and can stall on malformed streams.
+    if result.pages_with_text > 0:
+        try:
+            detected = await asyncio.wait_for(
+                asyncio.to_thread(_detect_language_from_text, pdf_path),
+                timeout=_TEXT_DETECT_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Text-based language detection timed out after %.0fs for %s",
+                _TEXT_DETECT_TIMEOUT_SECONDS,
+                pdf_path.name,
+            )
+            detected = None
+        if detected:
+            result.detected_language = detected
+
+    logger.info(
+        "Classified %s: %s (%d/%d pages with text, lang=%s)",
+        pdf_path.name,
+        result.type,
+        result.pages_with_text,
+        result.total_pages,
+        result.detected_language,
+    )
 
     # For scanned/mixed docs without detected language, probe-OCR page 1.
+    # Bounded overall — the probe-OCR call has its own 30s OCR timeout, but
+    # OCRmyPDF setup/teardown plus pdfminer extraction can legitimately exceed
+    # that, so we cap the whole path here.
     if not result.detected_language and result.total_pages > 0:
-        detected = await _probe_ocr_detect(pdf_path)
+        try:
+            detected = await asyncio.wait_for(
+                _probe_ocr_detect(pdf_path),
+                timeout=_PROBE_OCR_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Probe-OCR language detection timed out after %.0fs for %s",
+                _PROBE_OCR_TIMEOUT_SECONDS,
+                pdf_path.name,
+            )
+            detected = None
         if detected:
             result.detected_language = detected
             logger.info("Probe OCR detected language for %s: %s", pdf_path.name, detected)

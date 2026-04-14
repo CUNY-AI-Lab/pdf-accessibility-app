@@ -6,6 +6,7 @@ import logging
 import re
 from bisect import bisect_right
 from contextlib import contextmanager
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
@@ -69,28 +70,145 @@ _GENERATED_LINK_TEXT_RE = re.compile(
     r"(?:destination|bibitem|cite(?:\b|[._:-])|section|subsection|appendix|figure|table|equation|eqn|footnote|endnote|page)\b",
     re.IGNORECASE,
 )
-IMPLAUSIBLE_LINK_TEXT_MAX_CHARS = 160
-IMPLAUSIBLE_LINK_TEXT_MAX_WORDS = 18
+# ──────────────────────────────────────────────────────────────────────────────
+# Fidelity thresholds
+#
+# All numeric cutoffs for post-remediation checks live here, grouped by check
+# and documented with the rationale behind each value. External code (tests,
+# roundtrip_compare) and the rest of this module reference the aliases below
+# the dataclass, which read from a single ``FIDELITY_THRESHOLDS`` instance.
+# ──────────────────────────────────────────────────────────────────────────────
 
-TEXT_SAMPLE_MAX_PAGES = 10
-TEXT_SAMPLE_MAX_CHARS = 20000
-TEXT_SAMPLE_MIN_CHARS = 300
-SCANNED_TEXT_MIN_CHARS = 40
-OCR_VISUAL_SAMPLE_MAX_PAGES = 3
-OCR_VISUAL_NONWHITE_THRESHOLD = 245
-OCR_VISUAL_MIN_INK_RATIO = 0.001
-OCR_CONTAINMENT_FAIL = 85
-OCR_CONTAINMENT_WARN = 92
-OCR_PRESERVATION_FAIL = 0.90
-OCR_PRESERVATION_WARN = 0.95
-STRUCTURE_FRAGMENT_LIMIT = 24
-STRUCTURE_FRAGMENT_MIN_LEN = 18
+
+@dataclass(frozen=True)
+class FidelityThresholds:
+    """Tunable cutoffs for post-remediation fidelity checks.
+
+    Every threshold is empirically tuned against the CUNY corpus. When bumping
+    a value, update both the default and the rationale comment so the next
+    person tuning it understands why the previous value was chosen.
+    """
+
+    # --- Link-text quality ------------------------------------------------
+    # Beyond ~160 chars a "link" is almost certainly a prose sentence
+    # accidentally tagged as /Link; ~18 words is the matching word budget.
+    implausible_link_text_max_chars: int = 160
+    implausible_link_text_max_words: int = 18
+
+    # --- Text sampling ----------------------------------------------------
+    # 10 pages is the sweet spot: enough signal to catch OCR drift on any
+    # document region, few enough that SequenceMatcher stays cheap.
+    text_sample_max_pages: int = 10
+    # 20k chars caps SequenceMatcher at O(n²) ≈ 4×10⁸ ops worst-case — still
+    # sub-second. Larger samples add noise without improving drift signal.
+    text_sample_max_chars: int = 20_000
+    # Below 300 chars, SequenceMatcher ratios are dominated by variance; we
+    # skip the drift check rather than report false signals.
+    text_sample_min_chars: int = 300
+    # Per-page minimum to count a page as "has a text layer" in scanned mode.
+    scanned_text_min_chars: int = 40
+
+    # --- Visual ink sampling (scanned-PDF classifier) --------------------
+    # Most scan jobs have a blank cover; sampling the first 3 pages is enough
+    # to decide "is there meaningful ink" without the cost of rendering all.
+    ocr_visual_sample_max_pages: int = 3
+    # Pixel value ≥ 245 treated as paper (not ink). Allows ~4% JPEG noise.
+    ocr_visual_nonwhite_threshold: int = 245
+    # Below 0.1% ink ratio, the page is effectively blank.
+    ocr_visual_min_ink_ratio: float = 0.001
+
+    # --- OCR-document text drift (asymmetric) ----------------------------
+    # OCR legitimately expands the text layer by pulling text from images, so
+    # we measure containment (original text preserved in output) rather than
+    # symmetric similarity. Values are rapidfuzz partial_ratio 0–100.
+    # Below 85 means >15% of original text is corrupted or missing — hard fail.
+    ocr_containment_fail: float = 85
+    # Between 85–92 is a warn: real drift but possibly benign (ligature splits,
+    # footnote renumbering); user spot-check is appropriate.
+    ocr_containment_warn: float = 92
+    # Character-level preservation (1 − Levenshtein/len). 90% is the minimum
+    # before we assume the OCR engine corrupted source glyphs.
+    ocr_preservation_fail: float = 0.90
+    ocr_preservation_warn: float = 0.95
+    # Losing >30% of chars overall is a fail even if containment passes
+    # (e.g. OCR dropped a whole region that partial_ratio didn't penalize).
+    ocr_length_ratio_fail_low: float = 0.70
+
+    # --- OCR-rescue spot-check (retag_input vs. output) ------------------
+    # When OCR rescue replaced the original text layer, we also compare
+    # against the *pre-rescue* text; weaker thresholds because OCR noise is
+    # expected but gross drift still warrants a spot-check task.
+    ocr_rescue_similarity_fail: float = 0.82
+    ocr_rescue_length_ratio_low: float = 0.70
+    ocr_rescue_length_ratio_high: float = 1.45
+
+    # --- Digital-PDF text drift (symmetric) ------------------------------
+    # Digital PDFs should preserve the text layer exactly. 0.82 is chosen
+    # because footnote markers / ligature splits score ~0.84 on clean Docling
+    # output; tightening to 0.85 produced false positives in testing.
+    digital_similarity_fail: float = 0.82
+    # 0.90 is the warn boundary: visible drift but not catastrophic.
+    digital_similarity_warn: float = 0.90
+    # Length-ratio fail bounds are wide because Docling reflow legitimately
+    # reshuffles whitespace and may drop/add page numbers & headers.
+    digital_length_ratio_fail_low: float = 0.70
+    digital_length_ratio_fail_high: float = 1.45
+    digital_length_ratio_warn_low: float = 0.85
+    digital_length_ratio_warn_high: float = 1.20
+
+    # --- Structural fragment sampling ------------------------------------
+    # Caps for fragment-based reading-order signal — larger samples add cost
+    # without improving order-rate estimates.
+    structure_fragment_limit: int = 24
+    structure_fragment_min_len: int = 18
+
+    # --- Reading-order metrics -------------------------------------------
+    # Below ~8 fragments the order-rate estimate is noisy; we only emit
+    # reading-order tasks when we have enough signal to be confident.
+    reading_order_min_fragments: int = 8
+    # Fraction of fragments found in output below which the structure is broken.
+    reading_order_hit_rate_fail: float = 0.40
+    # Fraction of those that appear in the correct order below which it's broken.
+    reading_order_order_rate_fail: float = 0.55
+    reading_order_hit_rate_warn: float = 0.65
+    reading_order_order_rate_warn: float = 0.85
+
+    # --- Table risk ------------------------------------------------------
+    # Sum of weighted risk reasons above which a table is high-risk. 2.5
+    # corresponds to e.g. "multi-level header pattern" (1.0) + "sparse cells"
+    # (0.5) + at least one other structural signal.
+    table_high_risk_score: float = 2.5
+
+    # --- Grounded-text candidates ----------------------------------------
+    grounded_text_target_limit: int = 6
+
+
+FIDELITY_THRESHOLDS = FidelityThresholds()
+
+# Module-level aliases — kept stable for external imports (tests, other modules).
+# New code should reference ``FIDELITY_THRESHOLDS.<attr>`` directly.
+IMPLAUSIBLE_LINK_TEXT_MAX_CHARS = FIDELITY_THRESHOLDS.implausible_link_text_max_chars
+IMPLAUSIBLE_LINK_TEXT_MAX_WORDS = FIDELITY_THRESHOLDS.implausible_link_text_max_words
+TEXT_SAMPLE_MAX_PAGES = FIDELITY_THRESHOLDS.text_sample_max_pages
+TEXT_SAMPLE_MAX_CHARS = FIDELITY_THRESHOLDS.text_sample_max_chars
+TEXT_SAMPLE_MIN_CHARS = FIDELITY_THRESHOLDS.text_sample_min_chars
+SCANNED_TEXT_MIN_CHARS = FIDELITY_THRESHOLDS.scanned_text_min_chars
+OCR_VISUAL_SAMPLE_MAX_PAGES = FIDELITY_THRESHOLDS.ocr_visual_sample_max_pages
+OCR_VISUAL_NONWHITE_THRESHOLD = FIDELITY_THRESHOLDS.ocr_visual_nonwhite_threshold
+OCR_VISUAL_MIN_INK_RATIO = FIDELITY_THRESHOLDS.ocr_visual_min_ink_ratio
+OCR_CONTAINMENT_FAIL = FIDELITY_THRESHOLDS.ocr_containment_fail
+OCR_CONTAINMENT_WARN = FIDELITY_THRESHOLDS.ocr_containment_warn
+OCR_PRESERVATION_FAIL = FIDELITY_THRESHOLDS.ocr_preservation_fail
+OCR_PRESERVATION_WARN = FIDELITY_THRESHOLDS.ocr_preservation_warn
+STRUCTURE_FRAGMENT_LIMIT = FIDELITY_THRESHOLDS.structure_fragment_limit
+STRUCTURE_FRAGMENT_MIN_LEN = FIDELITY_THRESHOLDS.structure_fragment_min_len
+GROUNDED_TEXT_TARGET_LIMIT = FIDELITY_THRESHOLDS.grounded_text_target_limit
+
 NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 TABLE_KEYWORDS = ("table", "thead", "tbody", "tfoot", "tr", "th", "td")
 FONT_SUBSET_RE = re.compile(r"^[A-Z]{6}\+")
 USED_GLYPH_FONT_RE = re.compile(r"usedGlyphs\[\d+\]\(([^ )]+)")
 PDFMINER_FONTBBOX_WARNING = "Could not get FontBBox from font descriptor because"
-GROUNDED_TEXT_TARGET_LIMIT = 6
 
 
 class _PdfMinerFontBBoxFilter(logging.Filter):
@@ -402,7 +520,7 @@ def _table_semantics_risk(structure_json: dict[str, Any]) -> dict[str, Any]:
             continue
 
         complex_tables += 1
-        if risk_score >= 2.5:
+        if risk_score >= FIDELITY_THRESHOLDS.table_high_risk_score:
             high_risk_tables += 1
 
         total_risk_score += risk_score
@@ -1163,9 +1281,9 @@ def assess_fidelity(
             original_similarity = SequenceMatcher(None, original_source_text, output_text).ratio()
             original_length_ratio = len(output_text) / max(len(original_source_text), 1)
             if (
-                original_similarity < 0.82
-                or original_length_ratio < 0.7
-                or original_length_ratio > 1.45
+                original_similarity < FIDELITY_THRESHOLDS.ocr_rescue_similarity_fail
+                or original_length_ratio < FIDELITY_THRESHOLDS.ocr_rescue_length_ratio_low
+                or original_length_ratio > FIDELITY_THRESHOLDS.ocr_rescue_length_ratio_high
             ):
                 add_task(
                     "review:content_fidelity:ocr_rescue",
@@ -1194,7 +1312,11 @@ def assess_fidelity(
             containment = partial_ratio(source_text, output_text)
             preservation = _compute_preservation(source_text, output_text)
 
-            if containment < OCR_CONTAINMENT_FAIL or preservation < OCR_PRESERVATION_FAIL or length_ratio < 0.7:
+            if (
+                containment < FIDELITY_THRESHOLDS.ocr_containment_fail
+                or preservation < FIDELITY_THRESHOLDS.ocr_preservation_fail
+                or length_ratio < FIDELITY_THRESHOLDS.ocr_length_ratio_fail_low
+            ):
                 status = "fail"
                 add_task(
                     "review:content_fidelity",
@@ -1213,7 +1335,10 @@ def assess_fidelity(
                         "preservation": round(preservation, 4),
                     },
                 )
-            elif containment < OCR_CONTAINMENT_WARN or preservation < OCR_PRESERVATION_WARN:
+            elif (
+                containment < FIDELITY_THRESHOLDS.ocr_containment_warn
+                or preservation < FIDELITY_THRESHOLDS.ocr_preservation_warn
+            ):
                 status = "warning"
                 add_task(
                     "review:content_fidelity",
@@ -1267,7 +1392,11 @@ def assess_fidelity(
         else:
             # Digital PDFs: use strict symmetric similarity thresholds.
             # The text layer should be preserved with minimal drift.
-            if similarity < 0.82 or length_ratio < 0.7 or length_ratio > 1.45:
+            if (
+                similarity < FIDELITY_THRESHOLDS.digital_similarity_fail
+                or length_ratio < FIDELITY_THRESHOLDS.digital_length_ratio_fail_low
+                or length_ratio > FIDELITY_THRESHOLDS.digital_length_ratio_fail_high
+            ):
                 status = "fail"
                 add_task(
                     "review:content_fidelity",
@@ -1284,7 +1413,11 @@ def assess_fidelity(
                         "length_ratio": round(length_ratio, 4),
                     },
                 )
-            elif similarity < 0.9 or length_ratio < 0.85 or length_ratio > 1.2:
+            elif (
+                similarity < FIDELITY_THRESHOLDS.digital_similarity_warn
+                or length_ratio < FIDELITY_THRESHOLDS.digital_length_ratio_warn_low
+                or length_ratio > FIDELITY_THRESHOLDS.digital_length_ratio_warn_high
+            ):
                 status = "warning"
                 add_task(
                     "review:content_fidelity",
@@ -1403,7 +1536,10 @@ def assess_fidelity(
         hit_rate = float(order_metrics["hit_rate"])
         order_rate = float(order_metrics["order_rate"])
         status = "pass"
-        if len(fragments) >= 8 and (hit_rate < 0.4 or order_rate < 0.55):
+        if len(fragments) >= FIDELITY_THRESHOLDS.reading_order_min_fragments and (
+            hit_rate < FIDELITY_THRESHOLDS.reading_order_hit_rate_fail
+            or order_rate < FIDELITY_THRESHOLDS.reading_order_order_rate_fail
+        ):
             status = "fail"
             add_task(
                 "review:reading_order",
@@ -1417,7 +1553,10 @@ def assess_fidelity(
                 blocking=True,
                 metadata=order_metrics,
             )
-        elif len(fragments) >= 8 and (hit_rate < 0.65 or order_rate < 0.85):
+        elif len(fragments) >= FIDELITY_THRESHOLDS.reading_order_min_fragments and (
+            hit_rate < FIDELITY_THRESHOLDS.reading_order_hit_rate_warn
+            or order_rate < FIDELITY_THRESHOLDS.reading_order_order_rate_warn
+        ):
             status = "warning"
             add_task(
                 "review:reading_order",

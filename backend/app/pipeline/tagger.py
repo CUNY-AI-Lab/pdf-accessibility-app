@@ -100,12 +100,18 @@ class TaggingResult:
 
 
 def _obj_key(obj) -> tuple[int, int] | None:
-    """Return the (objgen) identity tuple for a pikepdf indirect object."""
+    """Return the (objgen) identity tuple for a pikepdf indirect object.
+
+    Returns None for direct (inline) objects — they have no object number and
+    ``obj.objgen`` raises. Genuine errors (malformed references) are logged at
+    debug so unexpected failures are traceable without noise.
+    """
     try:
         obj_num, gen_num = obj.objgen
         if isinstance(obj_num, int) and isinstance(gen_num, int) and obj_num > 0:
             return obj_num, gen_num
-    except Exception:
+    except Exception as exc:
+        logger.debug("_obj_key: could not read objgen on %r: %s", type(obj).__name__, exc)
         return None
     return None
 
