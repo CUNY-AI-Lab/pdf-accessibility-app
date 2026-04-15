@@ -411,6 +411,7 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
                 "type": "artifact",
                 "text": text,
                 "page": page,
+                "bbox": bbox,
                 "artifact_type": label,
             })
 

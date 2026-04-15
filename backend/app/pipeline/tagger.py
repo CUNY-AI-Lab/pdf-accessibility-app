@@ -76,6 +76,7 @@ CONTENT_PAINT_OPERATORS = frozenset({
     "b",
     "b*",
     "sh",
+    "INLINE IMAGE",
 })
 FRAGMENTED_TEXT_MIN_ELEMENTS = 2
 FRAGMENTED_TEXT_MIN_COVERAGE_GAIN = 2
@@ -3235,6 +3236,44 @@ def _instruction_paints_content(instr: Any) -> bool:
     return op in CONTENT_PAINT_OPERATORS
 
 
+def _artifact_properties_for_element(elem: dict | None) -> pikepdf.Dictionary | None:
+    if not isinstance(elem, dict):
+        return None
+
+    artifact_type = str(elem.get("artifact_type") or "").strip().lower()
+    properties = pikepdf.Dictionary()
+    if artifact_type == "page_header":
+        properties["/Type"] = pikepdf.Name("/Pagination")
+        properties["/Subtype"] = pikepdf.Name("/Header")
+        properties["/Attached"] = pikepdf.Array([pikepdf.Name("/Top")])
+    elif artifact_type == "page_footer":
+        properties["/Type"] = pikepdf.Name("/Pagination")
+        properties["/Subtype"] = pikepdf.Name("/Footer")
+        properties["/Attached"] = pikepdf.Array([pikepdf.Name("/Bottom")])
+    elif artifact_type in {"layout", "decorative", "decoration"}:
+        properties["/Type"] = pikepdf.Name("/Layout")
+    elif artifact_type == "background":
+        properties["/Type"] = pikepdf.Name("/Background")
+    elif artifact_type == "page":
+        properties["/Type"] = pikepdf.Name("/Page")
+
+    bbox = elem.get("bbox")
+    if isinstance(bbox, dict):
+        try:
+            rect = [
+                float(bbox["l"]),
+                float(bbox["b"]),
+                float(bbox["r"]),
+                float(bbox["t"]),
+            ]
+        except (KeyError, TypeError, ValueError):
+            rect = []
+        if len(rect) == 4 and rect[2] > rect[0] and rect[3] > rect[1]:
+            properties["/BBox"] = pikepdf.Array(rect)
+
+    return properties if len(properties) else None
+
+
 def _fragment_tag_for_element(elem: dict) -> str | None:
     elem_type = elem.get("type", "")
     if elem_type == "heading":
@@ -3821,7 +3860,7 @@ def _emit_tagged_region(
 
     # Types that wrap content as artifact (no struct elem needed)
     if elem_type == "artifact":
-        new_instructions.append(_make_bmc_artifact())
+        new_instructions.append(_make_bmc_artifact(elem))
         new_instructions.extend(region.instructions)
         new_instructions.append(_make_emc())
         return
@@ -4151,7 +4190,15 @@ def _make_emc() -> pikepdf.ContentStreamInstruction:
     return pikepdf.ContentStreamInstruction([], pikepdf.Operator("EMC"))
 
 
-def _make_bmc_artifact() -> pikepdf.ContentStreamInstruction:
+def _make_bmc_artifact(
+    elem: dict | None = None,
+) -> pikepdf.ContentStreamInstruction:
+    properties = _artifact_properties_for_element(elem)
+    if properties:
+        return pikepdf.ContentStreamInstruction(
+            [pikepdf.Name("/Artifact"), properties],
+            pikepdf.Operator("BDC"),
+        )
     return pikepdf.ContentStreamInstruction(
         [pikepdf.Name("/Artifact")], pikepdf.Operator("BMC"),
     )

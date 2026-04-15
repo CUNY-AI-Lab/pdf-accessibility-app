@@ -117,6 +117,31 @@ def test_normalize_docling_elements_normalizes_metadata_language_tags():
     assert elements[0]["lang"] == "fr"
 
 
+def test_normalize_docling_elements_keeps_page_artifact_bbox():
+    doc_dict = {
+        "body": {"children": [{"$ref": "#/texts/0"}]},
+        "texts": [
+            {
+                "label": "page_header",
+                "text": "Running header",
+                "prov": [{"page_no": 1, "bbox": {"l": 10, "b": 740, "r": 200, "t": 760}}],
+            }
+        ],
+    }
+
+    elements = _normalize_docling_elements(doc_dict)
+
+    assert elements == [
+        {
+            "type": "artifact",
+            "text": "Running header",
+            "page": 0,
+            "bbox": {"l": 10, "b": 740, "r": 200, "t": 760},
+            "artifact_type": "page_header",
+        }
+    ]
+
+
 def test_normalize_docling_elements_keeps_visible_contents_as_heading_and_paragraphs():
     doc_dict = {
         "body": {

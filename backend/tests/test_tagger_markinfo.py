@@ -28,6 +28,7 @@ _CONTENT_PAINT_OPERATORS = frozenset({
     "b",
     "b*",
     "sh",
+    "INLINE IMAGE",
 })
 
 
@@ -193,6 +194,57 @@ def _add_unmatched_page_drawing(path: Path) -> None:
             )
         )
         pdf.save(path)
+
+
+def _add_unmatched_inline_image(path: Path) -> None:
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        page = pdf.pages[0]
+        original = bytes(page.Contents.read_bytes())
+        inline_image = (
+            b"q 12 0 0 12 0 0 cm "
+            b"BI /W 1 /H 1 /BPC 1 /CS /DeviceGray ID \xff EI "
+            b"Q\n"
+        )
+        page["/Contents"] = pdf.make_stream(inline_image + original)
+        pdf.save(path)
+
+
+def _build_single_text_pdf(path: Path) -> None:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    font = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Font"),
+                "/Subtype": pikepdf.Name("/Type1"),
+                "/BaseFont": pikepdf.Name("/Helvetica"),
+            }
+        )
+    )
+    page["/Resources"] = pikepdf.Dictionary({"/Font": pikepdf.Dictionary({"/F1": font})})
+    page["/Contents"] = pdf.make_stream(
+        pikepdf.unparse_content_stream(
+            [
+                pikepdf.ContentStreamInstruction([], pikepdf.Operator("BT")),
+                pikepdf.ContentStreamInstruction([pikepdf.Name("/F1"), 12], pikepdf.Operator("Tf")),
+                pikepdf.ContentStreamInstruction([1, 0, 0, 1, 20, 160], pikepdf.Operator("Tm")),
+                pikepdf.ContentStreamInstruction([pikepdf.String("Running header")], pikepdf.Operator("Tj")),
+                pikepdf.ContentStreamInstruction([], pikepdf.Operator("ET")),
+            ]
+        )
+    )
+    pdf.save(path)
+
+
+def _artifact_property_dicts(page) -> list[pikepdf.Dictionary]:
+    property_dicts: list[pikepdf.Dictionary] = []
+    for instr in pikepdf.parse_content_stream(page):
+        if str(instr.operator) != "BDC":
+            continue
+        operands = list(instr.operands)
+        if len(operands) >= 2 and operands[0] == pikepdf.Name("/Artifact"):
+            property_dicts.append(operands[1])
+    return property_dicts
 
 
 def test_complete_table_grid_cells_requires_explicit_dimensions():
@@ -626,6 +678,98 @@ async def test_tag_pdf_artifacts_unmatched_drawing_in_fragmented_rewrite(tmp_pat
 
     with pikepdf.open(output_pdf) as pdf:
         assert _unmarked_paint_operators(pdf.pages[0]) == []
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_artifacts_unmatched_inline_image_in_fragmented_rewrite(tmp_path):
+    input_pdf = tmp_path / "page_level_ocr_table_with_inline_image.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_page_level_ocr_text_pdf(input_pdf)
+    _add_unmatched_inline_image(input_pdf)
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "type": "heading",
+                    "level": 1,
+                    "text": "Accessible Heading",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 154, "r": 150, "t": 176},
+                },
+                {
+                    "type": "table",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 100, "r": 190, "t": 150},
+                    "num_rows": 2,
+                    "num_cols": 2,
+                    "cells": [
+                        {
+                            "row": 0,
+                            "col": 0,
+                            "text": "First paragraph text",
+                            "is_header": True,
+                            "column_header": True,
+                            "row_span": 1,
+                            "col_span": 1,
+                        },
+                        {
+                            "row": 1,
+                            "col": 0,
+                            "text": "Second paragraph text",
+                            "is_header": False,
+                            "row_span": 1,
+                            "col_span": 1,
+                        },
+                    ],
+                },
+            ],
+            "title": "Page OCR Table",
+        },
+        alt_texts=[],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        assert _unmarked_paint_operators(pdf.pages[0]) == []
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_preserves_pagination_artifact_metadata(tmp_path):
+    input_pdf = tmp_path / "header.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_single_text_pdf(input_pdf)
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "type": "artifact",
+                    "artifact_type": "page_header",
+                    "text": "Running header",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 156, "r": 130, "t": 176},
+                },
+            ],
+            "title": "Header Artifact",
+        },
+        alt_texts=[],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        artifact_props = _artifact_property_dicts(pdf.pages[0])
+        assert artifact_props
+        assert artifact_props[0]["/Type"] == pikepdf.Name("/Pagination")
+        assert artifact_props[0]["/Subtype"] == pikepdf.Name("/Header")
+        assert artifact_props[0]["/Attached"] == pikepdf.Array([pikepdf.Name("/Top")])
+        assert list(artifact_props[0]["/BBox"]) == [18, 156, 130, 176]
 
 
 @pytest.mark.asyncio
