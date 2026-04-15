@@ -38,6 +38,9 @@ TOC_GROUP_HEADING_EXCLUDE = {
     "page",
     "lists",
 }
+DOCLING_SERVE_REQUEST_ATTEMPTS = 3
+DOCLING_SERVE_RETRY_DELAY_SECONDS = 2.0
+DOCLING_SERVE_RETRY_STATUS_CODES = {502, 503, 504}
 
 
 @dataclass
@@ -58,6 +61,64 @@ class StructureResult:
     headings_count: int = 0
     tables_count: int = 0
     figures_count: int = 0
+
+
+def _is_retryable_docling_serve_error(exc: Exception) -> bool:
+    import httpx
+
+    return isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+            httpx.ReadTimeout,
+            httpx.RemoteProtocolError,
+        ),
+    )
+
+
+async def _docling_serve_request(
+    client: Any,
+    method: str,
+    url: str,
+    *,
+    attempts: int = DOCLING_SERVE_REQUEST_ATTEMPTS,
+    retry_delay: float = DOCLING_SERVE_RETRY_DELAY_SECONDS,
+    **kwargs: Any,
+):
+    for attempt in range(1, attempts + 1):
+        try:
+            response = await client.request(method, url, **kwargs)
+        except Exception as exc:
+            if attempt >= attempts or not _is_retryable_docling_serve_error(exc):
+                raise
+            logger.warning(
+                "docling-serve %s request failed on attempt %d/%d: %s; retrying",
+                method.upper(),
+                attempt,
+                attempts,
+                exc,
+            )
+            await asyncio.sleep(retry_delay)
+            continue
+
+        if (
+            response.status_code in DOCLING_SERVE_RETRY_STATUS_CODES
+            and attempt < attempts
+        ):
+            logger.warning(
+                "docling-serve %s request returned HTTP %d on attempt %d/%d; retrying",
+                method.upper(),
+                response.status_code,
+                attempt,
+                attempts,
+            )
+            await asyncio.sleep(retry_delay)
+            continue
+        return response
+
+    raise RuntimeError("docling-serve request retries were exhausted")
 
 
 def _normalize_native_toc(node: Any) -> dict[str, Any] | None:
@@ -1108,25 +1169,27 @@ async def _convert_via_docling_serve(
     # Per-request timeout: generous but bounded; total timeout enforced by the polling loop
     per_request_timeout = httpx.Timeout(min(timeout, 120.0), connect=30.0)
     async with httpx.AsyncClient(timeout=per_request_timeout) as client:
-        with open(pdf_path, "rb") as f:
-            data = {
-                "to_formats": "json",
-                "ocr_engine": ocr_engine,
-                "do_table_structure": "true",
-                "do_picture_classification": "true",
-            }
-            if include_figure_images:
-                data.update({
-                    "image_export_mode": "embedded",
-                    "include_images": "true",
-                    "images_scale": "2.0",
-                })
-            resp = await client.post(
-                submit_url,
-                headers=auth_headers,
-                files={"files": (pdf_path.name, f, "application/pdf")},
-                data=data,
-            )
+        pdf_bytes = pdf_path.read_bytes()
+        data = {
+            "to_formats": "json",
+            "ocr_engine": ocr_engine,
+            "do_table_structure": "true",
+            "do_picture_classification": "true",
+        }
+        if include_figure_images:
+            data.update({
+                "image_export_mode": "embedded",
+                "include_images": "true",
+                "images_scale": "2.0",
+            })
+        resp = await _docling_serve_request(
+            client,
+            "POST",
+            submit_url,
+            headers=auth_headers,
+            files={"files": (pdf_path.name, pdf_bytes, "application/pdf")},
+            data=data,
+        )
         resp.raise_for_status()
         task_id = resp.json()["task_id"]
         logger.info("docling-serve task submitted: %s", task_id)
@@ -1141,7 +1204,12 @@ async def _convert_via_docling_serve(
                     f"docling-serve task {task_id} did not complete within {timeout}s"
                 )
             await asyncio.sleep(2)
-            poll_resp = await client.get(poll_url, headers=auth_headers)
+            poll_resp = await _docling_serve_request(
+                client,
+                "GET",
+                poll_url,
+                headers=auth_headers,
+            )
             poll_resp.raise_for_status()
             poll_data = poll_resp.json()
             status = poll_data.get("task_status")
@@ -1159,8 +1227,11 @@ async def _convert_via_docling_serve(
                 )
 
         # Fetch result
-        result_resp = await client.get(
-            f"{base_url}/v1/result/{task_id}", headers=auth_headers
+        result_resp = await _docling_serve_request(
+            client,
+            "GET",
+            f"{base_url}/v1/result/{task_id}",
+            headers=auth_headers,
         )
         result_resp.raise_for_status()
         result_data = result_resp.json()

@@ -1,6 +1,11 @@
 from types import SimpleNamespace
 
+import httpx
+import pytest
+
+from app.pipeline import structure
 from app.pipeline.structure import (
+    _docling_serve_request,
     _expand_toc_item_tables,
     _extract_bbox,
     _extract_title_from_docling,
@@ -11,6 +16,39 @@ from app.pipeline.structure import (
     _rebuild_toc_elements_from_page_rows,
     _toc_rows_from_word_cells,
 )
+
+
+@pytest.mark.asyncio
+async def test_docling_serve_request_retries_transient_connect_timeout(monkeypatch):
+    sleep_delays = []
+
+    async def fake_sleep(delay):
+        sleep_delays.append(delay)
+
+    monkeypatch.setattr(structure.asyncio, "sleep", fake_sleep)
+
+    class Client:
+        attempts = 0
+
+        async def request(self, method, url, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise httpx.ConnectTimeout("connect timed out")
+            return SimpleNamespace(status_code=200)
+
+    client = Client()
+
+    response = await _docling_serve_request(
+        client,
+        "GET",
+        "https://example.test/v1/status/poll/task",
+        attempts=2,
+        retry_delay=0.01,
+    )
+
+    assert response.status_code == 200
+    assert client.attempts == 2
+    assert sleep_delays == [0.01]
 
 
 def test_normalize_docling_elements_maps_footnotes_to_note_elements():
