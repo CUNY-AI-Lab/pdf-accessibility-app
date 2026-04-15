@@ -209,7 +209,7 @@ def _add_unmatched_inline_image(path: Path) -> None:
         pdf.save(path)
 
 
-def _build_single_text_pdf(path: Path) -> None:
+def _build_single_text_pdf(path: Path, text: str = "Running header") -> None:
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(200, 200))
     font = pdf.make_indirect(
@@ -228,7 +228,7 @@ def _build_single_text_pdf(path: Path) -> None:
                 pikepdf.ContentStreamInstruction([], pikepdf.Operator("BT")),
                 pikepdf.ContentStreamInstruction([pikepdf.Name("/F1"), 12], pikepdf.Operator("Tf")),
                 pikepdf.ContentStreamInstruction([1, 0, 0, 1, 20, 160], pikepdf.Operator("Tm")),
-                pikepdf.ContentStreamInstruction([pikepdf.String("Running header")], pikepdf.Operator("Tj")),
+                pikepdf.ContentStreamInstruction([pikepdf.String(text)], pikepdf.Operator("Tj")),
                 pikepdf.ContentStreamInstruction([], pikepdf.Operator("ET")),
             ]
         )
@@ -770,6 +770,128 @@ async def test_tag_pdf_preserves_pagination_artifact_metadata(tmp_path):
         assert artifact_props[0]["/Subtype"] == pikepdf.Name("/Header")
         assert artifact_props[0]["/Attached"] == pikepdf.Array([pikepdf.Name("/Top")])
         assert list(artifact_props[0]["/BBox"]) == [18, 156, 130, 176]
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_uses_caption_and_bibliography_struct_types(tmp_path):
+    caption_pdf = tmp_path / "caption.pdf"
+    caption_output = tmp_path / "caption_tagged.pdf"
+    _build_single_text_pdf(caption_pdf, "Figure 1. Results overview")
+
+    await tag_pdf(
+        input_path=caption_pdf,
+        output_path=caption_output,
+        structure_json={
+            "elements": [
+                {
+                    "type": "caption",
+                    "text": "Figure 1. Results overview",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 156, "r": 170, "t": 176},
+                },
+            ],
+            "title": "Caption",
+        },
+        alt_texts=[],
+        language="en",
+        original_filename=caption_pdf.name,
+    )
+
+    reference_pdf = tmp_path / "reference.pdf"
+    reference_output = tmp_path / "reference_tagged.pdf"
+    _build_single_text_pdf(reference_pdf, "Smith, J. 2024. Accessible documents.")
+
+    await tag_pdf(
+        input_path=reference_pdf,
+        output_path=reference_output,
+        structure_json={
+            "elements": [
+                {
+                    "type": "bib_entry",
+                    "text": "Smith, J. 2024. Accessible documents.",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 156, "r": 190, "t": 176},
+                },
+            ],
+            "title": "Reference",
+        },
+        alt_texts=[],
+        language="en",
+        original_filename=reference_pdf.name,
+    )
+
+    with pikepdf.open(caption_output) as pdf:
+        assert _first_struct_elem(pdf.Root["/StructTreeRoot"], "Caption") is not None
+    with pikepdf.open(reference_output) as pdf:
+        assert _first_struct_elem(pdf.Root["/StructTreeRoot"], "BibEntry") is not None
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_sets_list_numbering_attribute(tmp_path):
+    input_pdf = tmp_path / "list.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_single_text_pdf(input_pdf, "1. First item")
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "type": "list_item",
+                    "text": "1. First item",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 156, "r": 120, "t": 176},
+                    "marker": "1.",
+                    "enumerated": True,
+                    "list_group_ref": "list-1",
+                },
+            ],
+            "title": "List",
+        },
+        alt_texts=[],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        list_elem = _first_struct_elem(pdf.Root["/StructTreeRoot"], "L")
+        assert list_elem is not None
+        attrs = list_elem["/A"]
+        assert attrs["/O"] == pikepdf.Name("/List")
+        assert attrs["/ListNumbering"] == pikepdf.Name("/Decimal")
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_clamps_heading_levels_to_h6(tmp_path):
+    input_pdf = tmp_path / "heading.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_single_text_pdf(input_pdf, "Deep heading")
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "type": "heading",
+                    "text": "Deep heading",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 156, "r": 120, "t": 176},
+                    "level": 9,
+                },
+            ],
+            "title": "Heading",
+        },
+        alt_texts=[],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        root = pdf.Root["/StructTreeRoot"]
+        assert _first_struct_elem(root, "H1") is not None
+        assert _first_struct_elem(root, "H9") is None
 
 
 @pytest.mark.asyncio

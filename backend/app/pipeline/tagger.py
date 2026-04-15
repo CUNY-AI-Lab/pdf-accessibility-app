@@ -39,7 +39,9 @@ logger = logging.getLogger(__name__)
 IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
 TEXT_ELEMENT_TYPES = frozenset({
-    "heading", "paragraph", "list_item", "code", "artifact", "table", "formula", "note", "toc_caption", "toc_item", "toc_item_table",
+    "heading", "paragraph", "caption", "list_item", "code", "artifact", "table",
+    "formula", "note", "reference", "bib_entry", "toc_caption", "toc_item",
+    "toc_item_table",
 })
 MATCH_ACCEPT_THRESHOLD = 0.05
 LARGE_COST = 1e6
@@ -52,9 +54,12 @@ LINK_TEXT_ELEMENT_TYPES = frozenset({
     "heading",
     "paragraph",
     "list_item",
+    "caption",
     "note",
     "code",
     "formula",
+    "reference",
+    "bib_entry",
     "toc_caption",
     "toc_item",
     "toc_item_table",
@@ -1297,6 +1302,51 @@ def _table_summary_text(table_data: dict, *, num_rows: int, num_cols: int) -> st
             return content_summary
         return f"{dimensions_summary} {content_summary}"
     return content_summary or dimensions_summary
+
+
+def _list_numbering_name(marker: Any, *, enumerated: bool = False) -> str | None:
+    text = str(marker or "").strip()
+    token = text.strip("()[]{}.:")
+
+    if enumerated or re.match(r"^\d+", token):
+        return "Decimal"
+
+    roman_re = r"^(?=[ivxlcdm]+$)[ivxlcdm]+$"
+    if re.match(roman_re, token, flags=re.IGNORECASE):
+        return "UpperRoman" if token.isupper() else "LowerRoman"
+
+    if len(token) == 1 and token.isalpha():
+        return "UpperAlpha" if token.isupper() else "LowerAlpha"
+
+    if text in {"-", "*", "+"} or (len(text) == 1 and ord(text) in {0x2022, 0x25CF}):
+        return "Disc"
+    if len(text) == 1 and ord(text) in {0x25E6, 0x25CB}:
+        return "Circle"
+    if len(text) == 1 and ord(text) in {0x25AA, 0x25A0}:
+        return "Square"
+
+    return None
+
+
+def _set_list_numbering_attr(
+    list_elem: pikepdf.Object,
+    marker: Any,
+    *,
+    enumerated: bool = False,
+) -> None:
+    numbering = _list_numbering_name(marker, enumerated=enumerated)
+    if not numbering:
+        return
+
+    attrs = list_elem.get("/A")
+    if not isinstance(attrs, pikepdf.Dictionary):
+        attrs = pikepdf.Dictionary({"/O": pikepdf.Name("/List")})
+        list_elem["/A"] = attrs
+    elif attrs.get("/O") is None:
+        attrs["/O"] = pikepdf.Name("/List")
+
+    if attrs.get("/ListNumbering") is None:
+        attrs["/ListNumbering"] = pikepdf.Name(f"/{numbering}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2661,6 +2711,48 @@ class StructTreeBuilder:
         self._struct_elems_created += 1
         return mcid
 
+    def add_caption(
+        self,
+        page_index: int,
+        page_ref: pikepdf.Object,
+        *,
+        stream_owner: pikepdf.Object | None = None,
+    ) -> int:
+        return self._add_struct_elem(
+            "Caption",
+            page_index,
+            page_ref,
+            stream_owner=stream_owner,
+        )
+
+    def add_reference(
+        self,
+        page_index: int,
+        page_ref: pikepdf.Object,
+        *,
+        stream_owner: pikepdf.Object | None = None,
+    ) -> int:
+        return self._add_struct_elem(
+            "Reference",
+            page_index,
+            page_ref,
+            stream_owner=stream_owner,
+        )
+
+    def add_bib_entry(
+        self,
+        page_index: int,
+        page_ref: pikepdf.Object,
+        *,
+        stream_owner: pikepdf.Object | None = None,
+    ) -> int:
+        return self._add_struct_elem(
+            "BibEntry",
+            page_index,
+            page_ref,
+            stream_owner=stream_owner,
+        )
+
     def _get_or_create_toc(self, toc_group_ref: str | None) -> pikepdf.Object:
         if toc_group_ref and toc_group_ref in self._toc_cache:
             return self._toc_cache[toc_group_ref]
@@ -3009,6 +3101,8 @@ class StructTreeBuilder:
         page_ref: pikepdf.Object,
         list_group_ref: str | None,
         parent_list_group_ref: str | None = None,
+        marker: Any = None,
+        enumerated: bool = False,
         *,
         stream_owner: pikepdf.Object | None = None,
     ) -> int:
@@ -3052,6 +3146,7 @@ class StructTreeBuilder:
             self._struct_elems_created += 1
             if list_group_ref:
                 self._list_cache[list_group_ref] = (list_elem, None)
+        _set_list_numbering_attr(list_elem, marker, enumerated=enumerated)
 
         li_elem = self.pdf.make_indirect(pikepdf.Dictionary({
             "/Type": pikepdf.Name("/StructElem"),
@@ -3289,6 +3384,12 @@ def _fragment_tag_for_element(elem: dict) -> str | None:
         return "Formula"
     if elem_type == "note":
         return "Note"
+    if elem_type == "reference":
+        return "Reference"
+    if elem_type == "bib_entry":
+        return "BibEntry"
+    if elem_type == "caption":
+        return "Caption"
     if elem_type == "toc_caption":
         return "Caption"
     if elem_type in {"toc_item", "toc_item_table"}:
@@ -3360,6 +3461,8 @@ def _allocate_fragment_mcid(
             page_ref,
             elem.get("list_group_ref"),
             parent_list_group_ref=elem.get("parent_list_group_ref"),
+            marker=elem.get("marker"),
+            enumerated=bool(elem.get("enumerated", False)),
             stream_owner=stream_owner,
         )
     elif elem_type == "code":
@@ -3379,6 +3482,24 @@ def _allocate_fragment_mcid(
         )
     elif elem_type == "note":
         mcid = builder.add_note(
+            page_index,
+            page_ref,
+            stream_owner=stream_owner,
+        )
+    elif elem_type == "reference":
+        mcid = builder.add_reference(
+            page_index,
+            page_ref,
+            stream_owner=stream_owner,
+        )
+    elif elem_type == "bib_entry":
+        mcid = builder.add_bib_entry(
+            page_index,
+            page_ref,
+            stream_owner=stream_owner,
+        )
+    elif elem_type == "caption":
+        mcid = builder.add_caption(
             page_index,
             page_ref,
             stream_owner=stream_owner,
@@ -3876,8 +3997,12 @@ def _emit_tagged_region(
     # List items: use cached list groups to avoid duplicates
     if elem_type == "list_item":
         mcid = builder.add_list_item(
-            page_index, page_ref, elem.get("list_group_ref"),
+            page_index,
+            page_ref,
+            elem.get("list_group_ref"),
             parent_list_group_ref=elem.get("parent_list_group_ref"),
+            marker=elem.get("marker"),
+            enumerated=bool(elem.get("enumerated", False)),
             stream_owner=stream_owner,
         )
         if hasattr(builder, "remember_source_element"):
@@ -3891,7 +4016,7 @@ def _emit_tagged_region(
     elem_lang = elem.get("lang")  # per-element language (may be None)
 
     if elem_type == "heading":
-        level = elem.get("level", 1)
+        level = max(1, min(6, _as_positive_int(elem.get("level", 1), default=1)))
         mcid = builder.add_heading(
             level,
             page_index,
@@ -3939,6 +4064,15 @@ def _emit_tagged_region(
     elif elem_type == "note":
         mcid = builder.add_note(page_index, page_ref, stream_owner=stream_owner)
         tag = "Note"
+    elif elem_type == "reference":
+        mcid = builder.add_reference(page_index, page_ref, stream_owner=stream_owner)
+        tag = "Reference"
+    elif elem_type == "bib_entry":
+        mcid = builder.add_bib_entry(page_index, page_ref, stream_owner=stream_owner)
+        tag = "BibEntry"
+    elif elem_type == "caption":
+        mcid = builder.add_caption(page_index, page_ref, stream_owner=stream_owner)
+        tag = "Caption"
     elif elem_type == "toc_caption":
         mcid = builder.add_toc_caption(
             page_index,

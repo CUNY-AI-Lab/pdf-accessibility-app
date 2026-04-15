@@ -142,6 +142,35 @@ def test_normalize_docling_elements_keeps_page_artifact_bbox():
     ]
 
 
+def test_normalize_docling_elements_maps_captions_and_references():
+    doc_dict = {
+        "body": {
+            "children": [
+                {"$ref": "#/texts/0"},
+                {"$ref": "#/texts/1"},
+            ],
+        },
+        "texts": [
+            {
+                "label": "caption",
+                "text": "Figure 1. Results overview",
+                "prov": [{"page_no": 1, "bbox": {"l": 10, "b": 100, "r": 200, "t": 120}}],
+            },
+            {
+                "label": "reference",
+                "text": "Smith, J. 2024. Accessible documents.",
+                "prov": [{"page_no": 2, "bbox": {"l": 10, "b": 80, "r": 300, "t": 100}}],
+            },
+        ],
+    }
+
+    elements = _normalize_docling_elements(doc_dict)
+
+    assert [element["type"] for element in elements] == ["caption", "bib_entry"]
+    assert elements[0]["text"] == "Figure 1. Results overview"
+    assert elements[1]["page"] == 1
+
+
 def test_normalize_docling_elements_keeps_visible_contents_as_heading_and_paragraphs():
     doc_dict = {
         "body": {

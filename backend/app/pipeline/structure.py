@@ -317,10 +317,34 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
                 elem_dict["lang"] = _item_lang
             elements.append(elem_dict)
 
-        elif label in ("text", "paragraph", "caption", "reference"):
+        elif label in ("text", "paragraph"):
             if text.strip():
                 elem_dict = {
                     "type": "paragraph",
+                    "text": text,
+                    "page": page,
+                    "bbox": bbox,
+                }
+                if _item_lang:
+                    elem_dict["lang"] = _item_lang
+                elements.append(elem_dict)
+
+        elif label == "caption":
+            if text.strip():
+                elem_dict = {
+                    "type": "caption",
+                    "text": text,
+                    "page": page,
+                    "bbox": bbox,
+                }
+                if _item_lang:
+                    elem_dict["lang"] = _item_lang
+                elements.append(elem_dict)
+
+        elif label == "reference":
+            if text.strip():
+                elem_dict = {
+                    "type": "bib_entry",
                     "text": text,
                     "page": page,
                     "bbox": bbox,
