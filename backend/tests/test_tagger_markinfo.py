@@ -12,6 +12,38 @@ from app.pipeline.tagger import (
 )
 from tests.fixtures import TEST_SAMPLE_PDF
 
+_CONTENT_PAINT_OPERATORS = frozenset({
+    "Tj",
+    "TJ",
+    "'",
+    '"',
+    "Do",
+    "f",
+    "F",
+    "f*",
+    "S",
+    "s",
+    "B",
+    "B*",
+    "b",
+    "b*",
+    "sh",
+})
+
+
+def _unmarked_paint_operators(page) -> list[str]:
+    depth = 0
+    unmarked: list[str] = []
+    for instr in pikepdf.parse_content_stream(page):
+        op = str(instr.operator)
+        if op in {"BDC", "BMC"}:
+            depth += 1
+        elif op == "EMC":
+            depth = max(0, depth - 1)
+        elif op in _CONTENT_PAINT_OPERATORS and depth == 0:
+            unmarked.append(op)
+    return unmarked
+
 
 @pytest.mark.asyncio
 async def test_tag_pdf_sets_markinfo_suspects_false(tmp_path):
@@ -133,6 +165,34 @@ def _build_page_level_ocr_text_pdf(path: Path) -> None:
         )
     )
     pdf.save(path)
+
+
+def _add_unmatched_page_drawing(path: Path) -> None:
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        page = pdf.pages[0]
+        instructions = list(pikepdf.parse_content_stream(page))
+        decorative_prefix = [
+            pikepdf.ContentStreamInstruction([], pikepdf.Operator("q")),
+            pikepdf.ContentStreamInstruction([0.9, 0.9, 0.9], pikepdf.Operator("rg")),
+            pikepdf.ContentStreamInstruction([0, 0, 12, 12], pikepdf.Operator("re")),
+            pikepdf.ContentStreamInstruction([], pikepdf.Operator("f")),
+            pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q")),
+        ]
+        decorative_suffix = [
+            pikepdf.ContentStreamInstruction([], pikepdf.Operator("q")),
+            pikepdf.ContentStreamInstruction([0, 0, 0], pikepdf.Operator("RG")),
+            pikepdf.ContentStreamInstruction([1], pikepdf.Operator("w")),
+            pikepdf.ContentStreamInstruction([0, 0], pikepdf.Operator("m")),
+            pikepdf.ContentStreamInstruction([20, 0], pikepdf.Operator("l")),
+            pikepdf.ContentStreamInstruction([], pikepdf.Operator("S")),
+            pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q")),
+        ]
+        page["/Contents"] = pdf.make_stream(
+            pikepdf.unparse_content_stream(
+                decorative_prefix + instructions + decorative_suffix
+            )
+        )
+        pdf.save(path)
 
 
 def test_complete_table_grid_cells_requires_explicit_dimensions():
@@ -509,6 +569,63 @@ async def test_tag_pdf_tags_page_level_ocr_table_cells(tmp_path):
         assert b"/TH" in stream
         assert b"/TD" in stream
         assert page.get("/Tabs") == pikepdf.Name("/S")
+
+
+@pytest.mark.asyncio
+async def test_tag_pdf_artifacts_unmatched_drawing_in_fragmented_rewrite(tmp_path):
+    input_pdf = tmp_path / "page_level_ocr_table_with_decorative_drawing.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_page_level_ocr_text_pdf(input_pdf)
+    _add_unmatched_page_drawing(input_pdf)
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "type": "heading",
+                    "level": 1,
+                    "text": "Accessible Heading",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 154, "r": 150, "t": 176},
+                },
+                {
+                    "type": "table",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 100, "r": 190, "t": 150},
+                    "num_rows": 2,
+                    "num_cols": 2,
+                    "cells": [
+                        {
+                            "row": 0,
+                            "col": 0,
+                            "text": "First paragraph text",
+                            "is_header": True,
+                            "column_header": True,
+                            "row_span": 1,
+                            "col_span": 1,
+                        },
+                        {
+                            "row": 1,
+                            "col": 0,
+                            "text": "Second paragraph text",
+                            "is_header": False,
+                            "row_span": 1,
+                            "col_span": 1,
+                        },
+                    ],
+                },
+            ],
+            "title": "Page OCR Table",
+        },
+        alt_texts=[],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        assert _unmarked_paint_operators(pdf.pages[0]) == []
 
 
 @pytest.mark.asyncio

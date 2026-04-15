@@ -60,6 +60,23 @@ LINK_TEXT_ELEMENT_TYPES = frozenset({
     "toc_item_table",
 })
 TEXT_SHOW_OPERATORS = frozenset({"Tj", "TJ", "'", '"'})
+CONTENT_PAINT_OPERATORS = frozenset({
+    "Tj",
+    "TJ",
+    "'",
+    '"',
+    "Do",
+    "f",
+    "F",
+    "f*",
+    "S",
+    "s",
+    "B",
+    "B*",
+    "b",
+    "b*",
+    "sh",
+})
 FRAGMENTED_TEXT_MIN_ELEMENTS = 2
 FRAGMENTED_TEXT_MIN_COVERAGE_GAIN = 2
 FRAGMENTED_TEXT_MIN_ASSIGNED_RATIO = 0.40
@@ -3213,6 +3230,11 @@ def _strip_existing_markers(instructions: list) -> list:
     return stripped
 
 
+def _instruction_paints_content(instr: Any) -> bool:
+    op = str(instr.operator) if hasattr(instr, "operator") else ""
+    return op in CONTENT_PAINT_OPERATORS
+
+
 def _fragment_tag_for_element(elem: dict) -> str | None:
     elem_type = elem.get("type", "")
     if elem_type == "heading":
@@ -3632,7 +3654,12 @@ def _rewrite_content_stream_with_fragmented_text(
             else:
                 active_mark = None
 
-        new_instructions.append(instr)
+        if mark is None and _instruction_paints_content(instr):
+            new_instructions.append(_make_bmc_artifact())
+            new_instructions.append(instr)
+            new_instructions.append(_make_emc())
+        else:
+            new_instructions.append(instr)
 
     close_active()
     for source_region, elem_idx in overlay_targets:
