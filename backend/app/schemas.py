@@ -113,6 +113,7 @@ class ValidationReportResponse(BaseModel):
     remediation: dict[str, Any] = Field(default_factory=dict)
     fidelity: dict[str, Any] = Field(default_factory=dict)
     tagging: dict[str, Any] = Field(default_factory=dict)
+    semantic_coverage: dict[str, Any] = Field(default_factory=dict)
     claims: dict[str, Any] = Field(default_factory=dict)
 
 

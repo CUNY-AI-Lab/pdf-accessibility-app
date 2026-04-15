@@ -252,6 +252,45 @@ def _render_job_section(
             parts.append('<div class="stat"><div class="stat-value">&check;</div><div class="stat-label">Language set</div></div>')
         parts.append("</div>")
 
+    # --- Semantic coverage ---
+    semantic_coverage: dict[str, Any] = validation.get("semantic_coverage", {})
+    if semantic_coverage.get("available"):
+        interesting_tags = semantic_coverage.get("interesting_tags", {})
+        list_numbering = semantic_coverage.get("list_numbering", {})
+        semantic_items = [
+            ("Struct elements", semantic_coverage.get("total_struct_elems", 0)),
+            ("Headings", sum((semantic_coverage.get("heading_tags") or {}).values())),
+            ("Lists", interesting_tags.get("L", 0)),
+            ("Tables", interesting_tags.get("Table", 0)),
+            ("Figures", interesting_tags.get("Figure", 0)),
+            ("Captions", interesting_tags.get("Caption", 0)),
+            ("Bibliography entries", interesting_tags.get("BibEntry", 0)),
+            ("References", interesting_tags.get("Reference", 0)),
+        ]
+        if any(value for _, value in semantic_items) or list_numbering:
+            parts.append(f"<{h_sub}>Semantic coverage</{h_sub}>")
+            parts.append('<div class="stats">')
+            for label, value in semantic_items:
+                if value:
+                    parts.append(f"""
+                    <div class="stat">
+                      <div class="stat-value">{value}</div>
+                      <div class="stat-label">{label}</div>
+                    </div>
+                    """)
+            if list_numbering:
+                numbering_text = ", ".join(
+                    f"{_e(str(name))}: {_e(str(count))}"
+                    for name, count in sorted(list_numbering.items())
+                )
+                parts.append(f"""
+                <div class="stat">
+                  <div class="stat-value">{len(list_numbering)}</div>
+                  <div class="stat-label">List numbering ({numbering_text})</div>
+                </div>
+                """)
+            parts.append("</div>")
+
     # --- Remediation results ---
     # Rule-level issue counts (distinct accessibility problems), not raw
     # occurrence sums. veraPDF per-rule counts can reach the thousands and

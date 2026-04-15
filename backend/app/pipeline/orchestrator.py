@@ -128,6 +128,44 @@ LlmClient = _LlmClient
 
 
 FONT_RULE_FRAGMENT = "-7.21."
+
+SEMANTIC_COVERAGE_INTERESTING_TAGS = (
+    "Document",
+    "Part",
+    "Sect",
+    "Div",
+    "P",
+    "Span",
+    "H",
+    "H1",
+    "H2",
+    "H3",
+    "H4",
+    "H5",
+    "H6",
+    "L",
+    "LI",
+    "Lbl",
+    "LBody",
+    "Table",
+    "THead",
+    "TBody",
+    "TFoot",
+    "TR",
+    "TH",
+    "TD",
+    "Figure",
+    "Caption",
+    "Reference",
+    "BibEntry",
+    "Note",
+    "Formula",
+    "Link",
+    "TOC",
+    "TOCI",
+    "Quote",
+    "BlockQuote",
+)
 FONT_LANE_REPAIR_DICTS = "repair_font_dicts"
 FONT_LANE_REPAIR_TOUNICODE = "repair_tounicode"
 FONT_LANE_EMBED = "embed_fonts"
@@ -502,6 +540,86 @@ def _build_validation_changes(
     return changes, status_by_rule
 
 
+def _collect_semantic_coverage(
+    node: Any,
+    *,
+    tag_counts: dict[str, int],
+    list_numbering: dict[str, int],
+) -> None:
+    if isinstance(node, pikepdf.Dictionary):
+        struct_type = node.get("/S")
+        if struct_type is not None:
+            tag = str(struct_type).lstrip("/")
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            if tag == "L":
+                attrs = node.get("/A")
+                if isinstance(attrs, pikepdf.Dictionary):
+                    numbering = attrs.get("/ListNumbering")
+                    if numbering is not None:
+                        name = str(numbering).lstrip("/")
+                        list_numbering[name] = list_numbering.get(name, 0) + 1
+
+        _collect_semantic_coverage(
+            node.get("/K"),
+            tag_counts=tag_counts,
+            list_numbering=list_numbering,
+        )
+    elif isinstance(node, pikepdf.Array):
+        for child in node:
+            _collect_semantic_coverage(
+                child,
+                tag_counts=tag_counts,
+                list_numbering=list_numbering,
+            )
+
+
+def _semantic_coverage_summary(pdf_path: Path | str | None) -> dict[str, object]:
+    if pdf_path is None:
+        return {"available": False, "reason": "missing_output_path"}
+
+    tag_counts: dict[str, int] = {}
+    list_numbering: dict[str, int] = {}
+    try:
+        with pikepdf.open(str(pdf_path)) as pdf:
+            struct_root = pdf.Root.get("/StructTreeRoot")
+            if struct_root is None:
+                return {"available": False, "reason": "missing_struct_tree"}
+            _collect_semantic_coverage(
+                struct_root,
+                tag_counts=tag_counts,
+                list_numbering=list_numbering,
+            )
+    except Exception as exc:
+        logger.warning("Failed to collect semantic coverage for %s: %s", pdf_path, exc)
+        return {"available": False, "reason": "inspection_failed", "error": str(exc)}
+
+    heading_tags = {
+        tag: tag_counts[tag]
+        for tag in ("H", "H1", "H2", "H3", "H4", "H5", "H6")
+        if tag_counts.get(tag, 0)
+    }
+    illegal_heading_tags = {
+        tag: count
+        for tag, count in tag_counts.items()
+        if re.fullmatch(r"H(?:[7-9]|\d{2,})", tag)
+    }
+    interesting_tags = {
+        tag: tag_counts[tag]
+        for tag in SEMANTIC_COVERAGE_INTERESTING_TAGS
+        if tag_counts.get(tag, 0)
+    }
+
+    return {
+        "available": True,
+        "total_struct_elems": sum(tag_counts.values()),
+        "tag_counts": dict(sorted(tag_counts.items())),
+        "interesting_tags": interesting_tags,
+        "heading_tags": heading_tags,
+        "illegal_heading_tags": illegal_heading_tags,
+        "list_numbering": dict(sorted(list_numbering.items())),
+    }
+
+
 def _violation_weight(violation) -> int:
     count = getattr(violation, "count", 1)
     if isinstance(count, int) and count > 0:
@@ -633,6 +751,9 @@ def _build_validation_payload(
             "title_set": tagging_result.title_set,
             "lang_set": tagging_result.lang_set,
         },
+        "semantic_coverage": _semantic_coverage_summary(
+            getattr(tagging_result, "output_path", None)
+        ),
         "claims": claims_payload,
     }
 
