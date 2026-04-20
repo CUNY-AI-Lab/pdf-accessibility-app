@@ -67,6 +67,39 @@ async def test_tag_pdf_sets_markinfo_suspects_false(tmp_path):
         assert all(page.get("/Tabs") == pikepdf.Name("/S") for page in pdf.pages)
 
 
+@pytest.mark.asyncio
+async def test_tag_pdf_saves_linearized_output_and_sanitizes_leaf_bookmarks(tmp_path):
+    input_pdf = tmp_path / "heading.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    _build_single_text_pdf(input_pdf, "Accessible Heading")
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {
+                    "type": "heading",
+                    "text": "Accessible Heading",
+                    "page": 0,
+                    "bbox": {"l": 18, "b": 156, "r": 150, "t": 176},
+                    "level": 1,
+                },
+            ],
+            "title": "Accessible Heading",
+        },
+        alt_texts=[],
+        language="en",
+        original_filename=input_pdf.name,
+    )
+
+    with pikepdf.open(output_pdf) as pdf:
+        assert pdf.check_linearization() is True
+        first_bookmark = pdf.Root["/Outlines"]["/First"]
+        assert str(first_bookmark["/Title"]) == "Accessible Heading"
+        assert "/Count" not in first_bookmark
+
+
 def _build_ocr_form_text_pdf(
     path: Path,
     *,

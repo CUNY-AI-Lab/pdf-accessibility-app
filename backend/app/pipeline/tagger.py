@@ -4997,6 +4997,59 @@ def _add_bookmarks(
     return len(items)
 
 
+def _sanitize_outline_leaf_counts(pdf: pikepdf.Pdf) -> int:
+    """Remove explicit /Count 0 from bookmark leaves for stricter viewer compatibility."""
+    outlines = pdf.Root.get("/Outlines")
+    if not isinstance(outlines, pikepdf.Dictionary):
+        return 0
+
+    changed = 0
+    seen: set[tuple[int, int]] = set()
+
+    def _walk(item) -> None:
+        nonlocal changed
+        while isinstance(item, pikepdf.Dictionary):
+            item_key = _obj_key(item)
+            if item_key is not None:
+                if item_key in seen:
+                    return
+                seen.add(item_key)
+
+            first = item.get("/First")
+            if isinstance(first, pikepdf.Dictionary):
+                _walk(first)
+            else:
+                try:
+                    has_zero_count = int(item.get("/Count")) == 0
+                except (TypeError, ValueError):
+                    has_zero_count = False
+                if has_zero_count and "/Count" in item:
+                    del item["/Count"]
+                    changed += 1
+
+            next_item = item.get("/Next")
+            if not isinstance(next_item, pikepdf.Dictionary):
+                return
+            item = next_item
+
+    _walk(outlines.get("/First"))
+    return changed
+
+
+def _save_pdf_for_viewer_compatibility(pdf: pikepdf.Pdf, output_path: Path) -> None:
+    """Save linearized output when possible; fall back to a normal save."""
+    tmp_path = output_path.with_name(f"{output_path.name}.tmp")
+    tmp_path.unlink(missing_ok=True)
+    try:
+        pdf.save(str(tmp_path), linearize=True)
+    except Exception as exc:
+        tmp_path.unlink(missing_ok=True)
+        logger.warning("Could not save linearized PDF %s: %s", output_path.name, exc)
+        pdf.save(str(output_path))
+    else:
+        tmp_path.replace(output_path)
+
+
 def _tag_link_annotations(
     page: pikepdf.Page,
     page_ref: pikepdf.Object,
@@ -5507,8 +5560,9 @@ async def tag_pdf(
                 structure_json.get("native_toc"),
                 structure_json.get("title"),
             )
+            _sanitize_outline_leaf_counts(pdf)
 
-            pdf.save(str(output_path))
+            _save_pdf_for_viewer_compatibility(pdf, output_path)
 
         total_tags = tags_added + builder._struct_elems_created
         logger.info(
