@@ -94,9 +94,47 @@ docker run -d \
   pdf-accessibility-app
 ```
 
-The image preloads Docling models so there are no first-run downloads. For subpath deployments (e.g., behind a reverse proxy), set `VITE_APP_BASE_PATH=/pdf-accessibility/` before building.
+By default, the Docker image is slim and expects `DOCLING_SERVE_URL` to point to
+a remote `docling-serve` instance. Set `WITH_LOCAL_DOCLING=true` before building
+to include local Docling and preload models into the image. For subpath
+deployments (e.g., behind a reverse proxy), set
+`VITE_APP_BASE_PATH=/pdf-accessibility/` before building.
 
 Tesseract language packs included: English, Spanish, French, German, Chinese (Simplified and Traditional), Russian, Arabic, Korean, Bengali, Polish, Hebrew, Yiddish, Haitian Creole, Hindi, Italian, Portuguese, and Japanese. Add others by extending the Dockerfile.
+
+## NML Deployment
+
+The NML host is reached with the local `nml-ssh` wrapper. The deployed project
+lives at `/data/pdf-accessibility-app` and runs as the Docker Compose project
+`pdf-accessibility-app`.
+
+The NML override uses host networking because Docker bridge networking is not
+reliable on that VM. The app listens on `127.0.0.1:8001`/`0.0.0.0:8001`, and
+Nginx serves it publicly at
+`https://tools.cuny.qzz.io/pdf-accessibility/`.
+
+Required NML `.env` settings:
+
+```env
+ANONYMOUS_SESSION_COOKIE_SECURE=true
+CORS_ALLOW_ORIGINS=https://tools.cuny.qzz.io
+VITE_APP_BASE_PATH=/pdf-accessibility/
+DOCLING_SERVE_URL=https://workmac.tailc22a4b.ts.net/docling
+WITH_LOCAL_DOCLING=false
+```
+
+Deploy from the NML host:
+
+```bash
+cd /data/pdf-accessibility-app
+git pull
+docker compose up -d --build
+curl -fsS http://127.0.0.1:8001/health
+curl -fsS http://127.0.0.1:8001/health/ready
+curl -fsS https://tools.cuny.qzz.io/pdf-accessibility/health/ready
+```
+
+Do not commit `.env` or the backup `.env.*` files on the server.
 
 ## Configuration
 
@@ -113,10 +151,16 @@ Configure the app via `.env`. Key variables:
 | `GEMINI_DIRECT_ALT_TEXT_THINKING_LEVEL` | Thinking level for figure semantics and alt text | `medium` |
 | `ALT_TEXT_MAX_CONCURRENCY` | Max concurrent alt-text requests per PDF | `8` |
 | `ALT_TEXT_GLOBAL_MAX_CONCURRENCY` | Process-wide cap for alt-text requests | `12` |
+| `MAX_FILES_PER_UPLOAD` | Maximum PDFs accepted in one upload request | `5` |
+| `MAX_ACTIVE_JOBS_PER_SESSION` | Maximum queued/processing jobs per anonymous browser session | `3` |
+| `MAX_ACTIVE_JOBS_GLOBAL` | Maximum queued/processing jobs accepted across the app | `12` |
+| `MAX_CONCURRENT_JOBS` | Maximum PDF pipeline jobs actively executing in-process | `2` |
+| `WITH_LOCAL_DOCLING` | Include local Docling in Docker builds | `false` |
 | `DOCLING_SERVE_URL` | Remote `docling-serve` URL (falls back to local Docling when unset) | — |
 | `DOCLING_SERVE_TOKEN` | Bearer token for a protected `docling-serve` proxy | — |
 | `OCR_LANGUAGE` | Fallback Tesseract language code | `eng` |
 | `JOB_TTL_HOURS` | Hours before jobs expire | `12` |
+| `CSRF_PROTECTION_ENABLED` | Require CSRF header for cookie-authenticated write requests | `true` |
 | `VERAPDF_PATH` | Path to the veraPDF binary | `verapdf` |
 | `GHOSTSCRIPT_PATH` | Path to the Ghostscript binary | `gs` |
 
@@ -189,6 +233,11 @@ Verify the effective runtime (LLM provider, Docling target, installed binaries) 
 cd backend
 PYTHONPATH=. uv run python scripts/runtime_diagnostics.py
 ```
+
+When the app is running, `/health` is a lightweight liveness check and
+`/health/ready` verifies runtime dependencies needed for real PDF processing:
+database connectivity, writable storage, required PDF binaries, LLM
+configuration, and Docling/docling-serve availability.
 
 ## Documentation
 

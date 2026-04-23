@@ -120,3 +120,17 @@ class ValidationReportResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str = "ok"
     version: str = "0.1.0"
+
+
+class ReadinessCheckResponse(BaseModel):
+    ok: bool
+    status: Literal["ok", "error"]
+    detail: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReadinessResponse(BaseModel):
+    status: Literal["ready", "not_ready"]
+    version: str = "0.1.0"
+    checks: dict[str, ReadinessCheckResponse] = Field(default_factory=dict)
+    diagnostics: dict[str, Any] = Field(default_factory=dict)

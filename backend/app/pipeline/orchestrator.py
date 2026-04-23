@@ -23,7 +23,11 @@ from app.pipeline.fidelity import _table_semantics_risk, assess_fidelity
 from app.pipeline.language import bcp47_to_tesseract
 from app.pipeline.ocr import run_ocr
 from app.pipeline.structure import extract_structure
-from app.pipeline.subprocess_utils import SubprocessTimeout, communicate_with_timeout
+from app.pipeline.subprocess_utils import (
+    SubprocessTimeout,
+    communicate_with_timeout,
+    subprocess_process_group_kwargs,
+)
 from app.pipeline.tagger import tag_pdf
 from app.pipeline.validator import validate_pdf
 from app.services.applied_changes import add_applied_change
@@ -4904,6 +4908,7 @@ async def _rewrite_pdf_with_ghostscript_embed(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=enriched_subprocess_env(),
+        **subprocess_process_group_kwargs(),
     )
     try:
         stdout, stderr = await communicate_with_timeout(proc, timeout_seconds)

@@ -5,6 +5,8 @@ from collections import OrderedDict, defaultdict
 from collections.abc import Coroutine
 from typing import Any
 
+from app.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 # Sentinel value to signal SSE streams to close
@@ -17,10 +19,22 @@ _MAX_COMPLETED_JOBS = 500
 class JobManager:
     """Manages background pipeline tasks and SSE progress broadcasting."""
 
-    def __init__(self):
+    def __init__(self, *, max_concurrent_jobs: int = 2):
+        self.max_concurrent_jobs = max(1, int(max_concurrent_jobs))
+        self._semaphore = asyncio.Semaphore(self.max_concurrent_jobs)
         self._tasks: dict[str, asyncio.Task] = {}
         self._progress_channels: dict[str, list[asyncio.Queue]] = defaultdict(list)
         self._completed_jobs: OrderedDict[str, None] = OrderedDict()
+
+    async def _run_with_slot(self, coro: Coroutine[Any, Any, Any]) -> Any:
+        acquired = False
+        try:
+            async with self._semaphore:
+                acquired = True
+                return await coro
+        finally:
+            if not acquired:
+                coro.close()
 
     async def submit_job(
         self, job_id: str, coro: Coroutine[Any, Any, Any]
@@ -33,7 +47,7 @@ class JobManager:
             return existing
 
         try:
-            task = asyncio.create_task(coro, name=f"job-{job_id}")
+            task = asyncio.create_task(self._run_with_slot(coro), name=f"job-{job_id}")
         except Exception:
             coro.close()
             raise
@@ -124,5 +138,5 @@ _job_manager: JobManager | None = None
 def get_job_manager() -> JobManager:
     global _job_manager
     if _job_manager is None:
-        _job_manager = JobManager()
+        _job_manager = JobManager(max_concurrent_jobs=get_settings().max_concurrent_jobs)
     return _job_manager

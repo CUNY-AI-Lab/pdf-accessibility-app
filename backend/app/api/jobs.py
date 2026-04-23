@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, UploadFile
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only, selectinload
 from sse_starlette.sse import EventSourceResponse
@@ -19,6 +19,7 @@ from app.services.file_storage import cleanup_job_files, save_upload
 from app.services.html_report import render_batch_html_report
 from app.services.job_manager import _DONE, JobManager, get_job_manager
 from app.services.job_state import (
+    ACTIVE_JOB_STATUSES,
     CLEANUP_INTERRUPTED_ERROR,
     mark_job_failed,
 )
@@ -31,6 +32,15 @@ PIPELINE_STEPS = ["classify", "ocr", "structure", "alt_text", "tagging", "valida
 PIPELINE_STEP_ORDER = {name: idx for idx, name in enumerate(PIPELINE_STEPS)}
 JOB_START_FAILURE_ERROR = "Accessibility processing could not start. Please upload the PDF again."
 JOB_START_FAILURE_DETAIL = "Failed to start accessibility processing. Please upload again."
+TOO_MANY_FILES_DETAIL = "Too many files in one upload. Upload fewer files and try again."
+SESSION_JOB_LIMIT_DETAIL = (
+    "This browser session already has too many queued or processing jobs. "
+    "Wait for current jobs to finish before uploading more PDFs."
+)
+GLOBAL_JOB_LIMIT_DETAIL = (
+    "The server is already processing the maximum number of PDFs. "
+    "Try again after current jobs finish."
+)
 
 
 def _parse_result_json(raw: str | None):
@@ -48,6 +58,53 @@ def _validation_compliant(job: Job) -> bool | None:
         return report["compliant"]
 
     return None
+
+
+def _positive_int_setting(settings, name: str, default: int) -> int:
+    try:
+        value = int(getattr(settings, name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(1, value)
+
+
+async def _active_job_count(
+    db: AsyncSession,
+    *,
+    session_hash: str | None = None,
+) -> int:
+    query = select(func.count()).select_from(Job).where(
+        Job.status.in_(tuple(ACTIVE_JOB_STATUSES))
+    )
+    if session_hash is not None:
+        query = query.where(Job.owner_session_hash == session_hash)
+    result = await db.execute(query)
+    return int(result.scalar_one() or 0)
+
+
+async def _enforce_job_submission_limits(
+    *,
+    file_count: int,
+    db: AsyncSession,
+    session_hash: str,
+    settings,
+) -> None:
+    max_files = _positive_int_setting(settings, "max_files_per_upload", 5)
+    if file_count > max_files:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{TOO_MANY_FILES_DETAIL} Limit: {max_files}.",
+        )
+
+    max_session_jobs = _positive_int_setting(settings, "max_active_jobs_per_session", 3)
+    session_active = await _active_job_count(db, session_hash=session_hash)
+    if session_active + file_count > max_session_jobs:
+        raise HTTPException(status_code=429, detail=SESSION_JOB_LIMIT_DETAIL)
+
+    max_global_jobs = _positive_int_setting(settings, "max_active_jobs_global", 12)
+    global_active = await _active_job_count(db)
+    if global_active + file_count > max_global_jobs:
+        raise HTTPException(status_code=503, detail=GLOBAL_JOB_LIMIT_DETAIL)
 
 
 def job_to_response(job: Job, *, include_step_results: bool = True) -> JobResponse:
@@ -122,6 +179,14 @@ async def create_jobs(
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
 
+    settings = get_settings()
+    await _enforce_job_submission_limits(
+        file_count=len(files),
+        db=db,
+        session_hash=session.session_hash,
+        settings=settings,
+    )
+
     for file in files:
         raw_filename = str(file.filename or "").strip()
         original_filename = safe_filename(raw_filename)
@@ -169,7 +234,6 @@ async def create_jobs(
         raise
 
     # Submit each job to the pipeline
-    settings = get_settings()
     session_maker = get_session_maker()
     job_manager = get_job_manager()
     submitted_job_ids: set[str] = set()

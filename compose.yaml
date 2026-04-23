@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
       args:
         VITE_APP_BASE_PATH: ${VITE_APP_BASE_PATH:-/}
+        WITH_LOCAL_DOCLING: ${WITH_LOCAL_DOCLING:-false}
     env_file:
       - .env
     environment:

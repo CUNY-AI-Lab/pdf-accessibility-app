@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app import main
+from app.api import health
 from app.models import Base, Job, JobStep
 from app.services.job_state import CLEANUP_INTERRUPTED_ERROR, RESTART_INTERRUPTED_ERROR
 
@@ -53,6 +54,7 @@ def test_create_app_serves_built_frontend(tmp_path, monkeypatch):
         assert root_response.status_code == 200
         assert "div id='root'" in root_response.text
         assert "anon_session=" in root_response.headers["set-cookie"]
+        assert "anon_session_csrf=" in root_response.headers["set-cookie"]
         assert "HttpOnly" in root_response.headers["set-cookie"]
 
         root_head_response = client.head("/")
@@ -71,6 +73,107 @@ def test_create_app_serves_built_frontend(tmp_path, monkeypatch):
 
         health_response = client.get("/health")
         assert health_response.status_code == 200
+
+
+def test_cookie_authenticated_writes_require_csrf_header(tmp_path, monkeypatch):
+    dist_dir = tmp_path / "frontend" / "dist"
+    dist_dir.mkdir(parents=True)
+    (dist_dir / "index.html").write_text("<!doctype html><html></html>", encoding="utf-8")
+
+    monkeypatch.setattr(main, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(main, "init_db", _noop_async)
+    monkeypatch.setattr(main, "_cleanup_expired_jobs_once", _noop_async)
+    monkeypatch.setattr(main, "_fail_abandoned_jobs_once", _noop_async)
+    monkeypatch.setattr(main, "get_job_manager", lambda: _DummyJobManager())
+
+    app = main.create_app(frontend_dist_dir=dist_dir)
+
+    with TestClient(app) as client:
+        assert client.get("/").status_code == 200
+        csrf_token = client.cookies.get("anon_session_csrf")
+        assert csrf_token
+
+        missing_header = client.post("/api/jobs")
+        assert missing_header.status_code == 403
+        assert missing_header.json()["detail"] == "CSRF validation failed"
+
+        bad_origin = client.post(
+            "/api/jobs",
+            headers={
+                "Origin": "https://evil.example",
+                "X-CSRF-Token": csrf_token,
+            },
+        )
+        assert bad_origin.status_code == 403
+
+        allowed_by_csrf = client.post(
+            "/api/jobs",
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        assert allowed_by_csrf.status_code != 403
+
+
+def test_cookie_authenticated_writes_allow_forwarded_same_origin(tmp_path, monkeypatch):
+    dist_dir = tmp_path / "frontend" / "dist"
+    dist_dir.mkdir(parents=True)
+    (dist_dir / "index.html").write_text("<!doctype html><html></html>", encoding="utf-8")
+
+    monkeypatch.setattr(main, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(main, "init_db", _noop_async)
+    monkeypatch.setattr(main, "_cleanup_expired_jobs_once", _noop_async)
+    monkeypatch.setattr(main, "_fail_abandoned_jobs_once", _noop_async)
+    monkeypatch.setattr(main, "get_job_manager", lambda: _DummyJobManager())
+
+    app = main.create_app(frontend_dist_dir=dist_dir)
+
+    with TestClient(app) as client:
+        assert client.get("/").status_code == 200
+        csrf_token = client.cookies.get("anon_session_csrf")
+        assert csrf_token
+
+        response = client.post(
+            "/api/jobs",
+            headers={
+                "Host": "tools.cuny.qzz.io",
+                "Origin": "https://tools.cuny.qzz.io",
+                "X-Forwarded-Proto": "https",
+                "X-CSRF-Token": csrf_token,
+            },
+        )
+
+    assert response.status_code != 403
+
+
+def test_readiness_endpoint_returns_503_when_not_ready(monkeypatch):
+    async def _not_ready():
+        return {
+            "status": "not_ready",
+            "version": "0.1.0",
+            "checks": {
+                "binaries": {
+                    "ok": False,
+                    "status": "error",
+                    "detail": "Missing binaries",
+                    "metadata": {},
+                }
+            },
+            "diagnostics": {},
+        }
+
+    monkeypatch.setattr(main, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(main, "init_db", _noop_async)
+    monkeypatch.setattr(main, "_cleanup_expired_jobs_once", _noop_async)
+    monkeypatch.setattr(main, "_fail_abandoned_jobs_once", _noop_async)
+    monkeypatch.setattr(main, "get_job_manager", lambda: _DummyJobManager())
+    monkeypatch.setattr(health, "collect_readiness", _not_ready)
+
+    app = main.create_app()
+
+    with TestClient(app) as client:
+        response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "not_ready"
 
 
 def test_create_app_runs_startup_cleanup_before_failing_abandoned_jobs(monkeypatch):

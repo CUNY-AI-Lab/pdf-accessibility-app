@@ -6,7 +6,11 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.pipeline.subprocess_utils import SubprocessTimeout, communicate_with_timeout
+from app.pipeline.subprocess_utils import (
+    SubprocessTimeout,
+    communicate_with_timeout,
+    subprocess_process_group_kwargs,
+)
 from app.services.runtime_paths import enriched_subprocess_env
 
 logger = logging.getLogger(__name__)
@@ -94,6 +98,7 @@ async def run_ocr(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=enriched_subprocess_env(),
+        **subprocess_process_group_kwargs(),
     )
     try:
         stdout, stderr = await communicate_with_timeout(proc, timeout_seconds)

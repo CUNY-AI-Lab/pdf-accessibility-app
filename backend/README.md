@@ -128,7 +128,11 @@ This protects jobs inside the app's API surface; semantic LLM calls still go to
 the configured provider.
 
 For HTTPS deployments, set `ANONYMOUS_SESSION_COOKIE_SECURE=true` so the cookie
-is only sent over secure transport.
+is only sent over secure transport. If the app is served through a reverse proxy
+or subpath, include the public origin in `CORS_ALLOW_ORIGINS` (for example
+`https://tools.cuny.qzz.io`). The CSRF origin check also accepts same-origin
+requests when the proxy forwards the public `Host` and `X-Forwarded-Proto`
+headers.
 
 ## Tests
 

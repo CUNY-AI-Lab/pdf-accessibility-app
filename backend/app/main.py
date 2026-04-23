@@ -3,10 +3,11 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import and_, or_, select
 
 from app.api.health import router as health_router
@@ -15,6 +16,7 @@ from app.config import BASE_DIR, get_settings
 from app.database import get_session_maker, init_db
 from app.models import Job
 from app.services.anonymous_sessions import (
+    csrf_token_for_session,
     ensure_anonymous_session,
     set_anonymous_session_cookie,
 )
@@ -60,6 +62,88 @@ def _cors_origins() -> list[str]:
         for origin in (item.strip() for item in settings.cors_allow_origins.split(","))
         if origin
     ]
+
+
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_CSRF_HEADER_NAME = "x-csrf-token"
+
+
+def _normalized_origin(value: str) -> str | None:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+
+    default_port = 443 if parsed.scheme == "https" else 80
+    host = (parsed.hostname or "").lower()
+    port = parsed.port
+    if port is None or port == default_port:
+        return f"{parsed.scheme}://{host}"
+    return f"{parsed.scheme}://{host}:{port}"
+
+
+def _first_forwarded_value(value: str | None) -> str:
+    return (value or "").split(",", maxsplit=1)[0].strip()
+
+
+def _same_origin_candidates(request) -> set[str]:
+    candidates: set[str] = set()
+    request_origin = _normalized_origin(str(request.url))
+    if request_origin:
+        candidates.add(request_origin)
+
+    forwarded_proto = _first_forwarded_value(request.headers.get("x-forwarded-proto"))
+    forwarded_host = _first_forwarded_value(request.headers.get("x-forwarded-host"))
+    host = _first_forwarded_value(request.headers.get("host"))
+    external_host = forwarded_host or host
+    if forwarded_proto in {"http", "https"} and external_host:
+        forwarded_origin = _normalized_origin(f"{forwarded_proto}://{external_host}")
+        if forwarded_origin:
+            candidates.add(forwarded_origin)
+
+    return candidates
+
+
+def _request_origin_allowed(request) -> bool:
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin:
+        referer = (request.headers.get("referer") or "").strip()
+        if not referer:
+            return True
+        parsed_referer = urlparse(referer)
+        if not parsed_referer.scheme or not parsed_referer.netloc:
+            return False
+        origin = f"{parsed_referer.scheme}://{parsed_referer.netloc}"
+
+    normalized_origin = _normalized_origin(origin)
+    if normalized_origin is None:
+        return False
+    configured_origins = {
+        allowed_origin
+        for origin in _cors_origins()
+        if (allowed_origin := _normalized_origin(origin)) is not None
+    }
+    return (
+        normalized_origin in configured_origins
+        or normalized_origin in _same_origin_candidates(request)
+    )
+
+
+def _csrf_valid(request, session_token: str) -> bool:
+    settings = get_settings()
+    if not settings.csrf_protection_enabled:
+        return True
+    if request.method.upper() not in _UNSAFE_METHODS:
+        return True
+    if not request.url.path.startswith("/api"):
+        return True
+    if not request.cookies.get(settings.anonymous_session_cookie_name):
+        return True
+    if not _request_origin_allowed(request):
+        return False
+
+    supplied = (request.headers.get(_CSRF_HEADER_NAME) or "").strip()
+    expected = csrf_token_for_session(session_token)
+    return bool(supplied) and supplied == expected
 
 
 async def _periodic_cleanup():
@@ -228,8 +312,15 @@ def create_app(frontend_dist_dir: Path | None = None) -> FastAPI:
     @app.middleware("http")
     async def anonymous_session_middleware(request, call_next):
         session, created = ensure_anonymous_session(request)
+        if not _csrf_valid(request, session.token):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "CSRF validation failed"},
+            )
         response = await call_next(request)
-        if created:
+        settings = get_settings()
+        csrf_cookie = request.cookies.get(settings.anonymous_session_csrf_cookie_name)
+        if created or csrf_cookie != csrf_token_for_session(session.token):
             set_anonymous_session_cookie(response, session.token)
         return response
 

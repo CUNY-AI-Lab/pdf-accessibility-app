@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import secrets
 import string
 from dataclasses import dataclass
@@ -35,6 +36,14 @@ def hash_session_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def csrf_token_for_session(token: str) -> str:
+    return hmac.new(
+        token.encode("utf-8"),
+        b"pdf-accessibility-csrf-v1",
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def ensure_anonymous_session(request: Request) -> tuple[AnonymousSession, bool]:
     settings = get_settings()
     token = _normalize_session_token(
@@ -51,11 +60,21 @@ def ensure_anonymous_session(request: Request) -> tuple[AnonymousSession, bool]:
 
 def set_anonymous_session_cookie(response: Response, token: str) -> None:
     settings = get_settings()
+    max_age = max(1, settings.anonymous_session_cookie_max_age_hours) * 3600
     response.set_cookie(
         key=settings.anonymous_session_cookie_name,
         value=token,
-        max_age=max(1, settings.anonymous_session_cookie_max_age_hours) * 3600,
+        max_age=max_age,
         httponly=True,
+        secure=settings.anonymous_session_cookie_secure,
+        samesite="lax",
+        path="/",
+    )
+    response.set_cookie(
+        key=settings.anonymous_session_csrf_cookie_name,
+        value=csrf_token_for_session(token),
+        max_age=max_age,
+        httponly=False,
         secure=settings.anonymous_session_cookie_secure,
         samesite="lax",
         path="/",

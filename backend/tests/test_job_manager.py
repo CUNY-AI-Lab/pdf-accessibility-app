@@ -68,3 +68,32 @@ async def test_subscribe_after_completion_receives_done_sentinel():
     queue = manager.subscribe("job-1")
 
     assert await asyncio.wait_for(queue.get(), timeout=1) is _DONE
+
+
+@pytest.mark.asyncio
+async def test_submit_job_limits_concurrent_execution():
+    manager = JobManager(max_concurrent_jobs=1)
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    release_second = asyncio.Event()
+
+    async def first():
+        first_started.set()
+        await release_first.wait()
+
+    async def second():
+        second_started.set()
+        await release_second.wait()
+
+    first_task = await manager.submit_job("job-1", first())
+    second_task = await manager.submit_job("job-2", second())
+
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(second_started.wait(), timeout=0.05)
+
+    release_first.set()
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+    release_second.set()
+    await asyncio.gather(first_task, second_task)

@@ -46,6 +46,12 @@ class _FailingSubmitJobManager(_DummyJobManager):
         return None
 
 
+class _LimitSettings:
+    max_files_per_upload = 5
+    max_active_jobs_per_session = 3
+    max_active_jobs_global = 12
+
+
 @pytest.mark.asyncio
 async def test_create_jobs_binds_job_to_current_anonymous_session(tmp_path, monkeypatch):
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -267,9 +273,82 @@ async def test_list_jobs_does_not_depend_on_validation_step_result_json():
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_create_jobs_rejects_too_many_files(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    class _Settings(_LimitSettings):
+        max_files_per_upload = 1
+
+    monkeypatch.setattr(jobs, "get_settings", lambda: _Settings())
+
+    async with session_maker() as db:
+        uploads = [
+            UploadFile(filename="first.pdf", file=BytesIO(b"%PDF-1.7\n")),
+            UploadFile(filename="second.pdf", file=BytesIO(b"%PDF-1.7\n")),
+        ]
+
+        with pytest.raises(HTTPException) as exc_info:
+            await jobs.create_jobs(
+                files=uploads,
+                db=db,
+                session=_session("session-1-token-value"),
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "Limit: 1" in exc_info.value.detail
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_create_jobs_rejects_when_session_active_job_limit_is_reached(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    session = _session("session-1-token-value")
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    class _Settings(_LimitSettings):
+        max_active_jobs_per_session = 1
+
+    monkeypatch.setattr(jobs, "get_settings", lambda: _Settings())
+
+    async with session_maker() as db:
+        db.add(
+            Job(
+                id="existing-active-job",
+                filename="active.pdf",
+                original_filename="active.pdf",
+                owner_session_hash=session.session_hash,
+                status="processing",
+                input_path="/tmp/active.pdf",
+            )
+        )
+        await db.commit()
+
+        upload = UploadFile(filename="next.pdf", file=BytesIO(b"%PDF-1.7\n"))
+        with pytest.raises(HTTPException) as exc_info:
+            await jobs.create_jobs(files=[upload], db=db, session=session)
+
+        assert exc_info.value.status_code == 429
+        assert "too many queued or processing jobs" in exc_info.value.detail
+
+    await engine.dispose()
+
+
 def test_settings_default_job_ttl_is_12_hours():
     settings = Settings(_env_file=None, llm_base_url="http://localhost:11434/v1")
     assert settings.job_ttl_hours == 12
+    assert settings.max_files_per_upload == 5
+    assert settings.max_active_jobs_per_session == 3
+    assert settings.max_active_jobs_global == 12
+    assert settings.max_concurrent_jobs == 2
 
 
 @pytest.mark.asyncio

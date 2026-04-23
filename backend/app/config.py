@@ -92,14 +92,20 @@ class Settings(BaseSettings):
 
     # Upload limits
     max_upload_size_bytes: int = 500 * 1024 * 1024  # 500 MB
+    max_files_per_upload: int = 5
+    max_active_jobs_per_session: int = 3
+    max_active_jobs_global: int = 12
+    max_concurrent_jobs: int = 2
 
     # Job lifecycle
     job_ttl_hours: int = 12
 
     # Anonymous browser session
     anonymous_session_cookie_name: str = "anon_session"
+    anonymous_session_csrf_cookie_name: str = "anon_session_csrf"
     anonymous_session_cookie_max_age_hours: int = 24 * 30
     anonymous_session_cookie_secure: bool = False
+    csrf_protection_enabled: bool = True
 
     # CORS
     cors_allow_origins: str = (

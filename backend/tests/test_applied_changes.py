@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api import review
-from app.models import AppliedChange, Base, Job, JobStep
+from app.models import AppliedChange, Base, Job, JobStep, ReviewTask
 from app.services.anonymous_sessions import AnonymousSession, hash_session_token
 
 
@@ -74,6 +74,53 @@ async def test_keep_applied_change_returns_current_job_status():
         assert response.status == "kept"
         assert response.job_status == "complete"
         assert change.review_status == "kept"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_resolving_review_tasks_does_not_promote_manual_job_to_complete():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_maker() as db:
+        job = Job(
+            id="job-review-resolution",
+            filename="sample.pdf",
+            original_filename="sample.pdf",
+            owner_session_hash=_session("session-1-token-value").session_hash,
+            status="manual_remediation",
+            input_path="/tmp/sample.pdf",
+            validation_json='{"compliant": true}',
+        )
+        task = ReviewTask(
+            job_id="job-review-resolution",
+            task_type="content_fidelity",
+            title="Review content fidelity",
+            detail="Review manually.",
+            severity="high",
+            blocking=True,
+            status="pending_review",
+        )
+        db.add_all([job, task])
+        await db.commit()
+
+        response = await review.resolve_review_task(
+            job_id="job-review-resolution",
+            task_id=1,
+            db=db,
+            session=_session("session-1-token-value"),
+        )
+
+        await db.refresh(job)
+        await db.refresh(task)
+        assert response.status == "resolved"
+        assert response.job_status == "manual_remediation"
+        assert job.status == "manual_remediation"
+        assert task.status == "resolved"
 
     await engine.dispose()
 

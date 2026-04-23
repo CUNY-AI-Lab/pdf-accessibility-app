@@ -1,4 +1,3 @@
-import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -646,25 +645,6 @@ async def resolve_review_task(
 
     task.status = "resolved"
     job.updated_at = datetime.now(UTC)
-
-    # If no blocking tasks remain unresolved, upgrade job to complete
-    # (provided validation was compliant).
-    remaining = await db.execute(
-        select(ReviewTask.id).where(
-            ReviewTask.job_id == job_id,
-            ReviewTask.blocking == True,  # noqa: E712
-            ReviewTask.status != "resolved",
-        )
-    )
-    if not remaining.scalars().first() and job.status == "manual_remediation":
-        validation = {}
-        if job.validation_json:
-            try:
-                validation = json.loads(job.validation_json)
-            except json.JSONDecodeError:
-                pass
-        if validation.get("compliant", False):
-            job.status = "complete"
 
     await db.commit()
     return AppliedChangeActionResponse(

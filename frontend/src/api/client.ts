@@ -14,9 +14,24 @@ const APP_BASE_PATH = normalizeBasePath(import.meta.env.BASE_URL);
 
 export const ROUTER_BASENAME = APP_BASE_PATH || undefined;
 export const BASE_URL = joinPath(APP_BASE_PATH, "/api");
+const CSRF_COOKIE_NAME = "anon_session_csrf";
+const CSRF_HEADER_NAME = "X-CSRF-Token";
 
 export function apiUrl(path: string): string {
   return joinPath(BASE_URL, path);
+}
+
+function readCookie(name: string): string | null {
+  const prefix = `${encodeURIComponent(name)}=`;
+  const cookie = document.cookie
+    .split(";")
+    .map((value) => value.trim())
+    .find((value) => value.startsWith(prefix));
+  return cookie ? decodeURIComponent(cookie.slice(prefix.length)) : null;
+}
+
+function isUnsafeMethod(method: string | undefined): boolean {
+  return !["GET", "HEAD", "OPTIONS"].includes((method ?? "GET").toUpperCase());
 }
 
 export class ApiError extends Error {
@@ -36,12 +51,16 @@ export async function apiFetch<T>(
   options?: RequestInit,
 ): Promise<T> {
   const url = apiUrl(path);
+  const csrfToken = isUnsafeMethod(options?.method)
+    ? readCookie(CSRF_COOKIE_NAME)
+    : null;
   const response = await fetch(url, {
     ...options,
     headers: {
       ...(options?.body instanceof FormData
         ? {}
         : { "Content-Type": "application/json" }),
+      ...(csrfToken ? { [CSRF_HEADER_NAME]: csrfToken } : {}),
       ...options?.headers,
     },
   });
