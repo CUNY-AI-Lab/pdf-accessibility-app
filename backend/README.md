@@ -130,9 +130,9 @@ the configured provider.
 For HTTPS deployments, set `ANONYMOUS_SESSION_COOKIE_SECURE=true` so the cookie
 is only sent over secure transport. If the app is served through a reverse proxy
 or subpath, include every public origin in `CORS_ALLOW_ORIGINS` (for example
-`https://tools.cuny.qzz.io,https://tools.ailab.gc.cuny.edu`). The CSRF origin
-check also accepts same-origin requests when the proxy forwards the public
-`Host` and `X-Forwarded-Proto` headers.
+`https://tools.ailab.gc.cuny.edu`). The CSRF origin check also accepts
+same-origin requests when the proxy forwards the public `Host` and
+`X-Forwarded-Proto` headers.
 
 ## Tests
 

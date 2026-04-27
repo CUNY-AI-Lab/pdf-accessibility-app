@@ -135,8 +135,8 @@ def test_cookie_authenticated_writes_allow_forwarded_same_origin(tmp_path, monke
         response = client.post(
             "/api/jobs",
             headers={
-                "Host": "tools.cuny.qzz.io",
-                "Origin": "https://tools.cuny.qzz.io",
+                "Host": "tools.ailab.gc.cuny.edu",
+                "Origin": "https://tools.ailab.gc.cuny.edu",
                 "X-Forwarded-Proto": "https",
                 "X-CSRF-Token": csrf_token,
             },
