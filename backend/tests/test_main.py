@@ -96,6 +96,7 @@ def test_cookie_authenticated_writes_require_csrf_header(tmp_path, monkeypatch):
         missing_header = client.post("/api/jobs")
         assert missing_header.status_code == 403
         assert missing_header.json()["detail"] == "CSRF validation failed"
+        assert "anon_session_csrf=" in missing_header.headers["set-cookie"]
 
         bad_origin = client.post(
             "/api/jobs",

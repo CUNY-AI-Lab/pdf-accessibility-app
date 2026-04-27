@@ -313,10 +313,12 @@ def create_app(frontend_dist_dir: Path | None = None) -> FastAPI:
     async def anonymous_session_middleware(request, call_next):
         session, created = ensure_anonymous_session(request)
         if not _csrf_valid(request, session.token):
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=403,
                 content={"detail": "CSRF validation failed"},
             )
+            set_anonymous_session_cookie(response, session.token)
+            return response
         response = await call_next(request)
         settings = get_settings()
         csrf_cookie = request.cookies.get(settings.anonymous_session_csrf_cookie_name)

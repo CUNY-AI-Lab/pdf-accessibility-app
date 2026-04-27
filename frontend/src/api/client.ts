@@ -14,6 +14,7 @@ const APP_BASE_PATH = normalizeBasePath(import.meta.env.BASE_URL);
 
 export const ROUTER_BASENAME = APP_BASE_PATH || undefined;
 export const BASE_URL = joinPath(APP_BASE_PATH, "/api");
+const HEALTH_URL = joinPath(APP_BASE_PATH, "/health");
 const CSRF_COOKIE_NAME = "anon_session_csrf";
 const CSRF_HEADER_NAME = "X-CSRF-Token";
 
@@ -34,6 +35,64 @@ function isUnsafeMethod(method: string | undefined): boolean {
   return !["GET", "HEAD", "OPTIONS"].includes((method ?? "GET").toUpperCase());
 }
 
+async function refreshCsrfToken(): Promise<string | null> {
+  try {
+    await fetch(HEALTH_URL, {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+  } catch {
+    return readCookie(CSRF_COOKIE_NAME);
+  }
+  return readCookie(CSRF_COOKIE_NAME);
+}
+
+async function csrfTokenForRequest(
+  method: string | undefined,
+): Promise<string | null> {
+  if (!isUnsafeMethod(method)) {
+    return null;
+  }
+  return readCookie(CSRF_COOKIE_NAME) ?? refreshCsrfToken();
+}
+
+function requestHeaders(
+  options: RequestInit | undefined,
+  csrfToken: string | null,
+): HeadersInit {
+  return {
+    ...(options?.body instanceof FormData
+      ? {}
+      : { "Content-Type": "application/json" }),
+    ...(csrfToken ? { [CSRF_HEADER_NAME]: csrfToken } : {}),
+    ...options?.headers,
+  };
+}
+
+async function sendApiRequest(
+  url: string,
+  options: RequestInit | undefined,
+  csrfToken: string | null,
+): Promise<Response> {
+  return fetch(url, {
+    ...options,
+    credentials: options?.credentials ?? "same-origin",
+    headers: requestHeaders(options, csrfToken),
+  });
+}
+
+async function isCsrfFailure(response: Response): Promise<boolean> {
+  if (response.status !== 403) {
+    return false;
+  }
+  try {
+    const errorBody = await response.clone().json();
+    return errorBody.detail === "CSRF validation failed";
+  } catch {
+    return false;
+  }
+}
+
 export class ApiError extends Error {
   status: number;
   detail: string;
@@ -51,19 +110,16 @@ export async function apiFetch<T>(
   options?: RequestInit,
 ): Promise<T> {
   const url = apiUrl(path);
-  const csrfToken = isUnsafeMethod(options?.method)
-    ? readCookie(CSRF_COOKIE_NAME)
-    : null;
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      ...(options?.body instanceof FormData
-        ? {}
-        : { "Content-Type": "application/json" }),
-      ...(csrfToken ? { [CSRF_HEADER_NAME]: csrfToken } : {}),
-      ...options?.headers,
-    },
-  });
+  const unsafeRequest = isUnsafeMethod(options?.method);
+  let csrfToken = await csrfTokenForRequest(options?.method);
+  let response = await sendApiRequest(url, options, csrfToken);
+
+  if (unsafeRequest && (await isCsrfFailure(response))) {
+    csrfToken = readCookie(CSRF_COOKIE_NAME) ?? (await refreshCsrfToken());
+    if (csrfToken) {
+      response = await sendApiRequest(url, options, csrfToken);
+    }
+  }
 
   if (!response.ok) {
     let detail = `Request failed with status ${response.status}`;
