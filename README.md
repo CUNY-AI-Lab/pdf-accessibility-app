@@ -109,15 +109,17 @@ lives at `/data/pdf-accessibility-app` and runs as the Docker Compose project
 `pdf-accessibility-app`.
 
 The NML override uses host networking because Docker bridge networking is not
-reliable on that VM. The app listens on `127.0.0.1:8001`/`0.0.0.0:8001`, and
-Nginx serves it publicly at
-`https://tools.cuny.qzz.io/pdf-accessibility/`.
+reliable on that VM. The app listens on `127.0.0.1:8001`/`0.0.0.0:8001`, and it
+is served publicly at:
+
+- `https://tools.ailab.gc.cuny.edu/pdf-accessibility/`
+- `https://tools.cuny.qzz.io/pdf-accessibility/`
 
 Required NML `.env` settings:
 
 ```env
 ANONYMOUS_SESSION_COOKIE_SECURE=true
-CORS_ALLOW_ORIGINS=https://tools.cuny.qzz.io
+CORS_ALLOW_ORIGINS=https://tools.cuny.qzz.io,https://tools.ailab.gc.cuny.edu
 VITE_APP_BASE_PATH=/pdf-accessibility/
 DOCLING_SERVE_URL=https://workmac.tailc22a4b.ts.net/docling
 WITH_LOCAL_DOCLING=false
@@ -131,6 +133,7 @@ git pull
 docker compose up -d --build
 curl -fsS http://127.0.0.1:8001/health
 curl -fsS http://127.0.0.1:8001/health/ready
+curl -fsS https://tools.ailab.gc.cuny.edu/pdf-accessibility/health/ready
 curl -fsS https://tools.cuny.qzz.io/pdf-accessibility/health/ready
 ```
 
