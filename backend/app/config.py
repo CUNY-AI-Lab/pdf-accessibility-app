@@ -91,11 +91,20 @@ class Settings(BaseSettings):
     subprocess_timeout_preview: int = 30  # single page render
 
     # Upload limits
-    max_upload_size_bytes: int = 500 * 1024 * 1024  # 500 MB
+    max_upload_size_bytes: int = 100 * 1024 * 1024  # 100 MB
+    max_upload_pages: int = 300
+    max_upload_page_render_pixels: int = 75_000_000
+    upload_preflight_render_dpi: int = 300
+    max_upload_image_pixels: int = 75_000_000
+    max_upload_total_image_pixels: int = 1_000_000_000
+    max_upload_image_heavy_pages: int = 75
+    upload_image_heavy_page_min_pixels: int = 4_000_000
     max_files_per_upload: int = 5
     max_active_jobs_per_session: int = 3
     max_active_jobs_global: int = 12
     max_concurrent_jobs: int = 2
+    ocrmypdf_jobs: int = 1
+    ocrmypdf_max_image_mpixels: int = 75
 
     # Job lifecycle
     job_ttl_hours: int = 12

@@ -1,5 +1,6 @@
 from io import BytesIO
 
+import pikepdf
 import pytest
 from fastapi import HTTPException, UploadFile
 from sqlalchemy import select
@@ -52,6 +53,26 @@ class _LimitSettings:
     max_active_jobs_global = 12
 
 
+def _allow_pdf_preflight(monkeypatch):
+    monkeypatch.setattr(jobs, "preflight_pdf_upload", lambda *_args, **_kwargs: None)
+
+
+def _write_image_pdf(path, *, image_width: int, image_height: int) -> None:
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    image = pdf.make_stream(b"\x00")
+    image["/Type"] = pikepdf.Name("/XObject")
+    image["/Subtype"] = pikepdf.Name("/Image")
+    image["/Width"] = image_width
+    image["/Height"] = image_height
+    image["/ColorSpace"] = pikepdf.Name("/DeviceGray")
+    image["/BitsPerComponent"] = 8
+    page.obj["/Resources"] = pikepdf.Dictionary({
+        "/XObject": pikepdf.Dictionary({"/Im0": image})
+    })
+    pdf.save(path)
+
+
 @pytest.mark.asyncio
 async def test_create_jobs_binds_job_to_current_anonymous_session(tmp_path, monkeypatch):
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -67,6 +88,7 @@ async def test_create_jobs_binds_job_to_current_anonymous_session(tmp_path, monk
         return "stored.pdf", upload_path, 1234
 
     monkeypatch.setattr(jobs, "save_upload", _fake_save_upload)
+    _allow_pdf_preflight(monkeypatch)
     monkeypatch.setattr(jobs, "get_settings", lambda: object())
     monkeypatch.setattr(jobs, "get_session_maker", lambda: None)
     monkeypatch.setattr(jobs, "get_job_manager", lambda: _DummyJobManager())
@@ -104,6 +126,7 @@ async def test_create_jobs_sanitizes_original_filename(tmp_path, monkeypatch):
         return "stored.pdf", upload_path, 1234
 
     monkeypatch.setattr(jobs, "save_upload", _fake_save_upload)
+    _allow_pdf_preflight(monkeypatch)
     monkeypatch.setattr(jobs, "get_settings", lambda: object())
     monkeypatch.setattr(jobs, "get_session_maker", lambda: None)
     monkeypatch.setattr(jobs, "get_job_manager", lambda: _DummyJobManager())
@@ -147,6 +170,7 @@ async def test_create_jobs_compensates_if_background_submission_fails(tmp_path, 
     job_manager = _FailingSubmitJobManager(fail_on_attempt=2)
 
     monkeypatch.setattr(jobs, "save_upload", _fake_save_upload)
+    _allow_pdf_preflight(monkeypatch)
     monkeypatch.setattr(jobs, "get_settings", lambda: object())
     monkeypatch.setattr(jobs, "get_session_maker", lambda: None)
     monkeypatch.setattr(jobs, "get_job_manager", lambda: job_manager)
@@ -169,6 +193,54 @@ async def test_create_jobs_compensates_if_background_submission_fails(tmp_path, 
         assert job_manager.submitted_job_ids and job_manager.cancelled_job_ids == job_manager.submitted_job_ids
         assert (await db.execute(select(Job))).scalars().all() == []
         assert all(not path.exists() for path in upload_paths)
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_create_jobs_rejects_image_heavy_pdf_before_creating_job(tmp_path, monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    upload_path = tmp_path / "huge-scan.pdf"
+    _write_image_pdf(upload_path, image_width=10_000, image_height=10_000)
+
+    async def _fake_save_upload(_file):
+        return "stored.pdf", upload_path, upload_path.stat().st_size
+
+    class _Settings(_LimitSettings):
+        max_upload_image_pixels = 10_000_000
+        max_upload_total_image_pixels = 1_000_000_000
+        max_upload_page_render_pixels = 75_000_000
+        max_upload_image_heavy_pages = 75
+        max_upload_pages = 300
+        upload_preflight_render_dpi = 300
+        upload_image_heavy_page_min_pixels = 4_000_000
+
+    job_manager = _DummyJobManager()
+    monkeypatch.setattr(jobs, "save_upload", _fake_save_upload)
+    monkeypatch.setattr(jobs, "get_settings", lambda: _Settings())
+    monkeypatch.setattr(jobs, "get_session_maker", lambda: None)
+    monkeypatch.setattr(jobs, "get_job_manager", lambda: job_manager)
+
+    async with session_maker() as db:
+        upload = UploadFile(filename="huge-scan.pdf", file=BytesIO(b"%PDF-1.7\n"))
+
+        with pytest.raises(HTTPException) as exc_info:
+            await jobs.create_jobs(
+                files=[upload],
+                db=db,
+                session=_session("session-1-token-value"),
+            )
+
+        assert exc_info.value.status_code == 413
+        assert "too large or image-heavy" in exc_info.value.detail
+        assert "downsample scans" in exc_info.value.detail
+        assert (await db.execute(select(Job))).scalars().all() == []
+        assert not upload_path.exists()
 
     await engine.dispose()
 

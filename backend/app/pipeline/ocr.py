@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.config import get_settings
 from app.pipeline.subprocess_utils import (
     SubprocessTimeout,
     communicate_with_timeout,
@@ -32,7 +33,23 @@ def _build_ocrmypdf_args(
     mode: str,
     rotate_pages: bool,
     deskew: bool,
+    jobs: int | None = None,
+    max_image_mpixels: int | None = None,
 ) -> list[str]:
+    settings = get_settings()
+    try:
+        resolved_jobs = int(jobs if jobs is not None else settings.ocrmypdf_jobs)
+    except (TypeError, ValueError):
+        resolved_jobs = 1
+    try:
+        resolved_max_image_mpixels = int(
+            max_image_mpixels
+            if max_image_mpixels is not None
+            else settings.ocrmypdf_max_image_mpixels
+        )
+    except (TypeError, ValueError):
+        resolved_max_image_mpixels = 75
+
     args = [
         sys.executable,
         "-m",
@@ -42,10 +59,11 @@ def _build_ocrmypdf_args(
         "--output-type",
         "pdf",
         "--jobs",
-        "2",
-        # Large-page academic PDFs can exceed Pillow's default decompression guard.
+        str(max(1, resolved_jobs)),
+        # Keep Pillow's decompression guard low enough that high-DPI scans fail
+        # cleanly instead of expanding until the app/container is killed.
         "--max-image-mpixels",
-        "1000",
+        str(max(1, resolved_max_image_mpixels)),
     ]
     if mode == "redo":
         if rotate_pages:
@@ -77,6 +95,8 @@ async def run_ocr(
     rotate_pages: bool = True,
     deskew: bool = True,
     timeout_seconds: int | None = None,
+    jobs: int | None = None,
+    max_image_mpixels: int | None = None,
 ) -> OcrResult:
     """Run OCRmyPDF as a subprocess to add text layer to scanned PDFs.
 
@@ -91,6 +111,8 @@ async def run_ocr(
         mode=mode,
         rotate_pages=rotate_pages,
         deskew=deskew,
+        jobs=jobs,
+        max_image_mpixels=max_image_mpixels,
     )
 
     proc = await asyncio.create_subprocess_exec(

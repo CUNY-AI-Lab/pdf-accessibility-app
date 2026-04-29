@@ -18,6 +18,8 @@ def test_build_ocrmypdf_args_enables_rotate_and_deskew():
     assert "--rotate-pages" in args
     assert "--deskew" in args
     assert "--skip-text" in args
+    assert args[args.index("--jobs") + 1] == "1"
+    assert args[args.index("--max-image-mpixels") + 1] == "75"
     assert args[-2:] == ["input.pdf", "output.pdf"]
 
 
@@ -50,6 +52,22 @@ def test_build_ocrmypdf_args_omits_deskew_in_redo_mode():
     assert "--rotate-pages" in args
     assert "--redo-ocr" in args
     assert "--deskew" not in args
+
+
+def test_build_ocrmypdf_args_accepts_resource_limits():
+    args = _build_ocrmypdf_args(
+        input_path=Path("input.pdf"),
+        output_path=Path("output.pdf"),
+        language="eng",
+        mode="skip",
+        rotate_pages=True,
+        deskew=True,
+        jobs=3,
+        max_image_mpixels=42,
+    )
+
+    assert args[args.index("--jobs") + 1] == "3"
+    assert args[args.index("--max-image-mpixels") + 1] == "42"
 
 
 def test_enriched_subprocess_env_adds_common_binary_dirs(monkeypatch):

@@ -151,10 +151,18 @@ Configure the app via `.env`. Key variables:
 | `GEMINI_DIRECT_ALT_TEXT_THINKING_LEVEL` | Thinking level for figure semantics and alt text | `medium` |
 | `ALT_TEXT_MAX_CONCURRENCY` | Max concurrent alt-text requests per PDF | `8` |
 | `ALT_TEXT_GLOBAL_MAX_CONCURRENCY` | Process-wide cap for alt-text requests | `12` |
+| `MAX_UPLOAD_SIZE_BYTES` | Maximum raw upload size accepted by the app | `104857600` |
+| `MAX_UPLOAD_PAGES` | Maximum pages accepted for self-service processing | `300` |
+| `MAX_UPLOAD_PAGE_RENDER_PIXELS` | Maximum estimated pixels for one page rendered at `UPLOAD_PREFLIGHT_RENDER_DPI` | `75000000` |
+| `MAX_UPLOAD_IMAGE_PIXELS` | Maximum embedded image pixels on one page | `75000000` |
+| `MAX_UPLOAD_TOTAL_IMAGE_PIXELS` | Maximum embedded image pixels across the PDF | `1000000000` |
+| `MAX_UPLOAD_IMAGE_HEAVY_PAGES` | Maximum pages with at least `UPLOAD_IMAGE_HEAVY_PAGE_MIN_PIXELS` image pixels | `75` |
 | `MAX_FILES_PER_UPLOAD` | Maximum PDFs accepted in one upload request | `5` |
 | `MAX_ACTIVE_JOBS_PER_SESSION` | Maximum queued/processing jobs per anonymous browser session | `3` |
 | `MAX_ACTIVE_JOBS_GLOBAL` | Maximum queued/processing jobs accepted across the app | `12` |
 | `MAX_CONCURRENT_JOBS` | Maximum PDF pipeline jobs actively executing in-process | `2` |
+| `OCRMYPDF_JOBS` | OCRmyPDF worker count per PDF; keep low on shared hosts | `1` |
+| `OCRMYPDF_MAX_IMAGE_MPIXELS` | OCRmyPDF image decompression ceiling per image | `75` |
 | `WITH_LOCAL_DOCLING` | Include local Docling in Docker builds | `false` |
 | `DOCLING_SERVE_URL` | Remote `docling-serve` URL (falls back to local Docling when unset) | — |
 | `DOCLING_SERVE_TOKEN` | Bearer token for a protected `docling-serve` proxy | — |

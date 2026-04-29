@@ -24,6 +24,7 @@ from app.services.job_state import (
     mark_job_failed,
 )
 from app.services.path_safety import safe_filename
+from app.services.pdf_preflight import PdfUploadPreflightError, preflight_pdf_upload
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 logger = logging.getLogger(__name__)
@@ -202,6 +203,10 @@ async def create_jobs(
         for file in files:
             stored_name, path, size = await save_upload(file)
             uploaded_paths.append(path)
+            try:
+                await asyncio.to_thread(preflight_pdf_upload, path, settings=settings)
+            except PdfUploadPreflightError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
             original_filename = safe_filename(str(file.filename or "").strip())
 
             job = Job(
