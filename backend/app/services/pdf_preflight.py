@@ -4,6 +4,8 @@ from typing import Any
 
 import pikepdf
 
+OCR_SCAN_METADATA_MARKERS = ("ocrmypdf", "paper capture", "tesseract")
+
 
 @dataclass(frozen=True)
 class PdfUploadPreflightReport:
@@ -12,6 +14,15 @@ class PdfUploadPreflightReport:
     max_image_pixels: int
     total_image_pixels: int
     image_heavy_pages: int
+    creator: str = ""
+    producer: str = ""
+    has_structure_tree: bool = False
+    has_acroform: bool = False
+
+    @property
+    def is_ocr_scan_like(self) -> bool:
+        metadata = f"{self.creator} {self.producer}".casefold()
+        return any(marker in metadata for marker in OCR_SCAN_METADATA_MARKERS)
 
 
 class PdfUploadPreflightError(ValueError):
@@ -38,6 +49,14 @@ def _setting_int(settings: Any, name: str, default: int) -> int:
 
 def _megapixels(pixels: int) -> str:
     return f"{pixels / 1_000_000:.0f} MP"
+
+
+def _metadata_text(info: Any, key: str) -> str:
+    try:
+        value = info.get(key, "")
+    except Exception:
+        return ""
+    return str(value or "").strip()
 
 
 def _object_key(obj: Any) -> tuple[int, int] | int:
@@ -103,6 +122,10 @@ def inspect_pdf_upload(path: Path, *, settings: Any) -> PdfUploadPreflightReport
     try:
         with pikepdf.open(str(path)) as pdf:
             page_count = len(pdf.pages)
+            creator = _metadata_text(pdf.docinfo, "/Creator")
+            producer = _metadata_text(pdf.docinfo, "/Producer")
+            has_structure_tree = "/StructTreeRoot" in pdf.Root
+            has_acroform = "/AcroForm" in pdf.Root
             max_page_render_pixels = 0
             max_image_pixels = 0
             total_image_pixels = 0
@@ -145,6 +168,10 @@ def inspect_pdf_upload(path: Path, *, settings: Any) -> PdfUploadPreflightReport
         max_image_pixels=max_image_pixels,
         total_image_pixels=total_image_pixels,
         image_heavy_pages=image_heavy_pages,
+        creator=creator,
+        producer=producer,
+        has_structure_tree=has_structure_tree,
+        has_acroform=has_acroform,
     )
 
 
@@ -160,6 +187,16 @@ def preflight_pdf_upload(path: Path, *, settings: Any) -> PdfUploadPreflightRepo
         1_000_000_000,
     )
     max_image_heavy_pages = _setting_int(settings, "max_upload_image_heavy_pages", 75)
+    max_ocr_scan_total_image_pixels = _setting_int(
+        settings,
+        "max_upload_ocr_scan_total_image_pixels",
+        150_000_000,
+    )
+    max_ocr_scan_image_heavy_pages = _setting_int(
+        settings,
+        "max_upload_ocr_scan_image_heavy_pages",
+        25,
+    )
 
     reasons: list[str] = []
     if report.page_count > max_pages:
@@ -184,12 +221,31 @@ def preflight_pdf_upload(path: Path, *, settings: Any) -> PdfUploadPreflightRepo
             f"{report.image_heavy_pages} image-heavy pages exceeds the "
             f"{max_image_heavy_pages}-page self-service limit"
         )
+    if (
+        report.is_ocr_scan_like
+        and report.total_image_pixels > max_ocr_scan_total_image_pixels
+    ):
+        reasons.append(
+            "this OCR/Paper Capture PDF embeds "
+            f"{_megapixels(report.total_image_pixels)} of scan image data, "
+            f"above the {_megapixels(max_ocr_scan_total_image_pixels)} "
+            "self-service limit"
+        )
+    if (
+        report.is_ocr_scan_like
+        and report.image_heavy_pages > max_ocr_scan_image_heavy_pages
+    ):
+        reasons.append(
+            f"this OCR/Paper Capture PDF has {report.image_heavy_pages} "
+            "image-heavy pages, above the "
+            f"{max_ocr_scan_image_heavy_pages}-page self-service limit"
+        )
 
     if reasons:
         raise PdfUploadPreflightError(
             "This PDF is too large or image-heavy for self-service processing: "
             + "; ".join(reasons)
-            + ". Split it into smaller sections, downsample scans to about 300 DPI, "
+            + ". Split it into smaller sections, downsample scan images, "
             "or contact the CUNY AI Lab for assisted remediation.",
             report=report,
         )

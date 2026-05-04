@@ -157,6 +157,8 @@ Configure the app via `.env`. Key variables:
 | `MAX_UPLOAD_IMAGE_PIXELS` | Maximum embedded image pixels on one page | `75000000` |
 | `MAX_UPLOAD_TOTAL_IMAGE_PIXELS` | Maximum embedded image pixels across the PDF | `1000000000` |
 | `MAX_UPLOAD_IMAGE_HEAVY_PAGES` | Maximum pages with at least `UPLOAD_IMAGE_HEAVY_PAGE_MIN_PIXELS` image pixels | `75` |
+| `MAX_UPLOAD_OCR_SCAN_TOTAL_IMAGE_PIXELS` | Stricter embedded scan-image pixel cap for OCR/Paper Capture PDFs | `150000000` |
+| `MAX_UPLOAD_OCR_SCAN_IMAGE_HEAVY_PAGES` | Stricter image-heavy page cap for OCR/Paper Capture PDFs | `25` |
 | `MAX_FILES_PER_UPLOAD` | Maximum PDFs accepted in one upload request | `5` |
 | `MAX_ACTIVE_JOBS_PER_SESSION` | Maximum queued/processing jobs per anonymous browser session | `3` |
 | `MAX_ACTIVE_JOBS_GLOBAL` | Maximum queued/processing jobs accepted across the app | `12` |

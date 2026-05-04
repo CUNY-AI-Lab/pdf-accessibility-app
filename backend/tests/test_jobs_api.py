@@ -238,7 +238,7 @@ async def test_create_jobs_rejects_image_heavy_pdf_before_creating_job(tmp_path,
 
         assert exc_info.value.status_code == 413
         assert "too large or image-heavy" in exc_info.value.detail
-        assert "downsample scans" in exc_info.value.detail
+        assert "downsample scan images" in exc_info.value.detail
         assert (await db.execute(select(Job))).scalars().all() == []
         assert not upload_path.exists()
 

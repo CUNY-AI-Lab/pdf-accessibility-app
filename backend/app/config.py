@@ -98,6 +98,8 @@ class Settings(BaseSettings):
     max_upload_image_pixels: int = 75_000_000
     max_upload_total_image_pixels: int = 1_000_000_000
     max_upload_image_heavy_pages: int = 75
+    max_upload_ocr_scan_total_image_pixels: int = 150_000_000
+    max_upload_ocr_scan_image_heavy_pages: int = 25
     upload_image_heavy_page_min_pixels: int = 4_000_000
     max_files_per_upload: int = 5
     max_active_jobs_per_session: int = 3
