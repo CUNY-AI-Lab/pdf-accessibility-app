@@ -5,10 +5,16 @@ import logging
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import pikepdf
 
 from app.pipeline.language import detect_language
+from app.services.pdf_preflight import (
+    PdfUploadPreflightError,
+    PdfUploadPreflightReport,
+    inspect_pdf_upload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,15 +38,24 @@ _TEXT_DETECT_SAMPLE_TIERS = (
 # is bounded internally at 30s but OCRmyPDF itself can exceed that in rare cases.
 _TEXT_DETECT_TIMEOUT_SECONDS = 20.0
 _PROBE_OCR_TIMEOUT_SECONDS = 90.0
+_OCR_SCAN_IMAGE_HEAVY_RATIO = 0.75
+_OCR_SCAN_TEXT_RATIO = 0.9
+_OCR_SCAN_PREFLIGHT_SETTINGS = SimpleNamespace(
+    upload_preflight_render_dpi=300,
+    upload_image_heavy_page_min_pixels=4_000_000,
+)
 
 
 @dataclass
 class ClassificationResult:
-    type: str  # "scanned", "digital", "mixed"
+    type: str  # "scanned", "digital", "mixed", "ocr_scan"
     confidence: float
     pages_with_text: int
     total_pages: int
     detected_language: str | None = field(default=None)
+    image_heavy_pages: int = 0
+    total_image_pixels: int = 0
+    ocr_scan_like: bool = False
 
 
 def _page_has_text(page: pikepdf.Page) -> bool:
@@ -103,6 +118,30 @@ def _detect_language_from_text(pdf_path: Path) -> str | None:
     return None
 
 
+def _inspect_workload(pdf_path: Path) -> PdfUploadPreflightReport | None:
+    try:
+        return inspect_pdf_upload(pdf_path, settings=_OCR_SCAN_PREFLIGHT_SETTINGS)
+    except PdfUploadPreflightError:
+        return None
+
+
+def _is_ocr_scan_with_text(
+    report: PdfUploadPreflightReport | None,
+    *,
+    pages_with_text: int,
+    total_pages: int,
+) -> bool:
+    if report is None or total_pages <= 0:
+        return False
+    text_ratio = pages_with_text / total_pages
+    image_heavy_ratio = report.image_heavy_pages / max(report.page_count, 1)
+    return (
+        report.is_ocr_scan_like
+        and text_ratio >= _OCR_SCAN_TEXT_RATIO
+        and image_heavy_ratio >= _OCR_SCAN_IMAGE_HEAVY_RATIO
+    )
+
+
 async def _probe_ocr_detect(pdf_path: Path) -> str | None:
     """Probe-OCR page 1 with all languages, then detect from the OCR'd text.
 
@@ -152,7 +191,7 @@ async def _probe_ocr_detect(pdf_path: Path) -> str | None:
 
 
 async def classify_pdf(pdf_path: Path) -> ClassificationResult:
-    """Classify whether a PDF is scanned (image-only), digital, or mixed."""
+    """Classify whether a PDF is scanned, digital, mixed, or an OCR'd scan."""
 
     def _classify_structure() -> ClassificationResult:
         with pikepdf.open(str(pdf_path)) as pdf:
@@ -164,10 +203,23 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
 
             pages_with_text = sum(1 for page in pdf.pages if _page_has_text(page))
             ratio = pages_with_text / total
+            workload = _inspect_workload(pdf_path)
 
             if ratio < 0.1:
                 classification = "scanned"
                 confidence = 1 - ratio
+            elif _is_ocr_scan_with_text(
+                workload,
+                pages_with_text=pages_with_text,
+                total_pages=total,
+            ):
+                classification = "ocr_scan"
+                image_heavy_ratio = (
+                    workload.image_heavy_pages / max(workload.page_count, 1)
+                    if workload
+                    else 0.0
+                )
+                confidence = min(1.0, max(0.75, (ratio + image_heavy_ratio) / 2))
             elif ratio > 0.9:
                 classification = "digital"
                 confidence = ratio
@@ -180,6 +232,9 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
                 confidence=confidence,
                 pages_with_text=pages_with_text,
                 total_pages=total,
+                image_heavy_pages=workload.image_heavy_pages if workload else 0,
+                total_image_pixels=workload.total_image_pixels if workload else 0,
+                ocr_scan_like=bool(workload and workload.is_ocr_scan_like),
             )
 
     result = await asyncio.to_thread(_classify_structure)

@@ -5244,6 +5244,9 @@ async def run_pipeline(
                     "confidence": classification.confidence,
                     "pages_with_text": classification.pages_with_text,
                     "total_pages": classification.total_pages,
+                    "image_heavy_pages": classification.image_heavy_pages,
+                    "total_image_pixels": classification.total_image_pixels,
+                    "ocr_scan_like": classification.ocr_scan_like,
                     "detected_language": classification.detected_language,
                     "ocr_language": job.ocr_language,
                 },
@@ -5297,6 +5300,25 @@ async def run_pipeline(
                     raise RuntimeError(
                         f"OCR failed for {classification.type} document: {ocr_result.message}"
                     )
+            elif classification.type == "ocr_scan":
+                await _update_step(
+                    db,
+                    job_id,
+                    "ocr",
+                    "skipped",
+                    result={
+                        "skipped": True,
+                        "message": (
+                            "Skipped OCR because this scan already has an OCR text layer."
+                        ),
+                    },
+                )
+                job_manager.emit_progress(
+                    job_id,
+                    step="ocr",
+                    status="skipped",
+                    result={"reason": "existing_ocr_text_layer"},
+                )
             else:
                 await _update_step(db, job_id, "ocr", "skipped")
                 job_manager.emit_progress(job_id, step="ocr", status="skipped")

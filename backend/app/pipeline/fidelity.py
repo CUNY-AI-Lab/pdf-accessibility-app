@@ -1302,7 +1302,7 @@ def assess_fidelity(
                     },
                 )
 
-        is_ocr_document = classification in ("scanned", "mixed")
+        is_ocr_document = classification in ("scanned", "mixed", "ocr_scan")
 
         if is_ocr_document:
             # For scanned/mixed PDFs, use asymmetric metrics: OCR legitimately

@@ -8,7 +8,7 @@ import PipelineProgress from "../components/PipelineProgress";
 import RemediationSummary from "../components/RemediationSummary";
 import ValidationReport from "../components/ValidationReport";
 import { useJobProgress } from "../hooks/useJobProgress";
-import { formatBytes } from "../utils/format";
+import { formatBytes, formatClassification } from "../utils/format";
 import { asNumber } from "../utils/typeGuards";
 
 export default function JobDetailPage() {
@@ -130,7 +130,7 @@ export default function JobDetailPage() {
           {job.classification && (
             <>
               <span className="opacity-30">&middot;</span>
-              <span className="capitalize">{job.classification}</span>
+              <span>{formatClassification(job.classification)}</span>
             </>
           )}
           {job.page_count && (

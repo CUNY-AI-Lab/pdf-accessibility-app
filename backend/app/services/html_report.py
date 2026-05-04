@@ -27,6 +27,12 @@ def _e(text: str | None) -> str:
     return html.escape(str(text)) if text else ""
 
 
+def _format_classification(classification: str | None) -> str:
+    if classification == "ocr_scan":
+        return "OCR scan"
+    return classification or "unknown"
+
+
 # ---------------------------------------------------------------------------
 # CSS
 # ---------------------------------------------------------------------------
@@ -219,7 +225,7 @@ def _render_job_section(
     <p class="subtitle">
       Processed {_e(job.updated_at.strftime("%B %d, %Y at %I:%M %p") if job.updated_at else "—")}
       &middot; {job.page_count or "?"} pages
-      &middot; {_e(job.classification or "unknown")} document
+      &middot; {_e(_format_classification(job.classification))} document
     </p>
     """)
 

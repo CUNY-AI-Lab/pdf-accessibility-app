@@ -19,6 +19,11 @@ export function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+export function formatClassification(classification: string): string {
+  if (classification === "ocr_scan") return "OCR scan";
+  return classification.charAt(0).toUpperCase() + classification.slice(1);
+}
+
 /**
  * Formats a date string into a relative time or short date.
  */

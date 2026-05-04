@@ -6,7 +6,7 @@ type IconName = "wrench" | "scan" | "layout" | "image" | "eye-off" | "bookmark" 
 
 interface RemediationSummaryProps {
   report: ValidationReport;
-  classification?: "scanned" | "digital" | "mixed";
+  classification?: "scanned" | "digital" | "mixed" | "ocr_scan";
 }
 
 export default function RemediationSummary({
@@ -42,13 +42,19 @@ export default function RemediationSummary({
   }
 
   // OCR
-  if (classification === "scanned" || classification === "mixed") {
+  if (
+    classification === "scanned" ||
+    classification === "mixed" ||
+    classification === "ocr_scan"
+  ) {
     lines.push({
       icon: "scan",
       text:
         classification === "scanned"
           ? "Extracted text from scanned pages using OCR"
-          : "Extracted text from scanned sections using OCR",
+          : classification === "mixed"
+            ? "Extracted text from scanned sections using OCR"
+            : "Used the existing OCR text layer from scanned pages",
     });
   }
 

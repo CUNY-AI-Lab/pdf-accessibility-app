@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useDeleteJob } from "../api/jobs";
-import { formatBytes, formatDate } from "../utils/format";
+import { formatBytes, formatClassification, formatDate } from "../utils/format";
 import ConfirmDialog from "./ConfirmDialog";
 import type { Job, JobStatus } from "../types";
 import { CheckIcon } from "./Icons";
@@ -97,7 +97,7 @@ export default function JobCard({ job }: JobCardProps) {
               {job.classification && (
                 <>
                   <span className="opacity-30">&middot;</span>
-                  <span className="capitalize">{job.classification}</span>
+                  <span>{formatClassification(job.classification)}</span>
                 </>
               )}
             </div>
