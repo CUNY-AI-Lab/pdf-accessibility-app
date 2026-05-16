@@ -418,3 +418,42 @@ async def test_download_report_validates_payload_before_returning():
             )
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_download_html_report_uses_ascii_safe_content_disposition():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_maker() as db:
+        db.add(
+            Job(
+                id="job-doc-html-report",
+                filename="sample.pdf",
+                original_filename='résumé "draft".pdf',
+                owner_session_hash=_session("session-1-token-value").session_hash,
+                status="complete",
+                input_path="/tmp/sample.pdf",
+                validation_json=(
+                    '{"compliant": true, "violations": [], "summary": {}, '
+                    '"remediation": {}, "tagging": {}}'
+                ),
+            )
+        )
+        await db.commit()
+
+        response = await documents.download_html_report(
+            job_id="job-doc-html-report",
+            db=db,
+            session=_session("session-1-token-value"),
+        )
+
+        disposition = response.headers["content-disposition"]
+        assert disposition.startswith('attachment; filename="report_r_sum_draft.html"')
+        assert "filename*=UTF-8''report_r%C3%A9sum%C3%A9%20%22draft%22.html" in disposition
+        disposition.encode("ascii")
+
+    await engine.dispose()

@@ -15,7 +15,11 @@ from app.models import AltTextEntry, Job, ReviewTask
 from app.schemas import ReviewTaskResponse, ValidationReportResponse
 from app.services.anonymous_sessions import AnonymousSession, get_anonymous_session
 from app.services.html_report import render_html_report
-from app.services.path_safety import safe_filename, validate_path_within_allowed_roots
+from app.services.path_safety import (
+    attachment_content_disposition,
+    safe_filename,
+    validate_path_within_allowed_roots,
+)
 from app.services.pdf_preview import render_page_png_bytes
 from app.services.review_surface import is_user_visible_review_task_type
 
@@ -211,12 +215,13 @@ async def download_html_report(
     ).scalars().all()
 
     html_content = render_html_report(job, validation, list(alt_texts), list(review_tasks))
-    filename = safe_filename(job.original_filename).rsplit(".", 1)[0]
     return Response(
         content=html_content,
         media_type="text/html",
         headers={
             **_NO_STORE_HEADERS,
-            "Content-Disposition": f'attachment; filename="report_{filename}.html"',
+            "Content-Disposition": attachment_content_disposition(
+                f"report_{safe_filename(job.original_filename).rsplit('.', 1)[0]}.html"
+            ),
         },
     )

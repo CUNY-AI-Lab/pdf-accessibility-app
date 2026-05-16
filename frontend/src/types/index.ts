@@ -5,7 +5,7 @@ export type JobStatus =
   | "complete"
   | "failed";
 
-export type StepStatus =
+type StepStatus =
   | "pending"
   | "running"
   | "complete"
@@ -108,13 +108,6 @@ export interface ValidationReport {
   fidelity?: Record<string, unknown>;
   tagging?: Record<string, unknown>;
   claims?: Record<string, unknown>;
-}
-
-export interface StructureElement {
-  type: string;
-  text?: string;
-  level?: number;
-  children?: StructureElement[];
 }
 
 export interface ProgressEvent {

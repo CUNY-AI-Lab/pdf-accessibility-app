@@ -13,13 +13,13 @@ function joinPath(basePath: string, path: string): string {
 const APP_BASE_PATH = normalizeBasePath(import.meta.env.BASE_URL);
 
 export const ROUTER_BASENAME = APP_BASE_PATH || undefined;
-export const BASE_URL = joinPath(APP_BASE_PATH, "/api");
+const API_BASE_URL = joinPath(APP_BASE_PATH, "/api");
 const HEALTH_URL = joinPath(APP_BASE_PATH, "/health");
 const CSRF_COOKIE_NAME = "anon_session_csrf";
 const CSRF_HEADER_NAME = "X-CSRF-Token";
 
 export function apiUrl(path: string): string {
-  return joinPath(BASE_URL, path);
+  return joinPath(API_BASE_URL, path);
 }
 
 function readCookie(name: string): string | null {
@@ -93,7 +93,7 @@ async function isCsrfFailure(response: Response): Promise<boolean> {
   }
 }
 
-export class ApiError extends Error {
+class ApiError extends Error {
   status: number;
   detail: string;
 

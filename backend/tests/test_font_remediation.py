@@ -526,13 +526,6 @@ async def test_pretag_grounded_text_resolutions_apply_safe_spacing_fix(monkeypat
 
 @pytest.mark.asyncio
 async def test_pretag_grounded_text_resolutions_artifact_duplicate_noise_block(monkeypatch, tmp_path):
-    class _FakeLlmClient:
-        def __init__(self, *args, **kwargs):
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
     monkeypatch.setattr(
         orchestrator,
         "collect_grounded_text_candidates",
@@ -556,7 +549,6 @@ async def test_pretag_grounded_text_resolutions_artifact_duplicate_noise_block(m
             ],
         },
     )
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
 
     async def _fake_generate(**kwargs):
         return {
@@ -627,13 +619,6 @@ async def test_pretag_grounded_text_resolutions_artifact_duplicate_noise_block(m
 
 @pytest.mark.asyncio
 async def test_pretag_grounded_text_resolutions_artifact_mark_decorative_block(monkeypatch, tmp_path):
-    class _FakeLlmClient:
-        def __init__(self, *args, **kwargs):
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
     monkeypatch.setattr(
         orchestrator,
         "collect_grounded_text_candidates",
@@ -658,7 +643,6 @@ async def test_pretag_grounded_text_resolutions_artifact_mark_decorative_block(m
             ],
         },
     )
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
 
     async def _fake_generate(**kwargs):
         return {
@@ -841,13 +825,6 @@ def test_grounded_text_retry_improved_when_confirmed_blocks_drop_inside_same_tas
 
 @pytest.mark.asyncio
 async def test_pretag_grounded_text_resolutions_apply_grounded_code_fix(monkeypatch, tmp_path):
-    class _FakeLlmClient:
-        def __init__(self, *args, **kwargs):
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
     monkeypatch.setattr(
         orchestrator,
         "collect_grounded_text_candidates",
@@ -867,7 +844,6 @@ async def test_pretag_grounded_text_resolutions_apply_grounded_code_fix(monkeypa
             ],
         },
     )
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
 
     async def _fake_generate(**kwargs):
         return {
@@ -926,13 +902,6 @@ async def test_pretag_grounded_text_resolutions_apply_grounded_code_fix(monkeypa
 
 @pytest.mark.asyncio
 async def test_pretag_grounded_text_resolutions_apply_localized_encoding_fix(monkeypatch, tmp_path):
-    class _FakeLlmClient:
-        def __init__(self, *args, **kwargs):
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
     monkeypatch.setattr(
         orchestrator,
         "collect_grounded_text_candidates",
@@ -957,7 +926,6 @@ async def test_pretag_grounded_text_resolutions_apply_localized_encoding_fix(mon
             ],
         },
     )
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
 
     async def _fake_generate(**kwargs):
         return {
@@ -1011,14 +979,6 @@ async def test_pretag_grounded_text_resolutions_apply_localized_encoding_fix(mon
 
 @pytest.mark.asyncio
 async def test_pretag_table_intelligence_applies_high_confidence_header_fix(monkeypatch, tmp_path):
-    class _FakeLlmClient:
-        def __init__(self, *args, **kwargs):
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
     monkeypatch.setattr(
         orchestrator,
         "_table_semantics_risk",
@@ -1124,13 +1084,6 @@ async def test_pretag_form_intelligence_sets_accessible_label(monkeypatch, tmp_p
     pdf_path = tmp_path / "form.pdf"
     _pdf_with_real_widget(pdf_path)
 
-    class _FakeLlmClient:
-        def __init__(self, *args, **kwargs):
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
     async def _fake_generate(**kwargs):
         target = kwargs["target"]
         assert target["field_name"] == "field1"
@@ -1145,7 +1098,6 @@ async def test_pretag_form_intelligence_sets_accessible_label(monkeypatch, tmp_p
             "accessible_label": "First name and middle initial",
         }
 
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
     monkeypatch.setattr(orchestrator, "generate_form_intelligence", _fake_generate)
 
     updated_pdf, audit = await _apply_pretag_form_intelligence(
@@ -1187,13 +1139,6 @@ async def test_pretag_form_intelligence_applies_safe_page_results_when_fallback_
     fields = _extract_widget_fields(pdf_path)
     targets = [{**field, "nearby_blocks": [], "context_blocks": []} for field in fields]
 
-    class _FakeLlmClient:
-        def __init__(self, *args, **kwargs):
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
     async def _fake_generate_page(**kwargs):
         page_targets = kwargs["targets"]
         return [
@@ -1224,7 +1169,6 @@ async def test_pretag_form_intelligence_applies_safe_page_results_when_fallback_
     async def _fake_generate(**kwargs):
         raise TimeoutError("form_intelligence[field2] timed out")
 
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
     monkeypatch.setattr(orchestrator, "generate_form_intelligence_for_page", _fake_generate_page)
     monkeypatch.setattr(orchestrator, "generate_form_intelligence", _fake_generate)
 
@@ -1370,14 +1314,6 @@ async def test_pretag_widget_rationalization_noops_without_nonheuristic_targets(
 
 @pytest.mark.asyncio
 async def test_pretag_table_intelligence_retries_manual_only_aggressively(monkeypatch, tmp_path):
-    class _FakeLlmClient:
-        def __init__(self, *args, **kwargs):
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
     monkeypatch.setattr(
         orchestrator,
         "_table_semantics_risk",
@@ -1483,14 +1419,6 @@ async def test_pretag_table_intelligence_retries_manual_only_aggressively(monkey
 
 @pytest.mark.asyncio
 async def test_pretag_table_intelligence_retries_to_confirm_existing_headers(monkeypatch, tmp_path):
-    class _FakeLlmClient:
-        def __init__(self, *args, **kwargs):
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
     monkeypatch.setattr(
         orchestrator,
         "_table_semantics_risk",
@@ -1597,14 +1525,6 @@ async def test_pretag_table_intelligence_retries_to_confirm_existing_headers(mon
 
 @pytest.mark.asyncio
 async def test_pretag_table_intelligence_times_out_cleanly(monkeypatch, tmp_path):
-    class _FakeLlmClient:
-        def __init__(self, *args, **kwargs):
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
     monkeypatch.setattr(
         orchestrator,
         "_table_semantics_risk",
@@ -2612,14 +2532,6 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
     source_pdf = tmp_path / "source.pdf"
     source_pdf.write_bytes(b"%PDF-1.4\n% test\n")
 
-    class _FakeLlmClient:
-        def __init__(self, *args, **kwargs):
-            self.model = "google/gemini-3-flash-preview"
-
-        async def close(self):
-            return None
-
-    monkeypatch.setattr(orchestrator, "LlmClient", _FakeLlmClient)
     async def _generate_remediation_intelligence(**kwargs):
         return {
             "task_type": "font_text_fidelity",

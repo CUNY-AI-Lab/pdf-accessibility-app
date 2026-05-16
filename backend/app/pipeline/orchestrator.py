@@ -21,6 +21,24 @@ from app.pipeline.alt_text import figure_applied_change_specs, generate_alt_text
 from app.pipeline.classify import classify_pdf
 from app.pipeline.fidelity import _table_semantics_risk, assess_fidelity
 from app.pipeline.language import bcp47_to_tesseract
+from app.pipeline.llm_operations import (
+    await_llm_operation as _await_llm_operation,
+)
+from app.pipeline.llm_operations import (
+    empty_llm_usage as _empty_llm_usage,
+)
+from app.pipeline.llm_operations import (
+    llm_usage_snapshot as _llm_usage_snapshot,
+)
+from app.pipeline.llm_operations import (
+    make_pretag_llm_client as _make_pretag_llm_client,
+)
+from app.pipeline.llm_operations import (
+    pretag_llm_fallback_operation_timeout_seconds as _pretag_llm_fallback_operation_timeout_seconds,
+)
+from app.pipeline.llm_operations import (
+    pretag_llm_operation_timeout_seconds as _pretag_llm_operation_timeout_seconds,
+)
 from app.pipeline.ocr import run_ocr
 from app.pipeline.structure import extract_structure
 from app.pipeline.subprocess_utils import (
@@ -48,7 +66,6 @@ from app.services.font_intelligence_auto import (
     fidelity_not_worse as _fidelity_not_worse,
 )
 from app.services.form_fields import apply_field_accessible_names, remove_widget_fields
-from app.services.gemini_direct import direct_gemini_pdf_enabled, direct_gemini_timeout_override
 from app.services.grounded_text_apply import (
     PRETAG_GROUNDED_TEXT_TARGET_LIMIT,
 )
@@ -82,8 +99,7 @@ from app.services.intelligence_gemini_widgets import (
 )
 from app.services.job_manager import JobManager
 from app.services.job_state import clear_terminal_artifacts
-from app.services.llm_client import LlmClient as _LlmClient
-from app.services.llm_client import make_llm_client, make_llm_client_with_overrides, track_llm_usage
+from app.services.llm_client import make_llm_client, track_llm_usage
 from app.services.page_intelligence import collect_grounded_text_candidates
 from app.services.review_surface import (
     filter_user_visible_review_tasks,
@@ -126,10 +142,6 @@ from app.services.validation_compare import is_better_validation as _is_better_v
 from app.services.visual_figure_rationalization import synthesize_missing_visual_figures
 
 logger = logging.getLogger(__name__)
-
-# Preserved for test monkeypatch compatibility around LLM-backed pre-tag helpers.
-LlmClient = _LlmClient
-
 
 FONT_RULE_FRAGMENT = "-7.21."
 
@@ -183,130 +195,6 @@ FONT_SUBSET_RE = re.compile(r"^[A-Z]{6}\+.+")
 FONT_NAME_RE = re.compile(r"[^A-Za-z0-9]+")
 HEX_STR_RE = re.compile(r"<([0-9A-Fa-f]+)>")
 MAX_TOUNICODE_BFRANGE_SPAN = 65536
-
-
-def _llm_operation_timeout_seconds_from_values(
-    *,
-    per_attempt: float,
-    retries: int,
-    retry_backoff_cap: float,
-) -> float:
-    retry_slack = min(retry_backoff_cap * retries, max(30.0, per_attempt * 0.5))
-    completion_slack = min(15.0, max(1.0, per_attempt * 0.25))
-    return per_attempt + retry_slack + completion_slack
-
-
-def _llm_operation_timeout_seconds(settings: Settings) -> float:
-    """Bound one logical LLM operation, including modest retry/backoff slack."""
-    return _llm_operation_timeout_seconds_from_values(
-        per_attempt=max(1.0, float(getattr(settings, "llm_timeout", 120) or 120)),
-        retries=max(0, int(getattr(settings, "llm_max_retries", 0) or 0)),
-        retry_backoff_cap=max(
-            0.0,
-            float(getattr(settings, "llm_retry_max_backoff_seconds", 0.0) or 0.0),
-        ),
-    )
-
-
-def _pretag_llm_operation_timeout_seconds(settings: Settings) -> float:
-    """Bound non-critical pretag intelligence so flaky endpoints fail open quickly."""
-    return _llm_operation_timeout_seconds_from_values(
-        per_attempt=max(
-            1.0,
-            float(getattr(settings, "llm_pretag_timeout", getattr(settings, "llm_timeout", 120)) or 120),
-        ),
-        retries=max(
-            0,
-            int(getattr(settings, "llm_pretag_max_retries", getattr(settings, "llm_max_retries", 0)) or 0),
-        ),
-        retry_backoff_cap=max(
-            0.0,
-            float(getattr(settings, "llm_retry_max_backoff_seconds", 0.0) or 0.0),
-        ),
-    )
-
-
-def _pretag_llm_fallback_operation_timeout_seconds(settings: Settings) -> float:
-    """Use a shorter bound for per-item fallbacks after page-batch evidence was tried."""
-    primary_per_attempt = max(
-        1.0,
-        float(getattr(settings, "llm_pretag_timeout", getattr(settings, "llm_timeout", 120)) or 120),
-    )
-    fallback_per_attempt = max(
-        1.0,
-        float(getattr(settings, "llm_pretag_fallback_timeout", primary_per_attempt) or primary_per_attempt),
-    )
-    return _llm_operation_timeout_seconds_from_values(
-        per_attempt=min(primary_per_attempt, fallback_per_attempt),
-        retries=0,
-        retry_backoff_cap=max(
-            0.0,
-            float(getattr(settings, "llm_retry_max_backoff_seconds", 0.0) or 0.0),
-        ),
-    )
-
-
-def _make_pretag_llm_client(settings: Settings) -> _LlmClient:
-    return make_llm_client_with_overrides(
-        settings,
-        timeout=int(getattr(settings, "llm_pretag_timeout", settings.llm_timeout) or settings.llm_timeout),
-        max_retries=int(
-            getattr(settings, "llm_pretag_max_retries", settings.llm_max_retries) or settings.llm_max_retries
-        ),
-    )
-
-
-async def _await_llm_operation(
-    *,
-    settings: Settings,
-    label: str,
-    awaitable,
-    timeout_seconds: float | None = None,
-):
-    timeout = timeout_seconds if timeout_seconds is not None else _llm_operation_timeout_seconds(settings)
-    timeout_guard = direct_gemini_timeout_override(None)
-    if direct_gemini_pdf_enabled(settings):
-        # Direct Gemini requests run through the sync SDK in a worker thread.
-        # Bound them with the SDK timeout instead of clipping them with pretag's
-        # shorter wrapper timeout; otherwise a page-batch timeout can cascade
-        # into many lower-quality individual fallback calls.
-        configured_direct_timeout = max(
-            1.0,
-            float(getattr(settings, "gemini_direct_timeout", 45) or 45),
-        )
-        timeout = max(
-            timeout,
-            configured_direct_timeout + min(5.0, max(1.0, configured_direct_timeout * 0.1)),
-        )
-        timeout_guard = direct_gemini_timeout_override(configured_direct_timeout)
-    try:
-        with timeout_guard:
-            operation = asyncio.ensure_future(awaitable)
-            return await asyncio.wait_for(operation, timeout=timeout)
-    except TimeoutError as exc:
-        raise RuntimeError(f"{label} timed out after {timeout:.1f}s") from exc
-
-
-def _empty_llm_usage() -> dict[str, float | int]:
-    return {
-        "request_count": 0,
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "total_tokens": 0,
-        "cost_usd": 0.0,
-    }
-
-
-def _llm_usage_snapshot(recorder) -> dict[str, float | int]:
-    if recorder is None:
-        return _empty_llm_usage()
-    return {
-        "request_count": int(getattr(recorder, "request_count", 0) or 0),
-        "prompt_tokens": int(getattr(recorder, "prompt_tokens", 0) or 0),
-        "completion_tokens": int(getattr(recorder, "completion_tokens", 0) or 0),
-        "total_tokens": int(getattr(recorder, "total_tokens", 0) or 0),
-        "cost_usd": float(getattr(recorder, "cost_usd", 0.0) or 0.0),
-    }
 
 
 def _accumulate_llm_usage(
@@ -5795,6 +5683,7 @@ async def run_tagging_and_validation(
         else:
             structure_json = {}
 
+    current_step = "validation"
     try:
         job.status = "processing"
         await db.commit()
@@ -5807,6 +5696,7 @@ async def run_tagging_and_validation(
         )
 
         # ── Step 5: Tagging ──
+        current_step = "tagging"
         await _update_step(db, job_id, "tagging", "running")
         job_manager.emit_progress(job_id, step="tagging", status="running")
 
@@ -5943,6 +5833,7 @@ async def run_tagging_and_validation(
         job_manager.emit_progress(job_id, step="tagging", status="complete")
 
         # ── Step 6: Validation ──
+        current_step = "validation"
         await _update_step(db, job_id, "validation", "running")
         job_manager.emit_progress(job_id, step="validation", status="running")
 
@@ -6185,6 +6076,7 @@ async def run_tagging_and_validation(
             },
         )
 
+        current_step = "fidelity"
         await _update_step(db, job_id, "fidelity", "running")
         job_manager.emit_progress(job_id, step="fidelity", status="running")
 
@@ -6625,6 +6517,13 @@ async def run_tagging_and_validation(
         logger.exception(f"Tagging/validation failed for job {job_id}")
         await db.rollback()
         user_error = re.sub(r"/\S*", "", str(e)).strip(": ")
+        await _update_step(
+            db,
+            job_id,
+            current_step,
+            "failed",
+            error=user_error or str(e),
+        )
         job = await db.get(Job, job_id)
         if job:
             job.status = "failed"
@@ -6633,7 +6532,7 @@ async def run_tagging_and_validation(
             await db.commit()
         job_manager.emit_progress(
             job_id,
-            step="error",
+            step=current_step,
             status="failed",
             message=user_error,
         )
