@@ -11,6 +11,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.36",
     "aiosqlite>=0.20.0",
     "pydantic-settings>=2.7.0",
+    "cryptography>=46.0.0",
     "pikepdf>=9.4.0",
     "httpx>=0.28.0",
     "sse-starlette>=2.2.0",

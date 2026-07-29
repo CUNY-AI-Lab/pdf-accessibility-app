@@ -162,6 +162,7 @@ RUN mkdir -p /app/data/uploads /app/data/processing /app/data/output /app/data/d
     && chown -R app:app /app/data /home/app
 
 ENV PATH="/app/backend/.venv/bin:${PATH}" \
+    UVICORN_HOST=0.0.0.0 \
     HOME=/home/app \
     XDG_CACHE_HOME=/home/app/.cache \
     HF_HOME=/home/app/.cache/huggingface \
@@ -179,4 +180,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
 
 ENTRYPOINT ["tini", "--"]
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "app.main:app", "--port", "8001"]

@@ -9,6 +9,7 @@ from fastapi import HTTPException, Request, Response
 from app.config import get_settings
 
 _SESSION_TOKEN_ALPHABET = set(string.ascii_letters + string.digits + "-_")
+_CAIL_SUBJECT_PREFIX = "cail-"
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,18 @@ def hash_session_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def hash_identity_subject(subject: str) -> str:
+    if (
+        not subject.startswith(_CAIL_SUBJECT_PREFIX)
+        or len(subject) != 37
+        or any(character not in "0123456789abcdef" for character in subject[5:])
+    ):
+        raise ValueError("CAIL identity subject is not canonical")
+    return hashlib.sha256(
+        b"pdf-accessibility-owner-v1\0" + subject.encode("ascii")
+    ).hexdigest()
+
+
 def csrf_token_for_session(token: str) -> str:
     return hmac.new(
         token.encode("utf-8"),
@@ -44,7 +57,11 @@ def csrf_token_for_session(token: str) -> str:
     ).hexdigest()
 
 
-def ensure_anonymous_session(request: Request) -> tuple[AnonymousSession, bool]:
+def ensure_anonymous_session(
+    request: Request,
+    *,
+    identity_subject: str | None = None,
+) -> tuple[AnonymousSession, bool]:
     settings = get_settings()
     token = _normalize_session_token(
         request.cookies.get(settings.anonymous_session_cookie_name)
@@ -53,7 +70,12 @@ def ensure_anonymous_session(request: Request) -> tuple[AnonymousSession, bool]:
     if token is None:
         token = generate_session_token()
 
-    session = AnonymousSession(token=token, session_hash=hash_session_token(token))
+    session_hash = (
+        hash_identity_subject(identity_subject)
+        if identity_subject is not None
+        else hash_session_token(token)
+    )
+    session = AnonymousSession(token=token, session_hash=session_hash)
     request.state.anonymous_session = session
     return session, created
 

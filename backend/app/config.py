@@ -118,6 +118,12 @@ class Settings(BaseSettings):
     anonymous_session_cookie_secure: bool = False
     csrf_protection_enabled: bool = True
 
+    # CAIL identity (source-ready but opt-in until the gateway is activated)
+    cail_identity_required: bool = False
+    cail_identity_jwks: str = ""
+    cail_identity_issuer: str = "https://tools.ailab.gc.cuny.edu/cail-sso"
+    cail_identity_clock_tolerance_seconds: int = 60
+
     # CORS
     cors_allow_origins: str = (
         "http://localhost:5173,"
