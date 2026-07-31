@@ -58,6 +58,8 @@ docker-compose.override.yml
 *.tmp
 *.bak
 *.orig
+# Local scratch (research runs, curl cookie jars with live session cookies)
+tmp/
 
 # PDF test files (keep test fixtures but ignore user uploads)
 # test_*.pdf — uncomment if you want to track test PDFs

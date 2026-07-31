@@ -258,3 +258,26 @@ configuration, and Docling/docling-serve availability.
 - [PDF/UA Rule Coverage](docs/pdfua_rule_coverage_matrix.md)
 - [Backend README](backend/README.md)
 - [Frontend README](frontend/README.md)
+
+## SSO Note (tools.ailab.gc.cuny.edu deployment)
+
+The CUNYLogin SSO gateway being rolled out on `tools.ailab.gc.cuny.edu`
+currently classifies `/pdf-accessibility/` as **public** — the
+anonymous-session, zero-retention workflow is intentionally preserved. If
+that policy changes, the proxy hands this app a short-lived signed
+`X-CAIL-Identity-JWT` assertion, which the backend verifies itself; see
+`backend/CAIL_IDENTITY.md` for the contract and activation inputs. Bare
+`X-CAIL-*` headers are never trusted as identity. The anonymous cookie
+remains separate (CSRF and anonymous-session isolation), while verified
+job ownership keys off the assertion's stable subject.
+
+**AI Gateway seam:** model traffic can be routed through Cloudflare AI
+Gateway without code changes via the existing `LLM_BASE_URL` /
+`LLM_API_KEY` variables — point them at the gateway's OpenAI-compatible
+endpoint for the provider (e.g.
+`https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/google-ai-studio/v1beta/openai`)
+to get lab-level spend logging/limits. The direct-PDF lanes
+(`USE_DIRECT_GEMINI_PDF`, native `google-genai` client) bypass
+`LLM_BASE_URL` and would need a separate base-URL option if they should
+also route through the gateway. Per-user spend keying is out of scope
+while the tool is public/anonymous.
