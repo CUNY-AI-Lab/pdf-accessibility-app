@@ -237,6 +237,12 @@ bun run lint
 bun run build
 ```
 
+From the repository root, run the credential-free backend/frontend check:
+
+```bash
+./scripts/check.sh
+```
+
 Verify the effective runtime (LLM provider, Docling target, installed binaries) with:
 
 ```bash
