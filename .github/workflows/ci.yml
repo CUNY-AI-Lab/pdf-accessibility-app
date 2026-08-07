@@ -49,3 +49,36 @@ jobs:
           sudo apt-get install --no-install-recommends -y poppler-utils
       - name: Run canonical source gate
         run: ./scripts/check.sh
+      - name: Build container image
+        run: docker build --tag pdf-accessibility-app:ci .
+      - name: Smoke-test container health
+        run: |
+          set -euo pipefail
+          container_name=pdf-accessibility-ci-smoke
+          host_port=18081
+          cleanup() {
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run --detach --name "$container_name" \
+            --publish "127.0.0.1:${host_port}:8001" \
+            --env GEMINI_API_KEY= \
+            --env GOOGLE_API_KEY= \
+            --env LLM_API_KEY=check-only \
+            --env LLM_BASE_URL=http://127.0.0.1:8000/v1 \
+            --env LLM_MODEL=gemini-check \
+            --env USE_DIRECT_GEMINI_PDF=false \
+            --env DOCLING_SERVE_URL= \
+            --env DOCLING_SERVE_TOKEN= \
+            pdf-accessibility-app:ci
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error "http://127.0.0.1:${host_port}/health"; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker logs "$container_name"
+          exit 1

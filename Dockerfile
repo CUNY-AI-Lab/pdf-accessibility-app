@@ -34,6 +34,7 @@ RUN apt-get update \
         fonts-dejavu-core \
         fonts-liberation \
         ghostscript \
+        gnupg \
         libspatialindex-dev \
         poppler-utils \
         qpdf \
@@ -90,12 +91,28 @@ RUN if [ "$WITH_LOCAL_DOCLING" = "true" ]; then \
         && chown -R app:app /home/app; \
     fi
 
+ARG VERAPDF_VERSION=1.28.2
+
 COPY backend/verapdf-auto-install.xml /tmp/verapdf-auto-install.xml
-RUN wget -q -O /tmp/verapdf-installer.zip https://software.verapdf.org/releases/verapdf-installer.zip \
-    && unzip -q /tmp/verapdf-installer.zip -d /tmp/verapdf-installer \
-    && bash /tmp/verapdf-installer/verapdf-greenfield-1.28.2/verapdf-install /tmp/verapdf-auto-install.xml \
-    && ln -sf /opt/verapdf/verapdf /usr/local/bin/verapdf \
-    && rm -rf /tmp/verapdf-installer /tmp/verapdf-installer.zip /tmp/verapdf-auto-install.xml
+RUN set -eux; \
+    verapdf_series="${VERAPDF_VERSION%.*}"; \
+    verapdf_url="https://software.verapdf.org/releases/${verapdf_series}/verapdf-greenfield-${VERAPDF_VERSION}-installer.zip"; \
+    wget -q -O /tmp/verapdf-installer.zip "$verapdf_url"; \
+    wget -q -O /tmp/verapdf-installer.zip.asc "${verapdf_url}.asc"; \
+    wget -q -O /tmp/verapdf-signing-key https://software.verapdf.org/keys/KEY; \
+    export GNUPGHOME=/tmp/verapdf-gnupg; \
+    mkdir -m 700 "$GNUPGHOME"; \
+    gpg --batch --import /tmp/verapdf-signing-key; \
+    gpg --batch --status-file /tmp/verapdf-gpg-status \
+        --verify /tmp/verapdf-installer.zip.asc /tmp/verapdf-installer.zip; \
+    grep -F 'VALIDSIG 13DD102B4DD69354D12DE5A83184863278B17FE7' /tmp/verapdf-gpg-status; \
+    unzip -q /tmp/verapdf-installer.zip -d /tmp/verapdf-installer; \
+    bash "/tmp/verapdf-installer/verapdf-greenfield-${VERAPDF_VERSION}/verapdf-install" \
+        /tmp/verapdf-auto-install.xml; \
+    ln -sf /opt/verapdf/verapdf /usr/local/bin/verapdf; \
+    rm -rf /tmp/verapdf-gnupg /tmp/verapdf-signing-key /tmp/verapdf-gpg-status \
+        /tmp/verapdf-installer /tmp/verapdf-installer.zip /tmp/verapdf-installer.zip.asc \
+        /tmp/verapdf-auto-install.xml
 
 # Install Python dependencies.
 # Default: core deps only (no torch/docling).
