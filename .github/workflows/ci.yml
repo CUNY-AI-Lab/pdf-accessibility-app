@@ -41,5 +41,11 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: bun install --frozen-lockfile
+      - name: Install PDF rendering tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y poppler-utils
       - name: Run canonical source gate
         run: ./scripts/check.sh
