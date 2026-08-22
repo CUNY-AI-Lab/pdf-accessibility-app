@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from re import findall
 
 import pytest
 from fastapi.testclient import TestClient
@@ -35,11 +36,15 @@ def test_create_app_serves_built_frontend(tmp_path, monkeypatch):
     assets_dir = dist_dir / "assets"
     assets_dir.mkdir(parents=True)
     (dist_dir / "index.html").write_text(
-        "<!doctype html><html><body><div id='root'></div></body></html>",
+        "<!doctype html><html><head>"
+        "<script type='module' src='/assets/app.js'></script>"
+        "<link rel='stylesheet' href='/assets/app.css'>"
+        "</head><body><div id='root'></div></body></html>",
         encoding="utf-8",
     )
     (dist_dir / "vite.svg").write_text("<svg></svg>", encoding="utf-8")
     (assets_dir / "app.js").write_text("console.log('ok');", encoding="utf-8")
+    (assets_dir / "app.css").write_text("#root { display: block; }", encoding="utf-8")
 
     monkeypatch.setattr(main, "ensure_dirs", lambda: None)
     monkeypatch.setattr(main, "init_db", _noop_async)
@@ -53,9 +58,24 @@ def test_create_app_serves_built_frontend(tmp_path, monkeypatch):
         root_response = client.get("/")
         assert root_response.status_code == 200
         assert "div id='root'" in root_response.text
+        assert root_response.headers["cache-control"] == "no-cache, must-revalidate"
         assert "anon_session=" in root_response.headers["set-cookie"]
         assert "anon_session_csrf=" in root_response.headers["set-cookie"]
         assert "HttpOnly" in root_response.headers["set-cookie"]
+
+        referenced_assets = findall(
+            r"(?:src|href)=[\"'](/assets/[^\"']+)[\"']",
+            root_response.text,
+        )
+        assert referenced_assets == ["/assets/app.js", "/assets/app.css"]
+        for asset_path in referenced_assets:
+            referenced_response = client.get(asset_path)
+            assert referenced_response.status_code == 200
+            assert referenced_response.content
+            assert referenced_response.headers["cache-control"] == (
+                "public, max-age=31536000, immutable"
+            )
+            assert "set-cookie" not in referenced_response.headers
 
         root_head_response = client.head("/")
         assert root_head_response.status_code == 200
@@ -63,6 +83,15 @@ def test_create_app_serves_built_frontend(tmp_path, monkeypatch):
         asset_response = client.get("/assets/app.js")
         assert asset_response.status_code == 200
         assert asset_response.text == "console.log('ok');"
+
+        asset_head_response = client.head("/assets/app.css")
+        assert asset_head_response.status_code == 200
+        assert asset_head_response.headers["content-length"] == str(
+            len("#root { display: block; }")
+        )
+        assert asset_head_response.headers["cache-control"] == (
+            "public, max-age=31536000, immutable"
+        )
 
         missing_asset_response = client.get("/assets/missing.js")
         assert missing_asset_response.status_code == 404
