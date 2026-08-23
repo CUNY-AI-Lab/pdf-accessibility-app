@@ -37,6 +37,9 @@ export default function Layout() {
             <NavLink to="/dashboard" className={navLinkClass}>
               Dashboard
             </NavLink>
+            <a href="/" className={navLinkClass({ isActive: false })}>
+              All Tools
+            </a>
           </nav>
         </div>
       </header>
