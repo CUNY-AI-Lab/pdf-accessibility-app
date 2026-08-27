@@ -40,9 +40,14 @@ def _remote_docling_settings(tmp_path, *, token=""):
 def _patch_async_client(monkeypatch, *, response=None, error=None):
     calls = []
 
+    class FakeTransport:
+        def __init__(self, *, retries):
+            self.retries = retries
+
     class FakeAsyncClient:
-        def __init__(self, *, timeout):
+        def __init__(self, *, timeout, transport):
             self.timeout = timeout
+            self.transport = transport
 
         async def __aenter__(self):
             return self
@@ -51,11 +56,19 @@ def _patch_async_client(monkeypatch, *, response=None, error=None):
             return None
 
         async def get(self, url, *, headers):
-            calls.append({"timeout": self.timeout, "url": url, "headers": headers})
+            calls.append(
+                {
+                    "timeout": self.timeout,
+                    "transport": self.transport,
+                    "url": url,
+                    "headers": headers,
+                }
+            )
             if error is not None:
                 raise error
             return response
 
+    monkeypatch.setattr(readiness.httpx, "AsyncHTTPTransport", FakeTransport)
     monkeypatch.setattr(readiness.httpx, "AsyncClient", FakeAsyncClient)
     return calls
 
@@ -138,6 +151,7 @@ async def test_remote_docling_health_check_uses_canonical_endpoint_and_timeout(
     assert calls[0]["headers"] == {}
     assert calls[0]["timeout"].connect == 5
     assert calls[0]["timeout"].read == 5
+    assert calls[0]["transport"].retries == 2
 
 
 @pytest.mark.asyncio
