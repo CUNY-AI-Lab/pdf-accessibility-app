@@ -74,7 +74,7 @@ def _cors_origins() -> list[str]:
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _CSRF_HEADER_NAME = "x-csrf-token"
 _PUBLIC_IDENTITY_PATHS = frozenset({"/health", "/health/ready"})
-_FRONTEND_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+_FRONTEND_HASHED_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _FRONTEND_DOCUMENT_CACHE_CONTROL = "no-cache, must-revalidate"
 _FRONTEND_ROOT_ASSETS = frozenset({"/cuny-ai-lab-logo.png", "/favicon.svg"})
 
@@ -315,11 +315,14 @@ def _register_frontend_routes(app: FastAPI, frontend_dist_dir: Path) -> None:
     async def frontend_app(full_path: str):
         asset_path = _resolve_frontend_file(frontend_dist_dir, full_path)
         if asset_path is not None:
-            headers = (
-                {"Cache-Control": _FRONTEND_ASSET_CACHE_CONTROL}
-                if _is_frontend_asset_request(f"/{full_path}")
-                else None
-            )
+            request_path = f"/{full_path}"
+            if request_path.startswith("/assets/"):
+                cache_control = _FRONTEND_HASHED_ASSET_CACHE_CONTROL
+            elif request_path in _FRONTEND_ROOT_ASSETS:
+                cache_control = _FRONTEND_DOCUMENT_CACHE_CONTROL
+            else:
+                cache_control = None
+            headers = {"Cache-Control": cache_control} if cache_control else None
             return FileResponse(asset_path, headers=headers)
         if full_path and (full_path.startswith("assets/") or Path(full_path).suffix):
             raise HTTPException(status_code=404)

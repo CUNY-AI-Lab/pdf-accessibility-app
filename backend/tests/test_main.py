@@ -43,6 +43,7 @@ def test_create_app_serves_built_frontend(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     (dist_dir / "vite.svg").write_text("<svg></svg>", encoding="utf-8")
+    (dist_dir / "favicon.svg").write_text("<svg></svg>", encoding="utf-8")
     (assets_dir / "app.js").write_text("console.log('ok');", encoding="utf-8")
     (assets_dir / "app.css").write_text("#root { display: block; }", encoding="utf-8")
 
@@ -83,6 +84,13 @@ def test_create_app_serves_built_frontend(tmp_path, monkeypatch):
         asset_response = client.get("/assets/app.js")
         assert asset_response.status_code == 200
         assert asset_response.text == "console.log('ok');"
+
+        root_asset_response = client.get("/favicon.svg")
+        assert root_asset_response.status_code == 200
+        assert root_asset_response.headers["cache-control"] == (
+            "no-cache, must-revalidate"
+        )
+        assert "set-cookie" not in root_asset_response.headers
 
         asset_head_response = client.head("/assets/app.css")
         assert asset_head_response.status_code == 200

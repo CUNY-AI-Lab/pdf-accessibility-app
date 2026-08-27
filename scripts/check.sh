@@ -15,7 +15,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
     DOCLING_SERVE_URL= \
     DOCLING_SERVE_TOKEN= \
     PYTHONPATH=. \
-    uv run pytest tests -q
+    uv run --frozen pytest tests -q
 )
 
 (

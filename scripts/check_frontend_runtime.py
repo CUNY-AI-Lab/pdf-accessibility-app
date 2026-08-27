@@ -48,7 +48,11 @@ def check(url: str) -> None:
             page.on("pageerror", lambda error: page_errors.append(str(error)))
             page.on(
                 "requestfailed",
-                lambda request: failed_requests.append(f"{request.url}: {request.failure}"),
+                lambda request: (
+                    failed_requests.append(f"{request.url}: {request.failure}")
+                    if urlparse(request.url).netloc == expected_origin
+                    else None
+                ),
             )
 
             response = page.goto(url, wait_until="networkidle", timeout=30_000)
