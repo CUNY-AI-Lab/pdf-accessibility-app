@@ -13,9 +13,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  UV_LOCKED: "1"
-
 jobs:
   source-gate:
     name: Source gate
