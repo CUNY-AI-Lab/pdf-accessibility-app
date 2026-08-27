@@ -16,6 +16,7 @@ from app.services.runtime_diagnostics import collect_runtime_diagnostics
 from app.services.runtime_paths import resolve_binary
 
 _DOCLING_HEALTH_TIMEOUT_SECONDS = 5.0
+_DOCLING_HEALTH_CONNECT_RETRIES = 2
 
 
 def _check_payload(
@@ -150,7 +151,13 @@ async def _docling_check(settings: Any, diagnostics: dict[str, Any]) -> dict[str
             headers = {"Authorization": f"Bearer {token}"} if token else {}
             try:
                 timeout = httpx.Timeout(_DOCLING_HEALTH_TIMEOUT_SECONDS)
-                async with httpx.AsyncClient(timeout=timeout) as client:
+                transport = httpx.AsyncHTTPTransport(
+                    retries=_DOCLING_HEALTH_CONNECT_RETRIES
+                )
+                async with httpx.AsyncClient(
+                    timeout=timeout,
+                    transport=transport,
+                ) as client:
                     response = await client.get(health_url, headers=headers)
             except httpx.ConnectError:
                 return _check_payload(
