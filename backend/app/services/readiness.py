@@ -7,12 +7,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
 from sqlalchemy import text
 
 from app.config import LOCAL_LLM_HOSTS, PLACEHOLDER_LLM_KEYS, get_settings
 from app.database import get_session_maker
 from app.services.runtime_diagnostics import collect_runtime_diagnostics
 from app.services.runtime_paths import resolve_binary
+
+_DOCLING_HEALTH_TIMEOUT_SECONDS = 5.0
 
 
 def _check_payload(
@@ -129,7 +132,7 @@ def _llm_check(settings: Any) -> dict[str, Any]:
     )
 
 
-def _docling_check(settings: Any, diagnostics: dict[str, Any]) -> dict[str, Any]:
+async def _docling_check(settings: Any, diagnostics: dict[str, Any]) -> dict[str, Any]:
     docling = diagnostics.get("docling", {}) if isinstance(diagnostics, dict) else {}
     if getattr(settings, "docling_serve_url", ""):
         local = bool(docling.get("local"))
@@ -139,6 +142,55 @@ def _docling_check(settings: Any, diagnostics: dict[str, Any]) -> dict[str, Any]
                 ok=False,
                 detail="Local docling-serve is configured but no listener was found",
                 metadata=docling,
+            )
+        if not local:
+            base_url = str(settings.docling_serve_url).strip().rstrip("/")
+            health_url = f"{base_url}/health"
+            token = str(getattr(settings, "docling_serve_token", "") or "").strip()
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            try:
+                timeout = httpx.Timeout(_DOCLING_HEALTH_TIMEOUT_SECONDS)
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.get(health_url, headers=headers)
+            except httpx.ConnectError:
+                return _check_payload(
+                    ok=False,
+                    detail="Configured remote docling-serve health check could not connect",
+                    metadata={**docling, "health_check": "connection_failed"},
+                )
+            except httpx.TimeoutException:
+                return _check_payload(
+                    ok=False,
+                    detail="Configured remote docling-serve health check timed out",
+                    metadata={**docling, "health_check": "timed_out"},
+                )
+            except httpx.InvalidURL:
+                return _check_payload(
+                    ok=False,
+                    detail="Configured remote docling-serve health check URL is invalid",
+                    metadata={**docling, "health_check": "invalid_url"},
+                )
+            except httpx.HTTPError:
+                return _check_payload(
+                    ok=False,
+                    detail="Configured remote docling-serve health check failed",
+                    metadata={**docling, "health_check": "request_failed"},
+                )
+
+            if not 200 <= response.status_code < 300:
+                return _check_payload(
+                    ok=False,
+                    detail="Configured remote docling-serve health check returned a non-2xx status",
+                    metadata={
+                        **docling,
+                        "health_check": "non_2xx",
+                        "status_code": response.status_code,
+                    },
+                )
+            return _check_payload(
+                ok=True,
+                detail="Configured remote docling-serve health check passed",
+                metadata={**docling, "health_check": "ok"},
             )
         return _check_payload(
             ok=True,
@@ -171,7 +223,7 @@ async def collect_readiness(
         "storage": _storage_check(settings),
         "binaries": _binary_check(settings),
         "llm": _llm_check(settings),
-        "docling": _docling_check(settings, diagnostics),
+        "docling": await _docling_check(settings, diagnostics),
     }
     ready = all(bool(check.get("ok")) for check in checks.values())
     return {

@@ -74,6 +74,20 @@ def _cors_origins() -> list[str]:
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _CSRF_HEADER_NAME = "x-csrf-token"
 _PUBLIC_IDENTITY_PATHS = frozenset({"/health", "/health/ready"})
+_FRONTEND_HASHED_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+_FRONTEND_DOCUMENT_CACHE_CONTROL = "no-cache, must-revalidate"
+_FRONTEND_ROOT_ASSETS = frozenset({"/cuny-ai-lab-logo.png", "/favicon.svg"})
+
+
+def _is_frontend_asset_request(path: str) -> bool:
+    """Return whether a GET/HEAD path is a built frontend asset.
+
+    Built assets are content-addressed by Vite and do not need an anonymous
+    session. Keeping them outside the session middleware also lets the edge
+    cache them without carrying a per-browser cookie on the response.
+    """
+
+    return path.startswith("/assets/") or path in _FRONTEND_ROOT_ASSETS
 
 
 def _identity_error(
@@ -292,16 +306,30 @@ def _register_frontend_routes(app: FastAPI, frontend_dist_dir: Path) -> None:
 
     @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def frontend_index():
-        return FileResponse(index_path)
+        return FileResponse(
+            index_path,
+            headers={"Cache-Control": _FRONTEND_DOCUMENT_CACHE_CONTROL},
+        )
 
     @app.api_route("/{full_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
     async def frontend_app(full_path: str):
         asset_path = _resolve_frontend_file(frontend_dist_dir, full_path)
         if asset_path is not None:
-            return FileResponse(asset_path)
+            request_path = f"/{full_path}"
+            if request_path.startswith("/assets/"):
+                cache_control = _FRONTEND_HASHED_ASSET_CACHE_CONTROL
+            elif request_path in _FRONTEND_ROOT_ASSETS:
+                cache_control = _FRONTEND_DOCUMENT_CACHE_CONTROL
+            else:
+                cache_control = None
+            headers = {"Cache-Control": cache_control} if cache_control else None
+            return FileResponse(asset_path, headers=headers)
         if full_path and (full_path.startswith("assets/") or Path(full_path).suffix):
             raise HTTPException(status_code=404)
-        return FileResponse(index_path)
+        return FileResponse(
+            index_path,
+            headers={"Cache-Control": _FRONTEND_DOCUMENT_CACHE_CONTROL},
+        )
 
 
 def create_app(frontend_dist_dir: Path | None = None) -> FastAPI:
@@ -389,6 +417,10 @@ def create_app(frontend_dist_dir: Path | None = None) -> FastAPI:
                     retry=False,
                 )
         request.state.cail_identity = identity
+        if request.method in {"GET", "HEAD"} and _is_frontend_asset_request(
+            request.url.path
+        ):
+            return await call_next(request)
         session, created = ensure_anonymous_session(
             request,
             identity_subject=identity.subject if identity is not None else None,

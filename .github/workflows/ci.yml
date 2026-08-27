@@ -13,9 +13,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  UV_LOCKED: "1"
-
 jobs:
   source-gate:
     name: Source gate
@@ -38,6 +35,9 @@ jobs:
       - name: Install backend dependencies
         working-directory: backend
         run: uv sync --locked --extra dev
+      - name: Install Chromium
+        working-directory: backend
+        run: uv run --frozen playwright install --with-deps chromium
       - name: Install frontend dependencies
         working-directory: frontend
         run: bun install --frozen-lockfile
@@ -73,12 +73,22 @@ jobs:
             --env DOCLING_SERVE_TOKEN= \
             pdf-accessibility-app:ci
 
+          health_ok=false
           for attempt in $(seq 1 30); do
             if curl --fail --silent --show-error "http://127.0.0.1:${host_port}/health"; then
-              exit 0
+              health_ok=true
+              break
             fi
             sleep 1
           done
 
-          docker logs "$container_name"
-          exit 1
+          if [[ "$health_ok" != true ]]; then
+            docker logs "$container_name"
+            exit 1
+          fi
+
+          (
+            cd backend
+            uv run --frozen python ../scripts/check_frontend_runtime.py \
+              "http://127.0.0.1:${host_port}/"
+          )
