@@ -81,16 +81,16 @@ The standard:
 
 These are not the current concern:
 
-- PDF parsing and writing in [`tagger.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/pipeline/tagger.py)
-- schema validation and retry handling in [`intelligence_llm_utils.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/intelligence_llm_utils.py)
-- BCP-47 normalization and OCR language mapping in [`language.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/pipeline/language.py)
-- round-trip comparison logic in [`roundtrip_compare.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/roundtrip_compare.py), except where it accidentally encodes product expectations
+- PDF parsing and writing in [`tagger.py`](../backend/app/pipeline/tagger.py)
+- schema validation and retry handling in [`intelligence_llm_utils.py`](../backend/app/services/intelligence_llm_utils.py)
+- BCP-47 normalization and OCR language mapping in [`language.py`](../backend/app/pipeline/language.py)
+- round-trip comparison logic in [`roundtrip_compare.py`](../backend/app/services/roundtrip_compare.py), except where it accidentally encodes product expectations
 
 ## High-risk semantic heuristics
 
 ### Structure extraction
 
-[`structure.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/pipeline/structure.py) still makes several semantic calls locally:
+[`structure.py`](../backend/app/pipeline/structure.py) still makes several semantic calls locally:
 
 - `_mark_toc_sequences()`
   - decides that a heading is a TOC caption and that following elements are TOC items
@@ -109,7 +109,7 @@ These are the main structure-stage semantic rule layers.
 
 ### Title selection
 
-[`title_intelligence.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/title_intelligence.py) is model-assisted, but the evidence selection still encodes rules:
+[`title_intelligence.py`](../backend/app/services/title_intelligence.py) is model-assisted, but the evidence selection still encodes rules:
 
 - `TITLE_TEXT_TYPES`
   - only a fixed subset of element types can ever become title evidence
@@ -123,7 +123,7 @@ The model is deciding among a pre-curated candidate set rather than inspecting t
 
 ### TOC intelligence
 
-[`toc_intelligence.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/toc_intelligence.py) is also model-assisted but heavily shaped by local rules:
+[`toc_intelligence.py`](../backend/app/services/toc_intelligence.py) is also model-assisted but heavily shaped by local rules:
 
 - `TOC_HEADING_TEXTS`
   - a hardcoded heading-name gate for TOC discovery
@@ -142,7 +142,7 @@ This subsystem is not rule-free; it is a local candidate generator plus LLM adju
 
 ### Bookmark intelligence
 
-[`bookmark_intelligence.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/bookmark_intelligence.py) remains the densest semantic shaping layer:
+[`bookmark_intelligence.py`](../backend/app/services/bookmark_intelligence.py) remains the densest semantic shaping layer:
 
 - `BOOKMARK_HEADING_TYPES`, `BOOKMARK_LANDMARK_TYPES`
   - fixed type gates for what can become a bookmark candidate
@@ -161,7 +161,7 @@ This path is now more ML-driven than before, but it is still a model operating i
 
 ### Pretag auto-apply policy
 
-[`semantic_pretag_policy.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/semantic_pretag_policy.py) contains rule-based semantic gating:
+[`semantic_pretag_policy.py`](../backend/app/services/semantic_pretag_policy.py) contains rule-based semantic gating:
 
 - `PRETAG_TABLE_ALLOWED_ACTIONS`
 - `PRETAG_FORM_ALLOWED_TYPES`
@@ -173,7 +173,7 @@ This module decides when model output is trusted enough to mutate structure auto
 
 ### Grounded text auto-apply
 
-[`grounded_text_apply.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/grounded_text_apply.py) is strongly heuristic:
+[`grounded_text_apply.py`](../backend/app/services/grounded_text_apply.py) is strongly heuristic:
 
 - role allowlists
 - char-count limits
@@ -186,7 +186,7 @@ This module locally decides when text repair is safe, instead of using a model-b
 
 ### Tagging fallbacks
 
-[`tagger.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/pipeline/tagger.py) still contains semantic fallbacks:
+[`tagger.py`](../backend/app/pipeline/tagger.py) still contains semantic fallbacks:
 
 - bookmark-source fallback order
   - `bookmark_plan -> native_toc -> toc_entries -> headings`
@@ -205,11 +205,11 @@ Some of these are acceptable safety fallbacks, but some are still local semantic
 
 These are less central but still relevant:
 
-- [`language.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/pipeline/language.py)
+- [`language.py`](../backend/app/pipeline/language.py)
   - document or element language detection is inherently probabilistic; local detectors are still a model, but a separate offline one
-- [`semantic_pretag_policy.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/semantic_pretag_policy.py)
+- [`semantic_pretag_policy.py`](../backend/app/services/semantic_pretag_policy.py)
   - widget and form grouping logic depends on geometry thresholds
-- [`title_intelligence.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/title_intelligence.py)
+- [`title_intelligence.py`](../backend/app/services/title_intelligence.py)
   - page-1 focus is reasonable for many PDFs, but not universally justified
 
 ## Migration target
@@ -242,19 +242,19 @@ The app should move toward:
 
 ### Priority 1
 
-- reduce candidate shaping in [`bookmark_intelligence.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/bookmark_intelligence.py)
-- reduce TOC discovery heuristics in [`toc_intelligence.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/toc_intelligence.py)
-- reduce title pre-curation in [`title_intelligence.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/title_intelligence.py)
+- reduce candidate shaping in [`bookmark_intelligence.py`](../backend/app/services/bookmark_intelligence.py)
+- reduce TOC discovery heuristics in [`toc_intelligence.py`](../backend/app/services/toc_intelligence.py)
+- reduce title pre-curation in [`title_intelligence.py`](../backend/app/services/title_intelligence.py)
 
 ### Priority 2
 
-- replace grounded-text auto-apply heuristics in [`grounded_text_apply.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/grounded_text_apply.py) with model-backed adjudication plus fidelity gating
-- reduce local semantic gates in [`semantic_pretag_policy.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/services/semantic_pretag_policy.py)
+- replace grounded-text auto-apply heuristics in [`grounded_text_apply.py`](../backend/app/services/grounded_text_apply.py) with model-backed adjudication plus fidelity gating
+- reduce local semantic gates in [`semantic_pretag_policy.py`](../backend/app/services/semantic_pretag_policy.py)
 
 ### Priority 3
 
-- shrink semantic fallbacks in [`tagger.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/pipeline/tagger.py)
-- shrink TOC and heading inference rules in [`structure.py`](/Users/stephenzweibel/Apps/pdf-accessibility-app/backend/app/pipeline/structure.py)
+- shrink semantic fallbacks in [`tagger.py`](../backend/app/pipeline/tagger.py)
+- shrink TOC and heading inference rules in [`structure.py`](../backend/app/pipeline/structure.py)
 
 ## Principle for future changes
 
