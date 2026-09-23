@@ -10,16 +10,15 @@ improvement work that follows. Update it as phases land.
   gates access. Anonymous use ends at cutover.
 - **Models:** open-weight vision models through the CAIL Gateway. The direct
   Gemini path is removed after cutover, not kept as a fallback.
-- **Spend:** each person's own Gateway budget. A job holds a Doorway
-  delegation grant (Phase 1) and refreshes it for 5-minute `cail:gateway`
-  tokens, so it can keep calling the Gateway after the upload request ends.
-  Gateway still checks membership and quota on every call.
+- **Spend:** each person's own Gateway budget. Doorway's `cail:gateway` leg
+  lasts 24 hours (Phase 1), so a job can keep calling the Gateway after the
+  upload request ends. Gateway checks membership and quota on every call.
 - **Hosting:** a new Cloudflare Worker version of the app owns the interface,
   sign-in, grants, jobs, and storage. The Python pipeline (Docling, OCR,
   pikepdf, veraPDF) runs outside Cloudflare, on actual-dell or on the Lab's
   AWS account, because Cloudflare Containers cost too much for this workload.
-  The grant stays in the Worker; the pipeline host only receives 5-minute
-  tokens with each unit of work. Which host is still to be decided.
+  The Worker sends the pipeline host the job's Gateway token with each unit of
+  work. Which host is still to be decided.
 - **Improvements:** reliability, remediation quality, human-readable reports,
   and code health.
 
@@ -27,15 +26,12 @@ improvement work that follows. Update it as phases land.
 
 Each phase ships on its own and leaves a working product.
 
-### 1. Doorway delegation grants (cail-tools-admission)
+### 1. Long-lived Gateway leg (cail-tools-admission)
 
-Doorway's refresh-token grant for registered first-party Workers: 24-hour
-grants, rotating refresh tokens with reuse detection, an Admission check at
-every refresh, and 5-minute audience-bound tokens carrying `client_id`. People
-see and revoke running work on the Account Workspace settings page. Contract:
-`apps/doorway/docs/DELEGATION-GRANTS.md` in cail-tools-admission. Media Tools,
-Agent Studio, and Site Studio move onto it first; PDF Accessibility registers
-as a client when its Worker exists.
+Doorway's `cail:gateway` leg lasts 24 hours, capped by the session and the
+Admission membership; every other leg stays at five minutes
+(cail-tools-admission#246). Delegation grants (#245) are parked: every current
+long-running consumer needs only the Gateway, which re-checks every call.
 
 ### 2. Gateway model lane (this repo)
 
@@ -47,10 +43,9 @@ as a client when its Worker exists.
    the Gateway's chat completions endpoint. Add image-based versions of the
    title/front-matter and TOC lanes. Cap image and request sizes. Remove the
    `LLM_API_KEY`→Gemini fallback and the "gemini" model-name validator.
-3. **Per-job credential.** The Worker holds the job's grant and sends the
-   pipeline a fresh 5-minute Gateway token with each unit of work; the
-   pipeline never stores it. Revocation and `quota_exceeded` fail the job
-   with a clear message.
+3. **Per-job credential.** The Worker keeps the job's Gateway token and sends
+   it with each unit of work; the pipeline never stores it. Revocation and
+   `quota_exceeded` fail the job with a clear message.
 4. **Bake-off.** Run the corpus through candidate Gateway vision models
    (qwen3-vl, kimi-k2.6, others in the live catalog) against the Gemini
    baseline. Choose the model on the measured results.
@@ -58,8 +53,7 @@ as a client when its Worker exists.
 ### 3. Worker version behind Doorway
 
 - A Worker serves the app at `/pdf-accessibility` as a protected Doorway
-  product with audience `cail:pdf-accessibility`, and registers as a
-  delegation client for `cail:gateway`.
+  product with audience `cail:pdf-accessibility` and a `cail:gateway` leg.
 - Jobs, files, and results move to Cloudflare storage; the pipeline host
   receives work and returns results over an authenticated channel.
 - Retire the NML deployment, the two no-script bypass Worker Routes, and
@@ -70,7 +64,7 @@ as a client when its Worker exists.
 
 ### 4. Reliability
 
-- An overall job deadline, kept inside the 24-hour grant.
+- An overall job deadline, kept inside the 24-hour Gateway leg.
 - A Docling timeout that scales with page count instead of one fixed 300s.
 - Timeouts that actually cancel paid model calls (no `wait_for` over
   `to_thread` leaving the call running).
