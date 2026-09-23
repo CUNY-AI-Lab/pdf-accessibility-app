@@ -14,7 +14,7 @@ improvement work that follows. Update it as phases land.
   lasts 24 hours (Phase 1), so a job can keep calling the Gateway after the
   upload request ends. Gateway checks membership and quota on every call.
 - **Hosting:** a new Cloudflare Worker version of the app owns the interface,
-  sign-in, grants, jobs, and storage. The Python pipeline (Docling, OCR,
+  sign-in, jobs, and storage. The Python pipeline (Docling, OCR,
   pikepdf, veraPDF) runs outside Cloudflare, on actual-dell or on the Lab's
   AWS account, because Cloudflare Containers cost too much for this workload.
   The Worker sends the pipeline host the job's Gateway token with each unit of
