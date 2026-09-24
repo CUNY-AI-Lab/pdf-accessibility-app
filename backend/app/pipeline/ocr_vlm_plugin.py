@@ -10,16 +10,20 @@ across each line in proportion to word length: the renderer needs words, and a
 screen reader needs only the line's text and position.
 
 Page orientation and skew still come from Tesseract, and so does the text of
-any page the Gateway cannot read. A call is repeated unchanged only when the
-Gateway answered 429, 502, 503 or 504, which means no inference ran and nothing
-was charged. An answer that is cut off (usually a repetition loop) or has no
-readable lines is asked for again at a higher temperature, up to three
-answers; after that, or on any other failure, the page gets Tesseract's text.
+any page the Gateway cannot read. A call is repeated unchanged only after 429,
+502, 503 or 504, which carry no answer; a timeout on our side is not repeated,
+since the Gateway may already have metered an answer that arrived too late. An
+answer that is cut off (usually a repetition loop) or has no readable lines is
+asked for again at a higher temperature, up to three answers, within a time
+limit per page; after that, or on any other failure, the page gets
+Tesseract's text.
 
-The OCR step passes the connection in the environment:
-    CAIL_OCR_BASE_URL   Gateway base URL
-    CAIL_OCR_API_KEY    Gateway credential
-    CAIL_OCR_MODEL      vision model
+The OCR step passes the connection and the page time limit in the
+environment:
+    CAIL_OCR_BASE_URL       Gateway base URL
+    CAIL_OCR_API_KEY        Gateway credential
+    CAIL_OCR_MODEL          vision model
+    CAIL_OCR_PAGE_SECONDS   time for all of a page's Gateway calls
 """
 
 from __future__ import annotations
@@ -45,12 +49,10 @@ from PIL import Image
 if TYPE_CHECKING:
     from ocrmypdf._options import OcrOptions
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 # The long side sent to the model; larger images exceed provider body limits.
 MAX_SIDE = 1600
-# A non-streamed answer arrives all at once, so this covers the whole answer.
-REQUEST_TIMEOUT_SECONDS = 360
 # Well above the densest page measured, so a normal page is never cut short;
 # a repetition loop stops here.
 MAX_OUTPUT_TOKENS = 12000
@@ -58,8 +60,8 @@ MAX_OUTPUT_TOKENS = 12000
 # higher temperature, which usually breaks a repetition loop (olmOCR's
 # pipeline does the same, from 0.1 up).
 TEMPERATURES = (0.1, 0.4, 0.7)
-# Statuses for which the Gateway ran no inference, so a retry costs nothing.
-NOT_RUN_STATUSES = {429, 502, 503, 504}
+# Statuses that carry no answer, so the same request is sent again.
+NO_ANSWER_STATUSES = {429, 502, 503, 504}
 RETRY_DELAYS_SECONDS = (5, 20)
 
 SYSTEM_PROMPT = (
@@ -67,7 +69,8 @@ SYSTEM_PROMPT = (
     "JSON, in natural reading order (top to bottom; column by column for "
     "multi-column layouts). Output a JSON array only, no prose. Each item is "
     '{"bbox_2d": [x1, y1, x2, y2], "text": "..."} where the box tightly '
-    "encloses that one line and the text is exactly as written: keep original "
+    "encloses that one line, in coordinates from 0 to 1000 across the page's "
+    "width and down its height, and the text is exactly as written: keep original "
     "spelling, capitalization, and punctuation; do not correct or modernize. "
     "Include headings, running heads, page numbers, marginal notes, captions, "
     "and footnotes. One item per printed or handwritten line. Write a row of "
@@ -87,32 +90,44 @@ def _encoded_page(image: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def _complete(base_url: str, api_key: str, body: dict) -> dict:
-    """One answer, repeating the call only when the Gateway ran no inference."""
+def _complete(base_url: str, api_key: str, body: dict, deadline: float) -> dict:
+    """One answer, sending the request again only after a status that carries
+    no answer, and giving up at the page's deadline."""
     for delay in (*RETRY_DELAYS_SECONDS, None):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GatewayOcrError("page time limit reached")
         response = httpx.post(
             f"{base_url.rstrip('/')}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
             json=body,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=remaining,
         )
-        if response.status_code not in NOT_RUN_STATUSES or delay is None:
+        if response.status_code not in NO_ANSWER_STATUSES or delay is None:
             break
-        time.sleep(delay)
+        time.sleep(min(delay, max(deadline - time.monotonic(), 0)))
     if response.status_code != 200:
         raise GatewayOcrError(f"Gateway returned {response.status_code}")
     answer = response.json()
-    log.info("Gateway OCR usage: %s", answer.get("usage"))
+    logger.info("Gateway OCR usage: %s", answer.get("usage"))
     return answer["choices"][0]
 
 
 def _request_lines(image: Image.Image) -> list[dict]:
-    base_url, api_key, model = (
+    base_url, api_key, model, page_seconds = (
         os.environ.get(name, "").strip()
-        for name in ("CAIL_OCR_BASE_URL", "CAIL_OCR_API_KEY", "CAIL_OCR_MODEL")
+        for name in (
+            "CAIL_OCR_BASE_URL",
+            "CAIL_OCR_API_KEY",
+            "CAIL_OCR_MODEL",
+            "CAIL_OCR_PAGE_SECONDS",
+        )
     )
-    if not (base_url and api_key and model):
-        raise GatewayOcrError("CAIL_OCR_BASE_URL, CAIL_OCR_API_KEY and CAIL_OCR_MODEL are required")
+    if not (base_url and api_key and model and page_seconds):
+        raise GatewayOcrError(
+            "CAIL_OCR_BASE_URL, CAIL_OCR_API_KEY, CAIL_OCR_MODEL and "
+            "CAIL_OCR_PAGE_SECONDS are required"
+        )
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -127,6 +142,8 @@ def _request_lines(image: Image.Image) -> list[dict]:
         },
     ]
     problems = []
+    # A non-streamed answer arrives all at once, so one call may use all of it.
+    deadline = time.monotonic() + float(page_seconds)
     for temperature in TEMPERATURES:
         body = {
             "model": model,
@@ -134,7 +151,7 @@ def _request_lines(image: Image.Image) -> list[dict]:
             "max_tokens": MAX_OUTPUT_TOKENS,
             "messages": messages,
         }
-        choice = _complete(base_url, api_key, body)
+        choice = _complete(base_url, api_key, body, deadline)
         content = choice["message"]["content"] or ""
         finish = choice.get("finish_reason")
         lines = parse_lines(content)
@@ -287,8 +304,8 @@ class GatewayVisionOcrEngine(OcrEngine):
             )
             try:
                 lines = _request_lines(image)
-            except (GatewayOcrError, httpx.HTTPError, KeyError, ValueError) as exc:
-                log.warning(
+            except Exception as exc:  # noqa: BLE001 - any failure falls back to Tesseract
+                logger.warning(
                     "page %s: Gateway OCR failed (%s); using Tesseract", page_number + 1, exc
                 )
                 return _tesseract_page(input_file, options)

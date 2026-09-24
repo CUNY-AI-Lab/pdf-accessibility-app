@@ -50,7 +50,7 @@ def _page_image(tmp_path, size=(1000, 800), dpi=100):
     return path
 
 
-def _answer(monkeypatch, status=200, answers=None):
+def _answer(monkeypatch, status=200, answers=None, body=None):
     """Fake Gateway: the n-th call gets the n-th (content, finish_reason),
     and the last one repeats."""
     answers = answers or [(_fenced(MODEL_LINES), "stop")]
@@ -59,12 +59,13 @@ def _answer(monkeypatch, status=200, answers=None):
     def post(url, **kwargs):
         calls.append(kwargs["json"])
         content, finish = answers[min(len(calls), len(answers)) - 1]
-        body = {"choices": [{"message": {"content": content}, "finish_reason": finish}]}
-        return httpx.Response(status, json=body, request=httpx.Request("POST", url))
+        answer = body or {"choices": [{"message": {"content": content}, "finish_reason": finish}]}
+        return httpx.Response(status, json=answer, request=httpx.Request("POST", url))
 
     monkeypatch.setenv("CAIL_OCR_BASE_URL", "https://gateway.test/v1")
     monkeypatch.setenv("CAIL_OCR_API_KEY", "sk-test")
     monkeypatch.setenv("CAIL_OCR_MODEL", "vision-model")
+    monkeypatch.setenv("CAIL_OCR_PAGE_SECONDS", "300")
     monkeypatch.setattr(ocr_vlm_plugin.httpx, "post", post)
     monkeypatch.setattr(ocr_vlm_plugin.time, "sleep", lambda seconds: None)
     return calls
@@ -115,7 +116,9 @@ def test_rendered_text_layer_reads_every_line_once_in_order(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("status", [429, 502, 503, 504])
-def test_a_call_that_ran_no_inference_is_retried_before_falling_back(tmp_path, monkeypatch, status):
+def test_a_status_without_an_answer_is_sent_again_before_falling_back(
+    tmp_path, monkeypatch, status
+):
     calls = _answer(monkeypatch, status=status)
     used = _tesseract_fallback(monkeypatch)
     _page, text = GatewayVisionOcrEngine.generate_ocr(_page_image(tmp_path), options=None)
@@ -183,3 +186,26 @@ def test_the_page_image_is_sent_within_the_size_limit(tmp_path, monkeypatch):
     encoded = image_url.split(",", 1)[1]
     with Image.open(io.BytesIO(base64.b64decode(encoded))) as sent:
         assert max(sent.size) == ocr_vlm_plugin.MAX_SIDE
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"choices": []}, {"choices": [{"message": None}]}, {"error": {"message": "overloaded"}}],
+)
+def test_a_malformed_answer_falls_back_to_tesseract(tmp_path, monkeypatch, body):
+    calls = _answer(monkeypatch, body=body)
+    used = _tesseract_fallback(monkeypatch)
+    _page, text = GatewayVisionOcrEngine.generate_ocr(_page_image(tmp_path), options=None)
+    assert len(calls) == 1
+    assert text == "tesseract text"
+    assert len(used) == 1
+
+
+def test_no_call_is_made_after_the_page_time_limit(tmp_path, monkeypatch):
+    calls = _answer(monkeypatch)
+    used = _tesseract_fallback(monkeypatch)
+    monkeypatch.setenv("CAIL_OCR_PAGE_SECONDS", "0")
+    _page, text = GatewayVisionOcrEngine.generate_ocr(_page_image(tmp_path), options=None)
+    assert calls == []
+    assert text == "tesseract text"
+    assert len(used) == 1

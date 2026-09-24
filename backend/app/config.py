@@ -81,8 +81,10 @@ class Settings(BaseSettings):
     # (llm_base_url, llm_api_key); "tesseract" runs locally.
     ocr_engine: Literal["tesseract", "gateway"] = "tesseract"
     ocr_model: str = "qwen3-vl-235b-a22b-instruct"
-    # Gateway OCR waits on the network, so pages run in parallel.
+    # Gateway OCR waits on the network, so pages run in parallel, each within
+    # a time limit (retries included) after which it falls back to Tesseract.
     ocr_gateway_jobs: int = 8
+    ocr_gateway_page_seconds: int = 300
     ocr_language: str = "eng"
     ocr_rotate_pages: bool = True
     ocr_deskew: bool = True

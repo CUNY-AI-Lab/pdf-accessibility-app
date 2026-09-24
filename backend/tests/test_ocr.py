@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pikepdf
 import pytest
 
 from app.config import Settings
@@ -122,14 +123,24 @@ def test_gateway_engine_loads_the_plugin_and_runs_pages_in_parallel():
 
 
 @pytest.mark.asyncio
-async def test_gateway_engine_gives_ocrmypdf_the_llm_connection(monkeypatch, tmp_path):
+async def test_gateway_engine_gives_ocrmypdf_the_connection_and_time_for_every_page(
+    monkeypatch, tmp_path
+):
     settings = Settings(
         llm_base_url="https://gateway.test/v1",
         llm_api_key="sk-app",
         llm_model="gemini-check",
         ocr_model="vision-model",
+        ocr_gateway_jobs=8,
+        ocr_gateway_page_seconds=300,
+        subprocess_timeout_ocr=900,
     )
     monkeypatch.setattr(ocr, "get_settings", lambda: settings)
+    source = tmp_path / "in.pdf"
+    scan = pikepdf.new()
+    for _ in range(25):
+        scan.add_blank_page()
+    scan.save(source)
     seen = {}
 
     async def create_subprocess_exec(*args, env, **kwargs):
@@ -137,15 +148,20 @@ async def test_gateway_engine_gives_ocrmypdf_the_llm_connection(monkeypatch, tmp
         return SimpleNamespace(returncode=0)
 
     async def communicate(proc, timeout):
+        seen["timeout"] = timeout
         return b"", b""
 
     monkeypatch.setattr(ocr.asyncio, "create_subprocess_exec", create_subprocess_exec)
     monkeypatch.setattr(ocr, "communicate_with_timeout", communicate)
 
-    result = await ocr.run_ocr(tmp_path / "in.pdf", tmp_path / "out.pdf", engine="gateway")
+    result = await ocr.run_ocr(source, tmp_path / "out.pdf", engine="gateway")
 
     assert result.success
     assert "--plugin" in seen["args"]
     assert seen["env"]["CAIL_OCR_BASE_URL"] == "https://gateway.test/v1"
     assert seen["env"]["CAIL_OCR_API_KEY"] == "sk-app"
     assert seen["env"]["CAIL_OCR_MODEL"] == "vision-model"
+    assert seen["env"]["CAIL_OCR_PAGE_SECONDS"] == "300"
+    # 25 pages at 8 at a time is 4 rounds, each within the page limit plus
+    # time for a Tesseract fallback: more than the configured 900 s.
+    assert seen["timeout"] == 4 * (300 + ocr.GATEWAY_PAGE_FALLBACK_SECONDS)

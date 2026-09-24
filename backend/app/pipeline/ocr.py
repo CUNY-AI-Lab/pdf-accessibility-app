@@ -2,9 +2,12 @@
 
 import asyncio
 import logging
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+import pikepdf
 
 from app.config import get_settings
 from app.pipeline.subprocess_utils import (
@@ -17,6 +20,8 @@ from app.services.runtime_paths import enriched_subprocess_env
 logger = logging.getLogger(__name__)
 
 GATEWAY_OCR_PLUGIN = "app.pipeline.ocr_vlm_plugin"
+# Time for Tesseract to read a page after the Gateway gave up on it.
+GATEWAY_PAGE_FALLBACK_SECONDS = 60
 
 
 @dataclass
@@ -128,6 +133,13 @@ async def run_ocr(
         env["CAIL_OCR_BASE_URL"] = settings.llm_base_url
         env["CAIL_OCR_API_KEY"] = settings.llm_api_key
         env["CAIL_OCR_MODEL"] = settings.ocr_model
+        env["CAIL_OCR_PAGE_SECONDS"] = str(settings.ocr_gateway_page_seconds)
+        # Pages run in rounds of --jobs, each round within the page limit, so
+        # the whole run can take longer than the configured OCR timeout.
+        with pikepdf.open(input_path) as pdf:
+            rounds = math.ceil(len(pdf.pages) / max(1, jobs or settings.ocr_gateway_jobs))
+        needed = rounds * (settings.ocr_gateway_page_seconds + GATEWAY_PAGE_FALLBACK_SECONDS)
+        timeout_seconds = max(timeout_seconds or 0, needed)
 
     proc = await asyncio.create_subprocess_exec(
         *args,
