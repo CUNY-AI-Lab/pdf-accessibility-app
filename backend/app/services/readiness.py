@@ -108,7 +108,7 @@ def _binary_check(settings: Any) -> dict[str, Any]:
 def _llm_check(settings: Any) -> dict[str, Any]:
     base_url = str(settings.llm_base_url or "").strip()
     model = str(settings.llm_model or "").strip()
-    api_key = str(settings.llm_api_key or "").strip() or str(settings.gemini_api_key or "").strip()
+    api_key = settings.llm_credential
     parsed = urlparse(base_url)
     host = (parsed.hostname or "").lower()
     is_local = host in LOCAL_LLM_HOSTS

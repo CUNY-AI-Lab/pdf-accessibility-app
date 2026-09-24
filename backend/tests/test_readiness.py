@@ -1,15 +1,14 @@
-from types import SimpleNamespace
-
 import httpx
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.config import Settings
 from app.models import Base
 from app.services import readiness
 
 
 def _settings(tmp_path):
-    return SimpleNamespace(
+    return Settings(
         database_url="sqlite+aiosqlite:///:memory:",
         upload_dir=tmp_path / "uploads",
         processing_dir=tmp_path / "processing",

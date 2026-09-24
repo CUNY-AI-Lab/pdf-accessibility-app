@@ -17,6 +17,10 @@ PLACEHOLDER_LLM_KEYS = {
 LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
+# Google's OpenAI-compatible endpoint, the one LLM_BASE_URL GEMINI_API_KEY may serve.
+GOOGLE_LLM_HOST = "generativelanguage.googleapis.com"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=BASE_DIR / ".env", extra="ignore")
 
@@ -158,11 +162,21 @@ class Settings(BaseSettings):
     # Dev
     debug: bool = False
 
+    @property
+    def llm_credential(self) -> str:
+        """The key sent to LLM_BASE_URL: LLM_API_KEY, or GEMINI_API_KEY when
+        the base URL is Google's own endpoint. A key never goes to any other
+        service than the one that issued it."""
+        if key := self.llm_api_key.strip():
+            return key
+        host = (urlparse(self.llm_base_url.strip()).hostname or "").lower()
+        return self.gemini_api_key.strip() if host == GOOGLE_LLM_HOST else ""
+
     @model_validator(mode="after")
     def validate_llm_settings(self):
         base_url = self.llm_base_url.strip()
         model = self.llm_model.strip()
-        api_key = self.llm_api_key.strip() or self.gemini_api_key.strip()
+        api_key = self.llm_credential
 
         if not base_url:
             raise ValueError("LLM_BASE_URL must be set")

@@ -244,12 +244,9 @@ def make_llm_client_with_overrides(
     max_backoff_seconds: float | None = None,
     max_concurrency: int | None = None,
 ) -> LlmClient:
-    api_key = (getattr(settings, "llm_api_key", "") or "").strip() or (
-        getattr(settings, "gemini_api_key", "") or ""
-    ).strip()
     return LlmClient(
         base_url=settings.llm_base_url,
-        api_key=api_key,
+        api_key=settings.llm_credential,
         model=settings.llm_model,
         timeout=settings.llm_timeout if timeout is None else timeout,
         max_retries=settings.llm_max_retries if max_retries is None else max_retries,

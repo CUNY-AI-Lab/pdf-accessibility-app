@@ -126,3 +126,22 @@ def test_the_llm_credential_is_never_sent_to_google():
     assert not direct_gemini_pdf_enabled(settings)
     with pytest.raises(RuntimeError, match="not configured"):
         _gemini_api_key(settings)
+
+
+@pytest.mark.parametrize(
+    ("base_url", "llm_api_key", "sent"),
+    [
+        ("https://generativelanguage.googleapis.com/v1beta/openai", "", "google-key"),
+        ("https://tools.ailab.gc.cuny.edu/v1", "", ""),
+        ("https://tools.ailab.gc.cuny.edu/v1", "gateway-key", "gateway-key"),
+    ],
+)
+def test_the_google_credential_goes_only_to_google(base_url, llm_api_key, sent):
+    settings = Settings(
+        llm_base_url=base_url,
+        llm_api_key=llm_api_key,
+        llm_model="gemini-check",
+        gemini_api_key="google-key",
+        llm_strict_validation=False,
+    )
+    assert settings.llm_credential == sent
