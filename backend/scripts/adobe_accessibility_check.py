@@ -29,6 +29,21 @@ def _current_month(now: datetime | None = None) -> str:
     return f"{value.year:04d}-{value.month:02d}"
 
 
+def _console_project_credentials(raw: dict[str, Any]) -> dict[str, str] | None:
+    """The OAuth Server-to-Server credential in an Adobe Developer Console
+    project download (the project page's Download button)."""
+    workspace = (raw.get("project") or {}).get("workspace") or {}
+    for credential in (workspace.get("details") or {}).get("credentials") or []:
+        oauth = credential.get("oauth_server_to_server") if isinstance(credential, dict) else None
+        if isinstance(oauth, dict):
+            secrets = oauth.get("client_secrets") or []
+            return {
+                "client_id": oauth.get("client_id") or "",
+                "client_secret": secrets[0] if secrets else "",
+            }
+    return None
+
+
 def _load_credentials(path: Path) -> AdobeCredentials:
     if path.suffix.lower() == ".zip":
         with zipfile.ZipFile(path) as archive:
@@ -47,6 +62,8 @@ def _load_credentials(path: Path) -> AdobeCredentials:
         raw = json.loads(path.read_text())
 
     client_credentials = raw.get("client_credentials")
+    if client_credentials is None:
+        client_credentials = _console_project_credentials(raw)
     if not isinstance(client_credentials, dict):
         raise ValueError("Credentials file is missing client_credentials.")
 
