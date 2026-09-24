@@ -38,16 +38,54 @@ can be kept as HTML so their cell structure is scored.
 
 ## Results: printed books (`old_print`, 49 pages, 509 tests)
 
-OCR stage, raw text layer:
+What a screen reader hears after the full pipeline:
 
 | Candidate | Score | Present | Order | Absent |
 |---|---|---|---|---|
-| Tesseract 5.3 (production) | 59.9% ± 4.0 | 62.6% | 76.2% | 16.4% |
-| Qwen3-VL-235B line spotting via the Gateway (`OCR_ENGINE=gateway`) | 66.2% ± 3.9 | 73.7% | 84.4% | 0.0% |
+| Production (v1) | 30.5% ± 4.0 | 21.5% | 15.0% | 97.3% |
+| Fixed tagger, Tesseract | **91.7% ± 2.4** | 93.1% | 87.1% | 95.9% |
+| Fixed tagger, Gateway OCR (Qwen3-VL-235B) | 88.0% ± 2.8 | 88.6% | 83.0% | 95.9% |
 
-"Absent" tests expect running heads and page numbers to be left out. Both OCR
-engines keep them, as they should; the tagger is what must mark them as
-artifacts, which the full-pipeline runs measure.
+The tagger fix (every OCR line tagged once, in order) accounts for the gain.
+Through the full pipeline, Gateway OCR does not beat Tesseract on printed
+books, so Tesseract stays the default; Gateway OCR helps on handwriting.
+
+OCR stage alone (raw text layer read by pdfminer; its own layout guessing
+scrambles Tesseract's order, so these understate what the pipeline hears):
+Tesseract 59.9% ± 4.1, Qwen3-VL line spotting 66.2% ± 4.2 (67.4% with the
+retry ladder).
+
+## Results: born-digital pages (random samples of 60 pages each)
+
+| Subset (tests) | Production (v1) | Fixed tagger |
+|---|---|---|
+| `headers_footers` (absent tests, 170) | 91.5% ± 4.0 | 93.3% ± 4.0 |
+| `multi_column` (reading order, 219) | 32.0% ± 6.6 | 48.9% ± 6.6 |
+| `tables` (cell neighbors and headings, 336) | 8.8% ± 2.9 | 10.1% ± 3.4 |
+
+Docling finds these tables correctly (rows, columns, cell text); the tagger
+loses them. Its own content-stream interpreter guesses text positions (it
+ignores the text matrix's scale on `Td`, font widths, and `TJ` offsets, and
+reads `TJ` offsets as text), and it cannot split one text operator that draws
+several cells. Fixing both is the next tagger change.
+
+## Results: structure round-trip (11 gold documents)
+
+Gold documents (the PDF/UA reference suite, the Matterhorn Protocol, a NOAA
+report, a PDF/UA paper, a table set; 224 pages, 322 headings, 62 tables) have
+their tags stripped (`scripts/strip_accessibility.py`), go through the
+pipeline, and the resulting tag tree is compared with the original, both
+rendered as Markdown. Metrics are opendataloader-bench's: NID (text in
+reading order), TEDS (table tree edit similarity), MHS (section tree), plus
+MHS-L, which also counts heading levels.
+
+| | NID | TEDS | MHS | MHS-L |
+|---|---|---|---|---|
+| Production (v1) | 0.735 | 0.302 | 0.486 | 0.286 |
+| Current branch | 0.815 | 0.304 | 0.563 | 0.313 |
+
+For scale, opendataloader-bench reports NID about 0.90 and TEDS 0.887 for
+Docling's own output on its corpus.
 
 ## Results: manuscripts (`old_scans`)
 
@@ -90,10 +128,7 @@ cap, and occasional malformed JSON; such pages fall back to Tesseract.
 
 ## Not yet measured
 
-- Full pipeline on `old_print`: production, fixed tagger, and fixed tagger
-  with Gateway OCR (running).
-- Born-digital pages: `multi_column` (reading order), `headers_footers`
-  (artifacts), `tables` (cell structure from the tags).
-- Structure fidelity on well-tagged PDFs (strip-and-restore): headings, lists,
-  figures and alt text, title, language, veraPDF failures.
+- Adobe on printed books and born-digital pages (free-tier quota).
+- Figures and alt text, title, language, and veraPDF failures on the gold
+  set.
 - The app's LLM steps on Gateway models.
