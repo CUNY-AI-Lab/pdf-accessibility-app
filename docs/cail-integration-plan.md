@@ -68,10 +68,20 @@ long-running consumer needs only the Gateway, which re-checks every call.
    screen reader hears). Still to add: the app's LLM steps (alt text,
    headings, tables, reading order) with a Gemini baseline, and veraPDF and
    alt-text checks on the gold set.
-2. **Gateway client.** Send page images (the existing local-semantic lane) to
-   the Gateway's chat completions endpoint. Add image-based versions of the
-   title/front-matter and TOC lanes. Cap image and request sizes. Remove the
-   `LLM_API_KEY`→Gemini fallback and the "gemini" model-name validator.
+2. **Gateway client.** One model lane: the chat-completions client at
+   `LLM_BASE_URL` (the Gateway) with an open-weight vision `LLM_MODEL`, given
+   rendered page images, never PDF files.
+   - Every AI step goes through it. Title, front matter, and table of contents
+     today run only on direct Gemini with PDF input, so a Gateway setup would
+     skip them; they get the same image-based request as the other steps.
+   - The local-semantic lane, a second OpenAI-compatible client for local
+     models, is the same thing pointed elsewhere; it merges into this lane.
+   - Answers are read from `content` or, for reasoning models,
+     `reasoning_content`; structured output falls back from `json_schema` to
+     `json_object` to plain JSON, as today.
+   - The "gemini" model-name validator goes. Direct Gemini with PDF input stays
+     only as the baseline for the bake-off (step 4), selected by
+     `USE_DIRECT_GEMINI_PDF`, and is removed after it with `GEMINI_API_KEY`.
 3. **Per-job credential.** The Worker keeps the job's Gateway token and sends
    it with each unit of work; the pipeline never stores it. Revocation and
    `quota_exceeded` fail the job with a clear message.
