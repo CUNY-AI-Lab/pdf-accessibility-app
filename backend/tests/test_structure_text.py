@@ -7,20 +7,14 @@ import pytest
 
 from app.pipeline.pdf_repair import add_missing_icc_components
 from app.services.structure_text import screen_reader_text
+from tests.pdf_fixtures import helvetica
 
 
 def _tagged_pdf(path: Path, figure_alt: str | None) -> None:
     """A paragraph, then a Figure whose content is drawn text."""
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(300, 300))
-    font = pdf.make_indirect(
-        pikepdf.Dictionary(
-            Type=pikepdf.Name.Font,
-            Subtype=pikepdf.Name.Type1,
-            BaseFont=pikepdf.Name.Helvetica,
-            Encoding=pikepdf.Name.WinAnsiEncoding,
-        )
-    )
+    font = helvetica(pdf)
     page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
     page.Contents = pdf.make_stream(
         b"/P <</MCID 0>> BDC BT /F1 12 Tf 20 250 Td (Paragraph text) Tj ET EMC\n"
@@ -64,14 +58,7 @@ def _table_pdf(path: Path) -> None:
     """A header row of two cells, then one data cell spanning both columns."""
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(300, 300))
-    font = pdf.make_indirect(
-        pikepdf.Dictionary(
-            Type=pikepdf.Name.Font,
-            Subtype=pikepdf.Name.Type1,
-            BaseFont=pikepdf.Name.Helvetica,
-            Encoding=pikepdf.Name.WinAnsiEncoding,
-        )
-    )
+    font = helvetica(pdf)
     page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
     page.Contents = pdf.make_stream(
         b"/TH <</MCID 0>> BDC BT /F1 12 Tf 20 250 Td (Year) Tj ET EMC\n"
@@ -141,3 +128,41 @@ def test_a_page_with_an_icc_profile_missing_its_component_count_is_read(tmp_path
     with pikepdf.open(path) as pdf:
         assert add_missing_icc_components(pdf) == 1
         assert int(pdf.pages[0].Resources.ColorSpace.CS0[1].N) == 3
+
+
+def _paragraph_pdf(path: Path, content: bytes) -> None:
+    """One P element over MCID 0, drawn by the given content."""
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(300, 300))
+    font = helvetica(pdf)
+    page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+    page.Contents = pdf.make_stream(content)
+    paragraph = pikepdf.Dictionary(Type=pikepdf.Name.StructElem, S=pikepdf.Name.P, Pg=page.obj, K=0)
+    pdf.Root.StructTreeRoot = pdf.make_indirect(
+        pikepdf.Dictionary(Type=pikepdf.Name.StructTreeRoot, K=pdf.make_indirect(paragraph))
+    )
+    pdf.save(path)
+
+
+@pytest.mark.parametrize(
+    ("content", "heard"),
+    [
+        # ActualText on the MCID's own sequence replaces all its glyphs.
+        (
+            b"/P <</MCID 0 /ActualText (Whole paragraph text)>> BDC "
+            b"BT /F1 12 Tf 20 250 Td (First line only) Tj ET EMC",
+            "Whole paragraph text",
+        ),
+        # ActualText on a nested span replaces only the glyphs inside it.
+        (
+            b"/P <</MCID 0>> BDC BT /F1 12 Tf 20 250 Td (The ) Tj "
+            b"/Span <</ActualText (office)>> BDC (o\\336ce) Tj EMC "
+            b"( is open) Tj ET EMC",
+            "The office is open",
+        ),
+    ],
+)
+def test_marked_content_actual_text_is_read_in_place_of_its_glyphs(tmp_path, content, heard):
+    path = tmp_path / "actual_text.pdf"
+    _paragraph_pdf(path, content)
+    assert " ".join(screen_reader_text(path).split()) == heard

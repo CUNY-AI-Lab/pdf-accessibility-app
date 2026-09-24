@@ -6,9 +6,13 @@ step (per-element language tagging).
 
 from __future__ import annotations
 
+import functools
 import re
+import subprocess
 
 from lingua import Language, LanguageDetectorBuilder
+
+from app.services.runtime_paths import resolve_binary
 
 # ── Mapping tables ──
 
@@ -123,16 +127,26 @@ def detect_language(text: str) -> str | None:
     return None
 
 
-def bcp47_to_tesseract(tag: str | None, fallback: str = "eng") -> str:
-    """Convert a BCP-47 tag to a Tesseract language code.
+@functools.cache
+def installed_tesseract_languages() -> frozenset[str]:
+    """The language packs the installed Tesseract can use."""
+    binary = resolve_binary("tesseract") or "tesseract"
+    try:
+        listing = subprocess.run(
+            [binary, "--list-langs"], capture_output=True, text=True, check=False
+        ).stdout
+    except OSError:
+        return frozenset()
+    # The first line is a header naming the tessdata directory.
+    return frozenset(line.strip() for line in listing.splitlines()[1:] if line.strip())
 
-    Falls back to the provided default if the tag is unknown.
-    """
+
+def bcp47_to_tesseract(tag: str | None, fallback: str = "eng") -> str:
+    """The Tesseract language pack for a BCP-47 tag, if it is installed;
+    otherwise the fallback. OCR fails outright on a pack that is not
+    installed, while the document's /Lang can still name the language."""
     if not tag:
         return fallback
-    code = BCP47_TO_TESSERACT.get(tag)
-    if code:
-        return code
-    # Try the primary subtag (e.g. "zh-Hans" → "zh")
-    primary = tag.split("-")[0]
-    return BCP47_TO_TESSERACT.get(primary, fallback)
+    # Try the full tag, then the primary subtag (e.g. "zh-Hans", then "zh").
+    code = BCP47_TO_TESSERACT.get(tag) or BCP47_TO_TESSERACT.get(tag.split("-")[0])
+    return code if code in installed_tesseract_languages() else fallback

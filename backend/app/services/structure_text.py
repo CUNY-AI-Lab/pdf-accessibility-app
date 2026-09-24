@@ -2,8 +2,9 @@
 
 Walks the structure tree in logical order. An element with ``/ActualText``
 contributes that text and hides its descendants; otherwise each marked-content
-reference contributes the glyphs drawn inside it on its page, joined into words
-by position. Artifacts and untagged content are not in the structure tree, so
+reference contributes what that marked content reads as (its glyphs joined
+into words by position, or the ``/ActualText`` of marked content that carries
+one; see ``app/pipeline/page_glyphs.py``). Artifacts and untagged content are not in the structure tree, so
 they are not read. Figure ``/Alt`` text is left out: it describes an image, not
 page text. Text drawn inside a Figure is not read either, unless
 ``figure_text`` asks for the reading some screen readers give a Figure that
@@ -20,16 +21,11 @@ from __future__ import annotations
 
 import html
 import re
-from collections import defaultdict
 from pathlib import Path
 
 import pikepdf
-from pdfminer.converter import PDFLayoutAnalyzer
-from pdfminer.layout import LTChar
-from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
-from pdfminer.pdfpage import PDFPage
 
-from app.pipeline.pdf_repair import pdfminer_readable
+from app.pipeline.page_glyphs import PdfGlyphReader, StreamKey, join_glyphs
 
 BLOCK_ROLES = {
     "P",
@@ -78,65 +74,24 @@ def _cell_spans(node: pikepdf.Dictionary) -> str:
     return spans
 
 
-class MarkedContentChars(PDFLayoutAnalyzer):
-    """Collects each glyph under the innermost marked-content ID drawing it."""
+def _form_paths(page: pikepdf.Object) -> dict[tuple[int, int], StreamKey]:
+    """The name path by which the page draws each Form XObject (see
+    page_glyphs.StreamKey), keyed by the form's object."""
+    paths: dict[tuple[int, int], StreamKey] = {}
 
-    def __init__(self, manager: PDFResourceManager) -> None:
-        super().__init__(manager, laparams=None)
-        self.stack: list[int | None] = []
-        self.chars: dict[int, list[LTChar]] = defaultdict(list)
+    def visit(owner: pikepdf.Object, prefix: StreamKey) -> None:
+        resources = owner.get("/Resources")
+        xobjects = resources.get("/XObject") if isinstance(resources, pikepdf.Dictionary) else None
+        if not isinstance(xobjects, pikepdf.Dictionary):
+            return
+        for name, xobject in xobjects.items():
+            if xobject.get("/Subtype") != "/Form" or xobject.objgen in paths:
+                continue
+            paths[xobject.objgen] = (*prefix, name.lstrip("/"))
+            visit(xobject, paths[xobject.objgen])
 
-    def begin_tag(self, tag, props=None) -> None:
-        mcid = props.get("MCID") if isinstance(props, dict) else None
-        self.stack.append(int(mcid) if isinstance(mcid, int) else None)
-
-    def end_tag(self) -> None:
-        if self.stack:
-            self.stack.pop()
-
-    def render_char(self, matrix, font, fontsize, scaling, rise, cid, ncs, graphicstate):
-        advance = super().render_char(matrix, font, fontsize, scaling, rise, cid, ncs, graphicstate)
-        mcid = next((m for m in reversed(self.stack) if m is not None), None)
-        if mcid is not None:
-            self.chars[mcid].append(self.cur_item._objs[-1])
-        return advance
-
-    def receive_layout(self, ltpage) -> None:
-        return None
-
-
-def glyphs_to_text(chars: list[LTChar]) -> str:
-    """Join glyphs in drawing order, adding a space at word and line gaps."""
-    text: list[str] = []
-    previous: LTChar | None = None
-    for char in chars:
-        if previous is not None:
-            size = max(char.size, previous.size, 1.0)
-            new_line = abs(char.y0 - previous.y0) > 0.5 * size
-            gap = char.x0 - previous.x1
-            if (new_line or gap > 0.15 * size) and not text[-1].endswith(" "):
-                text.append(" ")
-        text.append(char.get_text())
-        previous = char
-    return "".join(text)
-
-
-def _parse_mcid_text(pdf_path: Path) -> list[dict[int, str]]:
-    """Text drawn inside each MCID, per page, decoded through the fonts."""
-    pages: list[dict[int, str]] = []
-    manager = PDFResourceManager()
-    with pdf_path.open("rb") as handle:
-        for page in PDFPage.get_pages(handle):
-            device = MarkedContentChars(manager)
-            PDFPageInterpreter(manager, device).process_page(page)
-            pages.append({mcid: glyphs_to_text(chars) for mcid, chars in device.chars.items()})
-    return pages
-
-
-def page_mcid_text(pdf_path: Path) -> list[dict[int, str]]:
-    """Text drawn inside each MCID, per page."""
-    with pdfminer_readable(pdf_path) as readable:
-        return _parse_mcid_text(readable)
+    visit(page, ())
+    return paths
 
 
 HEADING_LEVELS = {"Title": 1, "H": 1, **{f"H{level}": level for level in range(1, 7)}}
@@ -164,14 +119,26 @@ def _standard_role(node: pikepdf.Dictionary, role_map) -> str:
 
 
 def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: bool = False) -> str:
-    mcid_text = page_mcid_text(pdf_path)
-    with pikepdf.open(pdf_path) as pdf:
+    with PdfGlyphReader(pdf_path) as glyphs, pikepdf.open(pdf_path) as pdf:
         page_index = {page.objgen: index for index, page in enumerate(pdf.pages)}
         root = pdf.Root.get("/StructTreeRoot")
         if root is None:
             return ""
         role_map = root.get("/RoleMap")
         blocks: list[str] = []
+        marked_text: dict[int, dict[tuple[StreamKey, int], str]] = {}
+        form_paths: dict[int, dict[tuple[int, int], StreamKey]] = {}
+
+        def read_mcid(page: int, stream: pikepdf.Object | None, mcid: int) -> str:
+            if page not in marked_text:
+                marked = glyphs.page(page).marked
+                marked_text[page] = {key: join_glyphs(items) for key, items in marked.items()}
+                form_paths[page] = _form_paths(pdf.pages[page].obj)
+            if stream is None:
+                return marked_text[page].get(((), mcid), "")
+            if (path := form_paths[page].get(stream.objgen)) is None:
+                return ""
+            return marked_text[page].get((path, mcid), "")
 
         def inline(node, page) -> str:
             parts: list[str] = []
@@ -181,13 +148,14 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
                 walk(node.K, page, parts)
             return " ".join("".join(parts).split())
 
-        def mcid_of(kid, inherited_page):
+        def marked_ref(kid, inherited_page):
+            """(page, content stream or None for the page's own, MCID)."""
             if isinstance(kid, int):
-                return inherited_page, kid
+                return inherited_page, None, kid
             if isinstance(kid, pikepdf.Dictionary) and kid.get("/Type") == "/MCR":
                 page = kid.get("/Pg")
                 index = page_index.get(page.objgen) if page is not None else inherited_page
-                return index, int(kid.MCID)
+                return index, kid.get("/Stm"), int(kid.MCID)
             return None
 
         def walk(node, page, out: list[str]) -> None:
@@ -195,15 +163,12 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
                 for kid in node:
                     walk(kid, page, out)
                 return
-            if not isinstance(node, pikepdf.Dictionary):
-                ref = mcid_of(node, page)
-                if ref and ref[0] is not None:
-                    out.append(mcid_text[ref[0]].get(ref[1], ""))
-                return
-            ref = mcid_of(node, page)
+            ref = marked_ref(node, page)
             if ref is not None:
                 if ref[0] is not None:
-                    out.append(mcid_text[ref[0]].get(ref[1], ""))
+                    out.append(read_mcid(*ref))
+                return
+            if not isinstance(node, pikepdf.Dictionary):
                 return
             if node.get("/Type") == "/OBJR":
                 return

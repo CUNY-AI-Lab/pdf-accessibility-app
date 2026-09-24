@@ -39,6 +39,7 @@ dev = [
     "httpx>=0.28.0",
     "playwright>=1.55.0",
     "ruff>=0.8.0",
+    "pypdfium2>=5.6.0",
 ]
 
 [build-system]
