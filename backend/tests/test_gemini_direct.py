@@ -1,9 +1,12 @@
+import pytest
 from google.genai import types
 
 from app.config import Settings
 from app.services.gemini_direct import (
     _build_prompt_text,
+    _gemini_api_key,
     _gemini_json_config,
+    direct_gemini_pdf_enabled,
     direct_gemini_thinking_override,
     direct_gemini_timeout_override,
 )
@@ -110,3 +113,16 @@ def test_gemini_json_config_uses_timeout_override():
         )
 
     assert config.http_options.timeout == 7250
+
+
+def test_the_llm_credential_is_never_sent_to_google():
+    settings = Settings(
+        llm_base_url="https://gateway.test/v1",
+        llm_api_key="gateway-key",
+        llm_model="gemini-check",
+        gemini_api_key="",
+    )
+
+    assert not direct_gemini_pdf_enabled(settings)
+    with pytest.raises(RuntimeError, match="not configured"):
+        _gemini_api_key(settings)

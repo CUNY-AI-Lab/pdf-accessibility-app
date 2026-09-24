@@ -45,7 +45,7 @@ def direct_gemini_pdf_enabled(settings: Settings | None = None) -> bool:
     resolved_settings = settings or get_settings()
     return bool(
         resolved_settings.use_direct_gemini_pdf
-        and ((resolved_settings.gemini_api_key or "").strip() or (resolved_settings.llm_api_key or "").strip())
+        and (resolved_settings.gemini_api_key or "").strip()
         and resolved_settings.gemini_model.strip()
     )
 
@@ -302,7 +302,10 @@ def _gemini_json_config(
 
 
 def _gemini_api_key(settings: Settings) -> str:
-    value = (settings.gemini_api_key or "").strip() or (settings.llm_api_key or "").strip()
+    # Only GEMINI_API_KEY goes to Google. LLM_API_KEY belongs to whatever
+    # LLM_BASE_URL points at (such as the CAIL Gateway) and must never be sent
+    # to another service.
+    value = (settings.gemini_api_key or "").strip()
     if not value:
         raise RuntimeError("Gemini API key is not configured")
     return value
