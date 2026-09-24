@@ -36,7 +36,7 @@ both the current app (v1) and Adobe Acrobat's tagging on the same documents.
 - **Audience:** CUNY-only. Doorway signs people in and Admission membership
   gates access. Anonymous use ends at cutover.
 - **Models:** open-weight vision models through the CAIL Gateway. The direct
-  Gemini path is removed after cutover, not kept as a fallback.
+  Gemini path was removed after the bake-off, not kept as a fallback.
 - **Spend:** each person's own Gateway budget. Doorway's `cail:gateway` leg
   lasts 24 hours (Phase 1), so a job can keep calling the Gateway after the
   upload request ends. Gateway checks membership and quota on every call.
@@ -62,32 +62,30 @@ long-running consumer needs only the Gateway, which re-checks every call.
 
 ### 2. Gateway model lane (this repo)
 
-1. **Evaluation first.** Done for the deterministic pipeline: see
-   [evaluation.md](evaluation.md) (olmOCR-Bench subsets, a printed-book set,
-   and a structure round-trip on gold tagged PDFs, all scored on what a
-   screen reader hears). Still to add: the app's LLM steps (alt text,
-   headings, tables, reading order) with a Gemini baseline, and veraPDF and
-   alt-text checks on the gold set.
+1. **Evaluation first.** Done: see [evaluation.md](evaluation.md)
+   (olmOCR-Bench subsets, a printed-book set, and a structure round-trip on
+   gold tagged PDFs, all scored on what a screen reader hears; title,
+   language, and alt text on the gold set scored by a judge model). Still to
+   add: veraPDF results on the gold set.
 2. **Gateway client.** One model lane: the chat-completions client at
    `LLM_BASE_URL` (the Gateway) with an open-weight vision `LLM_MODEL`, given
    rendered page images, never PDF files.
-   - Every AI step goes through it. Title, front matter, and table of contents
-     today run only on direct Gemini with PDF input, so a Gateway setup would
-     skip them; they get the same image-based request as the other steps.
-   - The local-semantic lane, a second OpenAI-compatible client for local
-     models, is the same thing pointed elsewhere; it merges into this lane.
-   - Answers are read from `content` or, for reasoning models,
-     `reasoning_content`; structured output falls back from `json_schema` to
-     `json_object` to plain JSON, as today.
-   - The "gemini" model-name validator goes. Direct Gemini with PDF input stays
-     only as the baseline for the bake-off (step 4), selected by
-     `USE_DIRECT_GEMINI_PDF`, and is removed after it with `GEMINI_API_KEY`.
+   Done. Every AI step goes through it, including title, front matter, and
+   table of contents, which used to run only on direct Gemini with PDF input.
+   The local-semantic lane merged into it. Answers are read from `content` or,
+   for reasoning models, `reasoning_content`; structured output falls back
+   from `json_schema` to `json_object` to plain JSON. The direct Gemini path,
+   its model-name validator, and `GEMINI_API_KEY` are gone.
 3. **Per-job credential.** The Worker keeps the job's Gateway token and sends
    it with each unit of work; the pipeline never stores it. Revocation and
    `quota_exceeded` fail the job with a clear message.
-4. **Bake-off.** Run the corpus through candidate Gateway vision models
-   (qwen3-vl, kimi-k2.6, others in the live catalog) against the Gemini
-   baseline. Choose the model on the measured results.
+4. **Bake-off.** Done 2026-09-24; results in [evaluation.md](evaluation.md).
+   `qwen3-vl-235b-a22b-instruct` is the default: on the gold set its titles
+   and alt text judge as well as Gemini 3 Flash Preview's and 3.8 Flash's,
+   and it writes alt text for fewer figures (110 of 163 against 124), mostly
+   because it treats screenshots of tables as tables. No model changes the
+   structure or table scores. Mistral Large 3 (three images per request at
+   most), Kimi K2.5, and Gemma 3 27B (timeouts) were dropped early.
 
 ### 3. Worker version behind Doorway
 
@@ -132,8 +130,12 @@ changes. Each change reports its before/after on the corpus.
 Done so far (branch `agent/cail-integration-plan`), each measured in
 [evaluation.md](evaluation.md):
 
-- Every OCR line reaches the structure tree once, in order (printed books
-  30.5% → 91.7%).
+- Every OCR line reaches the structure tree once, in order. (An earlier
+  measurement credited this with printed books 30.5% → 91.7%. That baseline
+  was wrong: the scorer's reader ignored marked-content `/ActualText`.
+  Measured correctly, production scores 92.1% and the branch 92.5%.)
+- Tables: 10.1% → 64.8% of olmOCR-Bench table tests; multi-column reading
+  order: 41.1% → 58.0%.
 - Text positions come from pdfminer's measurement of each text operator, not
   estimates, and a text operator spanning several table cells is split so
   each cell is tagged.

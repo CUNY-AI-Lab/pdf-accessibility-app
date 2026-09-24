@@ -9,7 +9,8 @@ handwriting is a side case.
 ## Method
 
 Everything is scored on what a screen reader hears: the text reachable through
-the structure tree, in tag order, with artifacts left out
+the structure tree, in tag order, with artifacts left out and marked-content
+`/ActualText` read in place of the glyphs it covers
 (`backend/app/services/structure_text.py`). Text inside a Figure is left out
 unless the Figure has no alt text and the lenient reading is asked for; tables
 can be kept as HTML so their cell structure is scored.
@@ -29,12 +30,23 @@ can be kept as HTML so their cell structure is scored.
   command inside the production image and reads the raw text layer.
 - **Full pipeline:** `backend/scripts/run_pipeline_bench.sh` runs
   `run_pipeline` (classify, OCR, Docling structure through docling-serve as in
-  production, tagging, validation) on each page in the production image and
-  reads the tagged result. The app's LLM steps are off in these runs.
+  production, tagging, validation) on each page and reads the tagged result.
+  The app's AI steps are off unless a run names a Gateway model (`--llm`).
+- **AI steps:** `backend/scripts/score_semantics.py` compares the title,
+  language, and figure alt text of each remediated gold document with the
+  author's. A judge model (`deepseek-v4-pro-0813` on the Gateway) scores
+  titles and alt text 1–5 for how much of what the author's version tells a
+  reader the remediated one tells them too; wording may differ.
 - **Adobe:** `backend/scripts/adobe_bench.py` runs Adobe PDF Services OCR then
   Auto-Tag, two transactions per page. The free tier ran out after 44
   `old_scans` pages in September 2026.
 - **Data** lives in `backend/data/eval/` (git-ignored).
+
+**Correction (2026-09-24).** Results published here before this date read the
+structure tree without marked-content `/ActualText`, so they badly understated
+production, whose tagger carries OCR text that way (printed books appeared to
+go from 30.5% to 91.7%). Every number below was measured with the corrected
+reader.
 
 ## Results: printed books (`old_print`, 49 pages, 509 tests)
 
@@ -42,14 +54,12 @@ What a screen reader hears after the full pipeline:
 
 | Candidate | Score | Present | Order | Absent |
 |---|---|---|---|---|
-| Production (v1) | 30.5% ± 4.0 | 21.5% | 15.0% | 97.3% |
-| OCR lines fixed, Tesseract | 91.7% ± 2.4 | 93.1% | 87.1% | 95.9% |
-| OCR lines fixed, Gateway OCR (Qwen3-VL-235B) | 88.0% ± 2.8 | 88.6% | 83.0% | 95.9% |
-| Current branch (also measured text positions), Tesseract | **92.5% ± 2.3** | 93.8% | 88.4% | 95.9% |
+| Production (v1) | 92.1% ± 2.5 | 94.1% | 86.4% | 95.9% |
+| Current branch, Tesseract | **92.5% ± 2.3** | 93.8% | 88.4% | 95.9% |
+| Current branch, Gateway OCR (Qwen3-VL-235B) | 83.3% ± 3.3 | 83.7% | 76.2% | 95.9% |
 
-The tagger fix (every OCR line tagged once, in order) accounts for the gain.
-Through the full pipeline, Gateway OCR does not beat Tesseract on printed
-books, so Tesseract stays the default; Gateway OCR helps on handwriting.
+Production already handles printed books well. Gateway OCR does worse than
+Tesseract here, so Tesseract stays the default.
 
 OCR stage alone (raw text layer read by pdfminer; its own layout guessing
 scrambles Tesseract's order, so these understate what the pipeline hears):
@@ -58,19 +68,19 @@ retry ladder).
 
 ## Results: born-digital pages (random samples of 60 pages each)
 
-| Subset (tests) | Production (v1) | OCR lines fixed | Current branch |
-|---|---|---|---|
-| `headers_footers` (absent tests, 170) | 91.5% ± 4.0 | 93.3% ± 4.0 | |
-| `multi_column` (reading order, 219) | 32.0% ± 6.6 | 48.9% ± 6.6 | **60.7% ± 6.4** |
-| `tables` (cell neighbors and headings, 336) | 10.1% ± 3.1 | 10.1% ± 3.4 | **64.2% ± 4.8** |
+| Subset (tests) | Production (v1) | Current branch |
+|---|---|---|
+| `tables` (cell neighbors and headings, 336) | 10.1% ± 3.3 | **64.8% ± 5.4** |
+| `multi_column` (reading order, 219) | 41.1% ± 6.4 | **58.0% ± 6.4** |
+| `headers_footers` (absent tests, 170) | 95.3% ± 3.3 | 95.9% ± 2.7 |
 
-Docling found these tables correctly; the tagger lost them. Its own
-content-stream reading guessed text positions (it ignored the text matrix's
-scale on `Td`, font widths, and `TJ` offsets, and read `TJ` offsets as text),
-and it tagged a table row drawn by one `TJ` as one cell. The current branch
-takes positions and text from pdfminer's measurement of each text operator
-(`app/pipeline/text_geometry.py`) and splits a `TJ` that spans several cells
-into one per cell, which renders identically.
+Docling found these tables correctly; the production tagger lost them. It
+guessed text positions from its own content-stream reading (ignoring the text
+matrix's scale on `Td`, font widths, and `TJ` offsets, and reading `TJ`
+offsets as text), and it tagged a table row drawn by one `TJ` as one cell.
+The branch takes positions and text from pdfminer's measurement of each text
+operator (`app/pipeline/page_glyphs.py`) and splits a `TJ` that spans several
+cells into one per cell, which renders identically.
 
 ## Results: structure round-trip (11 gold documents)
 
@@ -84,12 +94,39 @@ MHS-L, which also counts heading levels.
 
 | | NID | TEDS | MHS | MHS-L |
 |---|---|---|---|---|
-| Production (v1) | 0.735 | 0.302 | 0.486 | 0.286 |
-| OCR lines and heading levels fixed | 0.815 | 0.304 | 0.563 | 0.313 |
-| Current branch (also measured text positions) | **0.878** | **0.449** | **0.611** | **0.353** |
+| Production (v1) | 0.792 | 0.301 | 0.576 | 0.339 |
+| Current branch | **0.876** | **0.449** | **0.620** | **0.361** |
 
 For scale, opendataloader-bench reports NID about 0.90 and TEDS 0.887 for
 Docling's own output on its corpus.
+
+## Results: AI steps (model bake-off, gold documents)
+
+The same 11 gold documents, remediated by the current branch with its AI
+steps on, each run with a different model. The gold set has 163 figures with
+author-written alt text.
+
+| Model | Title (1–5) | Figures given alt text | Alt text (1–5) |
+|---|---|---|---|
+| None (AI steps off) | 3.91 | 49 of 163 | 3.90 |
+| Gemini 3 Flash Preview (production until now) | 4.09 | 124 of 163 | 3.76 |
+| Gemini 3.8 Flash | 4.09 | 124 of 163 | 3.76 |
+| **Qwen3-VL-235B (Gateway)** | **4.27** | 110 of 163 | 3.75 |
+
+Every candidate set the right language on all 11 documents. The model makes
+no difference to structure: NID, TEDS, and MHS stay within 0.005 of the run
+without AI steps, and the `tables` sample scores 64.8% without AI steps,
+65.1% with Gemini 3.8 Flash, and 64.8% with Qwen3-VL. Without AI steps, alt
+text comes only from figure captions, so it covers few figures.
+
+Qwen3-VL writes alt text for 14 fewer figures than Gemini. Eight of those are
+screenshots of tables in one document: Qwen3-VL decides each is a table, not
+an image, and leaves it for manual review. The alt text it does write
+judges as well as Gemini's (3.75 against 3.76). Qwen3-VL is the default
+model.
+
+Mistral Large 3 (at most three images per request), Kimi K2.5, and
+Gemma 3 27B (repeated timeouts) were dropped before scoring.
 
 ## Results: manuscripts (`old_scans`)
 
@@ -101,23 +138,20 @@ On the 44 pages Adobe finished (240 tests):
 
 | Candidate | Score | Present | Order | Absent |
 |---|---|---|---|---|
-| Production pipeline, as heard | 17.1% ± 4.6 | 6.4% | 1.2% | 100% |
-| Adobe OCR + Auto-Tag, as heard | 20.8% ± 4.8 | 11.2% | 6.0% | 96.9% |
-| Adobe, counting text inside alt-less Figures | 22.5% ± 5.2 | 12.8% | 8.4% | 96.9% |
+| Production pipeline, as heard | 24.2% ± 5.6 | 15.2% | 8.4% | 100% |
+| Current branch, as heard | 24.2% ± 5.8 | 15.2% | 8.4% | 100% |
+| Adobe OCR + Auto-Tag, as heard | 19.2% ± 5.2 | 8.8% | 4.8% | 96.9% |
+| Adobe, counting text inside alt-less Figures | 21.2% ± 5.2 | 11.2% | 7.2% | 96.9% |
 | Tesseract text layer (OCR stage) | 39.2% ± 6.2 | 55.2% | 2.4% | 71.9% |
 | Qwen3-VL-235B plain transcription (no positions) | 47.1% ± 6.3 | 50.4% | 34.9% | 65.6% |
 
-On all 98 pages (526 tests), OCR stage: Tesseract 29.5% ± 3.9 (best models and
-`--clean` did not change it); Qwen3-VL plain transcription 44.1% ± 4.3.
-Published third-party `old_scans` scores: PaddleOCR-VL-1.5 39.2, Mistral OCR 3
-48.8.
+On all 98 pages (526 tests): production 25.3% ± 3.7, current branch
+25.5% ± 3.9. OCR stage: Tesseract 29.5% ± 3.9 (best models and `--clean` did
+not change it); Qwen3-VL plain transcription 44.1% ± 4.3. Published
+third-party `old_scans` scores: PaddleOCR-VL-1.5 39.2, Mistral OCR 3 48.8.
 
-- The production pipeline hears far less than its own OCR produced: the tagger
-  kept one text object per paragraph and marked the rest of an OCR'd
-  paragraph's lines as artifacts. Fixed in the tagger (see printed books).
-- Adobe loses text the same way at a smaller scale: it hears about a third of
-  its own text layer. Auto-Tag often wraps typed letter text in Figure tags
-  without alt text, and its OCR read some handwritten pages as Arabic script.
+Adobe's Auto-Tag often wraps typed letter text in Figure tags without alt
+text, and its OCR read some handwritten pages as Arabic script.
 
 ## Gateway OCR engine
 
@@ -132,6 +166,4 @@ cap, and occasional malformed JSON; such pages fall back to Tesseract.
 ## Not yet measured
 
 - Adobe on printed books and born-digital pages (free-tier quota).
-- Figures and alt text, title, language, and veraPDF failures on the gold
-  set.
-- The app's LLM steps on Gateway models.
+- veraPDF failures on the gold set.
