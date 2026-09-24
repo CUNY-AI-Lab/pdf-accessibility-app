@@ -6,8 +6,11 @@ import re
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+
+from PIL import Image
 
 from app.config import get_settings
 from app.models import Job
@@ -114,16 +117,19 @@ FIGURE_BATCH_SCHEMA: dict[str, Any] = {
 }
 
 
+# The long side of a figure image sent to the model. Docling saves figures at
+# twice page resolution, and a few at that size exceed provider request limits.
+FIGURE_IMAGE_MAX_SIDE = 1600
+
+
 def _image_data_url(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix in {".jpg", ".jpeg"}:
-        mime_type = "image/jpeg"
-    elif suffix == ".webp":
-        mime_type = "image/webp"
-    else:
-        mime_type = "image/png"
-    image_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime_type};base64,{image_b64}"
+    """The figure image as a JPEG data URL, no larger than FIGURE_IMAGE_MAX_SIDE."""
+    with Image.open(path) as image:
+        figure = image.convert("RGB")
+    figure.thumbnail((FIGURE_IMAGE_MAX_SIDE, FIGURE_IMAGE_MAX_SIDE))
+    buffer = BytesIO()
+    figure.save(buffer, format="JPEG", quality=85)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 def _normalize_figure_result(*, figure_index: int, raw: dict[str, Any]) -> dict[str, object]:

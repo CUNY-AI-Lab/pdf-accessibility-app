@@ -14,9 +14,14 @@ from app.services.intelligence_gemini_figures import (
 from app.services.semantic_units import SemanticDecision
 
 
+def _write_png(path) -> None:
+    from PIL import Image
+
+    Image.new("RGB", (8, 8), "white").save(path, format="PNG")
+
 def test_generate_figure_intelligence_normalizes_alt_text(monkeypatch, tmp_path):
     image_path = tmp_path / "figure.png"
-    image_path.write_bytes(b"fake-image")
+    _write_png(image_path)
     captured = {}
 
     async def _fake_adjudicate(*, job, unit, llm_client):
@@ -65,7 +70,7 @@ def test_generate_figure_intelligence_normalizes_alt_text(monkeypatch, tmp_path)
 
 def test_generate_figure_intelligence_fails_soft_to_manual_only(monkeypatch, tmp_path):
     image_path = tmp_path / "figure.png"
-    image_path.write_bytes(b"fake-image")
+    _write_png(image_path)
 
     async def _boom(*, job, unit, llm_client):
         raise ValueError("bad json")
@@ -93,7 +98,7 @@ def test_generate_figure_intelligence_fails_soft_to_manual_only(monkeypatch, tmp
 
 def test_generate_figure_intelligence_can_reclassify_nonfigure_region(monkeypatch, tmp_path):
     image_path = tmp_path / "figure.png"
-    image_path.write_bytes(b"fake-image")
+    _write_png(image_path)
     captured = {}
 
     async def _fake_adjudicate(*, job, unit, llm_client):
@@ -140,7 +145,7 @@ def test_generate_figures_intelligence_batches_by_page_and_falls_back(monkeypatc
     image_b = tmp_path / "b.png"
     image_c = tmp_path / "c.png"
     for path in (image_a, image_b, image_c):
-        path.write_bytes(b"fake-image")
+        _write_png(path)
 
     requested = {}
     fallback_calls = []
@@ -221,7 +226,7 @@ def test_generate_figures_intelligence_parallelizes_page_batches_with_bound(monk
     image_paths = []
     for index in range(4):
         path = tmp_path / f"figure-{index}.png"
-        path.write_bytes(b"fake-image")
+        _write_png(path)
         image_paths.append(path)
 
     monkeypatch.setattr(
@@ -298,7 +303,7 @@ def test_generate_figures_intelligence_global_bound_limits_parallel_jobs(monkeyp
     image_paths = []
     for index in range(8):
         path = tmp_path / f"figure-{index}.png"
-        path.write_bytes(b"fake-image")
+        _write_png(path)
         image_paths.append(path)
 
     monkeypatch.setattr(
@@ -383,8 +388,8 @@ def test_generate_figures_intelligence_global_bound_limits_parallel_jobs(monkeyp
 def test_figure_page_context_marks_tiny_child_ui_figures(tmp_path):
     image_a = tmp_path / "a.png"
     image_b = tmp_path / "b.png"
-    image_a.write_bytes(b"fake-image")
-    image_b.write_bytes(b"fake-image")
+    _write_png(image_a)
+    _write_png(image_b)
 
     context = _figure_page_context(
         [
@@ -426,7 +431,7 @@ def test_suppress_child_ui_alt_for_generic_icon_label():
 
 def test_generate_figure_intelligence_suppresses_generic_child_ui_alt(monkeypatch, tmp_path):
     image_path = tmp_path / "figure.png"
-    image_path.write_bytes(b"fake-image")
+    _write_png(image_path)
 
     async def _fake_adjudicate(*, job, unit, llm_client):
         return SemanticDecision(
@@ -463,8 +468,8 @@ def test_generate_figure_intelligence_suppresses_generic_child_ui_alt(monkeypatc
 def test_generate_alt_text_uses_batched_figure_intelligence(monkeypatch, tmp_path):
     image_a = tmp_path / "a.png"
     image_b = tmp_path / "b.png"
-    image_a.write_bytes(b"fake-image")
-    image_b.write_bytes(b"fake-image")
+    _write_png(image_a)
+    _write_png(image_b)
     captured = {}
 
     async def _fake_batch(*, figures, llm_client, job=None, original_filename=""):
@@ -523,7 +528,7 @@ def test_generate_figures_intelligence_uses_cached_pdf_page_with_direct_gemini(m
     image_paths = []
     for name in ("a.png", "b.png", "c.png", "d.png", "e.png"):
         path = tmp_path / name
-        path.write_bytes(b"fake-image")
+        _write_png(path)
         image_paths.append(path)
 
     fake_pdf_path = tmp_path / "doc.pdf"
@@ -632,7 +637,7 @@ def test_generate_figures_intelligence_uses_cached_pdf_page_with_direct_gemini(m
 
 def test_generate_figures_intelligence_direct_gemini_retries_unresolved_batch_items(monkeypatch, tmp_path):
     image_path = tmp_path / "a.png"
-    image_path.write_bytes(b"fake-image")
+    _write_png(image_path)
     fake_pdf_path = tmp_path / "doc.pdf"
     fake_pdf_path.write_bytes(b"%PDF-1.7 fake")
     fallback_calls = []
@@ -711,3 +716,21 @@ def test_generate_figures_intelligence_direct_gemini_retries_unresolved_batch_it
     assert fallback_calls == [1]
     assert results[0]["suggested_action"] == "set_alt_text"
     assert results[0]["alt_text"] == "Line chart of enrollment."
+
+
+def test_figure_images_are_sent_as_jpeg_no_larger_than_the_cap(tmp_path):
+    import base64
+    import io
+
+    from PIL import Image
+
+    from app.services.intelligence_gemini_figures import FIGURE_IMAGE_MAX_SIDE, _image_data_url
+
+    path = tmp_path / "figure.png"
+    Image.new("RGBA", (4000, 3000), (10, 20, 30, 255)).save(path)
+
+    url = _image_data_url(path)
+
+    assert url.startswith("data:image/jpeg;base64,")
+    with Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))) as sent:
+        assert max(sent.size) == FIGURE_IMAGE_MAX_SIDE
