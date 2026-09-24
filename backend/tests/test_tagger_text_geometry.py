@@ -208,3 +208,10 @@ async def test_splitting_a_tj_leaves_the_rest_of_the_page_in_place(tmp_path):
     assert _operators(tagged) == [*before[: split_at + 1], "TJ", *before[split_at + 1 :]]
     assert rendered(tagged) == rendered(source)
     assert " ".join(screen_reader_text(tagged).split()) == "Left Right Hidden words here"
+
+
+def test_estimated_text_leaves_out_tj_position_adjustments():
+    from app.pipeline.tagger import _extract_text_from_operands
+
+    array = pikepdf.Array([pikepdf.String("Year"), -5124.6, pikepdf.String("Crop"), 12])
+    assert _extract_text_from_operands("TJ", [array]) == "YearCrop"

@@ -16,6 +16,7 @@ import math
 import mimetypes
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
@@ -254,10 +255,11 @@ def _extract_text_from_operands(op: str, operands: list[Any]) -> str:
     if op == "TJ" and operands:
         arr = operands[0]
         if isinstance(arr, pikepdf.Array):
+            # pikepdf gives TJ position adjustments as int or Decimal.
             return "".join(
                 _decode_pdf_text_operand(item)
                 for item in arr
-                if not isinstance(item, (int, float))
+                if not isinstance(item, (int, float, Decimal))
             )
         return _decode_pdf_text_operand(arr)
     if op == "'":
