@@ -4,6 +4,27 @@ Status: approved 2026-09-23, revised the same day. This is the plan of record
 for moving PDF Accessibility behind Doorway and the CAIL Gateway and for the
 improvement work that follows. Update it as phases land.
 
+## Goal: version 2
+
+A new version of PDF Accessibility, built as a Cloudflare Worker, that beats
+both the current app (v1) and Adobe Acrobat's tagging on the same documents.
+
+- **Shape:** a Worker at `/pdf-accessibility` behind Doorway owns the interface,
+  sign-in, jobs (Workflows), storage (R2), and model calls (the CAIL Gateway,
+  via the 24-hour `cail:gateway` leg). The PDF tools that cannot run in a
+  Worker (OCR, pikepdf, veraPDF, Docling or its replacement) run in one compute
+  service the Worker calls. v1 keeps serving until v2 wins.
+- **Beats v1 and Adobe when,** on the evaluation suite in
+  [ocr-evaluation.md](ocr-evaluation.md), scored on what a screen reader
+  hears:
+  - OCR: v2 scores above v1 and Adobe on printed old books and on
+    `old_scans`, with 95% confidence intervals that do not overlap.
+  - Tagging (strip-and-restore corpus): v2 matches or beats Adobe on veraPDF
+    PDF/UA-1 failures, reading order, headings, tables, and lists, and never
+    regresses against v1 in any category.
+  - No recognized text is dropped from the structure tree.
+- **Targets** are set once the v1, v1-fixed, and Adobe baselines are measured.
+
 ## Decisions
 
 - **Audience:** CUNY-only. Doorway signs people in and Admission membership
