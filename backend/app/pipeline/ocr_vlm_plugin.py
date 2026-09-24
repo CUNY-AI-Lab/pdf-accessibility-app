@@ -9,7 +9,10 @@ Docling, the tagger, and validation are unchanged. Word boxes are laid out
 across each line in proportion to word length: the renderer needs words, and a
 screen reader needs only the line's text and position.
 
-Page orientation and skew still come from Tesseract.
+Page orientation and skew still come from Tesseract, and so does the text of
+any page the Gateway cannot read: a call is repeated only when the Gateway
+answered 429, 502, 503 or 504, which means no inference ran and nothing was
+charged; any other failure falls back to Tesseract for that page.
 
 The OCR step passes the connection in the environment:
     CAIL_OCR_BASE_URL   Gateway base URL
@@ -22,24 +25,35 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import os
 import re
+import tempfile
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
 from ocrmypdf import hookimpl
 from ocrmypdf.builtin_plugins.tesseract_ocr import TesseractOcrEngine
-from ocrmypdf.hocrtransform import BoundingBox, OcrClass, OcrElement
+from ocrmypdf.hocrtransform import BoundingBox, HocrParser, OcrClass, OcrElement
 from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
 from PIL import Image
 
 if TYPE_CHECKING:
     from ocrmypdf._options import OcrOptions
 
+log = logging.getLogger(__name__)
+
 # The long side sent to the model; larger images exceed provider body limits.
 MAX_SIDE = 1600
 REQUEST_TIMEOUT_SECONDS = 180
+# A cap on the answer, well above the densest page, so no provider default
+# cuts a page short.
+MAX_OUTPUT_TOKENS = 16384
+# Statuses for which the Gateway ran no inference, so a retry costs nothing.
+NOT_RUN_STATUSES = {429, 502, 503, 504}
+RETRY_DELAYS_SECONDS = (5, 20)
 
 SYSTEM_PROMPT = (
     "You read scanned document pages. Return every line of text on the page as "
@@ -75,6 +89,7 @@ def _request_lines(image: Image.Image) -> list[dict]:
     body = {
         "model": model,
         "temperature": 0,
+        "max_tokens": MAX_OUTPUT_TOKENS,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -89,18 +104,27 @@ def _request_lines(image: Image.Image) -> list[dict]:
             },
         ],
     }
-    # One attempt: the Gateway may already have charged for a request that
-    # failed afterwards, so a paid call is never repeated.
-    response = httpx.post(
-        f"{base_url.rstrip('/')}/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}"},
-        json=body,
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
+    for delay in (*RETRY_DELAYS_SECONDS, None):
+        response = httpx.post(
+            f"{base_url.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=body,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.status_code not in NOT_RUN_STATUSES or delay is None:
+            break
+        time.sleep(delay)
     if response.status_code != 200:
         raise GatewayOcrError(f"Gateway returned {response.status_code}")
-    content = response.json()["choices"][0]["message"]["content"] or ""
-    return parse_lines(content)
+    choice = response.json()["choices"][0]
+    content = choice["message"]["content"] or ""
+    try:
+        return parse_lines(content)
+    except json.JSONDecodeError as exc:
+        raise GatewayOcrError(
+            f"unreadable answer ({len(content)} chars, finish_reason "
+            f"{choice.get('finish_reason')}): {exc}"
+        ) from exc
 
 
 def parse_lines(content: str) -> list[dict]:
@@ -184,6 +208,13 @@ def page_from_lines(
     )
 
 
+def _tesseract_page(input_file: Path, options: OcrOptions) -> tuple[OcrElement, str]:
+    with tempfile.TemporaryDirectory() as tmp:
+        hocr, text = Path(tmp) / "page.hocr", Path(tmp) / "page.txt"
+        TesseractOcrEngine.generate_hocr(input_file, hocr, text, options)
+        return HocrParser(hocr).parse(), text.read_text(encoding="utf-8")
+
+
 class GatewayVisionOcrEngine(OcrEngine):
     """Text from a Gateway vision model; orientation and skew from Tesseract."""
 
@@ -227,7 +258,13 @@ class GatewayVisionOcrEngine(OcrEngine):
                 if dpi_info
                 else None
             )
-            lines = _request_lines(image)
+            try:
+                lines = _request_lines(image)
+            except (GatewayOcrError, httpx.HTTPError, KeyError, ValueError) as exc:
+                log.warning(
+                    "page %s: Gateway OCR failed (%s); using Tesseract", page_number + 1, exc
+                )
+                return _tesseract_page(input_file, options)
         page = page_from_lines(lines, width, height, dpi, page_number)
         return page, "\n".join(line.text for line in page.children)
 
