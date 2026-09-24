@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
-from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
+from app.services.intelligence_pages import generate_suspicious_text_intelligence
 from app.services.semantic_units import SemanticDecision
 
 
@@ -37,7 +37,7 @@ def test_generate_suspicious_text_intelligence_returns_normalized_blocks(monkeyp
         ]
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_pages.adjudicate_semantic_units",
+        "app.services.intelligence_pages.adjudicate_semantic_units",
         _fake_adjudicate,
     )
 
@@ -111,7 +111,7 @@ def test_generate_suspicious_text_intelligence_keeps_mark_decorative_blocks(monk
         ]
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_pages.adjudicate_semantic_units",
+        "app.services.intelligence_pages.adjudicate_semantic_units",
         _fake_adjudicate,
     )
 

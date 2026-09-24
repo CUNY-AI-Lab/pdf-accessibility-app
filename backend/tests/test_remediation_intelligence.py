@@ -321,7 +321,7 @@ def test_generate_remediation_intelligence_supports_reading_order(monkeypatch, t
     assert suggestion["readable_text_hints"][0]["readable_text_hint"] == "Data Book"
     assert suggestion["readable_text_hints"][0]["ocr_text_candidate"] == "Data Book"
     assert suggestion["readable_text_hints"][0]["chosen_source"] == "ocr"
-    assert suggestion["document_overlay"]["provenance"] == "gemini_remediation_intelligence"
+    assert suggestion["document_overlay"]["provenance"] == "model_remediation_intelligence"
     assert suggestion["document_overlay"]["pages"][0]["page_number"] == 1
     assert suggestion["model"] == "qwen3-vl-235b-a22b-instruct"
     assert fake_llm.calls == []
@@ -639,7 +639,7 @@ def test_generate_remediation_intelligence_supports_table_semantics(monkeypatch,
     assert suggestion["confidence"] == "medium"
     assert len(suggestion["proposed_table_updates"]) == 1
     assert len(suggestion["table_intelligence"]) == 2
-    assert suggestion["document_overlay"]["provenance"] == "gemini_remediation_intelligence"
+    assert suggestion["document_overlay"]["provenance"] == "model_remediation_intelligence"
     assert suggestion["document_overlay"]["pages"][0]["page_number"] == 1
     assert "reviewed" in suggestion["summary"].lower()
     assert fake_llm.calls == []

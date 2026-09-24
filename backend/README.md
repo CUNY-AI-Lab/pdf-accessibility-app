@@ -36,15 +36,15 @@ The semantic layer is generic-first, not element-type specific.
 
 Shared pieces:
 - [app/services/semantic_units.py](app/services/semantic_units.py)
-- [app/services/intelligence_gemini_semantics.py](app/services/intelligence_gemini_semantics.py)
+- [app/services/intelligence_semantics.py](app/services/intelligence_semantics.py)
 - [app/services/document_intelligence_models.py](app/services/document_intelligence_models.py)
 
 Wrappers over the shared engine:
-- [app/services/intelligence_gemini_pages.py](app/services/intelligence_gemini_pages.py)
-- [app/services/intelligence_gemini_tables.py](app/services/intelligence_gemini_tables.py)
-- [app/services/intelligence_gemini_forms.py](app/services/intelligence_gemini_forms.py)
-- [app/services/intelligence_gemini_figures.py](app/services/intelligence_gemini_figures.py)
-- [app/services/intelligence_gemini_toc.py](app/services/intelligence_gemini_toc.py)
+- [app/services/intelligence_pages.py](app/services/intelligence_pages.py)
+- [app/services/intelligence_tables.py](app/services/intelligence_tables.py)
+- [app/services/intelligence_forms.py](app/services/intelligence_forms.py)
+- [app/services/intelligence_figures.py](app/services/intelligence_figures.py)
+- [app/services/intelligence_toc.py](app/services/intelligence_toc.py)
 
 ## LLM transport
 

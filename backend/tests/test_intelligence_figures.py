@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from app.pipeline.alt_text import generate_alt_text
 from app.pipeline.structure import FigureInfo
-from app.services.intelligence_gemini_figures import (
+from app.services.intelligence_figures import (
     _figure_page_context,
     _should_suppress_child_ui_alt,
     generate_figure_intelligence,
@@ -39,7 +39,7 @@ def test_generate_figure_intelligence_normalizes_alt_text(monkeypatch, tmp_path)
         )
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_figures.adjudicate_semantic_unit",
+        "app.services.intelligence_figures.adjudicate_semantic_unit",
         _fake_adjudicate,
     )
 
@@ -73,7 +73,7 @@ def test_generate_figure_intelligence_fails_soft_to_manual_only(monkeypatch, tmp
         raise ValueError("bad json")
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_figures.adjudicate_semantic_unit",
+        "app.services.intelligence_figures.adjudicate_semantic_unit",
         _boom,
     )
 
@@ -112,7 +112,7 @@ def test_generate_figure_intelligence_can_reclassify_nonfigure_region(monkeypatc
         )
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_figures.adjudicate_semantic_unit",
+        "app.services.intelligence_figures.adjudicate_semantic_unit",
         _fake_adjudicate,
     )
 
@@ -189,11 +189,11 @@ def test_generate_figures_intelligence_batches_by_page_and_falls_back(monkeypatc
         }
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_figures.request_llm_json",
+        "app.services.intelligence_figures.request_llm_json",
         _fake_request_llm_json,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_figures.generate_figure_intelligence",
+        "app.services.intelligence_figures.generate_figure_intelligence",
         _fake_single,
     )
 
@@ -227,7 +227,7 @@ def test_generate_figures_intelligence_parallelizes_page_batches_with_bound(monk
         image_paths.append(path)
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_figures.get_settings",
+        "app.services.intelligence_figures.get_settings",
         lambda: SimpleNamespace(
             alt_text_max_concurrency=2,
             alt_text_global_max_concurrency=8,
@@ -271,7 +271,7 @@ def test_generate_figures_intelligence_parallelizes_page_batches_with_bound(monk
         }
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_figures.request_llm_json",
+        "app.services.intelligence_figures.request_llm_json",
         _fake_request_llm_json,
     )
 
@@ -302,7 +302,7 @@ def test_generate_figures_intelligence_global_bound_limits_parallel_jobs(monkeyp
         image_paths.append(path)
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_figures.get_settings",
+        "app.services.intelligence_figures.get_settings",
         lambda: SimpleNamespace(
             alt_text_max_concurrency=4,
             alt_text_global_max_concurrency=3,
@@ -344,7 +344,7 @@ def test_generate_figures_intelligence_global_bound_limits_parallel_jobs(monkeyp
         }
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_figures.request_llm_json",
+        "app.services.intelligence_figures.request_llm_json",
         _fake_request_llm_json,
     )
 
@@ -440,7 +440,7 @@ def test_generate_figure_intelligence_suppresses_generic_child_ui_alt(monkeypatc
         )
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_figures.adjudicate_semantic_unit",
+        "app.services.intelligence_figures.adjudicate_semantic_unit",
         _fake_adjudicate,
     )
 
@@ -523,7 +523,7 @@ def test_figure_images_are_sent_as_jpeg_no_larger_than_the_cap(tmp_path):
 
     from PIL import Image
 
-    from app.services.intelligence_gemini_figures import FIGURE_IMAGE_MAX_SIDE, _image_data_url
+    from app.services.intelligence_figures import FIGURE_IMAGE_MAX_SIDE, _image_data_url
 
     path = tmp_path / "figure.png"
     Image.new("RGBA", (4000, 3000), (10, 20, 30, 255)).save(path)

@@ -1,6 +1,6 @@
 import asyncio
 
-from app.services.intelligence_gemini_toc import generate_toc_group_intelligence
+from app.services.intelligence_toc import generate_toc_group_intelligence
 from app.services.semantic_units import SemanticDecision
 
 
@@ -27,7 +27,7 @@ def test_generate_toc_group_intelligence_maps_entry_indexes(monkeypatch, tmp_pat
         )
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_toc.adjudicate_semantic_unit",
+        "app.services.intelligence_toc.adjudicate_semantic_unit",
         _fake_adjudicate,
     )
 
@@ -84,7 +84,7 @@ def test_generate_toc_group_intelligence_defaults_to_all_candidates_for_positive
         )
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_toc.adjudicate_semantic_unit",
+        "app.services.intelligence_toc.adjudicate_semantic_unit",
         _fake_adjudicate,
     )
 

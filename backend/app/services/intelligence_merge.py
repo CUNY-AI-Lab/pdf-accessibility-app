@@ -4,19 +4,19 @@ from copy import deepcopy
 from typing import Any
 
 from app.services.document_intelligence_models import DocumentModel
-from app.services.intelligence_gemini import (
+from app.services.intelligence_normalize import (
     normalize_reading_order_intelligence,
     normalize_table_intelligence,
 )
 
-GEMINI_PROVENANCE = "gemini_remediation_intelligence"
+MODEL_PROVENANCE = "model_remediation_intelligence"
 
 
 def _update_block_metadata(block, *, confidence: float) -> None:
-    block.provenance = GEMINI_PROVENANCE
+    block.provenance = MODEL_PROVENANCE
     block.confidence = max(float(block.confidence), float(confidence))
-    if GEMINI_PROVENANCE not in block.source_ids:
-        block.source_ids.append(GEMINI_PROVENANCE)
+    if MODEL_PROVENANCE not in block.source_ids:
+        block.source_ids.append(MODEL_PROVENANCE)
 
 
 def _apply_block_resolution(block, hint: dict[str, Any], *, confidence: float) -> None:
@@ -41,10 +41,10 @@ def _apply_block_resolution(block, hint: dict[str, Any], *, confidence: float) -
 
 
 def _update_table_metadata(table, *, confidence: float) -> None:
-    table.provenance = GEMINI_PROVENANCE
+    table.provenance = MODEL_PROVENANCE
     table.confidence = max(float(table.confidence), float(confidence))
-    if GEMINI_PROVENANCE not in table.source_ids:
-        table.source_ids.append(GEMINI_PROVENANCE)
+    if MODEL_PROVENANCE not in table.source_ids:
+        table.source_ids.append(MODEL_PROVENANCE)
 
 
 def apply_reading_order_overlay(
@@ -204,10 +204,10 @@ def document_overlay_for_intelligence(
         else:
             overlaid, affected_pages = apply_table_overlay(document, intelligence)
     else:
-        return {"provenance": GEMINI_PROVENANCE, "pages": []}
+        return {"provenance": MODEL_PROVENANCE, "pages": []}
 
     return {
-        "provenance": GEMINI_PROVENANCE,
+        "provenance": MODEL_PROVENANCE,
         "pages": [
             page.to_dict()
             for page in overlaid.pages

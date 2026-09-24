@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pikepdf
 
-from app.services.intelligence_gemini_tables import (
+from app.services.intelligence_tables import (
     generate_table_intelligence,
     generate_table_intelligence_for_page,
 )
@@ -41,7 +41,7 @@ def test_generate_table_intelligence_returns_normalized_update(monkeypatch, tmp_
         )
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_tables.adjudicate_semantic_unit",
+        "app.services.intelligence_tables.adjudicate_semantic_unit",
         _fake_adjudicate,
     )
 
@@ -116,11 +116,11 @@ def test_generate_table_intelligence_for_page_sends_the_page_image(monkeypatch, 
         )
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_tables.request_llm_json_with_response",
+        "app.services.intelligence_tables.request_llm_json_with_response",
         _fake_request_llm_json_with_response,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_tables.page_preview_parts",
+        "app.services.intelligence_tables.page_preview_parts",
         lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": "data:image/png;base64,page"}}],
     )
 

@@ -3,13 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 from app.models import Job
-from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_llm_utils import (
     context_json_part,
     page_preview_parts,
     preferred_cache_breakpoint_index,
     request_llm_json,
 )
+from app.services.intelligence_normalize import confidence_label, confidence_score
 from app.services.llm_client import LlmClient
 
 READING_ORDER_INTELLIGENCE_PROMPT = """You are a PDF accessibility reading-order assistant.

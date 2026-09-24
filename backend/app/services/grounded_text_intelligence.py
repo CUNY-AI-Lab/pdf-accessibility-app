@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
+from app.services.intelligence_pages import generate_suspicious_text_intelligence
 from app.services.llm_client import make_llm_client
 
 if TYPE_CHECKING:

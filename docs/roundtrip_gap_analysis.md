@@ -84,8 +84,8 @@ Observed failure mode:
 
 Relevant code paths:
 
-- `backend/app/services/intelligence_gemini_forms.py`
-- `backend/app/services/intelligence_gemini_semantics.py`
+- `backend/app/services/intelligence_forms.py`
+- `backend/app/services/intelligence_semantics.py`
 - `backend/app/services/semantic_pretag_policy.py`
 - `backend/app/pipeline/orchestrator.py`
 

@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import pikepdf
 
-from app.services import intelligence_gemini_semantics
-from app.services.intelligence_gemini_semantics import (
+from app.services import intelligence_semantics
+from app.services.intelligence_semantics import (
     adjudicate_semantic_unit,
     adjudicate_semantic_units,
 )
@@ -40,7 +40,7 @@ def _job(tmp_path):
 
 def test_adjudicate_semantic_unit_normalizes_text_block(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        intelligence_gemini_semantics,
+        intelligence_semantics,
         "page_preview_parts",
         lambda job, page_numbers: [
             {
@@ -50,7 +50,7 @@ def test_adjudicate_semantic_unit_normalizes_text_block(monkeypatch, tmp_path):
         ],
     )
     monkeypatch.setattr(
-        intelligence_gemini_semantics,
+        intelligence_semantics,
         "render_bbox_preview_png_data_url",
         lambda pdf_path, page_number, bbox: f"data:image/png;base64:bbox-{page_number}",
     )
@@ -122,7 +122,7 @@ def test_adjudicate_semantic_unit_normalizes_text_block(monkeypatch, tmp_path):
 
 def test_adjudicate_semantic_units_preserves_order(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        intelligence_gemini_semantics,
+        intelligence_semantics,
         "page_preview_parts",
         lambda job, page_numbers: [
             {
@@ -176,7 +176,7 @@ def test_adjudicate_semantic_units_preserves_order(monkeypatch, tmp_path):
 
 def test_adjudicate_semantic_unit_repairs_missing_required_payload(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        intelligence_gemini_semantics,
+        intelligence_semantics,
         "page_preview_parts",
         lambda job, page_numbers: [
             {
@@ -234,7 +234,7 @@ def test_adjudicate_semantic_unit_allows_cross_type_reclassification_for_table(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(
-        intelligence_gemini_semantics,
+        intelligence_semantics,
         "page_preview_parts",
         lambda job, page_numbers: [
             {

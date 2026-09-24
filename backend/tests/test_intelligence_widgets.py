@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pikepdf
 
-from app.services.intelligence_gemini_widgets import (
+from app.services.intelligence_widgets import (
     generate_widget_intelligence,
     generate_widget_intelligence_for_page,
 )
@@ -53,11 +53,11 @@ def test_generate_widget_intelligence_sends_the_page_image(monkeypatch, tmp_path
         }
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_widgets.request_llm_json",
+        "app.services.intelligence_widgets.request_llm_json",
         _fake_request_llm_json,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_widgets.page_preview_parts",
+        "app.services.intelligence_widgets.page_preview_parts",
         lambda job, page_numbers: [
             {
                 "type": "image_url",
@@ -123,11 +123,11 @@ def test_generate_widget_intelligence_for_page_sends_the_page_image(monkeypatch,
         )
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_widgets.request_llm_json_with_response",
+        "app.services.intelligence_widgets.request_llm_json_with_response",
         _fake_request_llm_json_with_response,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_widgets.page_preview_parts",
+        "app.services.intelligence_widgets.page_preview_parts",
         lambda job, page_numbers: [
             {
                 "type": "image_url",

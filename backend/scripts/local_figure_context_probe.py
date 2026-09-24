@@ -11,7 +11,7 @@ from typing import Any
 
 from app.services.local_semantic import _extract_json_from_message
 
-from app.services.intelligence_gemini_figures import (
+from app.services.intelligence_figures import (
     FIGURE_BATCH_PROMPT,
     FIGURE_BATCH_SCHEMA,
 )

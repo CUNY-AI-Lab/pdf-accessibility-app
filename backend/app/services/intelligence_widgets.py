@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 from app.models import Job
-from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_llm_utils import (
     context_json_part,
     page_preview_parts,
@@ -11,6 +10,7 @@ from app.services.intelligence_llm_utils import (
     request_llm_json,
     request_llm_json_with_response,
 )
+from app.services.intelligence_normalize import confidence_label, confidence_score
 from app.services.llm_client import LlmClient
 
 WIDGET_BATCH_PROMPT = """You are a PDF accessibility widget-rationalization assistant.

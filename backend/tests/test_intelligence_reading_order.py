@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pikepdf
 
-from app.services.intelligence_gemini_reading_order import (
+from app.services.intelligence_reading_order import (
     generate_reading_order_intelligence,
 )
 
@@ -46,11 +46,11 @@ def test_generate_reading_order_intelligence_sends_the_page_image(monkeypatch, t
         }
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_reading_order.request_llm_json",
+        "app.services.intelligence_reading_order.request_llm_json",
         _fake_request_llm_json,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_reading_order.page_preview_parts",
+        "app.services.intelligence_reading_order.page_preview_parts",
         lambda job, page_numbers: [
             {
                 "type": "image_url",

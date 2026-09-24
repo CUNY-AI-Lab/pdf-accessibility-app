@@ -118,14 +118,14 @@ Main implementation files:
 
 ### Generic semantic adjudication
 - [backend/app/services/semantic_units.py](../backend/app/services/semantic_units.py)
-- [backend/app/services/intelligence_gemini_semantics.py](../backend/app/services/intelligence_gemini_semantics.py)
+- [backend/app/services/intelligence_semantics.py](../backend/app/services/intelligence_semantics.py)
 
 ### Specialized wrappers over the shared semantic engine
-- [backend/app/services/intelligence_gemini_pages.py](../backend/app/services/intelligence_gemini_pages.py)
-- [backend/app/services/intelligence_gemini_tables.py](../backend/app/services/intelligence_gemini_tables.py)
-- [backend/app/services/intelligence_gemini_forms.py](../backend/app/services/intelligence_gemini_forms.py)
-- [backend/app/services/intelligence_gemini_figures.py](../backend/app/services/intelligence_gemini_figures.py)
-- [backend/app/services/intelligence_gemini_toc.py](../backend/app/services/intelligence_gemini_toc.py)
+- [backend/app/services/intelligence_pages.py](../backend/app/services/intelligence_pages.py)
+- [backend/app/services/intelligence_tables.py](../backend/app/services/intelligence_tables.py)
+- [backend/app/services/intelligence_forms.py](../backend/app/services/intelligence_forms.py)
+- [backend/app/services/intelligence_figures.py](../backend/app/services/intelligence_figures.py)
+- [backend/app/services/intelligence_toc.py](../backend/app/services/intelligence_toc.py)
 
 ### Shared LLM transport
 - [backend/app/services/llm_client.py](../backend/app/services/llm_client.py)

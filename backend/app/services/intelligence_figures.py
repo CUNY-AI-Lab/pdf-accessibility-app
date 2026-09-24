@@ -16,13 +16,13 @@ from PIL import Image
 from app.config import get_settings
 from app.models import Job
 from app.pipeline.structure import FigureInfo
-from app.services.intelligence_gemini import confidence_label, confidence_score
-from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
 from app.services.intelligence_llm_utils import (
     context_json_part,
     page_preview_parts,
     request_llm_json,
 )
+from app.services.intelligence_normalize import confidence_label, confidence_score
+from app.services.intelligence_semantics import adjudicate_semantic_unit
 from app.services.llm_client import LlmClient
 from app.services.semantic_units import SemanticUnit
 

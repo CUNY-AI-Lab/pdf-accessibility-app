@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pikepdf
 
-from app.services.intelligence_gemini_forms import (
+from app.services.intelligence_forms import (
     generate_form_intelligence,
     generate_form_intelligence_for_page,
 )
@@ -40,7 +40,7 @@ def test_generate_form_intelligence_normalizes_response(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.adjudicate_semantic_unit",
+        "app.services.intelligence_forms.adjudicate_semantic_unit",
         _fake_adjudicate,
     )
 
@@ -132,11 +132,11 @@ def test_generate_form_intelligence_for_page_normalizes_batch_response(monkeypat
         )
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.request_llm_json_with_response",
+        "app.services.intelligence_forms.request_llm_json_with_response",
         _fake_request_llm_json_with_response,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.page_preview_parts",
+        "app.services.intelligence_forms.page_preview_parts",
         lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": "data:image/png;base64,page"}}],
     )
 
@@ -218,15 +218,15 @@ def test_form_fields_on_a_page_are_asked_about_in_batches(monkeypatch, tmp_path)
         )
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.request_llm_json_with_response",
+        "app.services.intelligence_forms.request_llm_json_with_response",
         _fake_request_llm_json_with_response,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.page_preview_parts",
+        "app.services.intelligence_forms.page_preview_parts",
         lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": "data:image/png;base64,page"}}],
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.get_settings",
+        "app.services.intelligence_forms.get_settings",
         lambda: SimpleNamespace(llm_page_candidate_batch_size=2, llm_max_concurrency=2),
     )
 

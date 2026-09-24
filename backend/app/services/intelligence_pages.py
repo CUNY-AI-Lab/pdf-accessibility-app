@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.models import Job
-from app.services.intelligence_gemini_semantics import adjudicate_semantic_units
+from app.services.intelligence_semantics import adjudicate_semantic_units
 from app.services.llm_client import LlmClient
 from app.services.semantic_units import SemanticUnit
 

@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
-from app.services.intelligence_gemini_toc import generate_toc_group_intelligence
+from app.services.intelligence_toc import generate_toc_group_intelligence
 from app.services.toc_intelligence import (
     apply_toc_intelligence,
     collect_toc_candidates,
@@ -247,7 +247,7 @@ def test_generate_toc_group_intelligence_asks_the_model_about_the_toc_pages(monk
         }
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_toc.request_pdf_pages_json",
+        "app.services.intelligence_toc.request_pdf_pages_json",
         _fake_pages_request,
     )
 

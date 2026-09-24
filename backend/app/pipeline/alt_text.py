@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.pipeline.structure import FigureInfo
-from app.services.intelligence_gemini import confidence_label
-from app.services.intelligence_gemini_figures import generate_figures_intelligence
+from app.services.intelligence_figures import generate_figures_intelligence
+from app.services.intelligence_normalize import confidence_label
 from app.services.llm_client import LlmClient
 
 logger = logging.getLogger(__name__)

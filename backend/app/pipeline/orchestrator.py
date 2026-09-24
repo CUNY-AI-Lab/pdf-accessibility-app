@@ -84,16 +84,16 @@ from app.services.grounded_text_intelligence import (
 from app.services.grounded_text_intelligence import (
     recalculate_fidelity_summary as _recalculate_fidelity_summary,
 )
-from app.services.intelligence_gemini_forms import (
+from app.services.intelligence_forms import (
     generate_form_intelligence,
     generate_form_intelligence_for_page,
 )
-from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
-from app.services.intelligence_gemini_tables import (
+from app.services.intelligence_pages import generate_suspicious_text_intelligence
+from app.services.intelligence_tables import (
     generate_table_intelligence,
     generate_table_intelligence_for_page,
 )
-from app.services.intelligence_gemini_widgets import (
+from app.services.intelligence_widgets import (
     generate_widget_intelligence,
     generate_widget_intelligence_for_page,
 )

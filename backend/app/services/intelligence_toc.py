@@ -3,8 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
-from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
 from app.services.intelligence_llm_utils import request_pdf_pages_json
+from app.services.intelligence_semantics import adjudicate_semantic_unit
 from app.services.semantic_units import SemanticUnit
 
 _DEFAULT_ADJUDICATE_SEMANTIC_UNIT = adjudicate_semantic_unit

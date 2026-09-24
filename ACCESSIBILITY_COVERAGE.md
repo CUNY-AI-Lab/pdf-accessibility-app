@@ -42,7 +42,7 @@ Covered areas include:
 Primary implementation:
 - [backend/app/pipeline/orchestrator.py](backend/app/pipeline/orchestrator.py)
 - [backend/app/services/page_intelligence.py](backend/app/services/page_intelligence.py)
-- [backend/app/services/intelligence_gemini_pages.py](backend/app/services/intelligence_gemini_pages.py)
+- [backend/app/services/intelligence_pages.py](backend/app/services/intelligence_pages.py)
 
 ### Semantic adjudication for hard regions
 
@@ -60,7 +60,7 @@ This is the main product differentiator: the app no longer treats all semantic a
 
 Primary implementation:
 - [backend/app/services/semantic_units.py](backend/app/services/semantic_units.py)
-- [backend/app/services/intelligence_gemini_semantics.py](backend/app/services/intelligence_gemini_semantics.py)
+- [backend/app/services/intelligence_semantics.py](backend/app/services/intelligence_semantics.py)
 
 ### Forms
 
