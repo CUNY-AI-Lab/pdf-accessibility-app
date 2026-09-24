@@ -45,15 +45,10 @@ class Settings(BaseSettings):
     gemini_direct_thinking_budget: int = 0
     gemini_direct_alt_text_thinking_level: str = "medium"
     gemini_direct_alt_text_thinking_budget: int = 0
-    semantic_media_backend: str = "gemini"
-    local_semantic_base_url: str = "http://127.0.0.1:8000/v1"
-    local_semantic_api_key: str = ""
-    local_semantic_model: str = ""
-    local_semantic_timeout: int = 120
-    local_semantic_max_retries: int = 1
-    local_semantic_max_concurrency: int = 2
-    local_semantic_page_candidate_batch_size: int = 1
-    local_semantic_bookmark_preview_pages: int = 4
+    # Page images carry less than a PDF, so image requests ask about a page's
+    # form fields in batches and show bookmarks a sample of pages.
+    llm_page_candidate_batch_size: int = 12
+    llm_bookmark_preview_pages: int = 4
     llm_timeout: int = 120
     llm_pretag_timeout: int = 45
     llm_pretag_fallback_timeout: int = 15
@@ -194,11 +189,6 @@ class Settings(BaseSettings):
             if api_key.lower() in PLACEHOLDER_LLM_KEYS:
                 raise ValueError(
                     "LLM_API_KEY is required for remote LLM endpoints (set a real API key in .env)"
-                )
-            if "gemini" not in model.lower():
-                raise ValueError(
-                    "Remote LLM endpoint must use a Gemini model "
-                    "(expected LLM_MODEL to contain 'gemini')"
                 )
         return self
 

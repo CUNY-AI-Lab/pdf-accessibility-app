@@ -3,8 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
-from app.services.gemini_direct import request_direct_gemini_pdf_json
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
+from app.services.intelligence_llm_utils import request_pdf_pages_json
 from app.services.semantic_units import SemanticUnit
 
 _DEFAULT_ADJUDICATE_SEMANTIC_UNIT = adjudicate_semantic_unit
@@ -147,7 +147,8 @@ async def generate_toc_group_intelligence(
             ),
         }
 
-    parsed = await request_direct_gemini_pdf_json(
+    parsed = await request_pdf_pages_json(
+        schema_name="toc_group_decision",
         pdf_path=pdf_path,
         page_numbers=pages,
         prompt=TOC_GROUP_DIRECT_PROMPT,

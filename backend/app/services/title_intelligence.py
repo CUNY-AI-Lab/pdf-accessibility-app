@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.pipeline.structure import _collapse_spaced_title_caps
-from app.services.gemini_direct import request_direct_gemini_pdf_json
+from app.services.intelligence_llm_utils import request_pdf_pages_json
 from app.services.llm_client import LlmClient
 
 TITLE_DECISION_SCHEMA: dict[str, Any] = {
@@ -102,7 +102,8 @@ async def enhance_document_title_with_intelligence(
         "title_candidates": candidates,
         "current_title": existing_title,
     }
-    parsed = await request_direct_gemini_pdf_json(
+    parsed = await request_pdf_pages_json(
+        schema_name="title_decision",
         pdf_path=pdf_path,
         page_numbers=list(range(1, TITLE_MAX_PAGES + 1)),
         prompt=TITLE_INTELLIGENCE_PROMPT,

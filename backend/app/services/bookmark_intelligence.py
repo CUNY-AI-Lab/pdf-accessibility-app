@@ -8,6 +8,7 @@ from app.config import get_settings
 from app.services.gemini_direct import (
     create_direct_gemini_pdf_cache,
     delete_direct_gemini_pdf_cache,
+    direct_gemini_pdf_enabled,
     request_direct_gemini_cached_json,
 )
 from app.services.intelligence_llm_utils import (
@@ -17,7 +18,6 @@ from app.services.intelligence_llm_utils import (
     request_llm_json,
 )
 from app.services.llm_client import LlmClient
-from app.services.local_semantic import local_semantic_enabled
 
 BOOKMARK_DOCUMENT_CANDIDATE_PLAN_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -334,7 +334,7 @@ def _sample_preview_pages(pages: list[int], *, limit: int = 4) -> list[int]:
     return sampled
 
 
-def _bookmark_prompt_for_local(preview_prompt: str) -> str:
+def _bookmark_prompt_for_images(preview_prompt: str) -> str:
     return preview_prompt.replace("cached PDF", "page preview images").replace(
         "cached pdf", "page preview images"
     )
@@ -374,7 +374,7 @@ def _pages_from_outline_candidates(entries: list[dict[str, Any]]) -> list[int]:
     return pages
 
 
-def _local_bookmark_preview_pages(
+def _bookmark_preview_pages(
     *,
     base_pages: list[int],
     extra_pages: list[int] | None = None,
@@ -384,7 +384,7 @@ def _local_bookmark_preview_pages(
         pages.extend(extra_pages)
     sampled = _sample_preview_pages(
         pages,
-        limit=max(1, int(get_settings().local_semantic_bookmark_preview_pages or 4)),
+        limit=max(1, int(get_settings().llm_bookmark_preview_pages)),
     )
     return sampled or [1]
 
@@ -400,10 +400,10 @@ async def _request_bookmark_json(
     preview_pages: list[int] | None = None,
     cache_handle: Any | None = None,
 ) -> dict[str, Any]:
-    if local_semantic_enabled():
+    if not direct_gemini_pdf_enabled():
         job = _bookmark_job_for_preview(pdf_path, original_filename)
         content = [
-            {"type": "text", "text": _bookmark_prompt_for_local(prompt)},
+            {"type": "text", "text": _bookmark_prompt_for_images(prompt)},
             *page_preview_parts(job, preview_pages or [1]),
             context_json_part(context_payload),
         ]
@@ -1331,9 +1331,9 @@ async def enhance_bookmark_structure_with_intelligence(
         candidate_payload,
         structure_json.get("elements") or [],
     )
-    use_local_bookmark_backend = local_semantic_enabled()
+    use_page_images = not direct_gemini_pdf_enabled()
     cache_handle = None
-    if not use_local_bookmark_backend:
+    if not use_page_images:
         cache_handle = await create_direct_gemini_pdf_cache(
             pdf_path=pdf_path,
             system_instruction=BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
@@ -1355,7 +1355,7 @@ async def enhance_bookmark_structure_with_intelligence(
             prompt=BOOKMARK_DOCUMENT_CANDIDATE_PLAN_PROMPT,
             context_payload=candidate_context,
             response_schema=BOOKMARK_DOCUMENT_CANDIDATE_PLAN_SCHEMA,
-            preview_pages=_local_bookmark_preview_pages(
+            preview_pages=_bookmark_preview_pages(
                 base_pages=list(candidate_payload.get("pages") or []),
             ),
         )
@@ -1420,7 +1420,7 @@ async def enhance_bookmark_structure_with_intelligence(
                         ),
                     },
                     response_schema=BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_SCHEMA,
-                    preview_pages=_local_bookmark_preview_pages(
+                    preview_pages=_bookmark_preview_pages(
                         base_pages=_pages_from_outline_entries(outline_entries),
                         extra_pages=_pages_from_outline_candidates(remaining_heading_candidates),
                     ),
@@ -1458,7 +1458,7 @@ async def enhance_bookmark_structure_with_intelligence(
                     "selected_outline_entries": _serialize_selected_outline_for_landmark_llm(outline_entries),
                 },
                 response_schema=BOOKMARK_DOCUMENT_LANDMARK_PLAN_SCHEMA,
-                preview_pages=_local_bookmark_preview_pages(
+                preview_pages=_bookmark_preview_pages(
                     base_pages=_pages_from_outline_entries(outline_entries),
                     extra_pages=[
                         _int_or_default(entry.get("page"), -1)

@@ -264,6 +264,10 @@ def test_materialize_outline_entries_preserves_toc_preferred_label():
 
 
 def test_bookmark_intelligence_uses_direct_gemini_cached_path(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.direct_gemini_pdf_enabled",
+        lambda: True,
+    )
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path, page_count=5)
     seen_calls: list[tuple[str, dict[str, object]]] = []
@@ -370,7 +374,7 @@ def test_bookmark_intelligence_uses_direct_gemini_cached_path(monkeypatch, tmp_p
     assert audit["front_matter_applied"] is True
 
 
-def test_bookmark_intelligence_uses_local_semantic_preview_path(monkeypatch, tmp_path):
+def test_bookmark_intelligence_sends_page_images_on_the_chat_lane(monkeypatch, tmp_path):
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path, page_count=5)
     seen_calls: list[tuple[str, list[dict[str, object]]]] = []
@@ -432,8 +436,8 @@ def test_bookmark_intelligence_uses_local_semantic_preview_path(monkeypatch, tmp
         }
 
     monkeypatch.setattr(
-        "app.services.bookmark_intelligence.local_semantic_enabled",
-        lambda: True,
+        "app.services.bookmark_intelligence.direct_gemini_pdf_enabled",
+        lambda: False,
     )
     monkeypatch.setattr(
         "app.services.bookmark_intelligence.create_direct_gemini_pdf_cache",
@@ -497,6 +501,10 @@ def test_bookmark_intelligence_uses_local_semantic_preview_path(monkeypatch, tmp
 
 
 def test_bookmark_intelligence_uses_prefetched_front_matter_entries(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "app.services.bookmark_intelligence.direct_gemini_pdf_enabled",
+        lambda: True,
+    )
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path, page_count=4)
     seen_candidate_contexts: list[dict[str, object]] = []

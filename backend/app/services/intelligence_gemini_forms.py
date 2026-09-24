@@ -5,6 +5,7 @@ from typing import Any
 
 from app.config import get_settings
 from app.models import Job
+from app.services.gemini_direct import direct_gemini_pdf_enabled
 from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
 from app.services.intelligence_llm_utils import (
@@ -14,7 +15,6 @@ from app.services.intelligence_llm_utils import (
     semantic_page_parts,
 )
 from app.services.llm_client import LlmClient
-from app.services.local_semantic import local_semantic_enabled
 from app.services.semantic_units import SemanticUnit
 
 FORM_BATCH_PROMPT = """You are a PDF accessibility form-label assistant.
@@ -158,12 +158,14 @@ def _batch_prompt_target(target: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _local_page_target_batches(targets: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+def _page_target_batches(targets: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Fields to ask about per request. Page images carry less than the PDF
+    itself, so the image lane asks about a page's fields in batches."""
     if not targets:
         return []
-    if not local_semantic_enabled():
+    if direct_gemini_pdf_enabled():
         return [targets]
-    batch_size = max(1, int(get_settings().local_semantic_page_candidate_batch_size or 12))
+    batch_size = max(1, int(get_settings().llm_page_candidate_batch_size))
     return [targets[index : index + batch_size] for index in range(0, len(targets), batch_size)]
 
 
@@ -269,10 +271,10 @@ async def generate_form_intelligence_for_page(
     if not targets:
         return []
     decision_map: dict[str, dict[str, Any]] = {}
-    batches = _local_page_target_batches(targets)
-    if local_semantic_enabled() and len(batches) > 1:
+    batches = _page_target_batches(targets)
+    if len(batches) > 1:
         settings = get_settings()
-        semaphore = asyncio.Semaphore(max(1, int(settings.local_semantic_max_concurrency or 2)))
+        semaphore = asyncio.Semaphore(max(1, int(settings.llm_max_concurrency)))
 
         async def _run_batch(batch: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             async with semaphore:

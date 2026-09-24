@@ -48,7 +48,7 @@ def _job(tmp_path):
 def test_adjudicate_semantic_unit_normalizes_text_block(monkeypatch, tmp_path):
     monkeypatch.setattr(
         intelligence_gemini_semantics,
-        "pdf_file_parts",
+        "semantic_page_parts",
         lambda job, page_numbers, filename=None: [
             {
                 "type": "file",
@@ -130,7 +130,7 @@ def test_adjudicate_semantic_unit_normalizes_text_block(monkeypatch, tmp_path):
 def test_adjudicate_semantic_units_preserves_order(monkeypatch, tmp_path):
     monkeypatch.setattr(
         intelligence_gemini_semantics,
-        "pdf_file_parts",
+        "semantic_page_parts",
         lambda job, page_numbers, filename=None: [
             {
                 "type": "file",
@@ -184,7 +184,7 @@ def test_adjudicate_semantic_units_preserves_order(monkeypatch, tmp_path):
 def test_adjudicate_semantic_unit_repairs_missing_required_payload(monkeypatch, tmp_path):
     monkeypatch.setattr(
         intelligence_gemini_semantics,
-        "pdf_file_parts",
+        "semantic_page_parts",
         lambda job, page_numbers, filename=None: [
             {
                 "type": "file",
@@ -242,7 +242,7 @@ def test_adjudicate_semantic_unit_allows_cross_type_reclassification_for_table(
 ):
     monkeypatch.setattr(
         intelligence_gemini_semantics,
-        "pdf_file_parts",
+        "semantic_page_parts",
         lambda job, page_numbers, filename=None: [
             {
                 "type": "file",

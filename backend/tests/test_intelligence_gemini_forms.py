@@ -192,7 +192,7 @@ def test_generate_form_intelligence_for_page_normalizes_batch_response(monkeypat
     assert result[1]["confidence_score"] == 0.4
 
 
-def test_generate_form_intelligence_for_page_chunks_local_batches(monkeypatch, tmp_path):
+def test_form_fields_on_a_page_are_asked_about_in_batches_on_the_image_lane(monkeypatch, tmp_path):
     call_sizes = []
 
     async def _fake_request_llm_json_with_response(
@@ -226,15 +226,12 @@ def test_generate_form_intelligence_for_page_chunks_local_batches(monkeypatch, t
         lambda job, page_numbers, filename=None: [{"type": "image_url", "image_url": {"url": "data:image/png;base64,page"}}],
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.local_semantic_enabled",
-        lambda: True,
+        "app.services.intelligence_gemini_forms.direct_gemini_pdf_enabled",
+        lambda: False,
     )
     monkeypatch.setattr(
         "app.services.intelligence_gemini_forms.get_settings",
-        lambda: SimpleNamespace(
-            local_semantic_page_candidate_batch_size=2,
-            local_semantic_max_concurrency=2,
-        ),
+        lambda: SimpleNamespace(llm_page_candidate_batch_size=2, llm_max_concurrency=2),
     )
 
     targets = []

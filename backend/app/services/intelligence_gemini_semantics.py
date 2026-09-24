@@ -10,9 +10,7 @@ from app.services.intelligence_llm_utils import (
     context_json_part,
     preferred_cache_breakpoint_index,
     request_llm_json,
-)
-from app.services.intelligence_llm_utils import (
-    semantic_page_parts as pdf_file_parts,
+    semantic_page_parts,
 )
 from app.services.llm_client import LlmClient
 from app.services.pdf_preview import render_bbox_preview_png_data_url
@@ -289,7 +287,7 @@ async def adjudicate_semantic_unit(
         page_numbers.extend(
             page_number for page_number in extra_pages if isinstance(page_number, int)
         )
-    page_images = pdf_file_parts(
+    page_images = semantic_page_parts(
         job,
         page_numbers,
         filename=getattr(job, "original_filename", None),
