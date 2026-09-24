@@ -211,7 +211,14 @@ async def generate_alt_text(
                 used_placeholder_fallback=used_placeholder_fallback,
                 is_decorative=is_decorative,
             )
-            logger.info(f"Generated alt text for figure {fig.index}: {text[:80]}...")
+            logger.info(
+                "Figure %s: %s (%s confidence): %s; %s",
+                fig.index,
+                suggested_action or "no action",
+                confidence,
+                text[:80],
+                str(adjudication.get("reason") or "")[:160],
+            )
             existing[fig.index] = AltTextResult(
                 figure_index=fig.index,
                 generated_text=text,

@@ -3,16 +3,17 @@
 # structure from a docling-serve on the host (DOCLING_SERVE_URL, as in
 # production).
 #   run_pipeline_bench.sh <candidate> <subset> [--worktree] [--gateway-ocr]
-#     [--llm gemini | --llm gateway:<model>] [--shards N]
+#     [--llm gemini:<model> | --llm gateway:<model>] [--shards N]
 # By default the pipeline is production's, from pdf-a11y-eval:prod.
 # --worktree     runs this worktree's app/ (a snapshot, so later edits do not
 #                leak into a running bench) in pdf-a11y-eval:branch, built
 #                from this worktree: docker build -t pdf-a11y-eval:branch .
 # --gateway-ocr  recognizes text through the CAIL Gateway (OCR_ENGINE=gateway),
 #                with the key from the Keychain item "cail-gateway".
-# --llm          turns the app's AI steps on: "gemini" is production's Gemini
-#                setup (direct PDF input; GEMINI_API_KEY must be exported),
-#                "gateway:<model>" sends page images to that Gateway model.
+# --llm          turns the app's AI steps on: "gemini:<model>" is production's
+#                Gemini setup with that model (direct PDF input; GEMINI_API_KEY
+#                must be exported), "gateway:<model>" sends page images to that
+#                Gateway model.
 # Without --llm no model is reachable and the AI steps fail at once, so runs
 # compare the deterministic pipeline.
 set -euo pipefail
@@ -57,11 +58,12 @@ case $llm in
     [ -n "$gateway_ocr" ] && base_url=$gateway
     env+=(-e "LLM_BASE_URL=$base_url" -e LLM_MODEL=gemini-unused
       -e LLM_MAX_RETRIES=0 -e USE_DIRECT_GEMINI_PDF=false) ;;
-  gemini)
+  gemini:*)
     [ -n "$gateway_ocr" ] && { echo "--gateway-ocr needs the Gateway as LLM_BASE_URL" >&2; exit 2; }
     [ -n "${GEMINI_API_KEY:-}" ] || { echo "--llm gemini needs GEMINI_API_KEY exported" >&2; exit 2; }
     env+=(-e LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
-      -e LLM_MODEL=google/gemini-3-flash-preview -e GEMINI_API_KEY -e USE_DIRECT_GEMINI_PDF=true) ;;
+      -e "LLM_MODEL=google/${llm#gemini:}" -e "GEMINI_MODEL=${llm#gemini:}"
+      -e GEMINI_API_KEY -e USE_DIRECT_GEMINI_PDF=true) ;;
   gateway:*)
     env+=(-e "LLM_BASE_URL=$gateway" -e "LLM_MODEL=${llm#gateway:}" -e USE_DIRECT_GEMINI_PDF=false) ;;
   *) echo "unknown --llm $llm" >&2; exit 2 ;;

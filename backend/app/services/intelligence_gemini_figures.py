@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import re
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
@@ -32,6 +33,8 @@ from app.services.intelligence_llm_utils import (
 )
 from app.services.llm_client import LlmClient
 from app.services.semantic_units import SemanticUnit
+
+logger = logging.getLogger(__name__)
 
 MAX_FIGURES_PER_BATCH = 4
 _ALT_TEXT_GLOBAL_GATE_DEPTH: ContextVar[int] = ContextVar(
@@ -378,6 +381,7 @@ async def generate_figure_intelligence(
             async with _alt_text_global_slot():
                 decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)
         except Exception as exc:
+            logger.warning("Figure %s semantics failed: %s", figure.index, exc)
             return _manual_only_figure_result(
                 figure_index=figure.index,
                 reason=f"Figure semantics fallback: {exc}",
@@ -434,7 +438,8 @@ async def generate_figures_intelligence(
                                 system_instruction=FIGURE_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
                                 ttl="900s",
                             )
-                        except Exception:
+                        except Exception as exc:
+                            logger.warning("Figure PDF cache for page %s failed: %s", page, exc)
                             pdf_page_cache = None
 
                     try:
@@ -465,7 +470,8 @@ async def generate_figures_intelligence(
                                         context_payload=context_payload,
                                         response_schema=FIGURE_BATCH_SCHEMA,
                                     )
-                                except Exception:
+                                except Exception as exc:
+                                    logger.warning("Figure batch on page %s failed: %s", page, exc)
                                     parsed = None
                             if parsed is None:
                                 page_images: list[dict[str, Any]] = page_preview_parts(job, [page])
@@ -496,7 +502,8 @@ async def generate_figures_intelligence(
                                         response_schema=FIGURE_BATCH_SCHEMA,
                                         cache_breakpoint_index=len(page_images) if page_images else 0,
                                     )
-                                except Exception:
+                                except Exception as exc:
+                                    logger.warning("Figure batch on page %s failed: %s", page, exc)
                                     parsed = None
 
                             chunk_index_set = {figure.index for figure in chunk}
