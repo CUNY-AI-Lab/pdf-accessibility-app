@@ -1,14 +1,12 @@
-"""Produce olmOCR-Bench candidate outputs from the full remediation pipeline.
+"""Remediate benchmark PDFs with the full pipeline.
 
-Each single-page benchmark PDF goes through the production ``run_pipeline``
-(classification, OCR, Docling structure, tagging, validation, fidelity). The
-tagged output is then read the way a screen reader reads it
-(``app/services/structure_text.py``), and that text is written where the olmOCR-Bench
-scorer expects it:
-
-    <bench_dir>/<candidate>/<subset>/<pdf stem>_pg1_repeat1.md
-
-The remediated PDFs are kept next to the Markdown for inspection.
+Each PDF in ``<bench_dir>/pdfs/<subset>/`` goes through the production
+``run_pipeline`` (classification, OCR, Docling structure, tagging,
+validation, fidelity). The tagged result is saved as
+``<bench_dir>/<candidate>/<subset>/<stem>.tagged.pdf``; a PDF the pipeline
+produced nothing for gets ``<stem>.failed`` holding the job's status. Either
+file marks the PDF done, so an interrupted run resumes where it stopped;
+delete ``.failed`` files to retry them. The scorers read the tagged PDFs.
 """
 
 from __future__ import annotations
@@ -27,7 +25,6 @@ from app.config import get_settings
 from app.models import Base, Job, JobStep
 from app.pipeline.orchestrator import run_pipeline
 from app.services.job_manager import JobManager
-from app.services.structure_text import screen_reader_text
 
 OWNER = "0" * 64
 
@@ -80,16 +77,16 @@ async def main() -> None:
             out_dir.mkdir(parents=True, exist_ok=True)
             pdfs = sorted((options.bench_dir / "pdfs" / subset).glob("*.pdf"))
             for pdf in pdfs[shard::shards]:
-                target = out_dir / f"{pdf.stem}_pg1_repeat1.md"
-                if target.exists():
+                tagged = out_dir / f"{pdf.stem}.tagged.pdf"
+                failed = out_dir / f"{pdf.stem}.failed"
+                if tagged.exists() or failed.exists():
                     continue
                 output, status = await remediate(pdf, session_maker, settings, job_manager)
-                text = ""
                 if output is not None and output.exists():
-                    shutil.copy(output, out_dir / f"{pdf.stem}.tagged.pdf")
-                    text = screen_reader_text(output)
-                target.write_text(text, encoding="utf-8")
-                print(f"{subset}/{pdf.name}: {status} ({len(text.split())} words)", flush=True)
+                    shutil.copy(output, tagged)
+                else:
+                    failed.write_text(status + "\n", encoding="utf-8")
+                print(f"{subset}/{pdf.name}: {status}", flush=True)
         await engine.dispose()
 
 

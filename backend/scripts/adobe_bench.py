@@ -2,10 +2,9 @@
 
 For each benchmark PDF, runs Adobe PDF Services the way Acrobat Pro remediates
 a scan: the OCR operation (searchable image), then Auto-Tag. The tagged PDF is
-read as a screen reader would (``app/services/structure_text.py``) and written
-where the olmOCR-Bench scorer expects it:
-
-    <bench_dir>/<candidate>/<subset>/<pdf stem>_pg1_repeat1.md
+saved as ``<bench_dir>/<candidate>/<subset>/<stem>.tagged.pdf``, which the
+scorers read, with Adobe's Auto-Tag report beside it. A PDF with a tagged
+result is skipped, so a run can be resumed.
 
 Each page costs two Adobe document transactions, recorded one per completed
 operation in the same local ledger, under the same monthly cap, as
@@ -30,8 +29,6 @@ from adobe_accessibility_check import (
     _load_credentials,
     _record_usage,
 )
-
-from app.services.structure_text import screen_reader_text
 
 TRANSACTIONS_PER_PAGE = 2
 
@@ -105,9 +102,8 @@ def main() -> int:
     for subset in options.subsets:
         out_dir = options.bench_dir / options.candidate / subset
         for pdf in sorted((options.bench_dir / "pdfs" / subset).glob("*.pdf")):
-            target = out_dir / f"{pdf.stem}_pg1_repeat1.md"
-            if not target.exists():
-                jobs.append((pdf, out_dir, target))
+            if not (out_dir / f"{pdf.stem}.tagged.pdf").exists():
+                jobs.append((pdf, out_dir))
 
     month = _current_month()
     planned = TRANSACTIONS_PER_PAGE * len(jobs)
@@ -123,7 +119,7 @@ def main() -> int:
         return 2
     credentials = _load_credentials(Path(options.credentials).expanduser())
 
-    for pdf, out_dir, target in jobs:
+    for pdf, out_dir in jobs:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         def record(pdf: Path = pdf, out_dir: Path = out_dir) -> None:
@@ -136,13 +132,11 @@ def main() -> int:
             )
 
         try:
-            tagged, _report = adobe_remediate(pdf, out_dir, credentials, record)
+            adobe_remediate(pdf, out_dir, credentials, record)
         except Exception as exc:  # noqa: BLE001 - report and continue the batch
             print(f"{pdf.parent.name}/{pdf.name}: Adobe failed: {exc}", flush=True)
             continue
-        text = screen_reader_text(tagged)
-        target.write_text(text, encoding="utf-8")
-        print(f"{pdf.parent.name}/{pdf.name}: {len(text.split())} words", flush=True)
+        print(f"{pdf.parent.name}/{pdf.name}: tagged", flush=True)
     return 0
 
 
