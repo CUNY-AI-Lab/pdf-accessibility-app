@@ -15,13 +15,19 @@ both the current app (v1) and Adobe Acrobat's tagging on the same documents.
   Worker (OCR, pikepdf, veraPDF, Docling or its replacement) run in one compute
   service the Worker calls. v1 keeps serving until v2 wins.
 - **Beats v1 and Adobe when,** on the evaluation suite in
-  [ocr-evaluation.md](ocr-evaluation.md), scored on what a screen reader
-  hears:
-  - OCR: v2 scores above v1 and Adobe on printed old books and on
-    `old_scans`, with 95% confidence intervals that do not overlap.
-  - Tagging (strip-and-restore corpus): v2 matches or beats Adobe on veraPDF
-    PDF/UA-1 failures, reading order, headings, tables, and lists, and never
-    regresses against v1 in any category.
+  [evaluation.md](evaluation.md), scored on what a screen reader hears. The
+  documents that matter most are printed books and articles, scanned or born
+  digital; handwriting is a side case.
+  - Text and reading order: v2 scores above v1 and Adobe on printed old books
+    and born-digital multi-column pages, with 95% confidence intervals that do
+    not overlap.
+  - Page furniture: running heads, footers, and page numbers become artifacts
+    (the benchmark's `headers_footers` absent tests).
+  - Tables: header and data cells, and their neighbors, survive into the tags
+    (the benchmark's table tests, read from the tag tree).
+  - Structure (strip-and-restore corpus): v2 matches or beats Adobe on veraPDF
+    PDF/UA-1 failures, headings, lists, figures and alt text, title, and
+    language, and never regresses against v1 in any category.
   - No recognized text is dropped from the structure tree.
 - **Targets** are set once the v1, v1-fixed, and Adobe baselines are measured.
 
