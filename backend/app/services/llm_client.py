@@ -205,7 +205,8 @@ class LlmClient:
                     max_backoff_seconds=self.max_backoff_seconds,
                 )
                 logger.warning(
-                    "LLM request failed (%s), retrying in %.1fs [attempt %s/%s]",
+                    "LLM request failed (%s: %s), retrying in %.1fs [attempt %s/%s]",
+                    type(exc).__name__,
                     exc,
                     delay,
                     attempt_number,
@@ -222,6 +223,13 @@ class LlmClient:
                 "/chat/completions",
                 json={"model": self.model, "messages": messages, **kwargs},
             )
+            if response.is_error:
+                logger.warning(
+                    "LLM request to %s refused (%s): %s",
+                    self.model,
+                    response.status_code,
+                    _error_message(response),
+                )
             response.raise_for_status()
             payload = response.json()
             _record_response_usage(payload)
@@ -229,6 +237,17 @@ class LlmClient:
 
     async def close(self):
         await self.client.aclose()
+
+
+def _error_message(response: httpx.Response) -> str:
+    """The provider's own explanation of a refused request, if it gave one."""
+    try:
+        error = response.json().get("error")
+    except ValueError:
+        return response.text[:300]
+    if isinstance(error, dict):
+        return str(error.get("message") or error)[:300]
+    return str(error or response.text)[:300]
 
 
 def make_llm_client(settings: Any) -> LlmClient:

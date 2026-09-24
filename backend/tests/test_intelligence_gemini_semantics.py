@@ -278,3 +278,21 @@ def test_adjudicate_semantic_unit_allows_cross_type_reclassification_for_table(
 
     assert decision.suggested_action == "reclassify_region"
     assert decision.resolved_kind == "org_chart"
+
+
+def test_unit_images_are_not_repeated_as_prompt_text():
+    from app.services.semantic_units import SemanticUnit
+
+    data_url = "data:image/png;base64," + "A" * 100_000
+    unit = SemanticUnit(
+        unit_id="figure-0",
+        unit_type="figure",
+        page=1,
+        accessibility_goal="Describe the figure.",
+        metadata={"extra_image_data_urls": [data_url], "figure_index": 0},
+    )
+
+    prompt = unit.to_prompt_dict()
+
+    assert prompt["metadata"] == {"figure_index": 0}
+    assert unit.metadata["extra_image_data_urls"] == [data_url]
