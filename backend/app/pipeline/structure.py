@@ -953,7 +953,7 @@ def _get_caption_text(item: dict, doc_dict: dict) -> str | None:
     return " ".join(texts).strip() or None
 
 
-def _table_cell_bbox(cell: dict, page_height: float | None) -> dict | None:
+def _docling_cell_bbox(cell: dict, page_height: float | None) -> dict | None:
     """A Docling table cell's box in bottom-left coordinates, like element
     boxes. Docling gives cell boxes top-left, fitted to the cell's text."""
     bbox = cell.get("bbox")
@@ -973,7 +973,7 @@ def _normalize_table_cells(table_data: dict, page_height: float | None = None) -
     return [
         {
             "text": cell.get("text", ""),
-            "bbox": _table_cell_bbox(cell, page_height),
+            "bbox": _docling_cell_bbox(cell, page_height),
             "row": cell.get("start_row_offset_idx", 0),
             "col": cell.get("start_col_offset_idx", 0),
             "row_span": cell.get("row_span", 1),

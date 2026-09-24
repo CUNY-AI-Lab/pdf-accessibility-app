@@ -457,3 +457,28 @@ def test_extract_title_from_docling_uses_only_docling_title_labels():
     title = _extract_title_from_docling(doc_dict, elements=[])
 
     assert title == "CHAPTER 5"
+
+
+def test_table_cell_boxes_are_converted_to_bottom_left_like_element_boxes():
+    from app.pipeline.structure import _normalize_table_cells
+
+    table_data = {
+        "table_cells": [
+            {
+                "text": "Category",
+                "start_row_offset_idx": 0,
+                "start_col_offset_idx": 0,
+                "bbox": {"l": 74.0, "t": 102.0, "r": 110.0, "b": 111.5, "coord_origin": "TOPLEFT"},
+            },
+            {
+                "text": "Region",
+                "start_row_offset_idx": 0,
+                "start_col_offset_idx": 1,
+                "bbox": {"l": 167.0, "t": 691.7, "r": 195.0, "b": 682.2,
+                         "coord_origin": "BOTTOMLEFT"},
+            },
+        ]
+    }
+    cells = _normalize_table_cells(table_data, page_height=793.7)
+    assert cells[0]["bbox"] == pytest.approx({"l": 74.0, "b": 682.2, "r": 110.0, "t": 691.7})
+    assert cells[1]["bbox"] == pytest.approx({"l": 167.0, "b": 682.2, "r": 195.0, "t": 691.7})
