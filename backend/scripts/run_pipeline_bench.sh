@@ -21,7 +21,7 @@ env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001 -e LLM_MAX_RETRIES=0
 while [ $# -gt 0 ]; do
   case $1 in
     --worktree)
-      snapshot=$bench/.app-snapshot-$candidate
+      snapshot=$bench/.app-snapshot-$candidate-$subset
       rm -rf "$snapshot"; cp -R "$backend/app" "$snapshot"
       mounts=(-v "$bench:/bench" -v "$backend/scripts/pipeline_bench.py:/app/backend/pipeline_bench.py:ro"
         -v "$snapshot:/app/backend/app:ro") ;;
