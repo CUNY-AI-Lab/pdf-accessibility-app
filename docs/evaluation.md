@@ -110,8 +110,7 @@ Published third-party `old_scans` scores: PaddleOCR-VL-1.5 39.2, Mistral OCR 3
 
 - The production pipeline hears far less than its own OCR produced: the tagger
   kept one text object per paragraph and marked the rest of an OCR'd
-  paragraph's lines as artifacts. Fixed in the tagger; the fixed pipeline is
-  being measured.
+  paragraph's lines as artifacts. Fixed in the tagger (see printed books).
 - Adobe loses text the same way at a smaller scale: it hears about a third of
   its own text layer. Auto-Tag often wraps typed letter text in Figure tags
   without alt text, and its OCR read some handwritten pages as Arabic script.
