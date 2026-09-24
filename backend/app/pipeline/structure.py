@@ -225,6 +225,12 @@ def _walk_body_tree(doc_dict: dict) -> list[dict]:
     return items
 
 
+def _page_height(doc_dict: dict, page_index: int) -> float | None:
+    page = (doc_dict.get("pages") or {}).get(str(page_index + 1)) or {}
+    height = (page.get("size") or {}).get("height")
+    return float(height) if height else None
+
+
 def _extract_bbox(prov: list[dict]) -> dict | None:
     """Extract bounding box from Docling provenance data.
 
@@ -410,7 +416,7 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
                 "caption": _get_caption_text(item, doc_dict),
                 "num_rows": table_data.get("num_rows", 0),
                 "num_cols": table_data.get("num_cols", 0),
-                "cells": _normalize_table_cells(table_data),
+                "cells": _normalize_table_cells(table_data, _page_height(doc_dict, page)),
             })
 
         elif label == "code":
@@ -947,11 +953,27 @@ def _get_caption_text(item: dict, doc_dict: dict) -> str | None:
     return " ".join(texts).strip() or None
 
 
-def _normalize_table_cells(table_data: dict) -> list[dict]:
+def _table_cell_bbox(cell: dict, page_height: float | None) -> dict | None:
+    """A Docling table cell's box in bottom-left coordinates, like element
+    boxes. Docling gives cell boxes top-left, fitted to the cell's text."""
+    bbox = cell.get("bbox")
+    if not isinstance(bbox, dict):
+        return None
+    left, right = float(bbox.get("l", 0)), float(bbox.get("r", 0))
+    top, bottom = float(bbox.get("t", 0)), float(bbox.get("b", 0))
+    if str(bbox.get("coord_origin", "")).upper() == "TOPLEFT":
+        if not page_height:
+            return None
+        top, bottom = page_height - top, page_height - bottom
+    return {"l": left, "b": min(top, bottom), "r": right, "t": max(top, bottom)}
+
+
+def _normalize_table_cells(table_data: dict, page_height: float | None = None) -> list[dict]:
     """Normalize Docling table cells into a simpler format for the tagger."""
     return [
         {
             "text": cell.get("text", ""),
+            "bbox": _table_cell_bbox(cell, page_height),
             "row": cell.get("start_row_offset_idx", 0),
             "col": cell.get("start_col_offset_idx", 0),
             "row_span": cell.get("row_span", 1),

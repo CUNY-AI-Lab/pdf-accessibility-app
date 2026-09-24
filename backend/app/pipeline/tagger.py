@@ -10,6 +10,7 @@ non-sequential content stream ordering.
 """
 
 import asyncio
+import dataclasses
 import logging
 import math
 import mimetypes
@@ -30,6 +31,7 @@ from scipy.optimize import linear_sum_assignment
 
 from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
 from app.pipeline.pdf_repair import add_missing_icc_components
+from app.pipeline.text_geometry import MeasuredGlyph, MeasuredTextOp, measure_text_ops
 
 logger = logging.getLogger(__name__)
 
@@ -1711,6 +1713,158 @@ def _extract_text_show_runs(
     return runs
 
 
+def _split_text_ops_across_targets(
+    instructions: list,
+    measured_ops: list[MeasuredTextOp] | None,
+    elements: list[dict],
+) -> tuple[list, list[MeasuredTextOp] | None]:
+    """Split each TJ whose glyphs land in more than one table cell or text
+    element into consecutive TJs, one per cell or element, at TJ array
+    element boundaries, so each can be tagged on its own. Rendering is
+    unchanged: the text position carries over from one TJ to the next."""
+    if measured_ops is None:
+        return instructions, None
+    op_indices = [
+        idx for idx, instr in enumerate(instructions) if str(instr.operator) in TEXT_SHOW_OPERATORS
+    ]
+    if len(op_indices) != len(measured_ops):
+        return instructions, measured_ops
+
+    cell_boxes = [
+        box
+        for table_idx in _fragmented_table_element_indices(elements)
+        for cell in elements[table_idx].get("cells", [])
+        if isinstance(cell, dict)
+        and (box := _table_cell_bbox(elements[table_idx], cell)) is not None
+    ]
+    element_boxes = [
+        box
+        for _idx, element in _eligible_fragmented_text_elements(elements)
+        if (box := element.get("bbox"))
+    ]
+    targets = cell_boxes + element_boxes
+    if not targets:
+        return instructions, measured_ops
+
+    def target_of(glyph: MeasuredGlyph) -> int | None:
+        cx = (glyph.bbox["l"] + glyph.bbox["r"]) / 2
+        cy = (glyph.bbox["b"] + glyph.bbox["t"]) / 2
+        return next(
+            (index for index, box in enumerate(targets) if _point_in_bbox(cx, cy, box, margin=1.0)),
+            None,
+        )
+
+    measured_by_index = dict(zip(op_indices, measured_ops, strict=True))
+    new_instructions: list = []
+    new_measured: list[MeasuredTextOp] = []
+    for idx, instr in enumerate(instructions):
+        measured = measured_by_index.get(idx)
+        if measured is None:
+            new_instructions.append(instr)
+            continue
+        array = instr.operands[0] if str(instr.operator) == "TJ" and instr.operands else None
+        element_targets: dict[int, int | None] = {}
+        for glyph in measured.glyphs:
+            element_targets.setdefault(glyph.element, target_of(glyph))
+        if not isinstance(array, pikepdf.Array) or len(set(element_targets.values())) < 2:
+            new_instructions.append(instr)
+            new_measured.append(measured)
+            continue
+        # Group array elements by target; a number (a position adjustment)
+        # goes with the string after it.
+        groups: list[list[int]] = [[]]
+        group_target: int | None = None
+        for element_index in range(len(array)):
+            drawn = element_index in element_targets
+            target = element_targets.get(element_index, group_target)
+            group_drawn = any(i in element_targets for i in groups[-1])
+            if drawn and group_drawn and target != group_target:
+                groups.append([])
+            groups[-1].append(element_index)
+            if drawn:
+                group_target = target
+        for group in groups:
+            new_instructions.append(
+                pikepdf.ContentStreamInstruction(
+                    [pikepdf.Array([array[i] for i in group])], pikepdf.Operator("TJ")
+                )
+            )
+            members = set(group)
+            new_measured.append(
+                MeasuredTextOp(
+                    glyphs=[
+                        dataclasses.replace(glyph, element=group.index(glyph.element))
+                        for glyph in measured.glyphs
+                        if glyph.element in members
+                    ]
+                )
+            )
+    return new_instructions, new_measured
+
+
+def _apply_measured_geometry(
+    instructions: list,
+    regions: list[ContentRegion],
+    runs: list[TextShowRun],
+    measured_ops: list[MeasuredTextOp] | None,
+) -> bool:
+    """Give text runs and text regions the text and positions pdfminer measured
+    (see text_geometry) in place of the estimates above. Returns False, leaving
+    the estimates, when this stream's text operators do not line up one to
+    one with the measured ones."""
+    if measured_ops is None:
+        return False
+    op_indices = [
+        idx
+        for idx, instr in enumerate(instructions)
+        if str(instr.operator) in TEXT_SHOW_OPERATORS
+    ]
+    if len(op_indices) != len(measured_ops):
+        logger.warning(
+            "Text operators do not match measured text (%s parsed, %s measured); "
+            "using estimated positions",
+            len(op_indices),
+            len(measured_ops),
+        )
+        return False
+    measured_by_index = dict(zip(op_indices, measured_ops, strict=True))
+
+    for run in runs:
+        measured = measured_by_index.get(run.instruction_idx)
+        bbox = measured.bbox if measured is not None else None
+        if bbox is None:
+            continue
+        run.bbox = bbox
+        run.cx = (bbox["l"] + bbox["r"]) / 2
+        run.cy = (bbox["b"] + bbox["t"]) / 2
+        run.text = measured.text
+
+    for region in regions:
+        if region.kind != "text":
+            continue
+        inside = [
+            measured_by_index[idx]
+            for idx in op_indices
+            if region.start_idx <= idx < region.end_idx and measured_by_index[idx].bbox
+        ]
+        if not inside:
+            continue
+        boxes = [measured.bbox for measured in inside]
+        bbox = {
+            "l": min(box["l"] for box in boxes),
+            "b": min(box["b"] for box in boxes),
+            "r": max(box["r"] for box in boxes),
+            "t": max(box["t"] for box in boxes),
+        }
+        region.bbox = bbox
+        region.cx = (bbox["l"] + bbox["r"]) / 2
+        region.cy = (bbox["b"] + bbox["t"]) / 2
+        region.width = bbox["r"] - bbox["l"]
+        region.height = bbox["t"] - bbox["b"]
+        region.text = _normalize_text(" ".join(measured.text for measured in inside))
+    return True
+
+
 def _text_runs_look_like_hidden_ocr_layer(runs: list[TextShowRun]) -> bool:
     if not runs:
         return False
@@ -1780,6 +1934,10 @@ def _fragmented_table_element_indices(elements: list[dict]) -> set[int]:
 
 
 def _table_cell_bbox(table: dict, cell: dict) -> dict[str, float] | None:
+    """The cell's own box when the structure step has one (Docling's, fitted
+    to the cell text); otherwise an even share of the table's box."""
+    if isinstance(cell.get("bbox"), dict):
+        return cell["bbox"]
     table_bbox = table.get("bbox")
     if not isinstance(table_bbox, dict):
         return None
@@ -1917,6 +2075,10 @@ def _should_use_fragmented_text_rewrite(
     )
     if fragmented_tagged_runs > region_tagged_runs:
         # Region matching would drop recognized text from the structure tree.
+        return True
+    if table_cell_assignments:
+        # Region matching tags a table as one block; only the fragmented
+        # path puts text into its cells.
         return True
 
     eligible_element_indices = {
@@ -3901,6 +4063,7 @@ def _rewrite_content_stream(
     initial_ctm: tuple[float, float, float, float, float, float] = IDENTITY,
     stream_owner: pikepdf.Object | None = None,
     passthrough_regions: list[ContentRegion] | None = None,
+    measured_ops: list[MeasuredTextOp] | None = None,
 ) -> set[int]:
     """Insert BDC/EMC markers into the page's content stream using position-based matching."""
     try:
@@ -3913,7 +4076,12 @@ def _rewrite_content_stream(
     if not instructions:
         return set()
 
+    instructions, measured_ops = _split_text_ops_across_targets(
+        instructions, measured_ops, elements
+    )
     regions = _extract_content_regions(instructions, content_owner, initial_ctm=initial_ctm)
+    text_runs = _extract_text_show_runs(instructions, initial_ctm=initial_ctm)
+    _apply_measured_geometry(instructions, regions, text_runs, measured_ops)
     regions.extend(passthrough_regions or [])
     regions.sort(key=lambda region: region.start_idx)
     matches = _match_regions_to_elements(
@@ -3921,7 +4089,6 @@ def _rewrite_content_stream(
         elements,
         docling_page_lines=docling_page_lines,
     )
-    text_runs = _extract_text_show_runs(instructions, initial_ctm=initial_ctm)
     text_run_assignments = _assign_text_show_runs_to_elements(text_runs, elements)
     table_cell_assignments = _assign_text_show_runs_to_table_cells(text_runs, elements)
     if _should_use_fragmented_text_rewrite(
@@ -5389,6 +5556,7 @@ async def tag_pdf(
         except Exception as e:
             logger.warning(f"docling-parse unavailable for {input_path.name}: {e}")
 
+        measured_text_ops = measure_text_ops(input_path)
         with pikepdf.open(str(input_path)) as pdf:
             elements = structure_json.get("elements", [])
             source_figure_alt_lookup = _source_figure_alt_lookup(pdf, elements)
@@ -5512,6 +5680,7 @@ async def tag_pdf(
                         decorative_figures=decorative_figures,
                         docling_page_lines=page_lines,
                         passthrough_regions=ocr_passthrough_regions,
+                        measured_ops=measured_text_ops.get((page_index, None)),
                     )
                     page_tagged_elements.extend(
                         page_elems[idx]
@@ -5539,6 +5708,9 @@ async def tag_pdf(
                             docling_page_lines=page_lines,
                             initial_ctm=invocation.initial_ctm,
                             stream_owner=invocation.stream,
+                            measured_ops=measured_text_ops.get(
+                                (page_index, invocation.stream.objgen[0])
+                            ),
                         )
                         page_tagged_elements.extend(
                             remaining_elems[idx]
@@ -5575,6 +5747,7 @@ async def tag_pdf(
                         builder, page.obj, alt_lookup,
                         decorative_figures=decorative_figures,
                         docling_page_lines=None,
+                        measured_ops=measured_text_ops.get((page_index, None)),
                     )
 
                 _ensure_annotation_baseline(page)

@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
 import pikepdf
 
 # ICC profile header: the data colour space signature at bytes 16-19, and the
@@ -31,3 +36,23 @@ def add_missing_icc_components(pdf: pikepdf.Pdf) -> int:
             obj.N = components
             repaired += 1
     return repaired
+
+
+@contextmanager
+def pdfminer_readable(pdf_path: Path) -> Iterator[Path]:
+    """The PDF itself, or a repaired copy when it has objects pdfminer
+    cannot read."""
+    with pikepdf.open(pdf_path) as pdf:
+        if not add_missing_icc_components(pdf):
+            repaired = None
+        else:
+            tmp = tempfile.TemporaryDirectory()
+            repaired = Path(tmp.name) / "repaired.pdf"
+            pdf.save(repaired)
+    if repaired is None:
+        yield pdf_path
+        return
+    try:
+        yield repaired
+    finally:
+        tmp.cleanup()
