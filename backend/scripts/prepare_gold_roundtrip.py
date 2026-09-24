@@ -1,9 +1,10 @@
 """Prepare a structure round-trip set from well-tagged gold PDFs.
 
 For each ``name=path`` pair, writes the gold PDF's tags stripped (the pipeline's
-input) to ``<bench>/bench_data/pdfs/<subset>/<name>.pdf``, and the gold
-structure tree as Markdown (what ``score_structure.py`` compares against) to
-``<bench>/<subset>/<name>.md``.
+input) to ``<bench>/bench_data/pdfs/<subset>/<name>.pdf``, and to
+``<bench>/<subset>/`` the gold structure tree as Markdown (``<name>.md``, what
+``score_structure.py`` compares against) and the gold PDF itself (``<name>.pdf``,
+for ``score_semantics.py``).
 
     uv run python scripts/prepare_gold_roundtrip.py --bench data/eval/olmocr-bench \\
         ref_book_chapter=../gold/PDFUA-Ref-2-08_BookChapter.pdf ...
@@ -32,6 +33,7 @@ def main() -> None:
         name, _, path = pair.partition("=")
         source = Path(path)
         strip_accessibility(input_path=source, output_path=stripped_dir / f"{name}.pdf")
+        (gold_dir / f"{name}.pdf").write_bytes(source.read_bytes())
         markdown = screen_reader_text(source, markdown=True)
         (gold_dir / f"{name}.md").write_text(markdown, encoding="utf-8")
         headings = sum(1 for line in markdown.splitlines() if line.startswith("#"))

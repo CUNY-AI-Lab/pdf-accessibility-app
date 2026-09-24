@@ -53,7 +53,9 @@ def track_llm_usage():
 
 
 def _is_retryable(exc: BaseException) -> bool:
-    if isinstance(exc, httpx.TransportError):
+    # Repeat only a request that never reached the provider. After a read
+    # timeout the model may have run, and been paid for, anyway.
+    if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout | httpx.PoolTimeout):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in RETRYABLE_STATUS_CODES
