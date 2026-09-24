@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import logging
 import re
 import subprocess
@@ -1187,6 +1189,106 @@ def _repair_pdf_with_ghostscript(
     return output_path.exists() and output_path.stat().st_size > 0
 
 
+def _save_docling_figures(doc_dict: dict, figures_dir: Path) -> list[FigureInfo]:
+    """Save an image of each figure Docling found, for alt text: the figure's
+    own image when Docling returns one, else a crop of its page image."""
+    figures: list[FigureInfo] = []
+    figures_dir.mkdir(exist_ok=True)
+
+    dict_pictures = doc_dict.get("pictures", [])
+    pages_dict = doc_dict.get("pages", {})
+
+    # Build page image cache: page_no -> PIL Image
+    page_images: dict[int, Image.Image] = {}
+
+    for i, pic in enumerate(dict_pictures):
+        prov = pic.get("prov", [])
+        if not prov:
+            continue
+        page_no = prov[0].get("page_no")
+        bbox_data = prov[0].get("bbox")
+        if page_no is None or not bbox_data:
+            continue
+
+        caption = _get_caption_text(pic, doc_dict)
+        bbox = _extract_bbox(prov)
+
+        fig_path = figures_dir / f"figure_{i}.png"
+        # Docling's own image of the figure; docling-serve 1.35 returns it but
+        # returns page images only when asked (include_page_images).
+        picture_image = pic.get("image")
+        picture_uri = picture_image.get("uri", "") if isinstance(picture_image, dict) else ""
+        if picture_uri.startswith("data:image/"):
+            fig_path.write_bytes(base64.b64decode(picture_uri.split(",", 1)[1]))
+            figures.append(
+                FigureInfo(index=i, path=fig_path, caption=caption, page=page_no - 1, bbox=bbox)
+            )
+            continue
+
+        # Otherwise crop the figure from its page image.
+        if page_no not in page_images:
+            page_key = str(page_no)
+            page_info = pages_dict.get(page_key, {})
+            page_img_data = page_info.get("image", {})
+            uri = page_img_data.get("uri", "") if isinstance(page_img_data, dict) else ""
+            if uri.startswith("data:image/"):
+                try:
+                    from PIL import Image as PILImage
+
+                    # Strip data URI prefix
+                    b64_str = uri.split(",", 1)[1]
+                    img_bytes = base64.b64decode(b64_str)
+                    page_images[page_no] = PILImage.open(io.BytesIO(img_bytes))
+                except Exception as exc:
+                    logger.warning("Failed to decode page %d image: %s", page_no, exc)
+
+        page_img = page_images.get(page_no)
+        if page_img is not None and bbox_data:
+            try:
+                page_size = pages_dict.get(str(page_no), {}).get("size", {})
+                pdf_w = page_size.get("width", 612)
+                pdf_h = page_size.get("height", 792)
+                img_w, img_h = page_img.size
+
+                # Convert bbox from bottom-left PDF coords to top-left pixel coords
+                scale_x = img_w / pdf_w
+                scale_y = img_h / pdf_h
+                crop_l = bbox_data.get("l", 0) * scale_x
+                crop_r = bbox_data.get("r", 0) * scale_x
+                crop_t = (pdf_h - bbox_data.get("t", 0)) * scale_y
+                crop_b = (pdf_h - bbox_data.get("b", 0)) * scale_y
+
+                cropped = page_img.crop((
+                    int(crop_l), int(crop_t), int(crop_r), int(crop_b),
+                ))
+                cropped.save(str(fig_path), "PNG")
+            except Exception as exc:
+                logger.warning("Failed to crop figure %d: %s", i, exc)
+                fig_path = None  # type: ignore[assignment]
+        else:
+            fig_path = None  # type: ignore[assignment]
+
+        if fig_path and fig_path.exists():
+            figures.append(FigureInfo(
+                index=i,
+                path=fig_path,
+                caption=caption,
+                page=page_no - 1,  # Convert to 0-based
+                bbox=bbox,
+            ))
+        else:
+            logger.warning(
+                "No image for figure %d on page %d; it gets no generated alt text", i, page_no
+            )
+
+    # Close PIL images to free memory
+    for img in page_images.values():
+        img.close()
+    page_images.clear()
+
+    return figures
+
+
 async def _convert_via_docling_serve(
     pdf_path: Path,
     job_dir: Path,
@@ -1202,8 +1304,6 @@ async def _convert_via_docling_serve(
     the same Docling ``export_to_dict()`` structure as the local converter.
     Figure images are cropped from embedded page renders using bbox data.
     """
-    import base64
-    import io
     import time
 
     import httpx
@@ -1291,91 +1391,9 @@ async def _convert_via_docling_serve(
     if processing_time is not None:
         logger.info("docling-serve processing_time=%.1fs", processing_time)
 
-    # Extract figure images by cropping from embedded page renders
-    figures: list[FigureInfo] = []
     if not include_figure_images:
-        return doc_dict, figures
-
-    figures_dir = job_dir / "figures"
-    figures_dir.mkdir(exist_ok=True)
-
-    dict_pictures = doc_dict.get("pictures", [])
-    pages_dict = doc_dict.get("pages", {})
-
-    # Build page image cache: page_no -> PIL Image
-    page_images: dict[int, Image.Image] = {}
-
-    for i, pic in enumerate(dict_pictures):
-        prov = pic.get("prov", [])
-        if not prov:
-            continue
-        page_no = prov[0].get("page_no")
-        bbox_data = prov[0].get("bbox")
-        if page_no is None or not bbox_data:
-            continue
-
-        caption = _get_caption_text(pic, doc_dict)
-        bbox = _extract_bbox(prov)
-
-        # Try to crop figure from page image
-        fig_path = figures_dir / f"figure_{i}.png"
-        if page_no not in page_images:
-            page_key = str(page_no)
-            page_info = pages_dict.get(page_key, {})
-            page_img_data = page_info.get("image", {})
-            uri = page_img_data.get("uri", "") if isinstance(page_img_data, dict) else ""
-            if uri.startswith("data:image/"):
-                try:
-                    from PIL import Image as PILImage
-
-                    # Strip data URI prefix
-                    b64_str = uri.split(",", 1)[1]
-                    img_bytes = base64.b64decode(b64_str)
-                    page_images[page_no] = PILImage.open(io.BytesIO(img_bytes))
-                except Exception as exc:
-                    logger.warning("Failed to decode page %d image: %s", page_no, exc)
-
-        page_img = page_images.get(page_no)
-        if page_img is not None and bbox_data:
-            try:
-                page_size = pages_dict.get(str(page_no), {}).get("size", {})
-                pdf_w = page_size.get("width", 612)
-                pdf_h = page_size.get("height", 792)
-                img_w, img_h = page_img.size
-
-                # Convert bbox from bottom-left PDF coords to top-left pixel coords
-                scale_x = img_w / pdf_w
-                scale_y = img_h / pdf_h
-                crop_l = bbox_data.get("l", 0) * scale_x
-                crop_r = bbox_data.get("r", 0) * scale_x
-                crop_t = (pdf_h - bbox_data.get("t", 0)) * scale_y
-                crop_b = (pdf_h - bbox_data.get("b", 0)) * scale_y
-
-                cropped = page_img.crop((
-                    int(crop_l), int(crop_t), int(crop_r), int(crop_b),
-                ))
-                cropped.save(str(fig_path), "PNG")
-            except Exception as exc:
-                logger.warning("Failed to crop figure %d: %s", i, exc)
-                fig_path = None  # type: ignore[assignment]
-        else:
-            fig_path = None  # type: ignore[assignment]
-
-        if fig_path and fig_path.exists():
-            figures.append(FigureInfo(
-                index=i,
-                path=fig_path,
-                caption=caption,
-                page=page_no - 1,  # Convert to 0-based
-                bbox=bbox,
-            ))
-
-    # Close PIL images to free memory
-    for img in page_images.values():
-        img.close()
-    page_images.clear()
-
-    return doc_dict, figures
+        return doc_dict, []
+    return doc_dict, _save_docling_figures(doc_dict, job_dir / "figures")
 
 
 async def extract_structure(

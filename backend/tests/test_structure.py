@@ -482,3 +482,36 @@ def test_table_cell_boxes_are_converted_to_bottom_left_like_element_boxes():
     cells = _normalize_table_cells(table_data, page_height=793.7)
     assert cells[0]["bbox"] == pytest.approx({"l": 74.0, "b": 682.2, "r": 110.0, "t": 691.7})
     assert cells[1]["bbox"] == pytest.approx({"l": 167.0, "b": 682.2, "r": 195.0, "t": 691.7})
+
+
+def test_figures_use_doclings_own_images_without_page_images(tmp_path):
+    import base64
+    import io
+
+    from PIL import Image
+
+    from app.pipeline.structure import _save_docling_figures
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (40, 30), "red").save(buffer, format="PNG")
+    uri = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    doc_dict = {
+        "pages": {"1": {"size": {"width": 612, "height": 792}}},
+        "pictures": [
+            {
+                "prov": [{"page_no": 1, "bbox": {"l": 72, "t": 700, "r": 272, "b": 550,
+                                                 "coord_origin": "BOTTOMLEFT"}}],
+                "image": {"uri": uri},
+                "captions": [],
+            },
+            {"prov": [{"page_no": 1, "bbox": {"l": 72, "t": 400, "r": 272, "b": 250}}]},
+        ],
+    }
+
+    figures = _save_docling_figures(doc_dict, tmp_path / "figures")
+
+    # The first figure has its own image; the second has neither that nor a
+    # page image to crop from, so only the first can get alt text.
+    assert [figure.index for figure in figures] == [0]
+    assert Image.open(figures[0].path).size == (40, 30)
+    assert figures[0].page == 0
