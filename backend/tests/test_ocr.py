@@ -6,12 +6,12 @@ import pytest
 
 from app.config import Settings
 from app.pipeline import ocr
-from app.pipeline.ocr import _build_ocrmypdf_args
+from app.pipeline.ocr import build_ocrmypdf_args
 from app.services import runtime_paths
 
 
-def test_build_ocrmypdf_args_enables_rotate_and_deskew():
-    args = _build_ocrmypdf_args(
+def testbuild_ocrmypdf_args_enables_rotate_and_deskew():
+    args = build_ocrmypdf_args(
         input_path=Path("input.pdf"),
         output_path=Path("output.pdf"),
         language="eng",
@@ -28,8 +28,8 @@ def test_build_ocrmypdf_args_enables_rotate_and_deskew():
     assert args[-2:] == ["input.pdf", "output.pdf"]
 
 
-def test_build_ocrmypdf_args_respects_mode_and_optional_flags():
-    args = _build_ocrmypdf_args(
+def testbuild_ocrmypdf_args_respects_mode_and_optional_flags():
+    args = build_ocrmypdf_args(
         input_path=Path("input.pdf"),
         output_path=Path("output.pdf"),
         language="eng",
@@ -44,8 +44,8 @@ def test_build_ocrmypdf_args_respects_mode_and_optional_flags():
     assert "--skip-text" not in args
 
 
-def test_build_ocrmypdf_args_omits_deskew_in_redo_mode():
-    args = _build_ocrmypdf_args(
+def testbuild_ocrmypdf_args_omits_deskew_in_redo_mode():
+    args = build_ocrmypdf_args(
         input_path=Path("input.pdf"),
         output_path=Path("output.pdf"),
         language="eng",
@@ -59,8 +59,8 @@ def test_build_ocrmypdf_args_omits_deskew_in_redo_mode():
     assert "--deskew" not in args
 
 
-def test_build_ocrmypdf_args_accepts_resource_limits():
-    args = _build_ocrmypdf_args(
+def testbuild_ocrmypdf_args_accepts_resource_limits():
+    args = build_ocrmypdf_args(
         input_path=Path("input.pdf"),
         output_path=Path("output.pdf"),
         language="eng",
@@ -107,7 +107,7 @@ def test_enriched_subprocess_env_adds_configured_binary_dirs(monkeypatch):
 
 
 def test_gateway_engine_loads_the_plugin_and_runs_pages_in_parallel():
-    args = _build_ocrmypdf_args(
+    args = build_ocrmypdf_args(
         input_path=Path("input.pdf"),
         output_path=Path("output.pdf"),
         language="eng",

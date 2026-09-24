@@ -1,13 +1,15 @@
 """Produce olmOCR-Bench candidate outputs from the app's OCR stage.
 
 Runs the production OCRmyPDF command (built by the app's own
-``_build_ocrmypdf_args``) on each single-page benchmark PDF, extracts the
+``build_ocrmypdf_args``) on each single-page benchmark PDF, extracts the
 resulting text layer with pdfminer, and writes the Markdown files the
 olmOCR-Bench scorer expects:
 
     <bench_dir>/<candidate>/<subset>/<pdf stem>_pg1_repeat1.md
 
-Score afterwards with ``python -m olmocr.bench.benchmark --dir <bench_dir>``.
+Score afterwards with ``scripts/score_olmocr.py``. For the Gateway engine,
+pass ``--extra "--plugin app.pipeline.ocr_vlm_plugin"`` and the ``CAIL_OCR_*``
+environment the OCR step sets (see ``app/pipeline/ocr_vlm_plugin.py``).
 
 This measures the OCR text layer only. What a screen reader finally hears
 also depends on Docling's layout and the tagger, which a full-pipeline run
@@ -24,13 +26,14 @@ from pathlib import Path
 
 from pdfminer.high_level import extract_text
 
-from app.pipeline.ocr import _build_ocrmypdf_args
+from app.pipeline.ocr import build_ocrmypdf_args
+from app.pipeline.pdf_repair import pdfminer_readable
 
 DEFAULT_SUBSETS = ("old_scans", "long_tiny_text", "multi_column")
 
 
 def ocr_args(pdf: Path, output: Path, language: str, extra: list[str]) -> list[str]:
-    args = _build_ocrmypdf_args(
+    args = build_ocrmypdf_args(
         input_path=pdf,
         output_path=output,
         language=language,
@@ -42,16 +45,11 @@ def ocr_args(pdf: Path, output: Path, language: str, extra: list[str]) -> list[s
     return [*args[:-2], *extra, *args[-2:]]
 
 
-def page_text(pdf: Path) -> tuple[str, str]:
-    """The text layer, via pdfminer (what the app's fidelity checks read), or
-    Poppler's pdftotext when pdfminer cannot parse the file."""
-    try:
-        return extract_text(str(pdf)), "pdfminer"
-    except Exception:  # noqa: BLE001 - any parser failure falls back
-        result = subprocess.run(
-            ["pdftotext", str(pdf), "-"], capture_output=True, text=True, check=False
-        )
-        return result.stdout, "pdftotext"
+def page_text(pdf: Path) -> str:
+    """The text layer as pdfminer reads it, which is how the app's fidelity
+    checks read it."""
+    with pdfminer_readable(pdf) as readable:
+        return extract_text(str(readable))
 
 
 def convert(pdf: Path, target: Path, language: str, extra: list[str]) -> str:
@@ -72,9 +70,9 @@ def convert(pdf: Path, target: Path, language: str, extra: list[str]) -> str:
             # No output is written, so the next run retries the page.
             reason = (result.stderr.strip().splitlines() or [""])[-1]
             return f"exit {result.returncode}: {reason}"
-        text, extractor = page_text(output if output.exists() else pdf)
+        text = page_text(output if output.exists() else pdf)
     target.write_text(text, encoding="utf-8")
-    return f"exit {result.returncode} ({extractor})"
+    return f"exit {result.returncode}"
 
 
 def main() -> None:

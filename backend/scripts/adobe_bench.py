@@ -7,9 +7,10 @@ where the olmOCR-Bench scorer expects it:
 
     <bench_dir>/<candidate>/<subset>/<pdf stem>_pg1_repeat1.md
 
-Each page costs two Adobe document transactions, recorded in the same local
-ledger as ``adobe_accessibility_check.py``. Nothing is sent without
-``--confirm-spend``. Run with ``uv run --with pdfservices-sdk``.
+Each page costs two Adobe document transactions, recorded one per completed
+operation in the same local ledger, under the same monthly cap, as
+``adobe_accessibility_check.py``. Nothing is sent without ``--confirm-spend``.
+Run with ``uv run --with pdfservices-sdk``.
 """
 
 from __future__ import annotations
@@ -17,10 +18,12 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from adobe_accessibility_check import (
     DEFAULT_LEDGER_PATH,
+    DEFAULT_MONTHLY_LIMIT,
     AdobeCredentials,
     _assert_monthly_quota,
     _current_month,
@@ -33,8 +36,11 @@ from app.services.structure_text import screen_reader_text
 TRANSACTIONS_PER_PAGE = 2
 
 
-def adobe_remediate(pdf: Path, out_dir: Path, credentials: AdobeCredentials) -> tuple[Path, Path]:
-    """OCR then Auto-Tag one PDF; returns the tagged PDF and Adobe's report."""
+def adobe_remediate(
+    pdf: Path, out_dir: Path, credentials: AdobeCredentials, record: Callable[[], None]
+) -> tuple[Path, Path]:
+    """OCR then Auto-Tag one PDF, calling ``record`` after each operation
+    Adobe completes; returns the tagged PDF and Adobe's report."""
     from adobe.pdfservices.operation.auth.service_principal_credentials import (
         ServicePrincipalCredentials,
     )
@@ -64,11 +70,13 @@ def adobe_remediate(pdf: Path, out_dir: Path, credentials: AdobeCredentials) -> 
         ocr_pdf_params=OCRParams(ocr_type=OCRSupportedType.SEARCHABLE_IMAGE),
     )
     ocr_result = services.get_job_result(services.submit(ocr_job), OCRPDFResult).get_result()
+    record()
     tag_job = AutotagPDFJob(
         ocr_result.get_asset(),
         autotag_pdf_params=AutotagPDFParams(generate_report=True),
     )
     tag_result = services.get_job_result(services.submit(tag_job), AutotagPDFResult).get_result()
+    record()
 
     tagged = out_dir / f"{pdf.stem}.tagged.pdf"
     report = out_dir / f"{pdf.stem}.autotag-report.xlsx"
@@ -89,7 +97,7 @@ def main() -> int:
         help="Adobe credentials JSON or PDFServicesAPI-Credentials.zip.",
     )
     parser.add_argument("--quota-ledger", type=Path, default=DEFAULT_LEDGER_PATH)
-    parser.add_argument("--monthly-limit", type=int, default=450)
+    parser.add_argument("--monthly-limit", type=int, default=DEFAULT_MONTHLY_LIMIT)
     parser.add_argument("--confirm-spend", action="store_true")
     options = parser.parse_args()
 
@@ -117,19 +125,21 @@ def main() -> int:
 
     for pdf, out_dir, target in jobs:
         out_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            tagged, report = adobe_remediate(pdf, out_dir, credentials)
-        except Exception as exc:  # noqa: BLE001 - record and continue the batch
-            print(f"{pdf.parent.name}/{pdf.name}: Adobe failed: {exc}", flush=True)
-            continue
-        for _ in range(TRANSACTIONS_PER_PAGE):
+
+        def record(pdf: Path = pdf, out_dir: Path = out_dir) -> None:
             _record_usage(
                 options.quota_ledger,
                 month=month,
                 pdf_path=pdf,
-                report_path=report,
-                result_path=tagged,
+                report_path=out_dir / f"{pdf.stem}.autotag-report.xlsx",
+                result_path=out_dir / f"{pdf.stem}.tagged.pdf",
             )
+
+        try:
+            tagged, _report = adobe_remediate(pdf, out_dir, credentials, record)
+        except Exception as exc:  # noqa: BLE001 - report and continue the batch
+            print(f"{pdf.parent.name}/{pdf.name}: Adobe failed: {exc}", flush=True)
+            continue
         text = screen_reader_text(tagged)
         target.write_text(text, encoding="utf-8")
         print(f"{pdf.parent.name}/{pdf.name}: {len(text.split())} words", flush=True)

@@ -32,7 +32,7 @@ class OcrResult:
     message: str = ""
 
 
-def _build_ocrmypdf_args(
+def build_ocrmypdf_args(
     *,
     input_path: Path,
     output_path: Path,
@@ -116,7 +116,7 @@ async def run_ocr(
     """
     logger.info(f"Running OCR on {input_path.name} (language={language}, engine={engine})")
 
-    args = _build_ocrmypdf_args(
+    args = build_ocrmypdf_args(
         input_path=input_path,
         output_path=output_path,
         language=language,
