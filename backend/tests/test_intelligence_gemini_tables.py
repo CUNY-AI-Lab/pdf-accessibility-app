@@ -80,7 +80,7 @@ def test_generate_table_intelligence_returns_normalized_update(monkeypatch, tmp_
     assert unit.metadata["previous_intelligence"] == {"summary": "Previous", "suggested_action": "manual_only"}
 
 
-def test_generate_table_intelligence_for_page_uses_pdf_file_input(monkeypatch, tmp_path):
+def test_generate_table_intelligence_for_page_sends_the_page_image(monkeypatch, tmp_path):
     captured = {}
 
     async def _fake_request_llm_json_with_response(
@@ -120,8 +120,8 @@ def test_generate_table_intelligence_for_page_uses_pdf_file_input(monkeypatch, t
         _fake_request_llm_json_with_response,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_tables.semantic_page_parts",
-        lambda job, page_numbers, filename=None: [{"type": "file", "file": {"filename": filename or "sample.pdf", "file_data": "data:application/pdf;base64,page"}}],
+        "app.services.intelligence_gemini_tables.page_preview_parts",
+        lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": "data:image/png;base64,page"}}],
     )
 
     result = asyncio.run(
@@ -150,7 +150,7 @@ def test_generate_table_intelligence_for_page_uses_pdf_file_input(monkeypatch, t
 
     assert captured["schema_name"] == "table_page_intelligence"
     assert captured["cache_breakpoint_index"] == 1
-    assert captured["content"][1]["type"] == "file"
+    assert captured["content"][1]["type"] == "image_url"
     assert result[0]["table_review_id"] == "review-7"
     assert result[0]["suggested_action"] == "set_table_headers"
     assert result[0]["header_rows"] == [0]

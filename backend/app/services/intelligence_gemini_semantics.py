@@ -8,9 +8,9 @@ from app.models import Job
 from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_llm_utils import (
     context_json_part,
+    page_preview_parts,
     preferred_cache_breakpoint_index,
     request_llm_json,
-    semantic_page_parts,
 )
 from app.services.llm_client import LlmClient
 from app.services.pdf_preview import render_bbox_preview_png_data_url
@@ -287,11 +287,7 @@ async def adjudicate_semantic_unit(
         page_numbers.extend(
             page_number for page_number in extra_pages if isinstance(page_number, int)
         )
-    page_images = semantic_page_parts(
-        job,
-        page_numbers,
-        filename=getattr(job, "original_filename", None),
-    )
+    page_images = page_preview_parts(job, page_numbers)
     try:
         if job is not None and unit.bbox:
             from app.services.intelligence_llm_utils import job_pdf_path

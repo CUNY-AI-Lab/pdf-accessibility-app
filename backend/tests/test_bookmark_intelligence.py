@@ -33,7 +33,7 @@ def test_bookmark_prompts_stay_evidence_grounded():
         assert "procedural waypoint" not in lowered
         assert "callout title" not in lowered
         assert "do not aggressively compress" not in lowered
-        assert "cached pdf" in lowered or "visible document evidence" in lowered
+        assert "page images" in lowered or "visible document evidence" in lowered
 
 
 def test_collect_bookmark_heading_candidates_uses_toc_and_post_toc_headings():
@@ -263,130 +263,10 @@ def test_materialize_outline_entries_preserves_toc_preferred_label():
     assert outline_entries[0]["text"] == "1. Panel Report"
 
 
-def test_bookmark_intelligence_uses_direct_gemini_cached_path(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        "app.services.bookmark_intelligence.direct_gemini_pdf_enabled",
-        lambda: True,
-    )
-    pdf_path = tmp_path / "sample.pdf"
-    _make_pdf(pdf_path, page_count=5)
-    seen_calls: list[tuple[str, dict[str, object]]] = []
-    deleted: list[str] = []
-
-    async def _fake_create_cache(**kwargs):
-        assert kwargs["pdf_path"] == pdf_path
-        return type("CacheHandle", (), {"cache_name": "cache-1", "uploaded_file_name": "file-1"})()
-
-    async def _fake_delete_cache(cache_handle, **kwargs):
-        deleted.append(cache_handle.cache_name)
-
-    async def _fake_cached_request(**kwargs):
-        task_type = kwargs["response_schema"]["properties"]["task_type"]["enum"][0]
-        seen_calls.append((task_type, kwargs["context_payload"]))
-        if task_type == "bookmark_document_candidate_plan":
-            assert "front_matter_page_candidates" in kwargs["context_payload"]
-            return {
-                "task_type": "bookmark_document_candidate_plan",
-                "summary": "Built the bookmark skeleton.",
-                "confidence": "high",
-                "reason": "Grounded visible outline.",
-                "front_matter_entries": [{"page": 1, "label": "Cover"}],
-                "outline_entries": [
-                    {"candidate_id": "toc:0", "supported_label": "TABLE OF CONTENTS", "level": 1},
-                    {"candidate_id": "toc:1", "supported_label": "1 Intro", "level": 2},
-                ],
-            }
-        if task_type == "bookmark_document_heading_supplement":
-            return {
-                "task_type": "bookmark_document_heading_supplement",
-                "summary": "Added one useful visible subsection heading.",
-                "confidence": "high",
-                "reason": "The heading is visibly navigational.",
-                "outline_entries": [
-                    {"candidate_id": "heading:4", "supported_label": "Adding IDs", "level": 2},
-                ],
-            }
-        assert task_type == "bookmark_document_landmark_plan"
-        return {
-            "task_type": "bookmark_document_landmark_plan",
-            "summary": "Added one useful visible landmark.",
-            "confidence": "high",
-            "reason": "The paragraph behaves like a visible subsection title.",
-            "selected_landmarks": [
-                {
-                    "page": 4,
-                    "label": "Link texts and the Contents key",
-                    "anchor_candidate_id": "heading:4",
-                    "level": 3,
-                }
-            ],
-        }
-
-    monkeypatch.setattr(
-        "app.services.bookmark_intelligence.create_direct_gemini_pdf_cache",
-        _fake_create_cache,
-    )
-    monkeypatch.setattr(
-        "app.services.bookmark_intelligence.delete_direct_gemini_pdf_cache",
-        _fake_delete_cache,
-    )
-    monkeypatch.setattr(
-        "app.services.bookmark_intelligence.request_direct_gemini_cached_json",
-        _fake_cached_request,
-    )
-
-    structure_json = {
-        "elements": [
-            {"type": "heading", "text": "Manual Title", "page": 0, "level": 1},
-            {"type": "toc_caption", "text": "TABLE OF CONTENTS", "page": 1, "toc_group_ref": "toc-0"},
-            {"type": "toc_item", "text": "1 Intro", "page": 1, "toc_group_ref": "toc-0"},
-            {"type": "heading", "text": "1 Intro", "page": 2, "level": 1},
-            {"type": "heading", "text": "Adding IDs", "page": 3, "level": 2},
-            {"type": "paragraph", "text": "Link texts and the Contents key", "page": 3},
-        ],
-    }
-
-    updated, audit = asyncio.run(
-        enhance_bookmark_structure_with_intelligence(
-            pdf_path=pdf_path,
-            structure_json=structure_json,
-            original_filename="report.pdf",
-            llm_client=object(),
-        )
-    )
-
-    assert [task for task, _payload in seen_calls] == [
-        "bookmark_document_candidate_plan",
-        "bookmark_document_heading_supplement",
-        "bookmark_document_landmark_plan",
-    ]
-    assert deleted == ["cache-1"]
-    assert [entry["text"] for entry in updated["bookmark_plan"]] == [
-        "Cover",
-        "TABLE OF CONTENTS",
-        "1 Intro",
-        "Adding IDs",
-        "Link texts and the Contents key",
-    ]
-    assert audit["applied"] is True
-    assert audit["selected_heading_count"] == 1
-    assert audit["selected_landmark_count"] == 1
-    assert audit["front_matter_applied"] is True
-
-
-def test_bookmark_intelligence_sends_page_images_on_the_chat_lane(monkeypatch, tmp_path):
+def test_bookmark_intelligence_sends_page_images(monkeypatch, tmp_path):
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path, page_count=5)
     seen_calls: list[tuple[str, list[dict[str, object]]]] = []
-
-    async def _should_not_create_cache(**kwargs):
-        raise AssertionError("local bookmark path should not create a Gemini cache")
-
-    async def _should_not_delete_cache(*args, **kwargs):
-        raise AssertionError("local bookmark path should not delete a Gemini cache")
-
-    async def _should_not_request_cached(**kwargs):
-        raise AssertionError("local bookmark path should not use cached Gemini requests")
 
     async def _fake_request_llm_json(
         *,
@@ -435,22 +315,6 @@ def test_bookmark_intelligence_sends_page_images_on_the_chat_lane(monkeypatch, t
             ],
         }
 
-    monkeypatch.setattr(
-        "app.services.bookmark_intelligence.direct_gemini_pdf_enabled",
-        lambda: False,
-    )
-    monkeypatch.setattr(
-        "app.services.bookmark_intelligence.create_direct_gemini_pdf_cache",
-        _should_not_create_cache,
-    )
-    monkeypatch.setattr(
-        "app.services.bookmark_intelligence.delete_direct_gemini_pdf_cache",
-        _should_not_delete_cache,
-    )
-    monkeypatch.setattr(
-        "app.services.bookmark_intelligence.request_direct_gemini_cached_json",
-        _should_not_request_cached,
-    )
     monkeypatch.setattr(
         "app.services.bookmark_intelligence.page_preview_parts",
         lambda job, page_numbers: [
@@ -501,21 +365,11 @@ def test_bookmark_intelligence_sends_page_images_on_the_chat_lane(monkeypatch, t
 
 
 def test_bookmark_intelligence_uses_prefetched_front_matter_entries(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        "app.services.bookmark_intelligence.direct_gemini_pdf_enabled",
-        lambda: True,
-    )
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path, page_count=4)
     seen_candidate_contexts: list[dict[str, object]] = []
 
-    async def _fake_create_cache(**kwargs):
-        return type("CacheHandle", (), {"cache_name": "cache-2", "uploaded_file_name": "file-2"})()
-
-    async def _fake_delete_cache(cache_handle, **kwargs):
-        return None
-
-    async def _fake_cached_request(**kwargs):
+    async def _fake_request(**kwargs):
         task_type = kwargs["response_schema"]["properties"]["task_type"]["enum"][0]
         if task_type == "bookmark_document_candidate_plan":
             seen_candidate_contexts.append(kwargs["context_payload"])
@@ -546,18 +400,7 @@ def test_bookmark_intelligence_uses_prefetched_front_matter_entries(monkeypatch,
             "selected_landmarks": [],
         }
 
-    monkeypatch.setattr(
-        "app.services.bookmark_intelligence.create_direct_gemini_pdf_cache",
-        _fake_create_cache,
-    )
-    monkeypatch.setattr(
-        "app.services.bookmark_intelligence.delete_direct_gemini_pdf_cache",
-        _fake_delete_cache,
-    )
-    monkeypatch.setattr(
-        "app.services.bookmark_intelligence.request_direct_gemini_cached_json",
-        _fake_cached_request,
-    )
+    monkeypatch.setattr("app.services.bookmark_intelligence._request_bookmark_json", _fake_request)
 
     structure_json = {
         "elements": [

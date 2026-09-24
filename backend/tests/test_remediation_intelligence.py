@@ -43,7 +43,7 @@ def _task(task_type: str, *, metadata: dict | None = None):
 class _FakeLlmClient:
     def __init__(self, payload: dict):
         self.payload = payload
-        self.model = "google/gemini-3-flash-preview"
+        self.model = "qwen3-vl-235b-a22b-instruct"
         self.calls: list[dict] = []
 
     async def chat_completion(self, messages, **kwargs):
@@ -323,7 +323,7 @@ def test_generate_remediation_intelligence_supports_reading_order(monkeypatch, t
     assert suggestion["readable_text_hints"][0]["chosen_source"] == "ocr"
     assert suggestion["document_overlay"]["provenance"] == "gemini_remediation_intelligence"
     assert suggestion["document_overlay"]["pages"][0]["page_number"] == 1
-    assert suggestion["model"] == "google/gemini-3-flash-preview"
+    assert suggestion["model"] == "qwen3-vl-235b-a22b-instruct"
     assert fake_llm.calls == []
 
 

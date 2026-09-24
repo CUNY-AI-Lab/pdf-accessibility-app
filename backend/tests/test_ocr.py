@@ -129,7 +129,7 @@ async def test_gateway_engine_gives_ocrmypdf_the_connection_and_time_for_every_p
     settings = Settings(
         llm_base_url="https://gateway.test/v1",
         llm_api_key="sk-app",
-        llm_model="gemini-check",
+        llm_model="check-model",
         ocr_model="vision-model",
         ocr_gateway_jobs=8,
         ocr_gateway_page_seconds=300,

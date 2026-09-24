@@ -20,8 +20,8 @@ def test_parse_listener_pid_reads_lsof_machine_output():
 
 def test_collect_runtime_diagnostics_reports_local_docling_gpu_state(monkeypatch):
     settings = SimpleNamespace(
-        llm_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-        llm_model="google/gemini-3-flash-preview",
+        llm_base_url="https://tools.ailab.gc.cuny.edu/v1",
+        llm_model="qwen3-vl-235b-a22b-instruct",
         docling_serve_url="http://localhost:5001",
         docling_serve_ocr_engine="rapidocr",
     )

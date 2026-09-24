@@ -126,8 +126,8 @@ def apply_grounded_text_adjudication(
     )
     task["title"] = "Verify readable text on flagged blocks"
     task["detail"] = (
-        "Grounded Gemini review confirmed text blocks where the extracted accessible text "
-        "likely does not match what appears on the page."
+        "A model compared these text blocks with the page images and found that the "
+        "accessible text likely does not match what appears on the page."
     )
     task["severity"] = "high"
     task["blocking"] = True

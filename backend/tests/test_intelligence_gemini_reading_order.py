@@ -20,7 +20,7 @@ def _job(tmp_path):
     )
 
 
-def test_generate_reading_order_intelligence_uses_backend_aware_page_input(monkeypatch, tmp_path):
+def test_generate_reading_order_intelligence_sends_the_page_image(monkeypatch, tmp_path):
     captured = {}
 
     async def _fake_request_llm_json(
@@ -50,14 +50,11 @@ def test_generate_reading_order_intelligence_uses_backend_aware_page_input(monke
         _fake_request_llm_json,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_reading_order.semantic_page_parts",
-        lambda job, page_numbers, filename=None: [
+        "app.services.intelligence_gemini_reading_order.page_preview_parts",
+        lambda job, page_numbers: [
             {
-                "type": "file",
-                "file": {
-                    "filename": filename or "sample.pdf",
-                    "file_data": "data:application/pdf;base64,page",
-                },
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,page"},
             }
         ],
     )
@@ -81,7 +78,7 @@ def test_generate_reading_order_intelligence_uses_backend_aware_page_input(monke
 
     assert captured["schema_name"] is None
     assert captured["cache_breakpoint_index"] == 1
-    assert captured["content"][1]["type"] == "file"
+    assert captured["content"][1]["type"] == "image_url"
     assert "one PDF page input only" in captured["content"][0]["text"]
     assert result["suggested_action"] == "confirm_current_order"
     assert result["confidence"] == "high"

@@ -12,9 +12,9 @@ def _ok_response(request: httpx.Request, payload: dict | None = None) -> httpx.R
 
 def test_llm_client_honors_retry_after_header(monkeypatch):
     client = LlmClient(
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        base_url="https://tools.ailab.gc.cuny.edu/v1",
         api_key="test",
-        model="google/gemini-3-flash-preview",
+        model="qwen3-vl-235b-a22b-instruct",
         max_retries=1,
         max_concurrency=1,
     )
@@ -49,9 +49,9 @@ def test_llm_client_honors_retry_after_header(monkeypatch):
 
 def test_llm_client_retries_transport_error_then_succeeds(monkeypatch):
     client = LlmClient(
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        base_url="https://tools.ailab.gc.cuny.edu/v1",
         api_key="test",
-        model="google/gemini-3-flash-preview",
+        model="qwen3-vl-235b-a22b-instruct",
         max_retries=2,
         retry_backoff_base=2.0,
         max_concurrency=1,
@@ -82,9 +82,9 @@ def test_llm_client_retries_transport_error_then_succeeds(monkeypatch):
 
 def test_llm_client_limits_concurrency(monkeypatch):
     client = LlmClient(
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        base_url="https://tools.ailab.gc.cuny.edu/v1",
         api_key="test",
-        model="google/gemini-3-flash-preview",
+        model="qwen3-vl-235b-a22b-instruct",
         max_retries=0,
         max_concurrency=2,
     )
@@ -118,9 +118,9 @@ def test_llm_client_limits_concurrency(monkeypatch):
 
 def test_llm_client_tracks_usage_cost(monkeypatch):
     client = LlmClient(
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        base_url="https://tools.ailab.gc.cuny.edu/v1",
         api_key="test",
-        model="google/gemini-3-flash-preview",
+        model="qwen3-vl-235b-a22b-instruct",
         max_retries=0,
         max_concurrency=1,
     )

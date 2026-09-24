@@ -22,7 +22,7 @@ def _job(tmp_path):
     )
 
 
-def test_generate_widget_intelligence_uses_backend_aware_page_input(monkeypatch, tmp_path):
+def test_generate_widget_intelligence_sends_the_page_image(monkeypatch, tmp_path):
     captured = {}
 
     async def _fake_request_llm_json(
@@ -57,14 +57,11 @@ def test_generate_widget_intelligence_uses_backend_aware_page_input(monkeypatch,
         _fake_request_llm_json,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_widgets.semantic_page_parts",
-        lambda job, page_numbers, filename=None: [
+        "app.services.intelligence_gemini_widgets.page_preview_parts",
+        lambda job, page_numbers: [
             {
-                "type": "file",
-                "file": {
-                    "filename": filename or "sample.pdf",
-                    "file_data": "data:application/pdf;base64,page",
-                },
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,page"},
             }
         ],
     )
@@ -86,13 +83,13 @@ def test_generate_widget_intelligence_uses_backend_aware_page_input(monkeypatch,
 
     assert captured["schema_name"] == "widget_page_intelligence"
     assert captured["cache_breakpoint_index"] == 1
-    assert captured["content"][1]["type"] == "file"
+    assert captured["content"][1]["type"] == "image_url"
     assert result["field_review_id"] == "field-widget-10-0"
     assert result["suggested_action"] == "preserve_control"
     assert result["confidence"] == "high"
 
 
-def test_generate_widget_intelligence_for_page_uses_backend_aware_page_input(monkeypatch, tmp_path):
+def test_generate_widget_intelligence_for_page_sends_the_page_image(monkeypatch, tmp_path):
     captured = {}
 
     async def _fake_request_llm_json_with_response(
@@ -130,14 +127,11 @@ def test_generate_widget_intelligence_for_page_uses_backend_aware_page_input(mon
         _fake_request_llm_json_with_response,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_widgets.semantic_page_parts",
-        lambda job, page_numbers, filename=None: [
+        "app.services.intelligence_gemini_widgets.page_preview_parts",
+        lambda job, page_numbers: [
             {
-                "type": "file",
-                "file": {
-                    "filename": filename or "sample.pdf",
-                    "file_data": "data:application/pdf;base64,page",
-                },
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,page"},
             }
         ],
     )
@@ -162,7 +156,7 @@ def test_generate_widget_intelligence_for_page_uses_backend_aware_page_input(mon
 
     assert captured["schema_name"] == "widget_page_intelligence"
     assert captured["cache_breakpoint_index"] == 1
-    assert captured["content"][1]["type"] == "file"
+    assert captured["content"][1]["type"] == "image_url"
     assert result[0]["field_review_id"] == "field-widget-10-0"
     assert result[0]["suggested_action"] == "preserve_control"
     assert result[0]["batch_generated"] is True

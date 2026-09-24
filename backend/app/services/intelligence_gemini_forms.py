@@ -5,14 +5,13 @@ from typing import Any
 
 from app.config import get_settings
 from app.models import Job
-from app.services.gemini_direct import direct_gemini_pdf_enabled
 from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
 from app.services.intelligence_llm_utils import (
     context_json_part,
+    page_preview_parts,
     preferred_cache_breakpoint_index,
     request_llm_json_with_response,
-    semantic_page_parts,
 )
 from app.services.llm_client import LlmClient
 from app.services.semantic_units import SemanticUnit
@@ -159,12 +158,10 @@ def _batch_prompt_target(target: dict[str, Any]) -> dict[str, Any]:
 
 
 def _page_target_batches(targets: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    """Fields to ask about per request. Page images carry less than the PDF
-    itself, so the image lane asks about a page's fields in batches."""
+    """Fields to ask about per request: a page's fields in batches, so each
+    request stays small enough to answer well."""
     if not targets:
         return []
-    if direct_gemini_pdf_enabled():
-        return [targets]
     batch_size = max(1, int(get_settings().llm_page_candidate_batch_size))
     return [targets[index : index + batch_size] for index in range(0, len(targets), batch_size)]
 
@@ -183,7 +180,7 @@ async def _request_form_intelligence_batch(
     }
     content = [
         {"type": "text", "text": FORM_BATCH_PROMPT},
-        *semantic_page_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
+        *page_preview_parts(job, [page_number]),
         context_json_part(payload),
     ]
     parsed, _response = await request_llm_json_with_response(

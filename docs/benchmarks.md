@@ -96,7 +96,7 @@ Delta:
 The biggest clean wins so far come from:
 - semantic-unit prompt caching
 - page-scoped form batching with per-field fallback
-- Gemini structured outputs instead of looser JSON prompting
+- structured outputs instead of looser JSON prompting
 - provider retry/backoff instead of rerunning whole workflows after transient failures
 
 The next likely cost target for the real CUNY audience is figure-heavy guide/admin documents.

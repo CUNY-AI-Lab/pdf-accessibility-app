@@ -3,7 +3,6 @@ import json
 from types import SimpleNamespace
 
 import pikepdf
-import pytest
 
 from app.services import intelligence_gemini_semantics
 from app.services.intelligence_gemini_semantics import (
@@ -11,14 +10,6 @@ from app.services.intelligence_gemini_semantics import (
     adjudicate_semantic_units,
 )
 from app.services.semantic_units import SemanticUnit
-
-
-@pytest.fixture(autouse=True)
-def _disable_direct_gemini_by_default(monkeypatch):
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.direct_gemini_pdf_enabled",
-        lambda: False,
-    )
 
 
 class _FakeLlmClient:
@@ -50,11 +41,11 @@ def _job(tmp_path):
 def test_adjudicate_semantic_unit_normalizes_text_block(monkeypatch, tmp_path):
     monkeypatch.setattr(
         intelligence_gemini_semantics,
-        "semantic_page_parts",
-        lambda job, page_numbers, filename=None: [
+        "page_preview_parts",
+        lambda job, page_numbers: [
             {
-                "type": "file",
-                "file": {"filename": filename or "sample.pdf", "file_data": f"data:application/pdf;base64:page-{next(iter(page_numbers), 1)}"},
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64:page-{next(iter(page_numbers), 1)}"},
             }
         ],
     )
@@ -125,18 +116,18 @@ def test_adjudicate_semantic_unit_normalizes_text_block(monkeypatch, tmp_path):
         for item in llm.calls[0]["messages"][0]["content"]
         if item.get("cache_control") == {"type": "ephemeral"}
     )
-    assert cached_part["type"] in {"file", "image_url"}
-    assert llm.calls[0]["messages"][0]["content"][1]["type"] == "file"
+    assert cached_part["type"] == "image_url"
+    assert llm.calls[0]["messages"][0]["content"][1]["type"] == "image_url"
 
 
 def test_adjudicate_semantic_units_preserves_order(monkeypatch, tmp_path):
     monkeypatch.setattr(
         intelligence_gemini_semantics,
-        "semantic_page_parts",
-        lambda job, page_numbers, filename=None: [
+        "page_preview_parts",
+        lambda job, page_numbers: [
             {
-                "type": "file",
-                "file": {"filename": filename or "sample.pdf", "file_data": f"data:application/pdf;base64:page-{next(iter(page_numbers), 1)}"},
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64:page-{next(iter(page_numbers), 1)}"},
             }
         ],
     )
@@ -186,11 +177,11 @@ def test_adjudicate_semantic_units_preserves_order(monkeypatch, tmp_path):
 def test_adjudicate_semantic_unit_repairs_missing_required_payload(monkeypatch, tmp_path):
     monkeypatch.setattr(
         intelligence_gemini_semantics,
-        "semantic_page_parts",
-        lambda job, page_numbers, filename=None: [
+        "page_preview_parts",
+        lambda job, page_numbers: [
             {
-                "type": "file",
-                "file": {"filename": filename or "sample.pdf", "file_data": f"data:application/pdf;base64:page-{next(iter(page_numbers), 1)}"},
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64:page-{next(iter(page_numbers), 1)}"},
             }
         ],
     )
@@ -244,11 +235,11 @@ def test_adjudicate_semantic_unit_allows_cross_type_reclassification_for_table(
 ):
     monkeypatch.setattr(
         intelligence_gemini_semantics,
-        "semantic_page_parts",
-        lambda job, page_numbers, filename=None: [
+        "page_preview_parts",
+        lambda job, page_numbers: [
             {
-                "type": "file",
-                "file": {"filename": filename or "sample.pdf", "file_data": f"data:application/pdf;base64:page-{next(iter(page_numbers), 1)}"},
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64:page-{next(iter(page_numbers), 1)}"},
             }
         ],
     )

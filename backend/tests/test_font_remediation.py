@@ -68,8 +68,7 @@ from tests.fixtures import TEST_SAMPLE_PDF
 def _settings(**overrides) -> Settings:
     values = {
         "llm_base_url": "http://localhost:11434/v1",
-        "llm_model": "gemini-test",
-        "use_direct_gemini_pdf": False,
+        "llm_model": "test-model",
     }
     values.update(overrides)
     return Settings(**values)
@@ -2538,7 +2537,7 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
             "confidence": "high",
             "suggested_action": "font_map_candidate",
             "actualtext_candidates": [],
-            "model": "google/gemini-3-flash-preview",
+            "model": "qwen3-vl-235b-a22b-instruct",
         }
 
     monkeypatch.setattr(font_intelligence_auto, "generate_remediation_intelligence", _generate_remediation_intelligence)
@@ -2623,7 +2622,7 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
 
     class _FakeLlmClient:
         def __init__(self, *args, **kwargs):
-            self.model = "google/gemini-3-flash-preview"
+            self.model = "qwen3-vl-235b-a22b-instruct"
 
         async def close(self):
             return None
@@ -2636,7 +2635,7 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
             "confidence": "high",
             "suggested_action": "artifact_if_decorative",
             "actualtext_candidates": [],
-            "model": "google/gemini-3-flash-preview",
+            "model": "qwen3-vl-235b-a22b-instruct",
         }
 
     monkeypatch.setattr(font_intelligence_auto, "generate_remediation_intelligence", _generate_remediation_intelligence)
@@ -2725,7 +2724,7 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
 
     class _FakeLlmClient:
         def __init__(self, *args, **kwargs):
-            self.model = "google/gemini-3-flash-preview"
+            self.model = "qwen3-vl-235b-a22b-instruct"
 
         async def close(self):
             return None
@@ -2738,7 +2737,7 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
             "confidence": "high",
             "suggested_action": "artifact_if_decorative",
             "actualtext_candidates": [],
-            "model": "google/gemini-3-flash-preview",
+            "model": "qwen3-vl-235b-a22b-instruct",
         }
 
     monkeypatch.setattr(font_intelligence_auto, "generate_remediation_intelligence", _generate_remediation_intelligence)

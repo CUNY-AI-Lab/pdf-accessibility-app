@@ -48,34 +48,26 @@ Wrappers over the shared engine:
 
 ## LLM transport
 
-The backend now uses Gemini directly for PDF-native understanding and the Gemini Developer API chat-completions endpoint for the remaining structured JSON lanes.
+Every AI step sends rendered page images to one chat-completions lane: the
+CAIL Gateway at `LLM_BASE_URL`, with an open-weight vision `LLM_MODEL`
+(default `qwen3-vl-235b-a22b-instruct`) and a Gateway key in `LLM_API_KEY`.
 
 Important behaviors:
-- `json_schema` structured output requests
-- retry and `Retry-After` handling
+- `json_schema` structured output, falling back to `json_object` for models
+  without the structured-output capability, and to plain JSON after that
+- answers read from `content`, or `reasoning_content` for reasoning models
+- retries connection failures and 429/500/502/503/504 responses, never a
+  timed-out call
 - concurrency limits
-- prompt caching breakpoints
 - real usage/cost tracking from provider responses
 
 Main files:
 - [app/services/llm_client.py](app/services/llm_client.py)
 - [app/services/intelligence_llm_utils.py](app/services/intelligence_llm_utils.py)
 
-The same backend settings drive both the real app and the benchmark scripts. If `DOCLING_SERVE_URL` is set, the structure step uses that server; otherwise it falls back to local Docling. Semantic adjudication uses Gemini directly for PDF-native lanes and the configured Gemini chat-completions endpoint for the remaining JSON-only lanes.
+The same backend settings drive both the real app and the benchmark scripts. If `DOCLING_SERVE_URL` is set, the structure step uses that server; otherwise it falls back to local Docling.
 
-For Gemini-first deployments, prefer:
-- `GEMINI_API_KEY=<key>`
-- `LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`
-- `LLM_API_KEY=` blank, unless you intentionally want a separate credential for the chat-completions path
-- `LLM_MODEL=google/gemini-3-flash-preview`
-- `GEMINI_MODEL=gemini-3-flash-preview`
-- `USE_DIRECT_GEMINI_PDF=true`
-- `GEMINI_DIRECT_THINKING_LEVEL=low`
-- `GEMINI_DIRECT_ALT_TEXT_THINKING_LEVEL=medium`
-- `ALT_TEXT_MAX_CONCURRENCY=8`
-- `ALT_TEXT_GLOBAL_MAX_CONCURRENCY=12`
-
-The default direct-Gemini lanes use `low` thinking for bounded structured analysis. Figure semantics and alt text use `medium` because they are the highest-risk vision path. Alt-text concurrency is page-level and bounded per PDF by `ALT_TEXT_MAX_CONCURRENCY`.
+Alt-text concurrency is page-level and bounded per PDF by `ALT_TEXT_MAX_CONCURRENCY`.
 The global alt-text cap, `ALT_TEXT_GLOBAL_MAX_CONCURRENCY`, prevents batch uploads from multiplying per-PDF concurrency into unbounded provider work.
 
 On Apple Silicon, the recommended local setup is `docling-serve` with `DOCLING_DEVICE=mps`. That accelerates structure extraction, but the tagging/writer step in [app/pipeline/tagger.py](app/pipeline/tagger.py) remains CPU-bound.

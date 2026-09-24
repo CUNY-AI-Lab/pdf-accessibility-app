@@ -16,8 +16,7 @@ from app.pipeline.llm_operations import (
 def _settings(**overrides) -> Settings:
     values = {
         "llm_base_url": "http://localhost:11434/v1",
-        "llm_model": "gemini-test",
-        "use_direct_gemini_pdf": False,
+        "llm_model": "test-model",
     }
     values.update(overrides)
     return Settings(**values)

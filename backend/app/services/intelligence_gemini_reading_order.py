@@ -6,9 +6,9 @@ from app.models import Job
 from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_llm_utils import (
     context_json_part,
+    page_preview_parts,
     preferred_cache_breakpoint_index,
     request_llm_json,
-    semantic_page_parts,
 )
 from app.services.llm_client import LlmClient
 
@@ -132,7 +132,7 @@ async def generate_reading_order_intelligence(
                 f"{READING_ORDER_INTELLIGENCE_PROMPT}\n\nEvidence order: one PDF page input only."
             ),
         },
-        *semantic_page_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
+        *page_preview_parts(job, [page_number]),
         context_json_part(payload),
     ]
 

@@ -23,7 +23,7 @@ with the key in CAIL_API_KEY:
 
     CAIL_API_KEY=... uv run python scripts/score_semantics.py \\
         --judge-model deepseek-v4-pro-0813 data/eval/olmocr-bench/gold_rt \\
-        data/eval/olmocr-bench/bench_data/ai_gemini-3.8-flash/gold_rt ...
+        data/eval/olmocr-bench/bench_data/ai_qwen3-vl-235b-a22b/gold_rt ...
 """
 
 from __future__ import annotations

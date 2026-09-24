@@ -5,12 +5,6 @@ from types import SimpleNamespace
 from typing import Any
 
 from app.config import get_settings
-from app.services.gemini_direct import (
-    create_direct_gemini_pdf_cache,
-    delete_direct_gemini_pdf_cache,
-    direct_gemini_pdf_enabled,
-    request_direct_gemini_cached_json,
-)
 from app.services.intelligence_llm_utils import (
     context_json_part,
     page_preview_parts,
@@ -68,19 +62,19 @@ BOOKMARK_DOCUMENT_CANDIDATE_PLAN_SCHEMA: dict[str, Any] = {
 
 BOOKMARK_DOCUMENT_CANDIDATE_PLAN_PROMPT = """You are a PDF accessibility bookmark planning assistant.
 
-The cached PDF is the primary source of truth. The JSON context contains an exhaustive inventory of bookmark candidates
+The page images are the primary source of truth. The JSON context contains an exhaustive inventory of bookmark candidates
 derived from Docling-visible evidence.
 
 Your job is to adjudicate that candidate inventory and return the final bookmark outline.
 
 Rules:
-- Use the cached PDF as the main evidence. The JSON context is only an index into candidate IDs and page anchors.
+- Use the page images as the main evidence. The JSON context is only an index into candidate IDs and page anchors.
 - Use only the provided candidate_id values in outline_entries. Do not invent bookmark entries there.
-- Treat TOC candidates as the baseline skeleton unless the cached PDF makes one clearly invalid.
+- Treat TOC candidates as the baseline skeleton unless the page images make one clearly invalid.
 - Heading, heading_variant, and landmark candidates are optional evidence-backed suggestions.
-- Keep optional candidates when the cached PDF shows that they materially improve navigation.
+- Keep optional candidates when the page images show that they materially improve navigation.
 - Repeated visible labels on different pages are distinct candidates and may each be kept when they mark different visible sections.
-- Only suppress a candidate as redundant when the cached PDF shows it points to the same visible section as another kept candidate.
+- Only suppress a candidate as redundant when the page images show it points to the same visible section as another kept candidate.
 - Use supported_label only when choosing one of that candidate's supported_labels.
 - For TOC candidates, preserve preferred_label because it is the TOC-visible label; use heading variants as separate heading evidence, not as rewrites of the TOC label.
 - For non-TOC candidates, choose the label variant that best matches the visible document evidence.
@@ -88,7 +82,7 @@ Rules:
   - Cover
   - Inside-Cover page
   - Series Information
-- Do not invent labels that are not visibly supported by the cached PDF.
+- Do not invent labels that are not visibly supported by the page images.
 - Return the final outline in document order.
 """
 
@@ -126,12 +120,12 @@ BOOKMARK_DOCUMENT_LANDMARK_PLAN_SCHEMA: dict[str, Any] = {
 
 BOOKMARK_DOCUMENT_LANDMARK_PLAN_PROMPT = """You are a PDF accessibility bookmark landmark planning assistant.
 
-The cached PDF is the primary source of truth. You already have a selected bookmark skeleton from the TOC and visible headings.
+The page images are the primary source of truth. You already have a selected bookmark skeleton from the TOC and visible headings.
 
 Your job is to identify additional useful non-heading visible landmarks that should be inserted beneath that skeleton.
 
 Rules:
-- Use the cached PDF as the main evidence.
+- Use the page images as the main evidence.
 - Return only non-heading landmarks that are visibly distinct and materially improve navigation beneath the selected skeleton.
 - Do not return ordinary running prose, captions, or page furniture.
 - Use the provided anchor_candidate_id values to attach each extra landmark beneath the most appropriate selected outline entry.
@@ -172,24 +166,20 @@ BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_SCHEMA: dict[str, Any] = {
 
 BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_PROMPT = """You are a PDF accessibility bookmark supplement planning assistant.
 
-The cached PDF is the primary source of truth. You already have a selected bookmark skeleton.
+The page images are the primary source of truth. You already have a selected bookmark skeleton.
 Your job is to review the remaining heading candidates only and return any additional visible headings that materially improve navigation.
 
 Rules:
-- Use the cached PDF as the main evidence.
+- Use the page images as the main evidence.
 - Use only the provided candidate_id values in outline_entries.
 - Return only additional heading or heading_variant candidates that should be added to the existing skeleton.
 - Repeated visible labels on different pages are distinct candidates and may each be kept when they mark different visible sections.
 - Short visible subsection headings may still be useful when they clearly identify a navigable subsection.
 - Use supported_label only when choosing one of that candidate's supported_labels.
-- Do not invent labels or candidates that are not visibly supported by the cached PDF.
+- Do not invent labels or candidates that are not visibly supported by the page images.
 - Keep the list selective, but do not omit a visibly supported heading only because its label resembles another heading elsewhere in the document.
 """
 
-BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION = (
-    "You are evaluating PDF accessibility and bookmark/navigation semantics. "
-    "Stay grounded in the provided document evidence and return only valid JSON."
-)
 
 MAX_BOOKMARK_TOC_ITEMS = 80
 BOOKMARK_HEADING_TYPES = {"heading"}
@@ -334,12 +324,6 @@ def _sample_preview_pages(pages: list[int], *, limit: int = 4) -> list[int]:
     return sampled
 
 
-def _bookmark_prompt_for_images(preview_prompt: str) -> str:
-    return preview_prompt.replace("cached PDF", "page preview images").replace(
-        "cached pdf", "page preview images"
-    )
-
-
 def _bookmark_job_for_preview(pdf_path, original_filename: str) -> Any:
     return SimpleNamespace(
         original_filename=original_filename,
@@ -398,30 +382,19 @@ async def _request_bookmark_json(
     context_payload: dict[str, Any],
     response_schema: dict[str, Any],
     preview_pages: list[int] | None = None,
-    cache_handle: Any | None = None,
 ) -> dict[str, Any]:
-    if not direct_gemini_pdf_enabled():
-        job = _bookmark_job_for_preview(pdf_path, original_filename)
-        content = [
-            {"type": "text", "text": _bookmark_prompt_for_images(prompt)},
-            *page_preview_parts(job, preview_pages or [1]),
-            context_json_part(context_payload),
-        ]
-        return await request_llm_json(
-            llm_client=llm_client,
-            content=content,
-            schema_name=response_schema["properties"]["task_type"]["enum"][0],
-            response_schema=response_schema,
-            cache_breakpoint_index=preferred_cache_breakpoint_index(content),
-        )
-
-    if cache_handle is None:
-        raise RuntimeError("Gemini bookmark request requires a cache handle")
-    return await request_direct_gemini_cached_json(
-        cache_handle=cache_handle,
-        prompt=prompt,
-        context_payload=context_payload,
+    job = _bookmark_job_for_preview(pdf_path, original_filename)
+    content = [
+        {"type": "text", "text": prompt},
+        *page_preview_parts(job, preview_pages or [1]),
+        context_json_part(context_payload),
+    ]
+    return await request_llm_json(
+        llm_client=llm_client,
+        content=content,
+        schema_name=response_schema["properties"]["task_type"]["enum"][0],
         response_schema=response_schema,
+        cache_breakpoint_index=preferred_cache_breakpoint_index(content),
     )
 
 
@@ -1331,157 +1304,142 @@ async def enhance_bookmark_structure_with_intelligence(
         candidate_payload,
         structure_json.get("elements") or [],
     )
-    use_page_images = not direct_gemini_pdf_enabled()
-    cache_handle = None
-    if not use_page_images:
-        cache_handle = await create_direct_gemini_pdf_cache(
-            pdf_path=pdf_path,
-            system_instruction=BOOKMARK_DIRECT_GEMINI_SYSTEM_INSTRUCTION,
-            ttl="1800s",
+    candidate_context = {
+        "job_filename": original_filename,
+        "outline_candidates": _serialize_outline_candidates_for_direct_llm(document_outline_candidates),
+    }
+    if prefetched_front_matter_entries is None and prefetched_front_matter_audit is None:
+        candidate_context["front_matter_page_candidates"] = front_matter_page_candidates
+
+    parsed = await _request_bookmark_json(
+        pdf_path=pdf_path,
+        original_filename=original_filename,
+        llm_client=llm_client,
+        prompt=BOOKMARK_DOCUMENT_CANDIDATE_PLAN_PROMPT,
+        context_payload=candidate_context,
+        response_schema=BOOKMARK_DOCUMENT_CANDIDATE_PLAN_SCHEMA,
+        preview_pages=_bookmark_preview_pages(
+            base_pages=list(candidate_payload.get("pages") or []),
+        ),
+    )
+    confidence = str(parsed.get("confidence") or "").strip().lower()
+    candidate_plan_reason = str(parsed.get("reason") or "").strip()
+    outline_entries, _ = _materialize_outline_entries_from_plan(
+        parsed.get("outline_entries"),
+        outline_candidates=document_outline_candidates,
+    )
+
+    if prefetched_front_matter_entries is not None or prefetched_front_matter_audit is not None:
+        front_matter_entries = list(prefetched_front_matter_entries or [])
+        front_matter_audit = dict(
+            prefetched_front_matter_audit
+            or {
+                "attempted": False,
+                "applied": False,
+                "reason": "no_prefetched_front_matter",
+                "entry_count": 0,
+            }
         )
-    try:
-        candidate_context = {
-            "job_filename": original_filename,
-            "outline_candidates": _serialize_outline_candidates_for_direct_llm(document_outline_candidates),
+    else:
+        front_matter_entries = _materialize_front_matter_entries(
+            parsed.get("front_matter_entries"),
+            front_matter_page_candidates=front_matter_page_candidates,
+        )
+        front_matter_audit = {
+            "attempted": bool(front_matter_page_candidates),
+            "applied": bool(front_matter_entries),
+            "reason": candidate_plan_reason if front_matter_entries else "",
+            "confidence": confidence or "low",
+            "entry_count": len(front_matter_entries),
         }
-        if prefetched_front_matter_entries is None and prefetched_front_matter_audit is None:
-            candidate_context["front_matter_page_candidates"] = front_matter_page_candidates
 
-        parsed = await _request_bookmark_json(
-            pdf_path=pdf_path,
-            original_filename=original_filename,
-            llm_client=llm_client,
-            cache_handle=cache_handle,
-            prompt=BOOKMARK_DOCUMENT_CANDIDATE_PLAN_PROMPT,
-            context_payload=candidate_context,
-            response_schema=BOOKMARK_DOCUMENT_CANDIDATE_PLAN_SCHEMA,
-            preview_pages=_bookmark_preview_pages(
-                base_pages=list(candidate_payload.get("pages") or []),
-            ),
-        )
-        confidence = str(parsed.get("confidence") or "").strip().lower()
-        candidate_plan_reason = str(parsed.get("reason") or "").strip()
-        outline_entries, _ = _materialize_outline_entries_from_plan(
-            parsed.get("outline_entries"),
-            outline_candidates=document_outline_candidates,
-        )
-
-        if prefetched_front_matter_entries is not None or prefetched_front_matter_audit is not None:
-            front_matter_entries = list(prefetched_front_matter_entries or [])
-            front_matter_audit = dict(
-                prefetched_front_matter_audit
-                or {
-                    "attempted": False,
-                    "applied": False,
-                    "reason": "no_prefetched_front_matter",
-                    "entry_count": 0,
-                }
-            )
-        else:
-            front_matter_entries = _materialize_front_matter_entries(
-                parsed.get("front_matter_entries"),
-                front_matter_page_candidates=front_matter_page_candidates,
-            )
-            front_matter_audit = {
-                "attempted": bool(front_matter_page_candidates),
-                "applied": bool(front_matter_entries),
-                "reason": candidate_plan_reason if front_matter_entries else "",
-                "confidence": confidence or "low",
-                "entry_count": len(front_matter_entries),
-            }
-
-        supplement_confidence = "low"
-        supplement_reason = ""
-        if outline_entries:
-            selected_outline_ids = {
-                str(entry.get("candidate_id") or "").strip()
-                for entry in outline_entries
-                if isinstance(entry, dict)
-            }
-            remaining_heading_candidates = [
-                candidate
-                for candidate in document_outline_candidates
-                if candidate.get("source_kind") in {"heading", "heading_variant"}
-                and str(candidate.get("candidate_id") or "").strip() not in selected_outline_ids
-            ]
-            if remaining_heading_candidates:
-                heading_supplement_parsed = await _request_bookmark_json(
-                    pdf_path=pdf_path,
-                    original_filename=original_filename,
-                    llm_client=llm_client,
-                    cache_handle=cache_handle,
-                    prompt=BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_PROMPT,
-                    context_payload={
-                        "job_filename": original_filename,
-                        "selected_outline_entries": _serialize_selected_outline_for_landmark_llm(outline_entries),
-                        "remaining_heading_candidates": _serialize_heading_supplement_candidates_for_direct_llm(
-                            remaining_heading_candidates,
-                            selected_outline_entries=outline_entries,
-                        ),
-                    },
-                    response_schema=BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_SCHEMA,
-                    preview_pages=_bookmark_preview_pages(
-                        base_pages=_pages_from_outline_entries(outline_entries),
-                        extra_pages=_pages_from_outline_candidates(remaining_heading_candidates),
-                    ),
-                )
-                supplement_confidence = (
-                    str(heading_supplement_parsed.get("confidence") or "").strip().lower() or "low"
-                )
-                supplement_reason = str(heading_supplement_parsed.get("reason") or "").strip()
-                if supplement_confidence in {"high", "medium"}:
-                    supplement_entries, _ = _materialize_outline_entries_from_plan(
-                        heading_supplement_parsed.get("outline_entries"),
-                        outline_candidates=remaining_heading_candidates,
-                    )
-                    outline_entries = _merge_outline_entries(outline_entries, supplement_entries)
-
-        selected_heading_indexes = {
-            _int_or_default(entry.get("source_index"), -1)
+    supplement_confidence = "low"
+    supplement_reason = ""
+    if outline_entries:
+        selected_outline_ids = {
+            str(entry.get("candidate_id") or "").strip()
             for entry in outline_entries
-            if entry.get("source_kind") in {"heading", "heading_variant"}
-            and _int_or_default(entry.get("source_index"), -1) >= 0
+            if isinstance(entry, dict)
         }
-        landmark_entries: list[dict[str, Any]] = []
-        selected_landmark_indexes: set[int] = set()
-        landmark_confidence = "low"
-        landmark_reason = ""
-        if outline_entries and candidate_payload.get("landmark_candidates"):
-            landmark_parsed = await _request_bookmark_json(
+        remaining_heading_candidates = [
+            candidate
+            for candidate in document_outline_candidates
+            if candidate.get("source_kind") in {"heading", "heading_variant"}
+            and str(candidate.get("candidate_id") or "").strip() not in selected_outline_ids
+        ]
+        if remaining_heading_candidates:
+            heading_supplement_parsed = await _request_bookmark_json(
                 pdf_path=pdf_path,
                 original_filename=original_filename,
                 llm_client=llm_client,
-                cache_handle=cache_handle,
-                prompt=BOOKMARK_DOCUMENT_LANDMARK_PLAN_PROMPT,
+                prompt=BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_PROMPT,
                 context_payload={
                     "job_filename": original_filename,
                     "selected_outline_entries": _serialize_selected_outline_for_landmark_llm(outline_entries),
+                    "remaining_heading_candidates": _serialize_heading_supplement_candidates_for_direct_llm(
+                        remaining_heading_candidates,
+                        selected_outline_entries=outline_entries,
+                    ),
                 },
-                response_schema=BOOKMARK_DOCUMENT_LANDMARK_PLAN_SCHEMA,
+                response_schema=BOOKMARK_DOCUMENT_HEADING_SUPPLEMENT_SCHEMA,
                 preview_pages=_bookmark_preview_pages(
                     base_pages=_pages_from_outline_entries(outline_entries),
-                    extra_pages=[
-                        _int_or_default(entry.get("page"), -1)
-                        for entry in (candidate_payload.get("landmark_candidates") or [])
-                        if isinstance(entry, dict)
-                    ],
+                    extra_pages=_pages_from_outline_candidates(remaining_heading_candidates),
                 ),
             )
-            landmark_confidence = str(landmark_parsed.get("confidence") or "").strip().lower() or "low"
-            landmark_reason = str(landmark_parsed.get("reason") or "").strip()
-            if landmark_confidence in {"high", "medium"}:
-                landmark_entries, selected_landmark_indexes = _materialize_landmark_entries_from_plan(
-                    landmark_parsed.get("selected_landmarks"),
-                    landmark_candidates=candidate_payload.get("landmark_candidates") or [],
-                    anchor_level_by_id={
-                        str(entry.get("candidate_id") or ""): _int_or_default(entry.get("level"), 1)
-                        for entry in outline_entries
-                        if isinstance(entry, dict) and str(entry.get("candidate_id") or "").strip()
-                    },
+            supplement_confidence = (
+                str(heading_supplement_parsed.get("confidence") or "").strip().lower() or "low"
+            )
+            supplement_reason = str(heading_supplement_parsed.get("reason") or "").strip()
+            if supplement_confidence in {"high", "medium"}:
+                supplement_entries, _ = _materialize_outline_entries_from_plan(
+                    heading_supplement_parsed.get("outline_entries"),
+                    outline_candidates=remaining_heading_candidates,
                 )
-    finally:
-        if cache_handle is not None:
-            await delete_direct_gemini_pdf_cache(cache_handle)
+                outline_entries = _merge_outline_entries(outline_entries, supplement_entries)
+
+    selected_heading_indexes = {
+        _int_or_default(entry.get("source_index"), -1)
+        for entry in outline_entries
+        if entry.get("source_kind") in {"heading", "heading_variant"}
+        and _int_or_default(entry.get("source_index"), -1) >= 0
+    }
+    landmark_entries: list[dict[str, Any]] = []
+    selected_landmark_indexes: set[int] = set()
+    landmark_confidence = "low"
+    landmark_reason = ""
+    if outline_entries and candidate_payload.get("landmark_candidates"):
+        landmark_parsed = await _request_bookmark_json(
+            pdf_path=pdf_path,
+            original_filename=original_filename,
+            llm_client=llm_client,
+            prompt=BOOKMARK_DOCUMENT_LANDMARK_PLAN_PROMPT,
+            context_payload={
+                "job_filename": original_filename,
+                "selected_outline_entries": _serialize_selected_outline_for_landmark_llm(outline_entries),
+            },
+            response_schema=BOOKMARK_DOCUMENT_LANDMARK_PLAN_SCHEMA,
+            preview_pages=_bookmark_preview_pages(
+                base_pages=_pages_from_outline_entries(outline_entries),
+                extra_pages=[
+                    _int_or_default(entry.get("page"), -1)
+                    for entry in (candidate_payload.get("landmark_candidates") or [])
+                    if isinstance(entry, dict)
+                ],
+            ),
+        )
+        landmark_confidence = str(landmark_parsed.get("confidence") or "").strip().lower() or "low"
+        landmark_reason = str(landmark_parsed.get("reason") or "").strip()
+        if landmark_confidence in {"high", "medium"}:
+            landmark_entries, selected_landmark_indexes = _materialize_landmark_entries_from_plan(
+                landmark_parsed.get("selected_landmarks"),
+                landmark_candidates=candidate_payload.get("landmark_candidates") or [],
+                anchor_level_by_id={
+                    str(entry.get("candidate_id") or ""): _int_or_default(entry.get("level"), 1)
+                    for entry in outline_entries
+                    if isinstance(entry, dict) and str(entry.get("candidate_id") or "").strip()
+                },
+            )
 
     overall_confidence = _best_confidence_label([confidence, supplement_confidence, landmark_confidence])
     merged_outline_entries = _merge_outline_with_landmarks(outline_entries, landmark_entries)

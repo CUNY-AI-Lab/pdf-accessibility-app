@@ -1,13 +1,13 @@
 # Architecture
 
-Updated: 2026-04-08
+Updated: 2026-09-24
 
 This app has two distinct layers:
 
 1. semantic interpretation
 2. deterministic PDF writing and release gating
 
-That split is deliberate. Gemini is used where meaning is hard. The PDF writer stays deterministic.
+That split is deliberate. A vision model is used where meaning is hard. The PDF writer stays deterministic.
 
 The visible product model is also split cleanly:
 
@@ -30,7 +30,7 @@ flowchart TD
     G --> G3["native text"]
     G --> G4["OCR text"]
     G --> G5["nearby context"]
-    F --> H["Direct Gemini structured outputs\nFiles API + context cache"]
+    F --> H["Open-weight vision model on the CAIL Gateway\nstructured outputs over page images"]
     H --> I["Resolved semantic decisions"]
     I --> J["Pretag rationalization\n(widgets, figures, structure)"]
     J --> K["Deterministic tagger/remediator"]
@@ -76,9 +76,9 @@ Current semantic-unit families:
 - figures
 - TOC groups
 
-## Gemini's role
+## The model's role
 
-Gemini is the primary semantic judge for hard units.
+An open-weight vision model, reached through the CAIL Gateway, is the semantic judge for hard units.
 
 It decides things like:
 - what assistive tech should hear for a garbled block
@@ -87,7 +87,7 @@ It decides things like:
 - whether a figure candidate is actually a figure, a table, or a form region
 - whether a page region is a TOC group
 
-Gemini is not allowed to write PDF objects directly.
+The model is not allowed to write PDF objects directly.
 
 ## Deterministic layer
 
@@ -130,25 +130,23 @@ Main implementation files:
 ### Shared LLM transport
 - [backend/app/services/llm_client.py](../backend/app/services/llm_client.py)
 - [backend/app/services/intelligence_llm_utils.py](../backend/app/services/intelligence_llm_utils.py)
-- [backend/app/services/gemini_direct.py](../backend/app/services/gemini_direct.py)
 
 ## Transport choices
 
-The target transport is direct Gemini for PDF-understanding lanes.
+Every AI step uses one transport: chat completions at `LLM_BASE_URL`, the
+CAIL Gateway, with an open-weight vision `LLM_MODEL`. The model sees rendered
+page images and figure crops, never PDF files.
 
 The decision rule is Docling-first:
 - trust Docling-native title, language, hyperlink/widget metadata, and native TOC when present
-- escalate to Gemini only when the extracted document evidence is missing, weak, or semantically ambiguous
-- build Docling-derived ambiguity plans first so Gemini sees only unresolved units, not whole lanes
+- escalate to the model only when the extracted document evidence is missing, weak, or semantically ambiguous
+- build Docling-derived ambiguity plans first so the model sees only unresolved units, not whole lanes
 
 Important properties:
-- Gemini Files API / cached PDF context for reusable document slices
-- native `response_json_schema` structured output
+- `json_schema` structured output where the model supports it, `json_object` otherwise
 - candidate-ID adjudication for bookmark and navigation decisions
 - retry and timeout bounds
 - audit-grade token and cost tracking
-
-The intended semantic transport is Gemini directly. Where the chat-completions compatibility endpoint is still used, it should point at Google rather than a proxy.
 
 ## Release gate
 

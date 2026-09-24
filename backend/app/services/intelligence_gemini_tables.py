@@ -7,9 +7,9 @@ from app.services.intelligence_gemini import confidence_label, confidence_score
 from app.services.intelligence_gemini_semantics import adjudicate_semantic_unit
 from app.services.intelligence_llm_utils import (
     context_json_part,
+    page_preview_parts,
     preferred_cache_breakpoint_index,
     request_llm_json_with_response,
-    semantic_page_parts,
 )
 from app.services.llm_client import LlmClient
 from app.services.semantic_units import SemanticUnit
@@ -225,7 +225,7 @@ async def generate_table_intelligence_for_page(
     }
     content = [
         {"type": "text", "text": TABLE_BATCH_PROMPT},
-        *semantic_page_parts(job, [page_number], filename=getattr(job, "original_filename", None)),
+        *page_preview_parts(job, [page_number]),
         context_json_part(payload),
     ]
     parsed, _response = await request_llm_json_with_response(

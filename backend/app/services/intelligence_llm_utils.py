@@ -1,22 +1,13 @@
-import base64
 import copy
 import json
 import logging
 from collections.abc import Iterable
-from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import pikepdf
-
 from app.config import get_settings
 from app.models import Job
-from app.services.gemini_direct import (
-    direct_gemini_pdf_enabled,
-    request_direct_gemini_content_json_with_response,
-    request_direct_gemini_pdf_json,
-)
 from app.services.llm_client import LlmClient, is_retryable_llm_exception, make_llm_client
 from app.services.path_safety import validate_path_within_allowed_roots
 from app.services.pdf_preview import render_page_jpeg_data_url
@@ -68,81 +59,6 @@ def context_json_part(payload: Any, *, prefix: str = "Context JSON:\n") -> dict[
     }
 
 
-def _normalize_pdf_page_numbers(page_numbers: Iterable[int] | None, *, total_pages: int) -> list[int]:
-    if page_numbers is None:
-        return list(range(1, total_pages + 1))
-
-    normalized: list[int] = []
-    seen: set[int] = set()
-    for raw_page_number in page_numbers:
-        if not isinstance(raw_page_number, int):
-            continue
-        page_number = int(raw_page_number)
-        if page_number <= 0 or page_number > total_pages or page_number in seen:
-            continue
-        seen.add(page_number)
-        normalized.append(page_number)
-    return normalized
-
-
-def pdf_file_bytes(pdf_path: Path, page_numbers: Iterable[int] | None = None) -> bytes:
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-
-    with pikepdf.Pdf.open(pdf_path) as source_pdf:
-        total_pages = len(source_pdf.pages)
-        normalized_pages = _normalize_pdf_page_numbers(page_numbers, total_pages=total_pages)
-        if not normalized_pages:
-            raise ValueError("No valid PDF pages were selected for LLM document input")
-        if normalized_pages == list(range(1, total_pages + 1)):
-            return pdf_path.read_bytes()
-
-        subset_pdf = pikepdf.Pdf.new()
-        for page_number in normalized_pages:
-            subset_pdf.pages.append(source_pdf.pages[page_number - 1])
-        output = BytesIO()
-        subset_pdf.save(output)
-        return output.getvalue()
-
-
-def pdf_file_data_url(pdf_path: Path, page_numbers: Iterable[int] | None = None) -> str:
-    encoded = base64.b64encode(pdf_file_bytes(pdf_path, page_numbers)).decode("ascii")
-    return f"data:application/pdf;base64,{encoded}"
-
-
-def pdf_file_parts(
-    job: Job | Any | None,
-    page_numbers: Iterable[int] | None = None,
-    *,
-    filename: str | None = None,
-) -> list[dict[str, Any]]:
-    if job is None:
-        return []
-    try:
-        pdf_path = job_pdf_path(job)
-    except Exception:
-        logger.warning("Could not resolve PDF path for PDF document input (job %s)", getattr(job, "id", "?"))
-        return []
-
-    resolved_filename = (filename or getattr(job, "original_filename", None) or pdf_path.name).strip()
-    if not resolved_filename.lower().endswith(".pdf"):
-        resolved_filename = f"{resolved_filename}.pdf"
-
-    try:
-        return [
-            {
-                "type": "file",
-                "file": {
-                    "filename": resolved_filename,
-                    "file_data": pdf_file_data_url(pdf_path, page_numbers),
-                },
-            }
-        ]
-    except Exception:
-        logger.debug("Failed to prepare PDF document input for intelligence", exc_info=True)
-        return []
-
-
 def page_preview_parts(job: Job | Any | None, page_numbers: Iterable[int]) -> list[dict[str, Any]]:
     if job is None:
         return []
@@ -169,20 +85,6 @@ def page_preview_parts(job: Job | Any | None, page_numbers: Iterable[int]) -> li
             logger.debug("Failed to render page %d preview for intelligence", page_number)
             continue
     return parts
-
-
-def semantic_page_parts(
-    job: Job | Any | None,
-    page_numbers: Iterable[int],
-    *,
-    filename: str | None = None,
-) -> list[dict[str, Any]]:
-    """The pages as the model lane takes them: rendered images for the
-    chat-completions lane (open-weight vision models through the Gateway),
-    the PDF itself only for the direct Gemini baseline."""
-    if direct_gemini_pdf_enabled():
-        return pdf_file_parts(job, page_numbers, filename=filename)
-    return page_preview_parts(job, page_numbers)
 
 
 def extract_message_json(message: Any) -> dict[str, Any]:
@@ -249,7 +151,7 @@ def preferred_cache_breakpoint_index(content: list[dict[str, Any]]) -> int | Non
     for index, item in enumerate(content):
         if not isinstance(item, dict):
             continue
-        if item.get("type") in {"image_url", "file"}:
+        if item.get("type") == "image_url":
             last_media_index = index
 
     if last_media_index is not None:
@@ -286,16 +188,6 @@ async def request_llm_json_with_response(
     cache_breakpoint_index: int | None = None,
     conversation_prefix: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    if direct_gemini_pdf_enabled() and conversation_prefix is None:
-        response_schema_payload = response_schema if (response_schema and schema_name) else response_schema
-        return await request_direct_gemini_content_json_with_response(
-            content=content,
-            response_schema=response_schema_payload,
-            system_instruction=(
-                "You are evaluating PDF accessibility and document semantics. "
-                "Stay grounded in the provided document and return JSON only."
-            ),
-        )
     repair_note: str | None = None
 
     async def _request_once(request_content: list[dict[str, Any]]) -> Any:
@@ -385,18 +277,8 @@ async def request_pdf_pages_json(
     schema_name: str = "document_decision",
     system_instruction: str,
 ) -> dict[str, Any]:
-    """Ask the model lane about some pages of a PDF: rendered page images to
-    the chat-completions lane, or the PDF itself to the direct Gemini
-    baseline."""
-    if direct_gemini_pdf_enabled():
-        return await request_direct_gemini_pdf_json(
-            pdf_path=pdf_path,
-            page_numbers=page_numbers,
-            prompt=prompt,
-            context_payload=context_payload,
-            response_schema=response_schema,
-            system_instruction=system_instruction,
-        )
+    """Ask the model lane about some pages of a PDF, shown as rendered page
+    images."""
     job = SimpleNamespace(id=None, output_path=None, input_path=str(pdf_path))
     content: list[dict[str, Any]] = [
         {"type": "text", "text": prompt},

@@ -136,8 +136,8 @@ def test_generate_form_intelligence_for_page_normalizes_batch_response(monkeypat
         _fake_request_llm_json_with_response,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.semantic_page_parts",
-        lambda job, page_numbers, filename=None: [{"type": "file", "file": {"filename": filename or "sample.pdf", "file_data": "data:application/pdf;base64,page"}}],
+        "app.services.intelligence_gemini_forms.page_preview_parts",
+        lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": "data:image/png;base64,page"}}],
     )
 
     result = asyncio.run(
@@ -176,7 +176,7 @@ def test_generate_form_intelligence_for_page_normalizes_batch_response(monkeypat
 
     assert captured["schema_name"] == "form_page_intelligence"
     assert captured["cache_breakpoint_index"] == 1
-    assert captured["content"][1]["type"] == "file"
+    assert captured["content"][1]["type"] == "image_url"
     prompt = captured["content"][0]["text"]
     assert "section or group context" in prompt
     assert "instead of returning a bare short label" in prompt
@@ -192,7 +192,7 @@ def test_generate_form_intelligence_for_page_normalizes_batch_response(monkeypat
     assert result[1]["confidence_score"] == 0.4
 
 
-def test_form_fields_on_a_page_are_asked_about_in_batches_on_the_image_lane(monkeypatch, tmp_path):
+def test_form_fields_on_a_page_are_asked_about_in_batches(monkeypatch, tmp_path):
     call_sizes = []
 
     async def _fake_request_llm_json_with_response(
@@ -222,12 +222,8 @@ def test_form_fields_on_a_page_are_asked_about_in_batches_on_the_image_lane(monk
         _fake_request_llm_json_with_response,
     )
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.semantic_page_parts",
-        lambda job, page_numbers, filename=None: [{"type": "image_url", "image_url": {"url": "data:image/png;base64,page"}}],
-    )
-    monkeypatch.setattr(
-        "app.services.intelligence_gemini_forms.direct_gemini_pdf_enabled",
-        lambda: False,
+        "app.services.intelligence_gemini_forms.page_preview_parts",
+        lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": "data:image/png;base64,page"}}],
     )
     monkeypatch.setattr(
         "app.services.intelligence_gemini_forms.get_settings",

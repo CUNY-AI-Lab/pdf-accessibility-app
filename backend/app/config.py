@@ -11,14 +11,9 @@ PLACEHOLDER_LLM_KEYS = {
     "ollama",
     "changeme",
     "your-api-key",
-    "your_gemini_api_key",
     "replace_me",
 }
 LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1", "::1"}
-
-
-# Google's OpenAI-compatible endpoint, the one LLM_BASE_URL GEMINI_API_KEY may serve.
-GOOGLE_LLM_HOST = "generativelanguage.googleapis.com"
 
 
 class Settings(BaseSettings):
@@ -32,21 +27,13 @@ class Settings(BaseSettings):
     processing_dir: Path = BASE_DIR / "data" / "processing"
     output_dir: Path = BASE_DIR / "data" / "output"
 
-    # Gemini
-    llm_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    # Model lane: an open-weight vision model through the CAIL Gateway, given
+    # rendered page images.
+    llm_base_url: str = "https://tools.ailab.gc.cuny.edu/v1"
     llm_api_key: str = ""
-    llm_model: str = "google/gemini-3-flash-preview"
-    gemini_api_key: str = ""
-    gemini_model: str = "gemini-3-flash-preview"
-    use_direct_gemini_pdf: bool = True
-    gemini_direct_timeout: int = 120
-    gemini_direct_max_output_tokens: int = 8192
-    gemini_direct_thinking_level: str = "low"
-    gemini_direct_thinking_budget: int = 0
-    gemini_direct_alt_text_thinking_level: str = "medium"
-    gemini_direct_alt_text_thinking_budget: int = 0
-    # Page images carry less than a PDF, so image requests ask about a page's
-    # form fields in batches and show bookmarks a sample of pages.
+    llm_model: str = "qwen3-vl-235b-a22b-instruct"
+    # Requests ask about a page's form fields in batches and show bookmarks a
+    # sample of page images.
     llm_page_candidate_batch_size: int = 12
     llm_bookmark_preview_pages: int = 4
     llm_timeout: int = 120
@@ -157,21 +144,11 @@ class Settings(BaseSettings):
     # Dev
     debug: bool = False
 
-    @property
-    def llm_credential(self) -> str:
-        """The key sent to LLM_BASE_URL: LLM_API_KEY, or GEMINI_API_KEY when
-        the base URL is Google's own endpoint. A key never goes to any other
-        service than the one that issued it."""
-        if key := self.llm_api_key.strip():
-            return key
-        host = (urlparse(self.llm_base_url.strip()).hostname or "").lower()
-        return self.gemini_api_key.strip() if host == GOOGLE_LLM_HOST else ""
-
     @model_validator(mode="after")
     def validate_llm_settings(self):
         base_url = self.llm_base_url.strip()
         model = self.llm_model.strip()
-        api_key = self.llm_credential
+        api_key = self.llm_api_key.strip()
 
         if not base_url:
             raise ValueError("LLM_BASE_URL must be set")

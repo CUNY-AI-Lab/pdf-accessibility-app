@@ -24,7 +24,7 @@ Upload a PDF and the app classifies it, runs OCR if needed, extracts structure, 
 | Frontend | React, TypeScript, Vite, Tailwind CSS 4, TanStack Query |
 | PDF Processing | pikepdf, OCRmyPDF, Ghostscript, Poppler, QPDF |
 | Structure Extraction | Docling (local or `docling-serve`) |
-| Semantic Analysis | Gemini Developer API |
+| Semantic Analysis | Open-weight vision models through the CAIL Gateway |
 | Validation | veraPDF |
 
 ## Requirements
@@ -36,7 +36,7 @@ Upload a PDF and the app classifies it, runs OCR if needed, extracts structure, 
 - [Tesseract](https://github.com/tesseract-ocr/tesseract)
 - [Poppler](https://poppler.freedesktop.org/) (`pdftoppm`)
 - [veraPDF](https://verapdf.org/) and a Java runtime
-- A Gemini Developer API key
+- A CAIL Gateway API key
 
 On macOS, install system dependencies via Homebrew. On Debian/Ubuntu, install `ghostscript`, `poppler-utils`, `tesseract-ocr`, and a Java runtime.
 
@@ -47,7 +47,7 @@ On macOS, install system dependencies via Homebrew. On Debian/Ubuntu, install `g
 git clone <repo-url> pdf-accessibility-app
 cd pdf-accessibility-app
 cp .env.example .env
-# Edit .env and set GEMINI_API_KEY
+# Edit .env and set LLM_API_KEY (a CAIL Gateway key)
 
 # Install dependencies
 cd backend && uv sync
@@ -74,7 +74,7 @@ A single-container image bundles all system dependencies and serves the built fr
 
 ```bash
 cp .env.example .env
-# Set GEMINI_API_KEY
+# Set LLM_API_KEY
 
 docker compose up -d --build
 ```
@@ -142,13 +142,9 @@ Configure the app via `.env`. Key variables:
 
 | Variable | Description | Default |
 |---|---|---|
-| `GEMINI_API_KEY` | Google Gemini API key (required) | — |
-| `LLM_BASE_URL` | Chat-completions base URL | `https://generativelanguage.googleapis.com/v1beta/openai` |
-| `LLM_API_KEY` | Optional chat-completions credential (falls back to `GEMINI_API_KEY`) | — |
-| `LLM_MODEL` | Chat-completions model identifier | `google/gemini-3-flash-preview` |
-| `GEMINI_MODEL` | Native Gemini model for direct PDF lanes | `gemini-3-flash-preview` |
-| `GEMINI_DIRECT_THINKING_LEVEL` | Thinking level for direct PDF semantic lanes | `low` |
-| `GEMINI_DIRECT_ALT_TEXT_THINKING_LEVEL` | Thinking level for figure semantics and alt text | `medium` |
+| `LLM_BASE_URL` | Chat-completions base URL (the CAIL Gateway) | `https://tools.ailab.gc.cuny.edu/v1` |
+| `LLM_API_KEY` | CAIL Gateway key (required) | — |
+| `LLM_MODEL` | Open-weight vision model on the Gateway | `qwen3-vl-235b-a22b-instruct` |
 | `ALT_TEXT_MAX_CONCURRENCY` | Max concurrent alt-text requests per PDF | `8` |
 | `ALT_TEXT_GLOBAL_MAX_CONCURRENCY` | Process-wide cap for alt-text requests | `12` |
 | `MAX_UPLOAD_SIZE_BYTES` | Maximum raw upload size accepted by the app | `104857600` |
@@ -277,13 +273,8 @@ that policy changes, the proxy hands this app a short-lived signed
 remains separate (CSRF and anonymous-session isolation), while verified
 job ownership keys off the assertion's stable subject.
 
-**AI Gateway seam:** model traffic can be routed through Cloudflare AI
-Gateway without code changes via the existing `LLM_BASE_URL` /
-`LLM_API_KEY` variables — point them at the gateway's OpenAI-compatible
-endpoint for the provider (e.g.
-`https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/google-ai-studio/v1beta/openai`)
-to get lab-level spend logging/limits. The direct-PDF lanes
-(`USE_DIRECT_GEMINI_PDF`, native `google-genai` client) bypass
-`LLM_BASE_URL` and would need a separate base-URL option if they should
-also route through the gateway. Per-user spend keying is out of scope
-while the tool is public/anonymous.
+**Models:** every AI step calls the CAIL Gateway at `LLM_BASE_URL` with
+rendered page images, never PDF files. The Gateway admits only open-weight
+models and meters spend per key. Per-person Gateway credentials come with
+the Doorway version of the app; see
+[docs/cail-integration-plan.md](docs/cail-integration-plan.md).
