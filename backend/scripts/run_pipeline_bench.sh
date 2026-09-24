@@ -2,15 +2,19 @@
 # Run pipeline_bench.py over one benchmark subset in parallel containers, with
 # structure from a docling-serve on the host (DOCLING_SERVE_URL, as in
 # production).
-#   run_pipeline_bench.sh <candidate> <subset> [--worktree] [--gateway-ocr] [--shards N]
+#   run_pipeline_bench.sh <candidate> <subset> [--worktree] [--gateway-ocr]
+#     [--llm gemini | --llm gateway:<model>] [--shards N]
 # By default the pipeline is production's, from pdf-a11y-eval:prod.
 # --worktree     runs this worktree's app/ (a snapshot, so later edits do not
 #                leak into a running bench) in pdf-a11y-eval:branch, built
 #                from this worktree: docker build -t pdf-a11y-eval:branch .
 # --gateway-ocr  recognizes text through the CAIL Gateway (OCR_ENGINE=gateway),
 #                with the key from the Keychain item "cail-gateway".
-# The app's own LLM calls fail at once in every run (no LLM is reachable and
-# the direct Gemini path is off), so runs compare the deterministic pipeline.
+# --llm          turns the app's AI steps on: "gemini" is production's Gemini
+#                setup (direct PDF input; GEMINI_API_KEY must be exported),
+#                "gateway:<model>" sends page images to that Gateway model.
+# Without --llm no model is reachable and the AI steps fail at once, so runs
+# compare the deterministic pipeline.
 set -euo pipefail
 candidate=$1 subset=$2
 shift 2
@@ -19,9 +23,10 @@ bench=$backend/data/eval/olmocr-bench/bench_data
 shards=4
 image=pdf-a11y-eval:prod
 snapshot=
-llm_base_url=http://127.0.0.1:9/v1
-env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001 -e LLM_MAX_RETRIES=0
-  -e USE_DIRECT_GEMINI_PDF=false -e LLM_MODEL=gemini-unused)
+gateway=https://tools.ailab.gc.cuny.edu/v1
+llm=
+gateway_ocr=
+env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001)
 mounts=(-v "$bench:/bench" -v "$backend/scripts/pipeline_bench.py:/app/backend/pipeline_bench.py:ro")
 while [ $# -gt 0 ]; do
   case $1 in
@@ -30,17 +35,37 @@ while [ $# -gt 0 ]; do
       snapshot=$(mktemp -d "$bench/.app-snapshot-XXXXXX")
       cp -R "$backend/app/." "$snapshot"
       mounts+=(-v "$snapshot:/app/backend/app:ro") ;;
-    --gateway-ocr)
-      LLM_API_KEY=$(security find-generic-password -s cail-gateway -w)
-      export LLM_API_KEY
-      llm_base_url=https://tools.ailab.gc.cuny.edu/v1
-      env+=(-e OCR_ENGINE=gateway -e LLM_API_KEY) ;;
+    --gateway-ocr) gateway_ocr=1 ;;
+    --llm) llm=$2; shift ;;
     --shards) shards=$2; shift ;;
     *) echo "unknown flag $1" >&2; exit 2 ;;
   esac
   shift
 done
-env+=(-e "LLM_BASE_URL=$llm_base_url")
+# The Gateway key goes to the containers only when they call the Gateway.
+if [ -n "$gateway_ocr" ] || [[ $llm == gateway:* ]]; then
+  LLM_API_KEY=$(security find-generic-password -s cail-gateway -w)
+  export LLM_API_KEY
+  env+=(-e LLM_API_KEY)
+fi
+[ -n "$gateway_ocr" ] && env+=(-e OCR_ENGINE=gateway)
+case $llm in
+  "")
+    # Gateway OCR reads LLM_BASE_URL; the AI steps then name a model the
+    # Gateway refuses, so they fail at once as with no model at all.
+    base_url=http://127.0.0.1:9/v1
+    [ -n "$gateway_ocr" ] && base_url=$gateway
+    env+=(-e "LLM_BASE_URL=$base_url" -e LLM_MODEL=gemini-unused
+      -e LLM_MAX_RETRIES=0 -e USE_DIRECT_GEMINI_PDF=false) ;;
+  gemini)
+    [ -n "$gateway_ocr" ] && { echo "--gateway-ocr needs the Gateway as LLM_BASE_URL" >&2; exit 2; }
+    [ -n "${GEMINI_API_KEY:-}" ] || { echo "--llm gemini needs GEMINI_API_KEY exported" >&2; exit 2; }
+    env+=(-e LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+      -e LLM_MODEL=google/gemini-3-flash-preview -e GEMINI_API_KEY -e USE_DIRECT_GEMINI_PDF=true) ;;
+  gateway:*)
+    env+=(-e "LLM_BASE_URL=$gateway" -e "LLM_MODEL=${llm#gateway:}" -e USE_DIRECT_GEMINI_PDF=false) ;;
+  *) echo "unknown --llm $llm" >&2; exit 2 ;;
+esac
 mkdir -p "$bench/logs"
 [ -n "$snapshot" ] && trap 'rm -rf "$snapshot"' EXIT
 
