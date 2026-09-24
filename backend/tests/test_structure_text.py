@@ -5,6 +5,7 @@ from pathlib import Path
 import pikepdf
 import pytest
 
+from app.pipeline.pdf_repair import add_missing_icc_components
 from app.services.structure_text import screen_reader_text
 
 
@@ -121,3 +122,22 @@ def test_table_structure_is_kept_as_html_in_markdown(tmp_path):
         "<table><thead><tr><th>Year</th><th>Price &amp; tax</th></tr></thead>"
         '<tbody><tr><td colspan="2">No sales</td></tr></tbody></table>'
     )
+
+
+def test_a_page_with_an_icc_profile_missing_its_component_count_is_read(tmp_path):
+    path = tmp_path / "icc.pdf"
+    _tagged_pdf(path, figure_alt=None)
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        header = bytearray(128)
+        header[16:20] = b"RGB "
+        header[36:40] = b"acsp"
+        profile = pdf.make_stream(bytes(header))
+        pdf.pages[0].Resources.ColorSpace = pikepdf.Dictionary(
+            CS0=pikepdf.Array([pikepdf.Name.ICCBased, profile])
+        )
+        pdf.save(path)
+
+    assert " ".join(screen_reader_text(path).split()) == "Paragraph text"
+    with pikepdf.open(path) as pdf:
+        assert add_missing_icc_components(pdf) == 1
+        assert int(pdf.pages[0].Resources.ColorSpace.CS0[1].N) == 3

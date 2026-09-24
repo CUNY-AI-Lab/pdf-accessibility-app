@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import html
 import re
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -28,6 +29,8 @@ from pdfminer.converter import PDFLayoutAnalyzer
 from pdfminer.layout import LTChar
 from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
 from pdfminer.pdfpage import PDFPage
+
+from app.pipeline.pdf_repair import add_missing_icc_components
 
 BLOCK_ROLES = {
     "P",
@@ -119,7 +122,7 @@ def glyphs_to_text(chars: list[LTChar]) -> str:
     return "".join(text)
 
 
-def page_mcid_text(pdf_path: Path) -> list[dict[int, str]]:
+def _parse_mcid_text(pdf_path: Path) -> list[dict[int, str]]:
     """Text drawn inside each MCID, per page, decoded through the fonts."""
     pages: list[dict[int, str]] = []
     manager = PDFResourceManager()
@@ -129,6 +132,18 @@ def page_mcid_text(pdf_path: Path) -> list[dict[int, str]]:
             PDFPageInterpreter(manager, device).process_page(page)
             pages.append({mcid: glyphs_to_text(chars) for mcid, chars in device.chars.items()})
     return pages
+
+
+def page_mcid_text(pdf_path: Path) -> list[dict[int, str]]:
+    """Text drawn inside each MCID, per page. ICC profiles missing their
+    required /N are repaired on a copy first; pdfminer fails without it."""
+    with pikepdf.open(pdf_path) as pdf:
+        if add_missing_icc_components(pdf):
+            with tempfile.TemporaryDirectory() as tmp:
+                repaired = Path(tmp) / "repaired.pdf"
+                pdf.save(repaired)
+                return _parse_mcid_text(repaired)
+    return _parse_mcid_text(pdf_path)
 
 
 HEADING_LEVELS = {"Title": 1, "H": 1, **{f"H{level}": level for level in range(1, 7)}}

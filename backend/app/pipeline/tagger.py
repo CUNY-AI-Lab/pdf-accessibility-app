@@ -29,6 +29,7 @@ from rtree import index as rtree_index
 from scipy.optimize import linear_sum_assignment
 
 from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
+from app.pipeline.pdf_repair import add_missing_icc_components
 
 logger = logging.getLogger(__name__)
 
@@ -5077,6 +5078,7 @@ def _sanitize_outline_leaf_counts(pdf: pikepdf.Pdf) -> int:
 
 def _save_pdf_for_viewer_compatibility(pdf: pikepdf.Pdf, output_path: Path) -> None:
     """Save linearized output when possible; fall back to a normal save."""
+    add_missing_icc_components(pdf)
     tmp_path = output_path.with_name(f"{output_path.name}.tmp")
     tmp_path.unlink(missing_ok=True)
     try:
