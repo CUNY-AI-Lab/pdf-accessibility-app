@@ -3,7 +3,10 @@
 # structure from a docling-serve on the host (DOCLING_SERVE_URL, as in
 # production), split across parallel containers.
 #   run_pipeline_bench.sh <candidate> <subset> [--worktree] [--gateway-ocr] [--shards N]
-# --worktree     runs a snapshot of this worktree's app/ instead of the image's.
+# --worktree     runs a snapshot of this worktree's app/ in pdf-a11y-eval:branch,
+#                an image built from this worktree for its dependencies
+#                (docker build -t pdf-a11y-eval:branch .); otherwise the image
+#                is pdf-a11y-eval:prod, built from production.
 # --gateway-ocr  recognizes text through the CAIL Gateway (OCR_ENGINE=gateway),
 #                with the key from the Keychain item "cail-gateway".
 # The app's own LLM calls fail at once in every run (no retries), so runs
@@ -13,6 +16,7 @@ candidate=$1 subset=$2; shift 2
 backend=$(cd "$(dirname "$0")/.." && pwd)
 bench=$backend/data/eval/olmocr-bench/bench_data
 shards=4
+image=pdf-a11y-eval:prod
 mounts=(-v "$bench:/bench"
   -v "$backend/scripts/pipeline_bench.py:/app/backend/pipeline_bench.py:ro"
   -v "$backend/app/services/structure_text.py:/app/backend/app/services/structure_text.py:ro"
@@ -22,6 +26,7 @@ env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001 -e LLM_MAX_RETRIES=0 
 while [ $# -gt 0 ]; do
   case $1 in
     --worktree)
+      image=pdf-a11y-eval:branch
       snapshot=$bench/.app-snapshot-$candidate-$subset
       rm -rf "$snapshot"; cp -R "$backend/app" "$snapshot"
       mounts=(-v "$bench:/bench" -v "$backend/scripts/pipeline_bench.py:/app/backend/pipeline_bench.py:ro"
@@ -38,7 +43,7 @@ while [ $# -gt 0 ]; do
 done
 for i in $(seq 0 $((shards - 1))); do
   docker run --rm --name "pipe-$candidate-$subset-$i" --user 0 "${env[@]}" "${mounts[@]}" \
-    pdf-a11y-eval:prod sh -c "cd /app/backend && python pipeline_bench.py --bench-dir /bench \
+    "$image" sh -c "cd /app/backend && python pipeline_bench.py --bench-dir /bench \
       --candidate $candidate --subsets $subset --shard $i/$shards" \
     >> "$bench/$candidate.$subset.$i.log" 2>&1 &
 done
