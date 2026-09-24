@@ -3350,6 +3350,10 @@ class StructTreeBuilder:
 
         if parent is None:
             parent = self.doc_elem
+        # ActualText replaces an element's whole subtree for a screen reader,
+        # so it would hide the link; the parent reads from its glyphs instead.
+        if "/ActualText" in parent:
+            del parent["/ActualText"]
         annotation["/P"] = page_ref
         if not str(annotation.get("/Contents", "")).strip():
             annotation["/Contents"] = pikepdf.String(_infer_link_contents(annotation))

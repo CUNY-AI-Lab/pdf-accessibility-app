@@ -25,7 +25,13 @@ from pathlib import Path
 
 import pikepdf
 
-from app.pipeline.page_glyphs import PdfGlyphReader, StreamKey, join_glyphs
+from app.pipeline.page_glyphs import (
+    MeasuredGlyph,
+    PdfGlyphReader,
+    StreamKey,
+    join_glyphs,
+    separated,
+)
 
 BLOCK_ROLES = {
     "P",
@@ -126,19 +132,25 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
             return ""
         role_map = root.get("/RoleMap")
         blocks: list[str] = []
-        marked_text: dict[int, dict[tuple[StreamKey, int], str]] = {}
+        marked: dict[int, dict[tuple[StreamKey, int], list[MeasuredGlyph | str]]] = {}
         form_paths: dict[int, dict[tuple[int, int], StreamKey]] = {}
+        # The last glyph read, to decide whether the next marked content
+        # starts a new word; None after a block break or /ActualText.
+        last_glyph: list[MeasuredGlyph | None] = [None]
 
-        def read_mcid(page: int, stream: pikepdf.Object | None, mcid: int) -> str:
-            if page not in marked_text:
-                marked = glyphs.page(page).marked
-                marked_text[page] = {key: join_glyphs(items) for key, items in marked.items()}
+        def read_mcid(page: int, stream: pikepdf.Object | None, mcid: int, out: list[str]) -> None:
+            if page not in marked:
+                marked[page] = glyphs.page(page).marked
                 form_paths[page] = _form_paths(pdf.pages[page].obj)
-            if stream is None:
-                return marked_text[page].get(((), mcid), "")
-            if (path := form_paths[page].get(stream.objgen)) is None:
-                return ""
-            return marked_text[page].get((path, mcid), "")
+            path = () if stream is None else form_paths[page].get(stream.objgen)
+            items = marked[page].get((path, mcid), []) if path is not None else []
+            if not items:
+                return
+            first = items[0] if isinstance(items[0], MeasuredGlyph) else None
+            if last_glyph[0] is not None and (first is None or separated(last_glyph[0], first)):
+                out.append(" ")
+            out.append(join_glyphs(items))
+            last_glyph[0] = items[-1] if isinstance(items[-1], MeasuredGlyph) else None
 
         def inline(node, page) -> str:
             parts: list[str] = []
@@ -166,7 +178,7 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
             ref = marked_ref(node, page)
             if ref is not None:
                 if ref[0] is not None:
-                    out.append(read_mcid(*ref))
+                    read_mcid(*ref, out)
                 return
             if not isinstance(node, pikepdf.Dictionary):
                 return
@@ -198,6 +210,7 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
                 return
             if "/ActualText" in node:
                 out.append(str(node.ActualText))
+                last_glyph[0] = None
                 if role in BLOCK_ROLES:
                     out.append("\n")
                 return
@@ -210,6 +223,7 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
                 walk(kids, page, out)
             if role in BLOCK_ROLES:
                 out.append("\n\n" if markdown else "\n")
+                last_glyph[0] = None
 
         walk(root.get("/K"), None, blocks)
     text = "".join(blocks)

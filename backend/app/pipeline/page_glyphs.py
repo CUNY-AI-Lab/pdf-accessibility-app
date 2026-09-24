@@ -70,26 +70,30 @@ def union_bbox(boxes: Iterable[dict[str, float]]) -> dict[str, float] | None:
     }
 
 
+def separated(previous: MeasuredGlyph, glyph: MeasuredGlyph) -> bool:
+    """Whether a word break falls between two glyphs drawn one after the
+    other: a new line, or a gap wider than 0.15 em."""
+    size = max(glyph.bbox["t"] - glyph.bbox["b"], previous.bbox["t"] - previous.bbox["b"], 1.0)
+    new_line = abs(glyph.bbox["b"] - previous.bbox["b"]) > 0.5 * size
+    return new_line or glyph.bbox["l"] - previous.bbox["r"] > 0.15 * size
+
+
 def join_glyphs(items: Iterable[MeasuredGlyph | str]) -> str:
-    """Glyph text in drawing order, with a space at word gaps and line breaks
-    (many PDFs space words with TJ offsets, not space glyphs). A string item,
-    an /ActualText, stands as its own word."""
+    """Glyph text in drawing order, with a space at word breaks (many PDFs
+    space words with TJ offsets, not space glyphs). A string item, an
+    /ActualText, stands as its own word."""
     parts: list[str] = []
     previous: MeasuredGlyph | None = None
     for item in items:
-        text = item if isinstance(item, str) else item.text
-        if parts and not parts[-1].endswith(" "):
-            if isinstance(item, str) or previous is None:
-                parts.append(" ")
-            else:
-                size = max(
-                    item.bbox["t"] - item.bbox["b"], previous.bbox["t"] - previous.bbox["b"], 1.0
-                )
-                new_line = abs(item.bbox["b"] - previous.bbox["b"]) > 0.5 * size
-                if new_line or item.bbox["l"] - previous.bbox["r"] > 0.15 * size:
-                    parts.append(" ")
-        parts.append(text)
-        previous = None if isinstance(item, str) else item
+        glyph = None if isinstance(item, str) else item
+        if (
+            parts
+            and not parts[-1].endswith(" ")
+            and (glyph is None or previous is None or separated(previous, glyph))
+        ):
+            parts.append(" ")
+        parts.append(item if glyph is None else glyph.text)
+        previous = glyph
     return "".join(parts)
 
 
