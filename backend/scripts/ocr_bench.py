@@ -68,9 +68,11 @@ def convert(pdf: Path, target: Path, language: str, extra: list[str]) -> str:
             check=False,
         )
         # OCRmyPDF exit 6 means the page already had text and was skipped.
-        text, extractor = page_text(output if output.exists() else pdf)
         if result.returncode not in (0, 6):
-            text = ""
+            # No output is written, so the next run retries the page.
+            reason = (result.stderr.strip().splitlines() or [""])[-1]
+            return f"exit {result.returncode}: {reason}"
+        text, extractor = page_text(output if output.exists() else pdf)
     target.write_text(text, encoding="utf-8")
     return f"exit {result.returncode} ({extractor})"
 
@@ -93,12 +95,7 @@ def main() -> None:
     jobs = []
     for subset in options.subsets:
         for pdf in sorted((options.bench_dir / "pdfs" / subset).glob("*.pdf")):
-            target = (
-                options.bench_dir
-                / options.candidate
-                / subset
-                / f"{pdf.stem}_pg1_repeat1.md"
-            )
+            target = options.bench_dir / options.candidate / subset / f"{pdf.stem}_pg1_repeat1.md"
             jobs.append((pdf, target))
 
     with ThreadPoolExecutor(max_workers=options.workers) as pool:

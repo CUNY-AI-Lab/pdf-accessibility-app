@@ -1,6 +1,10 @@
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from app.config import Settings
+from app.pipeline import ocr
 from app.pipeline.ocr import _build_ocrmypdf_args
 from app.services import runtime_paths
 
@@ -99,3 +103,49 @@ def test_enriched_subprocess_env_adds_configured_binary_dirs(monkeypatch):
 
     assert "/srv/bin" in env["PATH"]
     assert "/opt/tools/bin" in env["PATH"]
+
+
+def test_gateway_engine_loads_the_plugin_and_runs_pages_in_parallel():
+    args = _build_ocrmypdf_args(
+        input_path=Path("input.pdf"),
+        output_path=Path("output.pdf"),
+        language="eng",
+        mode="skip",
+        rotate_pages=True,
+        deskew=True,
+        engine="gateway",
+    )
+
+    assert args[args.index("--plugin") + 1] == "app.pipeline.ocr_vlm_plugin"
+    assert args[args.index("--jobs") + 1] == str(Settings().ocr_gateway_jobs)
+    assert args[-2:] == ["input.pdf", "output.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_engine_gives_ocrmypdf_the_llm_connection(monkeypatch, tmp_path):
+    settings = Settings(
+        llm_base_url="https://gateway.test/v1",
+        llm_api_key="sk-app",
+        llm_model="gemini-check",
+        ocr_model="vision-model",
+    )
+    monkeypatch.setattr(ocr, "get_settings", lambda: settings)
+    seen = {}
+
+    async def create_subprocess_exec(*args, env, **kwargs):
+        seen.update(args=args, env=env)
+        return SimpleNamespace(returncode=0)
+
+    async def communicate(proc, timeout):
+        return b"", b""
+
+    monkeypatch.setattr(ocr.asyncio, "create_subprocess_exec", create_subprocess_exec)
+    monkeypatch.setattr(ocr, "communicate_with_timeout", communicate)
+
+    result = await ocr.run_ocr(tmp_path / "in.pdf", tmp_path / "out.pdf", engine="gateway")
+
+    assert result.success
+    assert "--plugin" in seen["args"]
+    assert seen["env"]["CAIL_OCR_BASE_URL"] == "https://gateway.test/v1"
+    assert seen["env"]["CAIL_OCR_API_KEY"] == "sk-app"
+    assert seen["env"]["CAIL_OCR_MODEL"] == "vision-model"

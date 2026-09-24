@@ -16,6 +16,8 @@ from app.services.runtime_paths import enriched_subprocess_env
 
 logger = logging.getLogger(__name__)
 
+GATEWAY_OCR_PLUGIN = "app.pipeline.ocr_vlm_plugin"
+
 
 @dataclass
 class OcrResult:
@@ -35,10 +37,12 @@ def _build_ocrmypdf_args(
     deskew: bool,
     jobs: int | None = None,
     max_image_mpixels: int | None = None,
+    engine: str = "tesseract",
 ) -> list[str]:
     settings = get_settings()
+    default_jobs = settings.ocr_gateway_jobs if engine == "gateway" else settings.ocrmypdf_jobs
     try:
-        resolved_jobs = int(jobs if jobs is not None else settings.ocrmypdf_jobs)
+        resolved_jobs = int(jobs if jobs is not None else default_jobs)
     except (TypeError, ValueError):
         resolved_jobs = 1
     try:
@@ -65,6 +69,8 @@ def _build_ocrmypdf_args(
         "--max-image-mpixels",
         str(max(1, resolved_max_image_mpixels)),
     ]
+    if engine == "gateway":
+        args.extend(["--plugin", GATEWAY_OCR_PLUGIN])
     if mode == "redo":
         if rotate_pages:
             args.append("--rotate-pages")
@@ -97,12 +103,13 @@ async def run_ocr(
     timeout_seconds: int | None = None,
     jobs: int | None = None,
     max_image_mpixels: int | None = None,
+    engine: str = "tesseract",
 ) -> OcrResult:
     """Run OCRmyPDF as a subprocess to add text layer to scanned PDFs.
 
     OCRmyPDF is not thread-safe, so we run it as a separate process.
     """
-    logger.info(f"Running OCR on {input_path.name} (language={language})")
+    logger.info(f"Running OCR on {input_path.name} (language={language}, engine={engine})")
 
     args = _build_ocrmypdf_args(
         input_path=input_path,
@@ -113,13 +120,20 @@ async def run_ocr(
         deskew=deskew,
         jobs=jobs,
         max_image_mpixels=max_image_mpixels,
+        engine=engine,
     )
+    env = enriched_subprocess_env()
+    if engine == "gateway":
+        settings = get_settings()
+        env["CAIL_OCR_BASE_URL"] = settings.llm_base_url
+        env["CAIL_OCR_API_KEY"] = settings.llm_api_key
+        env["CAIL_OCR_MODEL"] = settings.ocr_model
 
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=enriched_subprocess_env(),
+        env=env,
         **subprocess_process_group_kwargs(),
     )
     try:

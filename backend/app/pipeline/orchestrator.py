@@ -5162,6 +5162,7 @@ async def run_pipeline(
                     rotate_pages=settings.ocr_rotate_pages,
                     deskew=settings.ocr_deskew,
                     timeout_seconds=settings.subprocess_timeout_ocr,
+                    engine=settings.ocr_engine,
                 )
 
                 if ocr_result.success:

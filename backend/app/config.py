@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 from pydantic import model_validator
@@ -76,6 +77,12 @@ class Settings(BaseSettings):
     binary_search_dirs: str = ""
 
     # OCR
+    # "gateway" recognizes text with ocr_model through the LLM connection
+    # (llm_base_url, llm_api_key); "tesseract" runs locally.
+    ocr_engine: Literal["tesseract", "gateway"] = "tesseract"
+    ocr_model: str = "qwen3-vl-235b-a22b-instruct"
+    # Gateway OCR waits on the network, so pages run in parallel.
+    ocr_gateway_jobs: int = 8
     ocr_language: str = "eng"
     ocr_rotate_pages: bool = True
     ocr_deskew: bool = True
@@ -170,8 +177,7 @@ class Settings(BaseSettings):
         if self.llm_strict_validation and not is_local:
             if api_key.lower() in PLACEHOLDER_LLM_KEYS:
                 raise ValueError(
-                    "LLM_API_KEY is required for remote LLM endpoints "
-                    "(set a real API key in .env)"
+                    "LLM_API_KEY is required for remote LLM endpoints (set a real API key in .env)"
                 )
             if "gemini" not in model.lower():
                 raise ValueError(
