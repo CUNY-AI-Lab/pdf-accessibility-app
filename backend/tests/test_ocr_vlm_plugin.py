@@ -50,13 +50,16 @@ def _page_image(tmp_path, size=(1000, 800), dpi=100):
     return path
 
 
-def _answer(monkeypatch, status=200, items=MODEL_LINES, content=None):
+def _answer(monkeypatch, status=200, answers=None):
+    """Fake Gateway: the n-th call gets the n-th (content, finish_reason),
+    and the last one repeats."""
+    answers = answers or [(_fenced(MODEL_LINES), "stop")]
     calls = []
 
     def post(url, **kwargs):
         calls.append(kwargs["json"])
-        answer = _fenced(items) if content is None else content
-        body = {"choices": [{"message": {"content": answer}, "finish_reason": "stop"}]}
+        content, finish = answers[min(len(calls), len(answers)) - 1]
+        body = {"choices": [{"message": {"content": content}, "finish_reason": finish}]}
         return httpx.Response(status, json=body, request=httpx.Request("POST", url))
 
     monkeypatch.setenv("CAIL_OCR_BASE_URL", "https://gateway.test/v1")
@@ -131,13 +134,46 @@ def test_a_call_that_may_have_run_is_not_repeated(tmp_path, monkeypatch, status)
     assert len(used) == 1
 
 
-def test_an_unreadable_answer_falls_back_to_tesseract(tmp_path, monkeypatch):
-    calls = _answer(monkeypatch, content='[{"bbox_2d": [1, 2, 3, 4], "text": "cut sho')
+LOOP = '[{"bbox_2d": [1, 2, 3, 4], "text": "Contents . . . . . . . . . . . . . . . . .'
+
+
+def test_a_looping_answer_is_asked_for_again_warmer(tmp_path, monkeypatch):
+    calls = _answer(monkeypatch, answers=[(LOOP, "length"), (_fenced(MODEL_LINES), "stop")])
+    used = _tesseract_fallback(monkeypatch)
+    _page, text = GatewayVisionOcrEngine.generate_ocr(_page_image(tmp_path), options=None)
+    assert [call["temperature"] for call in calls] == list(ocr_vlm_plugin.TEMPERATURES[:2])
+    assert text.startswith("Dear Sir:-")
+    assert not used
+
+
+def test_three_unusable_answers_fall_back_to_tesseract(tmp_path, monkeypatch):
+    calls = _answer(monkeypatch, answers=[(LOOP, "length")])
+    used = _tesseract_fallback(monkeypatch)
+    _page, text = GatewayVisionOcrEngine.generate_ocr(_page_image(tmp_path), options=None)
+    assert len(calls) == len(ocr_vlm_plugin.TEMPERATURES)
+    assert text == "tesseract text"
+    assert len(used) == 1
+
+
+def test_a_malformed_item_costs_only_that_line(tmp_path, monkeypatch):
+    content = (
+        '[{"bbox_2d": [100, 100, 900, 150], "text": "First line"},\n'
+        ' {"bbox_2d": [100, 200, 900, 250], "text": "He said "no" twice"},\n'
+        ' {"bbox_2d": [100, 300, 900, 350], "text": "Third line"}]'
+    )
+    calls = _answer(monkeypatch, answers=[(content, "stop")])
+    _page, text = GatewayVisionOcrEngine.generate_ocr(_page_image(tmp_path), options=None)
+    assert len(calls) == 1
+    assert text.split("\n") == ["First line", "Third line"]
+
+
+def test_a_blank_page_is_read_once(tmp_path, monkeypatch):
+    calls = _answer(monkeypatch, answers=[("```json\n[]\n```", "stop")])
     used = _tesseract_fallback(monkeypatch)
     _page, text = GatewayVisionOcrEngine.generate_ocr(_page_image(tmp_path), options=None)
     assert len(calls) == 1
-    assert text == "tesseract text"
-    assert len(used) == 1
+    assert text == ""
+    assert not used
 
 
 def test_the_page_image_is_sent_within_the_size_limit(tmp_path, monkeypatch):

@@ -10,9 +10,11 @@ across each line in proportion to word length: the renderer needs words, and a
 screen reader needs only the line's text and position.
 
 Page orientation and skew still come from Tesseract, and so does the text of
-any page the Gateway cannot read: a call is repeated only when the Gateway
-answered 429, 502, 503 or 504, which means no inference ran and nothing was
-charged; any other failure falls back to Tesseract for that page.
+any page the Gateway cannot read. A call is repeated unchanged only when the
+Gateway answered 429, 502, 503 or 504, which means no inference ran and nothing
+was charged. An answer that is cut off (usually a repetition loop) or has no
+readable lines is asked for again at a higher temperature, up to three
+answers; after that, or on any other failure, the page gets Tesseract's text.
 
 The OCR step passes the connection in the environment:
     CAIL_OCR_BASE_URL   Gateway base URL
@@ -47,10 +49,15 @@ log = logging.getLogger(__name__)
 
 # The long side sent to the model; larger images exceed provider body limits.
 MAX_SIDE = 1600
-REQUEST_TIMEOUT_SECONDS = 180
-# A cap on the answer, well above the densest page, so no provider default
-# cuts a page short.
-MAX_OUTPUT_TOKENS = 16384
+# A non-streamed answer arrives all at once, so this covers the whole answer.
+REQUEST_TIMEOUT_SECONDS = 360
+# Well above the densest page measured, so a normal page is never cut short;
+# a repetition loop stops here.
+MAX_OUTPUT_TOKENS = 12000
+# An answer that is cut off or has no readable lines is asked for again at a
+# higher temperature, which usually breaks a repetition loop (olmOCR's
+# pipeline does the same, from 0.1 up).
+TEMPERATURES = (0.1, 0.4, 0.7)
 # Statuses for which the Gateway ran no inference, so a retry costs nothing.
 NOT_RUN_STATUSES = {429, 502, 503, 504}
 RETRY_DELAYS_SECONDS = (5, 20)
@@ -62,8 +69,9 @@ SYSTEM_PROMPT = (
     '{"bbox_2d": [x1, y1, x2, y2], "text": "..."} where the box tightly '
     "encloses that one line and the text is exactly as written: keep original "
     "spelling, capitalization, and punctuation; do not correct or modernize. "
-    "Include headings, handwritten text, marginal notes, captions, and "
-    "footnotes. One item per printed or handwritten line."
+    "Include headings, running heads, page numbers, marginal notes, captions, "
+    "and footnotes. One item per printed or handwritten line. Write a row of "
+    "dot leaders as a few dots, not every dot. If the page has no text, return []."
 )
 
 
@@ -79,31 +87,8 @@ def _encoded_page(image: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def _request_lines(image: Image.Image) -> list[dict]:
-    base_url, api_key, model = (
-        os.environ.get(name, "").strip()
-        for name in ("CAIL_OCR_BASE_URL", "CAIL_OCR_API_KEY", "CAIL_OCR_MODEL")
-    )
-    if not (base_url and api_key and model):
-        raise GatewayOcrError("CAIL_OCR_BASE_URL, CAIL_OCR_API_KEY and CAIL_OCR_MODEL are required")
-    body = {
-        "model": model,
-        "temperature": 0,
-        "max_tokens": MAX_OUTPUT_TOKENS,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Return the lines of this page."},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{_encoded_page(image)}"},
-                    },
-                ],
-            },
-        ],
-    }
+def _complete(base_url: str, api_key: str, body: dict) -> dict:
+    """One answer, repeating the call only when the Gateway ran no inference."""
     for delay in (*RETRY_DELAYS_SECONDS, None):
         response = httpx.post(
             f"{base_url.rstrip('/')}/chat/completions",
@@ -116,25 +101,67 @@ def _request_lines(image: Image.Image) -> list[dict]:
         time.sleep(delay)
     if response.status_code != 200:
         raise GatewayOcrError(f"Gateway returned {response.status_code}")
-    choice = response.json()["choices"][0]
-    content = choice["message"]["content"] or ""
-    try:
-        return parse_lines(content)
-    except json.JSONDecodeError as exc:
-        raise GatewayOcrError(
-            f"unreadable answer ({len(content)} chars, finish_reason "
-            f"{choice.get('finish_reason')}): {exc}"
-        ) from exc
+    answer = response.json()
+    log.info("Gateway OCR usage: %s", answer.get("usage"))
+    return answer["choices"][0]
+
+
+def _request_lines(image: Image.Image) -> list[dict]:
+    base_url, api_key, model = (
+        os.environ.get(name, "").strip()
+        for name in ("CAIL_OCR_BASE_URL", "CAIL_OCR_API_KEY", "CAIL_OCR_MODEL")
+    )
+    if not (base_url and api_key and model):
+        raise GatewayOcrError("CAIL_OCR_BASE_URL, CAIL_OCR_API_KEY and CAIL_OCR_MODEL are required")
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Return the lines of this page."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{_encoded_page(image)}"},
+                },
+            ],
+        },
+    ]
+    problems = []
+    for temperature in TEMPERATURES:
+        body = {
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "messages": messages,
+        }
+        choice = _complete(base_url, api_key, body)
+        content = choice["message"]["content"] or ""
+        finish = choice.get("finish_reason")
+        lines = parse_lines(content)
+        if finish == "stop" and (lines or _is_empty_array(content)):
+            return lines
+        problems.append(f"{temperature}: finish_reason {finish}, {len(lines)} lines")
+    raise GatewayOcrError("no usable answer (" + "; ".join(problems) + ")")
+
+
+def _is_empty_array(content: str) -> bool:
+    return re.sub(r"```(?:json)?|\s", "", content) == "[]"
 
 
 def parse_lines(content: str) -> list[dict]:
-    """The model's line list, tolerating a Markdown code fence around it."""
-    text = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", content.strip())
-    items = json.loads(text)
-    if not isinstance(items, list):
-        raise GatewayOcrError("model did not return a list of lines")
+    """Every readable line item in the answer. Items are decoded one at a
+    time, so a malformed item or a cut-off answer loses only the items it
+    touches."""
+    decoder = json.JSONDecoder()
     lines = []
-    for item in items:
+    position = content.find("{")
+    while position != -1:
+        try:
+            item, end = decoder.raw_decode(content, position)
+        except json.JSONDecodeError:
+            position = content.find("{", position + 1)
+            continue
+        position = content.find("{", end)
         box = item.get("bbox_2d") if isinstance(item, dict) else None
         line_text = item.get("text") if isinstance(item, dict) else None
         if (
