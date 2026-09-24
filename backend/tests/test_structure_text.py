@@ -14,7 +14,10 @@ def _tagged_pdf(path: Path, figure_alt: str | None) -> None:
     page = pdf.add_blank_page(page_size=(300, 300))
     font = pdf.make_indirect(
         pikepdf.Dictionary(
-            Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1, BaseFont=pikepdf.Name.Helvetica
+            Type=pikepdf.Name.Font,
+            Subtype=pikepdf.Name.Type1,
+            BaseFont=pikepdf.Name.Helvetica,
+            Encoding=pikepdf.Name.WinAnsiEncoding,
         )
     )
     page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
@@ -62,7 +65,10 @@ def _table_pdf(path: Path) -> None:
     page = pdf.add_blank_page(page_size=(300, 300))
     font = pdf.make_indirect(
         pikepdf.Dictionary(
-            Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1, BaseFont=pikepdf.Name.Helvetica
+            Type=pikepdf.Name.Font,
+            Subtype=pikepdf.Name.Type1,
+            BaseFont=pikepdf.Name.Helvetica,
+            Encoding=pikepdf.Name.WinAnsiEncoding,
         )
     )
     page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
