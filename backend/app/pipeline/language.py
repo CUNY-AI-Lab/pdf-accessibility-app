@@ -8,18 +8,7 @@ from __future__ import annotations
 
 import re
 
-# Optional lingua-py language detection (Rust-backed, fast, offline).
-# Install with: uv add lingua-language-detector
-try:
-    from lingua import LanguageDetectorBuilder  # type: ignore[import-untyped]
-
-    LINGUA_DETECTOR = (
-        LanguageDetectorBuilder.from_all_languages()
-        .with_minimum_relative_distance(0.25)
-        .build()
-    )
-except ImportError:
-    LINGUA_DETECTOR = None
+from lingua import Language, LanguageDetectorBuilder
 
 # ── Mapping tables ──
 
@@ -28,18 +17,29 @@ LINGUA_TO_BCP47: dict[str, str] = {
     "ENGLISH": "en", "SPANISH": "es", "FRENCH": "fr", "GERMAN": "de",
     "ITALIAN": "it", "PORTUGUESE": "pt", "DUTCH": "nl", "RUSSIAN": "ru",
     "JAPANESE": "ja", "CHINESE": "zh", "KOREAN": "ko", "ARABIC": "ar",
-    "TURKISH": "tr", "POLISH": "pl", "SWEDISH": "sv", "NORWEGIAN": "no",
+    "TURKISH": "tr", "POLISH": "pl", "SWEDISH": "sv",
+    # Bokmål alone: Nynorsk is too close to separate, and "no" is what a
+    # screen reader needs for either.
+    "BOKMAL": "no",
     "DANISH": "da", "FINNISH": "fi", "CZECH": "cs", "HUNGARIAN": "hu",
     "ROMANIAN": "ro", "GREEK": "el", "HEBREW": "he", "HINDI": "hi",
     "THAI": "th", "VIETNAMESE": "vi", "INDONESIAN": "id", "MALAY": "ms",
     "UKRAINIAN": "uk", "CATALAN": "ca", "CROATIAN": "hr", "SERBIAN": "sr",
-    "SLOVENIAN": "sl", "SLOVAK": "sk", "BULGARIAN": "bg", "LATVIAN": "lv",
+    "SLOVENE": "sl", "SLOVAK": "sk", "BULGARIAN": "bg", "LATVIAN": "lv",
     "LITHUANIAN": "lt", "ESTONIAN": "et", "BENGALI": "bn", "YORUBA": "yo",
 }
 
+# Detection among the languages the app can tag and OCR (lingua-py: offline,
+# Rust-backed; models load on first use).
+LINGUA_DETECTOR = (
+    LanguageDetectorBuilder.from_languages(*(getattr(Language, name) for name in LINGUA_TO_BCP47))
+    .with_minimum_relative_distance(0.25)
+    .build()
+)
+
 LANGUAGE_NAME_TO_BCP47 = {
     name.lower().replace("_", " "): code for name, code in LINGUA_TO_BCP47.items()
-}
+} | {"norwegian": "no", "slovenian": "sl"}
 
 # ISO 639-3 (Tesseract-style) → BCP-47.
 ISO639_3_TO_BCP47: dict[str, str] = {
@@ -112,7 +112,7 @@ def detect_language(text: str) -> str | None:
     Returns a BCP-47 tag (e.g. 'fr', 'es') or None if detection fails
     or the text is too short to detect reliably.
     """
-    if not LINGUA_DETECTOR or not text or len(text.split()) < 8:
+    if not text or len(text.split()) < 8:
         return None
     try:
         result = LINGUA_DETECTOR.detect_language_of(text)
