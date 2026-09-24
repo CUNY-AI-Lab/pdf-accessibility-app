@@ -506,8 +506,6 @@ def _normalize_heading_hierarchy(elements: list[dict]) -> None:
         level = _as_positive_int(heading.get("level", 1), default=1)
         if shift:
             level = max(1, level - shift)
-        if previous_level == 1 and level > 1:
-            level = 1
         if level > previous_level + 1:
             level = previous_level + 1
         heading["level"] = max(1, min(6, level))
