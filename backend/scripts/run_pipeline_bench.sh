@@ -15,7 +15,8 @@ bench=$backend/data/eval/olmocr-bench/bench_data
 shards=4
 mounts=(-v "$bench:/bench"
   -v "$backend/scripts/pipeline_bench.py:/app/backend/pipeline_bench.py:ro"
-  -v "$backend/app/services/structure_text.py:/app/backend/app/services/structure_text.py:ro")
+  -v "$backend/app/services/structure_text.py:/app/backend/app/services/structure_text.py:ro"
+  -v "$backend/app/pipeline/pdf_repair.py:/app/backend/app/pipeline/pdf_repair.py:ro")
 env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001 -e LLM_MAX_RETRIES=0 -e USE_DIRECT_GEMINI_PDF=false
   -e LLM_BASE_URL=http://127.0.0.1:9/v1 -e LLM_MODEL=gemini-unused)
 while [ $# -gt 0 ]; do
