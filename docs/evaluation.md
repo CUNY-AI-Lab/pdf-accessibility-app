@@ -43,8 +43,9 @@ What a screen reader hears after the full pipeline:
 | Candidate | Score | Present | Order | Absent |
 |---|---|---|---|---|
 | Production (v1) | 30.5% ± 4.0 | 21.5% | 15.0% | 97.3% |
-| Fixed tagger, Tesseract | **91.7% ± 2.4** | 93.1% | 87.1% | 95.9% |
-| Fixed tagger, Gateway OCR (Qwen3-VL-235B) | 88.0% ± 2.8 | 88.6% | 83.0% | 95.9% |
+| OCR lines fixed, Tesseract | 91.7% ± 2.4 | 93.1% | 87.1% | 95.9% |
+| OCR lines fixed, Gateway OCR (Qwen3-VL-235B) | 88.0% ± 2.8 | 88.6% | 83.0% | 95.9% |
+| Current branch (also measured text positions), Tesseract | **92.5% ± 2.3** | 93.8% | 88.4% | 95.9% |
 
 The tagger fix (every OCR line tagged once, in order) accounts for the gain.
 Through the full pipeline, Gateway OCR does not beat Tesseract on printed
@@ -57,17 +58,19 @@ retry ladder).
 
 ## Results: born-digital pages (random samples of 60 pages each)
 
-| Subset (tests) | Production (v1) | Fixed tagger |
-|---|---|---|
-| `headers_footers` (absent tests, 170) | 91.5% ± 4.0 | 93.3% ± 4.0 |
-| `multi_column` (reading order, 219) | 32.0% ± 6.6 | 48.9% ± 6.6 |
-| `tables` (cell neighbors and headings, 336) | 8.8% ± 2.9 | 10.1% ± 3.4 |
+| Subset (tests) | Production (v1) | OCR lines fixed | Current branch |
+|---|---|---|---|
+| `headers_footers` (absent tests, 170) | 91.5% ± 4.0 | 93.3% ± 4.0 | |
+| `multi_column` (reading order, 219) | 32.0% ± 6.6 | 48.9% ± 6.6 | **60.7% ± 6.4** |
+| `tables` (cell neighbors and headings, 336) | 10.1% ± 3.1 | 10.1% ± 3.4 | **64.2% ± 4.8** |
 
-Docling finds these tables correctly (rows, columns, cell text); the tagger
-loses them. Its own content-stream interpreter guesses text positions (it
-ignores the text matrix's scale on `Td`, font widths, and `TJ` offsets, and
-reads `TJ` offsets as text), and it cannot split one text operator that draws
-several cells. Fixing both is the next tagger change.
+Docling found these tables correctly; the tagger lost them. Its own
+content-stream reading guessed text positions (it ignored the text matrix's
+scale on `Td`, font widths, and `TJ` offsets, and read `TJ` offsets as text),
+and it tagged a table row drawn by one `TJ` as one cell. The current branch
+takes positions and text from pdfminer's measurement of each text operator
+(`app/pipeline/text_geometry.py`) and splits a `TJ` that spans several cells
+into one per cell, which renders identically.
 
 ## Results: structure round-trip (11 gold documents)
 
@@ -82,7 +85,8 @@ MHS-L, which also counts heading levels.
 | | NID | TEDS | MHS | MHS-L |
 |---|---|---|---|---|
 | Production (v1) | 0.735 | 0.302 | 0.486 | 0.286 |
-| Current branch | 0.815 | 0.304 | 0.563 | 0.313 |
+| OCR lines and heading levels fixed | 0.815 | 0.304 | 0.563 | 0.313 |
+| Current branch (also measured text positions) | **0.878** | **0.449** | **0.611** | **0.353** |
 
 For scale, opendataloader-bench reports NID about 0.90 and TEDS 0.887 for
 Docling's own output on its corpus.
