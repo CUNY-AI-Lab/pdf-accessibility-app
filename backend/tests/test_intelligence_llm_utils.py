@@ -9,6 +9,7 @@ import pikepdf
 import pytest
 
 from app.services.intelligence_llm_utils import (
+    JSON_SCHEMA_REFUSED_MODELS,
     apply_cache_breakpoint,
     extract_json_object,
     pdf_file_parts,
@@ -28,6 +29,13 @@ def _disable_direct_gemini_by_default(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _forget_json_schema_refusals():
+    JSON_SCHEMA_REFUSED_MODELS.clear()
+    yield
+    JSON_SCHEMA_REFUSED_MODELS.clear()
+
+
 def test_extract_json_object_accepts_trailing_text_after_first_json_object():
     parsed = extract_json_object('{"summary":"ok"}\n{"ignored":true}')
 
@@ -35,6 +43,8 @@ def test_extract_json_object_accepts_trailing_text_after_first_json_object():
 
 
 class _SchemaFallbackLlm:
+    model = "test-model"
+
     def __init__(self):
         self.calls = []
 
@@ -68,6 +78,8 @@ def test_request_llm_json_tries_json_schema_then_falls_back_to_json_object():
 
 
 class _RetryableFailureLlm:
+    model = "test-model"
+
     def __init__(self):
         self.calls = []
 
@@ -115,6 +127,8 @@ def test_apply_cache_breakpoint_marks_only_requested_content_item():
 
 
 class _CacheBreakpointLlm:
+    model = "test-model"
+
     def __init__(self):
         self.messages = []
 
@@ -154,7 +168,12 @@ def test_request_llm_json_with_response_uses_direct_gemini_for_media(monkeypatch
             {"summary": "ok"},
             {
                 "choices": [{"message": {"content": '{"summary":"ok"}', "annotations": []}}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.0},
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12,
+                    "cost": 0.0,
+                },
             },
         )
 
@@ -172,7 +191,13 @@ def test_request_llm_json_with_response_uses_direct_gemini_for_media(monkeypatch
             llm_client=object(),
             content=[
                 {"type": "text", "text": "prompt"},
-                {"type": "file", "file": {"filename": "doc.pdf", "file_data": "data:application/pdf;base64,AA=="}},
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": "doc.pdf",
+                        "file_data": "data:application/pdf;base64,AA==",
+                    },
+                },
             ],
             schema_name="demo",
             response_schema={
@@ -197,11 +222,18 @@ def test_request_llm_json_with_response_uses_direct_gemini_for_text_only(monkeyp
             {"summary": "ok"},
             {
                 "choices": [{"message": {"content": '{"summary":"ok"}', "annotations": []}}],
-                "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10, "cost": 0.0},
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 2,
+                    "total_tokens": 10,
+                    "cost": 0.0,
+                },
             },
         )
 
     class _UnexpectedLlm:
+        model = "test-model"
+
         async def chat_completion(self, messages, **kwargs):
             raise AssertionError("text-only structured calls should route directly to Gemini")
 
@@ -259,7 +291,13 @@ def test_request_llm_json_uses_the_direct_gemini_baseline_when_selected(monkeypa
             llm_client=object(),
             content=[
                 {"type": "text", "text": "prompt"},
-                {"type": "file", "file": {"filename": "doc.pdf", "file_data": "data:application/pdf;base64,AA=="}},
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": "doc.pdf",
+                        "file_data": "data:application/pdf;base64,AA==",
+                    },
+                },
             ],
             schema_name="demo",
             response_schema={
@@ -289,7 +327,10 @@ def test_preferred_cache_breakpoint_index_prefers_last_image_block():
 def test_preferred_cache_breakpoint_index_prefers_last_file_block():
     content = [
         {"type": "text", "text": "prompt"},
-        {"type": "file", "file": {"filename": "document.pdf", "file_data": "data:application/pdf;base64,abc"}},
+        {
+            "type": "file",
+            "file": {"filename": "document.pdf", "file_data": "data:application/pdf;base64,abc"},
+        },
         {"type": "text", "text": "dynamic"},
     ]
 
@@ -306,6 +347,8 @@ def test_preferred_cache_breakpoint_index_uses_last_block_when_no_images():
 
 
 class _MalformedThenValidLlm:
+    model = "test-model"
+
     def __init__(self):
         self.messages = []
 
@@ -340,6 +383,8 @@ def test_request_llm_json_retries_after_malformed_json_response():
 
 
 class _ConversationPrefixLlm:
+    model = "test-model"
+
     def __init__(self):
         self.messages = []
         self.kwargs = []
@@ -380,11 +425,15 @@ def test_request_llm_json_with_response_includes_conversation_prefix():
     assert llm.messages[0][1]["role"] == "user"
 
 
-def test_request_llm_json_with_response_keeps_conversation_prefix_on_chat_path_when_direct_enabled(monkeypatch):
+def test_request_llm_json_with_response_keeps_conversation_prefix_on_chat_path_when_direct_enabled(
+    monkeypatch,
+):
     llm = _ConversationPrefixLlm()
 
     async def _unexpected_direct_request(**kwargs):
-        raise AssertionError("conversation-prefix requests should stay on the chat-completions path")
+        raise AssertionError(
+            "conversation-prefix requests should stay on the chat-completions path"
+        )
 
     monkeypatch.setattr(
         "app.services.intelligence_llm_utils.direct_gemini_pdf_enabled",
@@ -461,6 +510,8 @@ def test_pdf_file_parts_emits_pdf_subset_as_file_content(tmp_path):
 
 
 class _RecordingLlm:
+    model = "test-model"
+
     def __init__(self, message):
         self.message = message
         self.messages = []
@@ -494,9 +545,7 @@ def test_a_reasoning_models_json_is_read_from_reasoning_content():
     assert parsed == {"summary": "ok"}
 
 
-@pytest.mark.parametrize(
-    ("direct_gemini", "part_type"), [(False, "image_url"), (True, "file")]
-)
+@pytest.mark.parametrize(("direct_gemini", "part_type"), [(False, "image_url"), (True, "file")])
 def test_pages_are_images_except_for_the_direct_gemini_baseline(
     monkeypatch, tmp_path, direct_gemini, part_type
 ):
@@ -538,3 +587,28 @@ def test_pdf_pages_request_sends_page_images_and_the_system_instruction(monkeypa
     assert system == {"role": "system", "content": "You read documents."}
     assert [part["type"] for part in user["content"]] == ["text", "image_url", "image_url", "text"]
     assert llm.closed
+
+
+def test_a_model_that_refused_json_schema_is_asked_for_json_object_next_time():
+    schema = {
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+    }
+    first, second = _SchemaFallbackLlm(), _SchemaFallbackLlm()
+
+    for llm in (first, second):
+        asyncio.run(
+            request_llm_json(
+                llm_client=llm,
+                content=[{"type": "text", "text": "hello"}],
+                schema_name="demo",
+                response_schema=schema,
+            )
+        )
+
+    assert [call["response_format"]["type"] for call in first.calls] == [
+        "json_schema",
+        "json_object",
+    ]
+    assert [call["response_format"]["type"] for call in second.calls] == ["json_object"]

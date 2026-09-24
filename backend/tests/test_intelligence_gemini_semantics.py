@@ -22,6 +22,8 @@ def _disable_direct_gemini_by_default(monkeypatch):
 
 
 class _FakeLlmClient:
+    model = "test-model"
+
     def __init__(self, payloads):
         self.payloads = list(payloads)
         self.calls: list[dict] = []

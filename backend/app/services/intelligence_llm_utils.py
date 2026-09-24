@@ -23,6 +23,11 @@ from app.services.pdf_preview import render_page_jpeg_data_url
 
 logger = logging.getLogger(__name__)
 
+# Models that refused json_schema output (the Gateway offers it only for
+# models with the structured-output capability); their later requests ask for
+# json_object directly instead of being refused again.
+JSON_SCHEMA_REFUSED_MODELS: set[str] = set()
+
 
 def _should_try_alternate_response_format(exc: BaseException) -> bool:
     """Fallback formats help with capability/validation issues, not flaky endpoints."""
@@ -303,7 +308,8 @@ async def request_llm_json_with_response(
             "temperature": 0,
         }
         response = None
-        if response_schema and schema_name:
+        model = str(llm_client.model)
+        if response_schema and schema_name and model not in JSON_SCHEMA_REFUSED_MODELS:
             try:
                 response = await llm_client.chat_completion(
                     **request_kwargs,
@@ -319,7 +325,8 @@ async def request_llm_json_with_response(
             except Exception as exc:
                 if not _should_try_alternate_response_format(exc):
                     raise
-                logger.debug("Structured json_schema LLM call failed, falling back to json_object")
+                logger.info("%s refused json_schema output; asking for json_object", model)
+                JSON_SCHEMA_REFUSED_MODELS.add(model)
                 response = None
         if response is None:
             try:
