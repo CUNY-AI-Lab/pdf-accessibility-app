@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import httpx
@@ -6,6 +7,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.models import Base
 from app.services import readiness
+
+
+@pytest.fixture(autouse=True)
+def _clear_docling_probe_cache():
+    readiness._docling_probe_cache.clear()
+    yield
+    readiness._docling_probe_cache.clear()
 
 
 def _settings(tmp_path):
@@ -253,3 +261,51 @@ async def test_remote_docling_health_check_sends_bearer_only_when_configured(
     assert result["ok"] is True
     assert calls[0]["headers"] == {"Authorization": "Bearer health-secret"}
     assert "health-secret" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_readiness_requests_share_one_remote_docling_probe(
+    tmp_path, monkeypatch
+):
+    response = httpx.Response(
+        200,
+        request=httpx.Request("GET", "https://docling.example.test/service/health"),
+    )
+    calls = _patch_async_client(monkeypatch, response=response)
+    settings = _remote_docling_settings(tmp_path)
+    diagnostics = {"docling": {"configured": True, "local": False}}
+
+    results = await asyncio.gather(
+        *(readiness._docling_check(settings, diagnostics) for _ in range(25))
+    )
+    results.append(await readiness._docling_check(settings, diagnostics))
+
+    assert all(result["ok"] is True for result in results)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_remote_docling_probe_failure_is_cached_until_window_expires(
+    tmp_path, monkeypatch
+):
+    calls = _patch_async_client(
+        monkeypatch,
+        error=httpx.ConnectError("unreachable"),
+    )
+    clock = [1000.0]
+    monkeypatch.setattr(readiness.time, "monotonic", lambda: clock[0])
+    settings = _remote_docling_settings(tmp_path)
+    diagnostics = {"docling": {"configured": True, "local": False}}
+
+    first = await readiness._docling_check(settings, diagnostics)
+    clock[0] += readiness._DOCLING_HEALTH_CACHE_SECONDS - 1
+    second = await readiness._docling_check(settings, diagnostics)
+
+    assert first["metadata"]["health_check"] == "connection_failed"
+    assert second == first
+    assert len(calls) == 1
+
+    clock[0] += 1
+    await readiness._docling_check(settings, diagnostics)
+
+    assert len(calls) == 2

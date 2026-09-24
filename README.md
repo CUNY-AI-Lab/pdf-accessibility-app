@@ -254,6 +254,9 @@ When the app is running, `/health` is a lightweight liveness check and
 `/health/ready` verifies runtime dependencies needed for real PDF processing:
 database connectivity, writable storage, required PDF binaries, LLM
 configuration, and Docling/docling-serve availability.
+A remote `docling-serve` is probed at most once per 30 seconds per app process;
+readiness requests inside that window reuse the last result, so repeated calls
+to the public endpoint do not reach docling-serve.
 
 ## Documentation
 
