@@ -1882,14 +1882,48 @@ def _assign_text_show_runs_to_table_cells(
     return assignments
 
 
+def _region_path_tagged_runs(
+    regions: list[ContentRegion],
+    normal_matches: dict[int, int],
+    elements: list[dict],
+    text_runs: list[TextShowRun],
+) -> int:
+    """How many text runs region matching would put in the structure tree.
+
+    Region matching pairs each content region with at most one element, so
+    when a paragraph is drawn as several text objects (one per OCR line),
+    only one of them is tagged and the rest become artifacts.
+    """
+    tagged_ranges = [
+        (regions[region_idx].start_idx, regions[region_idx].end_idx)
+        for region_idx, elem_idx in normal_matches.items()
+        if 0 <= region_idx < len(regions)
+        and 0 <= elem_idx < len(elements)
+        and elements[elem_idx].get("type") != "artifact"
+    ]
+    return sum(
+        1
+        for run in text_runs
+        if any(start <= run.instruction_idx < end for start, end in tagged_ranges)
+    )
+
+
 def _should_use_fragmented_text_rewrite(
     *,
     elements: list[dict],
     normal_matches: dict[int, int],
     text_run_assignments: dict[int, int],
     table_cell_assignments: dict[int, TableCellRunAssignment] | None = None,
+    region_tagged_runs: int = 0,
 ) -> bool:
     """Decide whether fine-grained OCR text anchors beat coarse region matching."""
+    fragmented_tagged_runs = len(
+        set(text_run_assignments) | set(table_cell_assignments or {})
+    )
+    if fragmented_tagged_runs > region_tagged_runs:
+        # Region matching would drop recognized text from the structure tree.
+        return True
+
     eligible_element_indices = {
         idx for idx, _elem in _eligible_fragmented_text_elements(elements)
     }
@@ -3527,6 +3561,14 @@ def _allocate_fragment_mcid(
         )
 
     builder.remember_source_element(elem, stream_owner or page_ref, mcid)
+    if actual_text and elem_type != "formula":
+        # An element's text covers all of its fragments. On the first
+        # fragment's marked content it would be read, and then the later
+        # fragments' own glyphs would be read again.
+        struct_elem = builder.source_element_struct(elem)
+        if struct_elem is not None:
+            struct_elem["/ActualText"] = pikepdf.String(actual_text)
+            actual_text = None
     return tag, mcid, actual_text
 
 
@@ -3892,6 +3934,9 @@ def _rewrite_content_stream(
         normal_matches=matches,
         text_run_assignments=text_run_assignments,
         table_cell_assignments=table_cell_assignments,
+        region_tagged_runs=_region_path_tagged_runs(
+            regions, matches, elements, text_runs
+        ),
     ):
         return _rewrite_content_stream_with_fragmented_text(
             pdf,
