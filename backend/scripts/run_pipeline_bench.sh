@@ -16,7 +16,7 @@ shards=4
 mounts=(-v "$bench:/bench"
   -v "$backend/scripts/pipeline_bench.py:/app/backend/pipeline_bench.py:ro"
   -v "$backend/app/services/structure_text.py:/app/backend/app/services/structure_text.py:ro")
-env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001 -e LLM_MAX_RETRIES=0
+env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001 -e LLM_MAX_RETRIES=0 -e USE_DIRECT_GEMINI_PDF=false
   -e LLM_BASE_URL=http://127.0.0.1:9/v1 -e LLM_MODEL=gemini-unused)
 while [ $# -gt 0 ]; do
   case $1 in
@@ -27,7 +27,7 @@ while [ $# -gt 0 ]; do
         -v "$snapshot:/app/backend/app:ro") ;;
     --gateway-ocr)
       export LLM_API_KEY; LLM_API_KEY=$(security find-generic-password -s cail-gateway -w)
-      env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001 -e LLM_MAX_RETRIES=0
+      env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001 -e LLM_MAX_RETRIES=0 -e USE_DIRECT_GEMINI_PDF=false
         -e OCR_ENGINE=gateway -e LLM_API_KEY
         -e LLM_BASE_URL=https://tools.ailab.gc.cuny.edu/v1 -e LLM_MODEL=gemini-unused) ;;
     --shards) shards=$2; shift ;;
