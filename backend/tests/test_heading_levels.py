@@ -19,6 +19,9 @@ def _headings(levels: list[int]) -> list[dict]:
         ([1, 2, 3, 2, 1, 2], [1, 2, 3, 2, 1, 2]),
         ([2, 3, 3, 2], [1, 2, 2, 1]),
         ([1, 3, 4], [1, 2, 3]),
+        # A chapter label deeper than the section headings after it does not
+        # squeeze their levels together.
+        ([3, 1, 2, 3, 2], [1, 1, 2, 3, 2]),
     ],
 )
 def test_heading_nesting_is_kept(levels, expected):

@@ -113,11 +113,11 @@ def _table_pdf(path: Path) -> None:
     pdf.save(path)
 
 
-def test_table_structure_is_kept_as_html_when_asked(tmp_path):
+def test_table_structure_is_kept_as_html_in_markdown(tmp_path):
     path = tmp_path / "table.pdf"
     _table_pdf(path)
     assert " ".join(screen_reader_text(path).split()) == "Year Price & tax No sales"
-    assert "".join(screen_reader_text(path, tables_as_html=True).split("\n")) == (
+    assert "".join(screen_reader_text(path, markdown=True).split("\n")) == (
         "<table><thead><tr><th>Year</th><th>Price &amp; tax</th></tr></thead>"
         '<tbody><tr><td colspan="2">No sales</td></tr></tbody></table>'
     )

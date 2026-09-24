@@ -7,10 +7,13 @@ by position. Artifacts and untagged content are not in the structure tree, so
 they are not read. Figure ``/Alt`` text is left out: it describes an image, not
 page text. Text drawn inside a Figure is not read either, unless
 ``figure_text`` asks for the reading some screen readers give a Figure that
-has no ``/Alt``: its text, as if it were not a Figure. With ``tables_as_html``
-a table's structure (rows, header and data cells, spans) is kept as an HTML
-table, so what a screen reader announces while moving through it can be
-checked.
+has no ``/Alt``: its text, as if it were not a Figure. Custom structure types
+are read as the standard types they are role-mapped to.
+
+With ``markdown`` the structure a screen reader announces is kept as
+Markdown: headings as ``#`` to ``######`` by level, list items as ``- ``, and
+tables as HTML tables with header and data cells and spans. That is the form
+structure benchmarks score.
 """
 
 from __future__ import annotations
@@ -128,16 +131,47 @@ def page_mcid_text(pdf_path: Path) -> list[dict[int, str]]:
     return pages
 
 
-def screen_reader_text(
-    pdf_path: Path, *, figure_text: bool = False, tables_as_html: bool = False
-) -> str:
+HEADING_LEVELS = {"Title": 1, "H": 1, **{f"H{level}": level for level in range(1, 7)}}
+
+
+def _standard_role(node: pikepdf.Dictionary, role_map) -> str:
+    """The structure type after following the role map (and, in PDF 2.0,
+    the element's namespace role map)."""
+    role = node.get("/S")
+    namespace = node.get("/NS")
+    for _ in range(10):
+        mapped = None
+        if isinstance(namespace, pikepdf.Dictionary):
+            namespace_map = namespace.get("/RoleMapNS")
+            if isinstance(namespace_map, pikepdf.Dictionary) and role in namespace_map:
+                mapped = namespace_map[role]
+                if isinstance(mapped, pikepdf.Array):
+                    mapped, namespace = mapped[0], mapped[1] if len(mapped) > 1 else None
+        if mapped is None and isinstance(role_map, pikepdf.Dictionary) and role in role_map:
+            mapped = role_map[role]
+        if mapped is None or mapped == role:
+            break
+        role = mapped
+    return str(role or "").lstrip("/")
+
+
+def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: bool = False) -> str:
     mcid_text = page_mcid_text(pdf_path)
     with pikepdf.open(pdf_path) as pdf:
         page_index = {page.objgen: index for index, page in enumerate(pdf.pages)}
         root = pdf.Root.get("/StructTreeRoot")
         if root is None:
             return ""
+        role_map = root.get("/RoleMap")
         blocks: list[str] = []
+
+        def inline(node, page) -> str:
+            parts: list[str] = []
+            if "/ActualText" in node:
+                parts.append(str(node.ActualText))
+            elif node.get("/K") is not None:
+                walk(node.K, page, parts)
+            return " ".join("".join(parts).split())
 
         def mcid_of(kid, inherited_page):
             if isinstance(kid, int):
@@ -167,16 +201,21 @@ def screen_reader_text(
                 return
             if "/Pg" in node:
                 page = page_index.get(node.Pg.objgen, page)
-            role = str(node.get("/S", "")).lstrip("/")
-            if tables_as_html and role in TABLE_HTML:
+            role = _standard_role(node, role_map)
+            if markdown and role in HEADING_LEVELS:
+                text = inline(node, page)
+                if text:
+                    out.append(f"\n\n{'#' * HEADING_LEVELS[role]} {text}\n\n")
+                return
+            if markdown and role == "LI":
+                text = inline(node, page)
+                if text:
+                    out.append(f"\n- {text}\n")
+                return
+            if markdown and role in TABLE_HTML:
                 tag = TABLE_HTML[role]
                 if tag in ("th", "td"):
-                    cell: list[str] = []
-                    if "/ActualText" in node:
-                        cell.append(str(node.ActualText))
-                    elif node.get("/K") is not None:
-                        walk(node.K, page, cell)
-                    text = html.escape(" ".join("".join(cell).split()))
+                    text = html.escape(inline(node, page))
                     out.append(f"<{tag}{_cell_spans(node)}>{text}</{tag}>")
                 else:
                     out.append(f"\n<{tag}>")
@@ -197,7 +236,7 @@ def screen_reader_text(
             if kids is not None:
                 walk(kids, page, out)
             if role in BLOCK_ROLES:
-                out.append("\n")
+                out.append("\n\n" if markdown else "\n")
 
         walk(root.get("/K"), None, blocks)
     text = "".join(blocks)

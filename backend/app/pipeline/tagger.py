@@ -485,7 +485,8 @@ def _as_positive_int(value: Any, default: int = 1) -> int:
 
 
 def _normalize_heading_hierarchy(elements: list[dict]) -> None:
-    """Normalize heading levels to start at H1 and avoid large level jumps."""
+    """Shift heading levels so the shallowest is H1, and close skipped levels
+    (an H4 right after an H2 becomes an H3), keeping the relative nesting."""
     headings = [el for el in elements if el.get("type") == "heading"]
     if not headings:
         return
@@ -498,17 +499,12 @@ def _normalize_heading_hierarchy(elements: list[dict]) -> None:
             _safe_float((h.get("bbox") or {}).get("l", 0.0)),
         ),
     )
-    first_level = _as_positive_int(sorted_headings[0].get("level", 1), default=1)
-    shift = first_level - 1 if first_level > 1 else 0
+    shift = min(_as_positive_int(h.get("level", 1), default=1) for h in headings) - 1
 
-    previous_level = 1
+    previous_level = 0
     for heading in sorted_headings:
-        level = _as_positive_int(heading.get("level", 1), default=1)
-        if shift:
-            level = max(1, level - shift)
-        if level > previous_level + 1:
-            level = previous_level + 1
-        heading["level"] = max(1, min(6, level))
+        level = _as_positive_int(heading.get("level", 1), default=1) - shift
+        heading["level"] = max(1, min(6, level, previous_level + 1))
         previous_level = heading["level"]
 
 

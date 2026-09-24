@@ -1200,6 +1200,9 @@ async def _convert_via_docling_serve(
             "ocr_engine": ocr_engine,
             "do_table_structure": "true",
             "do_picture_classification": "true",
+            # Heading levels from bookmarks, section numbering, and font
+            # style; without it every heading comes back as level 1.
+            "do_pdf_heading_hierarchy": "true",
         }
         if include_figure_images:
             data.update({
