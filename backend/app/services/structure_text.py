@@ -5,11 +5,17 @@ contributes that text and hides its descendants; otherwise each marked-content
 reference contributes the glyphs drawn inside it on its page, joined into words
 by position. Artifacts and untagged content are not in the structure tree, so
 they are not read. Figure ``/Alt`` text is left out: it describes an image, not
-page text.
+page text. Text drawn inside a Figure is not read either, unless
+``figure_text`` asks for the reading some screen readers give a Figure that
+has no ``/Alt``: its text, as if it were not a Figure. With ``tables_as_html``
+a table's structure (rows, header and data cells, spans) is kept as an HTML
+table, so what a screen reader announces while moving through it can be
+checked.
 """
 
 from __future__ import annotations
 
+import html
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -21,9 +27,50 @@ from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
 from pdfminer.pdfpage import PDFPage
 
 BLOCK_ROLES = {
-    "P", "H", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "LBody", "Lbl", "TD",
-    "TH", "Caption", "BlockQuote", "Note", "TOCI", "Title", "Formula", "Code",
+    "P",
+    "H",
+    "H1",
+    "H2",
+    "H3",
+    "H4",
+    "H5",
+    "H6",
+    "LI",
+    "LBody",
+    "Lbl",
+    "TD",
+    "TH",
+    "Caption",
+    "BlockQuote",
+    "Note",
+    "TOCI",
+    "Title",
+    "Formula",
+    "Code",
 }
+
+
+TABLE_HTML = {
+    "Table": "table",
+    "THead": "thead",
+    "TBody": "tbody",
+    "TFoot": "tfoot",
+    "TR": "tr",
+    "TH": "th",
+    "TD": "td",
+}
+
+
+def _cell_spans(node: pikepdf.Dictionary) -> str:
+    attributes = node.get("/A")
+    owners = attributes if isinstance(attributes, pikepdf.Array) else [attributes]
+    spans = ""
+    for owner in owners:
+        if isinstance(owner, pikepdf.Dictionary) and owner.get("/O") == "/Table":
+            for key, name in (("/RowSpan", "rowspan"), ("/ColSpan", "colspan")):
+                if int(owner.get(key, 1)) > 1:
+                    spans += f' {name}="{int(owner[key])}"'
+    return spans
 
 
 class MarkedContentChars(PDFLayoutAnalyzer):
@@ -43,9 +90,7 @@ class MarkedContentChars(PDFLayoutAnalyzer):
             self.stack.pop()
 
     def render_char(self, matrix, font, fontsize, scaling, rise, cid, ncs, graphicstate):
-        advance = super().render_char(
-            matrix, font, fontsize, scaling, rise, cid, ncs, graphicstate
-        )
+        advance = super().render_char(matrix, font, fontsize, scaling, rise, cid, ncs, graphicstate)
         mcid = next((m for m in reversed(self.stack) if m is not None), None)
         if mcid is not None:
             self.chars[mcid].append(self.cur_item._objs[-1])
@@ -79,13 +124,13 @@ def page_mcid_text(pdf_path: Path) -> list[dict[int, str]]:
         for page in PDFPage.get_pages(handle):
             device = MarkedContentChars(manager)
             PDFPageInterpreter(manager, device).process_page(page)
-            pages.append(
-                {mcid: glyphs_to_text(chars) for mcid, chars in device.chars.items()}
-            )
+            pages.append({mcid: glyphs_to_text(chars) for mcid, chars in device.chars.items()})
     return pages
 
 
-def screen_reader_text(pdf_path: Path) -> str:
+def screen_reader_text(
+    pdf_path: Path, *, figure_text: bool = False, tables_as_html: bool = False
+) -> str:
     mcid_text = page_mcid_text(pdf_path)
     with pikepdf.open(pdf_path) as pdf:
         page_index = {page.objgen: index for index, page in enumerate(pdf.pages)}
@@ -123,12 +168,30 @@ def screen_reader_text(pdf_path: Path) -> str:
             if "/Pg" in node:
                 page = page_index.get(node.Pg.objgen, page)
             role = str(node.get("/S", "")).lstrip("/")
+            if tables_as_html and role in TABLE_HTML:
+                tag = TABLE_HTML[role]
+                if tag in ("th", "td"):
+                    cell: list[str] = []
+                    if "/ActualText" in node:
+                        cell.append(str(node.ActualText))
+                    elif node.get("/K") is not None:
+                        walk(node.K, page, cell)
+                    text = html.escape(" ".join("".join(cell).split()))
+                    out.append(f"<{tag}{_cell_spans(node)}>{text}</{tag}>")
+                else:
+                    out.append(f"\n<{tag}>")
+                    if node.get("/K") is not None:
+                        walk(node.K, page, out)
+                    out.append(f"</{tag}>\n")
+                return
             if "/ActualText" in node:
                 out.append(str(node.ActualText))
                 if role in BLOCK_ROLES:
                     out.append("\n")
                 return
-            if role == "Figure" or role == "Artifact":
+            if role == "Artifact" or (
+                role == "Figure" and not (figure_text and "/Alt" not in node)
+            ):
                 return
             kids = node.get("/K")
             if kids is not None:
@@ -139,4 +202,3 @@ def screen_reader_text(pdf_path: Path) -> str:
         walk(root.get("/K"), None, blocks)
     text = "".join(blocks)
     return re.sub(r"[ \t]+", " ", re.sub(r"\n\s*\n+", "\n\n", text)).strip()
-

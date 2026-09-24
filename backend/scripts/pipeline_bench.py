@@ -61,7 +61,11 @@ async def main() -> None:
     parser.add_argument("--bench-dir", type=Path, required=True)
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--subsets", nargs="+", required=True)
+    parser.add_argument(
+        "--shard", default="0/1", help="i/n: run every n-th PDF starting at the i-th"
+    )
     options = parser.parse_args()
+    shard, shards = (int(part) for part in options.shard.split("/"))
 
     settings = get_settings()
     job_manager = JobManager()
@@ -74,7 +78,8 @@ async def main() -> None:
         for subset in options.subsets:
             out_dir = options.bench_dir / options.candidate / subset
             out_dir.mkdir(parents=True, exist_ok=True)
-            for pdf in sorted((options.bench_dir / "pdfs" / subset).glob("*.pdf")):
+            pdfs = sorted((options.bench_dir / "pdfs" / subset).glob("*.pdf"))
+            for pdf in pdfs[shard::shards]:
                 target = out_dir / f"{pdf.stem}_pg1_repeat1.md"
                 if target.exists():
                     continue

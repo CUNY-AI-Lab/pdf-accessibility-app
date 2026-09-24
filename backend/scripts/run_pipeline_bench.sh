@@ -1,54 +1,45 @@
 #!/usr/bin/env bash
-# Run pipeline_bench.py over the four old_scans parts in the Docling image,
-# at most two containers at a time (Docling's memory use makes more unsafe),
-# re-running any part until every page has output.
-#   run_pipeline_bench.sh <candidate> [--worktree] [--gateway-ocr]
+# Run pipeline_bench.py over one olmOCR-Bench subset in the prod image, with
+# structure from a docling-serve on the host (DOCLING_SERVE_URL, as in
+# production), split across parallel containers.
+#   run_pipeline_bench.sh <candidate> <subset> [--worktree] [--gateway-ocr] [--shards N]
 # --worktree     runs a snapshot of this worktree's app/ instead of the image's.
 # --gateway-ocr  recognizes text through the CAIL Gateway (OCR_ENGINE=gateway),
-#                with the key from the Keychain item "cail-gateway". The app's
-#                other LLM calls name a model the Gateway rejects, so they fail
-#                without inference, as they do in the other runs.
+#                with the key from the Keychain item "cail-gateway".
+# The app's own LLM calls fail at once in every run (no retries), so runs
+# compare the deterministic pipeline.
 set -uo pipefail
-candidate=$1; shift
+candidate=$1 subset=$2; shift 2
 backend=$(cd "$(dirname "$0")/.." && pwd)
 bench=$backend/data/eval/olmocr-bench/bench_data
+shards=4
 mounts=(-v "$bench:/bench"
-  -v "$backend/scripts/pipeline_bench.py:/app/backend/pipeline_bench.py"
-  -v "$backend/app/services/structure_text.py:/app/backend/app/services/structure_text.py")
-env=(-e TORCHDYNAMO_DISABLE=1 -e LLM_BASE_URL=http://127.0.0.1:9/v1 -e LLM_MODEL=gemini-unused)
-for flag in "$@"; do
-  case $flag in
+  -v "$backend/scripts/pipeline_bench.py:/app/backend/pipeline_bench.py:ro"
+  -v "$backend/app/services/structure_text.py:/app/backend/app/services/structure_text.py:ro")
+env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001 -e LLM_MAX_RETRIES=0
+  -e LLM_BASE_URL=http://127.0.0.1:9/v1 -e LLM_MODEL=gemini-unused)
+while [ $# -gt 0 ]; do
+  case $1 in
     --worktree)
       snapshot=$bench/.app-snapshot-$candidate
       rm -rf "$snapshot"; cp -R "$backend/app" "$snapshot"
-      mounts=(-v "$bench:/bench" -v "$backend/scripts/pipeline_bench.py:/app/backend/pipeline_bench.py"
-        -v "$snapshot:/app/backend/app") ;;
+      mounts=(-v "$bench:/bench" -v "$backend/scripts/pipeline_bench.py:/app/backend/pipeline_bench.py:ro"
+        -v "$snapshot:/app/backend/app:ro") ;;
     --gateway-ocr)
       export LLM_API_KEY; LLM_API_KEY=$(security find-generic-password -s cail-gateway -w)
-      env=(-e TORCHDYNAMO_DISABLE=1 -e OCR_ENGINE=gateway -e LLM_API_KEY
+      env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001 -e LLM_MAX_RETRIES=0
+        -e OCR_ENGINE=gateway -e LLM_API_KEY
         -e LLM_BASE_URL=https://tools.ailab.gc.cuny.edu/v1 -e LLM_MODEL=gemini-unused) ;;
-    *) echo "unknown flag $flag" >&2; exit 2 ;;
+    --shards) shards=$2; shift ;;
+    *) echo "unknown flag $1" >&2; exit 2 ;;
   esac
+  shift
 done
-remaining() { # pages in part $1 without output
-  local n=0
-  for f in "$bench/pdfs/old_scans_part$1"/*.pdf; do
-    [ -f "$bench/$candidate/old_scans_part$1/$(basename "$f" .pdf)_pg1_repeat1.md" ] || n=$((n+1))
-  done
-  echo $n
-}
-while :; do
-  todo=()
-  for p in 0 1 2 3; do [ "$(remaining $p)" -gt 0 ] && todo+=("$p"); done
-  [ ${#todo[@]} -eq 0 ] && break
-  for p in "${todo[@]}"; do
-    name=bench-$candidate-$p
-    docker ps --format "{{.Names}}" | grep -qxE "$name|pipe-part$p" && continue
-    while [ "$(docker ps --format '{{.Names}}' | grep -cE '^(bench-|pipe-part)')" -ge 2 ]; do sleep 30; done
-    docker run -d --rm --name "$name" --user 0 "${env[@]}" "${mounts[@]}" \
-      pdf-a11y-eval:docling sh -c "python pipeline_bench.py --bench-dir /bench --candidate $candidate --subsets old_scans_part$p >> /bench/$candidate.part$p.log 2>&1" >/dev/null
-    sleep 20
-  done
-  sleep 60
+for i in $(seq 0 $((shards - 1))); do
+  docker run --rm --name "pipe-$candidate-$subset-$i" --user 0 "${env[@]}" "${mounts[@]}" \
+    pdf-a11y-eval:prod sh -c "cd /app/backend && python pipeline_bench.py --bench-dir /bench \
+      --candidate $candidate --subsets $subset --shard $i/$shards" \
+    >> "$bench/$candidate.$subset.$i.log" 2>&1 &
 done
-echo "all old_scans pages done for $candidate"
+wait
+echo "$candidate $subset: $(ls "$bench/$candidate/$subset"/*.md 2>/dev/null | wc -l) of $(ls "$bench/pdfs/$subset"/*.pdf | wc -l) pages"
