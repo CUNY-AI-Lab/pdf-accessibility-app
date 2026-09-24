@@ -62,10 +62,12 @@ long-running consumer needs only the Gateway, which re-checks every call.
 
 ### 2. Gateway model lane (this repo)
 
-1. **Evaluation first.** Commit a small, redistributable benchmark corpus and a
-   scoring script (release-ready rate, veraPDF, fidelity, alt-text checks).
-   Record the current Gemini baseline so the model change is judged on
-   evidence.
+1. **Evaluation first.** Done for the deterministic pipeline: see
+   [evaluation.md](evaluation.md) (olmOCR-Bench subsets, a printed-book set,
+   and a structure round-trip on gold tagged PDFs, all scored on what a
+   screen reader hears). Still to add: the app's LLM steps (alt text,
+   headings, tables, reading order) with a Gemini baseline, and veraPDF and
+   alt-text checks on the gold set.
 2. **Gateway client.** Send page images (the existing local-semantic lane) to
    the Gateway's chat completions endpoint. Add image-based versions of the
    title/front-matter and TOC lanes. Cap image and request sizes. Remove the
@@ -116,6 +118,30 @@ what needs manual work, validation results, and generated alt text for review.
 Use the Phase 2 corpus to measure and improve the known gaps: complex tables,
 multi-column reading order, uncaptioned charts, math, and inline language
 changes. Each change reports its before/after on the corpus.
+
+Done so far (branch `agent/cail-integration-plan`), each measured in
+[evaluation.md](evaluation.md):
+
+- Every OCR line reaches the structure tree once, in order (printed books
+  30.5% → 91.7%).
+- Text positions come from pdfminer's measurement of each text operator, not
+  estimates, and a text operator spanning several table cells is split so
+  each cell is tagged.
+- Heading levels come from Docling's hierarchy stage and survive tagging.
+- Language detection runs (lingua was never installed).
+- ICC profiles missing /N no longer break text extraction.
+- Optional OCR through the Gateway (`OCR_ENGINE=gateway`); it helps
+  handwriting, not printed books, so Tesseract stays the default.
+
+Next, from the evaluation and from peer tools (opendataloader-pdf, olmOCR,
+the ASU/AWS remediation pipeline):
+
+- Running heads and footers detected across pages (recto/verso, page-number
+  sequences), not only per page.
+- Picture classification (already requested from Docling, never read) as
+  input to alt text and decorative-figure decisions.
+- The scanned-document language probe: 18 Tesseract languages under a 30 s
+  limit; use script detection first.
 
 ## Open decisions
 
