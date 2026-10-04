@@ -119,9 +119,16 @@ Required NML `.env` settings:
 ANONYMOUS_SESSION_COOKIE_SECURE=true
 CORS_ALLOW_ORIGINS=https://tools.ailab.gc.cuny.edu
 VITE_APP_BASE_PATH=/pdf-accessibility/
-DOCLING_SERVE_URL=https://workmac.tailc22a4b.ts.net/docling
+LLM_BASE_URL=https://tools.ailab.gc.cuny.edu/v1
+LLM_MODEL=qwen3-vl-235b-a22b-instruct
+LLM_API_KEY=<the app's sk-cail Gateway key>
+DOCLING_SERVE_URL=<actual-dell's Tailscale Serve URL, port 8444>
 WITH_LOCAL_DOCLING=false
 ```
+
+The app no longer reads `GEMINI_API_KEY` or `USE_DIRECT_GEMINI_PDF`; delete
+them from the server's `.env`. Without a real `LLM_API_KEY` the app refuses
+to start.
 
 Deploy from the NML host:
 

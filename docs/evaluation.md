@@ -40,7 +40,9 @@ can be kept as HTML so their cell structure is scored.
 - **Adobe:** `backend/scripts/adobe_bench.py` runs Adobe PDF Services OCR then
   Auto-Tag, two transactions per page. The free tier ran out after 44
   `old_scans` pages in September 2026.
-- **Data** lives in `backend/data/eval/` (git-ignored).
+- **Data** lived in `backend/data/eval/` (git-ignored) and was lost with its
+  worktree in late September 2026. The results below stand as measured, but
+  none can be re-run until the corpus is rebuilt (plan, Phase 2 step 6).
 
 **Correction (2026-09-24).** Results published here before this date read the
 structure tree without marked-content `/ActualText`, so they badly understated

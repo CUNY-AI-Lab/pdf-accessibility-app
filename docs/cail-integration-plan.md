@@ -1,6 +1,7 @@
 # CAIL integration and improvement plan
 
-Status: approved 2026-09-23, revised the same day. This is the plan of record
+Status: approved 2026-09-23, revised the same day and on 2026-10-04 (pipeline
+host, where the Gateway token lives, Phase 2 ships to v1). This is the plan of record
 for moving PDF Accessibility behind Doorway and the CAIL Gateway and for the
 improvement work that follows. Update it as phases land.
 
@@ -12,8 +13,8 @@ both the current app (v1) and Adobe Acrobat's tagging on the same documents.
 - **Shape:** a Worker at `/pdf-accessibility` behind Doorway owns the interface,
   sign-in, jobs (Workflows), storage (R2), and model calls (the CAIL Gateway,
   via the 24-hour `cail:gateway` leg). The PDF tools that cannot run in a
-  Worker (OCR, pikepdf, veraPDF, Docling or its replacement) run in one compute
-  service the Worker calls. v1 keeps serving until v2 wins.
+  Worker (OCR, pikepdf, veraPDF, Docling or its replacement) run on a pipeline
+  host that takes work from the Worker. v1 keeps serving until v2 wins.
 - **Beats v1 and Adobe when,** on the evaluation suite in
   [evaluation.md](evaluation.md), scored on what a screen reader hears. The
   documents that matter most are printed books and articles, scanned or born
@@ -41,11 +42,19 @@ both the current app (v1) and Adobe Acrobat's tagging on the same documents.
   lasts 24 hours (Phase 1), so a job can keep calling the Gateway after the
   upload request ends. Gateway checks membership and quota on every call.
 - **Hosting:** a new Cloudflare Worker version of the app owns the interface,
-  sign-in, jobs, and storage. The Python pipeline (Docling, OCR,
-  pikepdf, veraPDF) runs outside Cloudflare, on actual-dell or on the Lab's
-  AWS account, because Cloudflare Containers cost too much for this workload.
-  The Worker sends the pipeline host the job's Gateway token with each unit of
-  work. Which host is still to be decided.
+  sign-in, jobs, and storage. The Python pipeline (Docling, OCR, pikepdf,
+  veraPDF) runs outside Cloudflare, because Cloudflare Containers cost too
+  much for this workload, on actual-dell (decided 2026-10-04). actual-dell
+  already runs production's docling-serve, has a GPU, and adds no spend; the
+  Lab's AWS account would first need its invoice and procurement settled. The
+  cost of one machine is that queued jobs wait through its reboots.
+- **The Gateway token stays on Cloudflare** (decided 2026-10-04). Doorway keeps
+  identity legs in Worker-to-Worker headers, and actual-dell has a shared
+  administrator account. The pipeline host makes only outbound calls: it
+  takes work from the Worker and sends each model request to a Worker
+  endpoint with a credential good for that one job, and the Worker forwards
+  it to the Gateway with the person's token. Moving the pipeline to another
+  host is a redeploy, not a redesign.
 - **Improvements:** reliability, remediation quality, human-readable reports,
   and code health.
 
@@ -76,9 +85,15 @@ long-running consumer needs only the Gateway, which re-checks every call.
    for reasoning models, `reasoning_content`; structured output falls back
    from `json_schema` to `json_object` to plain JSON. The direct Gemini path,
    its model-name validator, and `GEMINI_API_KEY` are gone.
-3. **Per-job credential.** The Worker keeps the job's Gateway token and sends
-   it with each unit of work; the pipeline never stores it. Revocation and
-   `quota_exceeded` fail the job with a clear message.
+3. **Per-job credential.** The pipeline gets its model endpoint and
+   credential per job instead of from `LLM_API_KEY`, and never stores them.
+   In v2 these are the Worker's model-relay endpoint and the job's
+   credential (see Decisions). A refused credential stops the job's model
+   calls and fails the job with a clear message instead of being absorbed by
+   the AI steps' fallbacks: the Gateway's 401 `invalid_credential`, 403
+   `insufficient_scope` (membership ended), and 429 `quota_exceeded` (the
+   person's budget or the Lab's ceiling; `x-should-retry: false`, so not
+   retried).
 4. **Bake-off.** Done 2026-09-24; results in [evaluation.md](evaluation.md).
    `qwen3-vl-235b-a22b-instruct` is the default: on the gold set its titles
    and alt text judge as well as Gemini 3 Flash Preview's and 3.8 Flash's,
@@ -86,13 +101,27 @@ long-running consumer needs only the Gateway, which re-checks every call.
    because it treats screenshots of tables as tables. No model changes the
    structure or table scores. Mistral Large 3 (three images per request at
    most), Kimi K2.5, and Gemma 3 27B (timeouts) were dropped early.
+5. **Ship to v1.** Merge the branch and deploy v1 on NML with the Lab's own
+   Gateway key in place of the direct Gemini key, so v1 users get the
+   remediation gains before v2 exists. Step 3 follows.
+6. **Rebuild the evaluation data.** The corpus in `backend/data/eval/` was
+   git-ignored and was lost with its worktree in late September 2026. The
+   olmOCR-Bench subsets and the gold documents can be fetched again; the
+   `old_print` tests (checked by eye) and the Adobe outputs (free tier spent)
+   cannot. Keep test definitions and source lists in the repository and fetch
+   the PDFs by script, so the suite survives a checkout.
 
 ### 3. Worker version behind Doorway
 
 - A Worker serves the app at `/pdf-accessibility` as a protected Doorway
   product with audience `cail:pdf-accessibility` and a `cail:gateway` leg.
-- Jobs, files, and results move to Cloudflare storage; the pipeline host
-  receives work and returns results over an authenticated channel.
+- Jobs, files, and results move to Cloudflare storage. The pipeline host on
+  actual-dell takes work from the Worker, relays model calls through it, and
+  returns results, all over outbound HTTPS with its own host credential (no
+  inbound port or Tunnel).
+- A `cail:gateway` leg lasts at most 24 hours but is also capped by the
+  session's absolute deadline and the Admission membership, so the Worker
+  reads the token's actual expiry and does not start a job it cannot finish.
 - Retire the NML deployment, the two no-script bypass Worker Routes, and
   their release reconciliation.
 - Admission needs no product registration; add the app to the admin desk's
@@ -101,12 +130,12 @@ long-running consumer needs only the Gateway, which re-checks every call.
 
 ### 4. Reliability
 
-- An overall job deadline, kept inside the 24-hour Gateway leg.
+- An overall job deadline, kept inside the Gateway token's actual expiry.
 - A Docling timeout that scales with page count instead of one fixed 300s.
 - Timeouts that actually cancel paid model calls (no `wait_for` over
   `to_thread` leaving the call running).
 - Clean up `debug/` with the rest of the 12-hour retention sweep.
-- Correct the README's Docling host.
+- Keep internal hostnames and paths out of the public `/health/ready` body.
 
 ### 5. Human-readable reports
 
@@ -157,4 +186,4 @@ the ASU/AWS remediation pipeline):
 
 ## Open decisions
 
-- Pipeline host: actual-dell or the Lab's AWS account.
+None.
