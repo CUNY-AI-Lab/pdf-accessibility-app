@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -17,6 +19,7 @@ from app.services.runtime_paths import resolve_binary
 
 _DOCLING_HEALTH_TIMEOUT_SECONDS = 5.0
 _DOCLING_HEALTH_CONNECT_RETRIES = 2
+_DOCLING_HEALTH_CACHE_SECONDS = 30.0
 
 
 def _check_payload(
@@ -133,6 +136,68 @@ def _llm_check(settings: Any) -> dict[str, Any]:
     )
 
 
+_DoclingProbeResult = tuple[bool, str, dict[str, Any]]
+# Readiness is public, so remote probes are shared per (URL, token) for a short
+# window: request volume on /health/ready cannot become load on docling-serve.
+_docling_probe_cache: dict[tuple[str, str], tuple[float, asyncio.Task]] = {}
+
+
+async def _cached_docling_serve_probe(health_url: str, token: str) -> _DoclingProbeResult:
+    key = (health_url, token)
+    now = time.monotonic()
+    cached = _docling_probe_cache.get(key)
+    if cached is None or now - cached[0] >= _DOCLING_HEALTH_CACHE_SECONDS:
+        task = asyncio.ensure_future(_probe_docling_serve(health_url, token))
+        cached = (now, task)
+        _docling_probe_cache[key] = cached
+    return await asyncio.shield(cached[1])
+
+
+async def _probe_docling_serve(health_url: str, token: str) -> _DoclingProbeResult:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        timeout = httpx.Timeout(_DOCLING_HEALTH_TIMEOUT_SECONDS)
+        transport = httpx.AsyncHTTPTransport(retries=_DOCLING_HEALTH_CONNECT_RETRIES)
+        async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
+            response = await client.get(health_url, headers=headers)
+    except httpx.ConnectError:
+        return (
+            False,
+            "Configured remote docling-serve health check could not connect",
+            {"health_check": "connection_failed"},
+        )
+    except httpx.TimeoutException:
+        return (
+            False,
+            "Configured remote docling-serve health check timed out",
+            {"health_check": "timed_out"},
+        )
+    except httpx.InvalidURL:
+        return (
+            False,
+            "Configured remote docling-serve health check URL is invalid",
+            {"health_check": "invalid_url"},
+        )
+    except httpx.HTTPError:
+        return (
+            False,
+            "Configured remote docling-serve health check failed",
+            {"health_check": "request_failed"},
+        )
+
+    if not 200 <= response.status_code < 300:
+        return (
+            False,
+            "Configured remote docling-serve health check returned a non-2xx status",
+            {"health_check": "non_2xx", "status_code": response.status_code},
+        )
+    return (
+        True,
+        "Configured remote docling-serve health check passed",
+        {"health_check": "ok"},
+    )
+
+
 async def _docling_check(settings: Any, diagnostics: dict[str, Any]) -> dict[str, Any]:
     docling = diagnostics.get("docling", {}) if isinstance(diagnostics, dict) else {}
     if getattr(settings, "docling_serve_url", ""):
@@ -146,58 +211,14 @@ async def _docling_check(settings: Any, diagnostics: dict[str, Any]) -> dict[str
             )
         if not local:
             base_url = str(settings.docling_serve_url).strip().rstrip("/")
-            health_url = f"{base_url}/health"
             token = str(getattr(settings, "docling_serve_token", "") or "").strip()
-            headers = {"Authorization": f"Bearer {token}"} if token else {}
-            try:
-                timeout = httpx.Timeout(_DOCLING_HEALTH_TIMEOUT_SECONDS)
-                transport = httpx.AsyncHTTPTransport(
-                    retries=_DOCLING_HEALTH_CONNECT_RETRIES
-                )
-                async with httpx.AsyncClient(
-                    timeout=timeout,
-                    transport=transport,
-                ) as client:
-                    response = await client.get(health_url, headers=headers)
-            except httpx.ConnectError:
-                return _check_payload(
-                    ok=False,
-                    detail="Configured remote docling-serve health check could not connect",
-                    metadata={**docling, "health_check": "connection_failed"},
-                )
-            except httpx.TimeoutException:
-                return _check_payload(
-                    ok=False,
-                    detail="Configured remote docling-serve health check timed out",
-                    metadata={**docling, "health_check": "timed_out"},
-                )
-            except httpx.InvalidURL:
-                return _check_payload(
-                    ok=False,
-                    detail="Configured remote docling-serve health check URL is invalid",
-                    metadata={**docling, "health_check": "invalid_url"},
-                )
-            except httpx.HTTPError:
-                return _check_payload(
-                    ok=False,
-                    detail="Configured remote docling-serve health check failed",
-                    metadata={**docling, "health_check": "request_failed"},
-                )
-
-            if not 200 <= response.status_code < 300:
-                return _check_payload(
-                    ok=False,
-                    detail="Configured remote docling-serve health check returned a non-2xx status",
-                    metadata={
-                        **docling,
-                        "health_check": "non_2xx",
-                        "status_code": response.status_code,
-                    },
-                )
+            ok, detail, probe_metadata = await _cached_docling_serve_probe(
+                f"{base_url}/health", token
+            )
             return _check_payload(
-                ok=True,
-                detail="Configured remote docling-serve health check passed",
-                metadata={**docling, "health_check": "ok"},
+                ok=ok,
+                detail=detail,
+                metadata={**docling, **probe_metadata},
             )
         return _check_payload(
             ok=True,
