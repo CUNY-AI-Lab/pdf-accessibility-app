@@ -4,9 +4,10 @@ pdfium is the PDF engine of Chrome, whose accessibility tree screen readers
 read. Its text page infers each word space from the font's own space width,
 expands ligatures, drops a string drawn again over itself (fake bold), and
 marks a hyphen that breaks a word at a line end. Each character belongs to
-the text object that drew it, and so to that object's marked content; a
-character under marked content with /ActualText reads as that text, once for
-each run of characters under it. The screen-reader scorer reads marked
+the text object that drew it, and so to that object's marked content. pdfium
+tells which characters lie under marked content with /ActualText, but its
+mark API does not decode the text reliably (it drops characters past U+00FF),
+so the text itself comes from the caller's own parse of the content stream. The screen-reader scorer reads marked
 content this way, and the tagger gives elements the text of their glyphs this
 way, so what the tagger writes is what the scorer reads.
 """
@@ -33,9 +34,8 @@ class PageText:
     chars: list[str] = field(default_factory=list)
     # Characters pdfium inferred: a word space or line break the file omits.
     generated: list[bool] = field(default_factory=list)
-    # The /ActualText covering each character, as (the marked content that
-    # carries it, the text), or None.
-    actual: list[tuple[int, str] | None] = field(default_factory=list)
+    # The marked content with /ActualText covering each character, or None.
+    actual: list[int | None] = field(default_factory=list)
     # Each character's box (left, bottom, right, top) in PDF user space.
     boxes: list[tuple[float, float, float, float]] = field(default_factory=list)
     # Characters drawn (not inferred) by GRID_SIZE grid cell of their center.
@@ -45,20 +45,24 @@ class PageText:
         default_factory=lambda: defaultdict(list)
     )
 
-    def text(self, indices: list[int]) -> str:
+    def text(self, indices: list[int], actual_texts: list[str] | None = None) -> str:
         """The characters at ``indices`` as text: pdfium's inferred spaces
         and line breaks as word breaks, a space where the run skips other
-        text, and a word broken at a line end joined again."""
+        text, and a word broken at a line end joined again. With
+        ``actual_texts``, the /ActualText of the marked content under which
+        the characters lie, in order, each run of characters under one reads
+        as the next of them."""
+        replacements = iter(actual_texts or [])
         parts: list[str] = []
         for position, index in enumerate(indices):
             previous = indices[position - 1] if position else None
             if previous is not None and index != previous + 1:
                 if self.breaks_between(previous, index):
                     parts.append(" ")
-            actual = self.actual[index]
+            actual = self.actual[index] if actual_texts else None
             if actual is not None:
                 if previous is None or self.actual[previous] != actual:
-                    parts.append(actual[1])
+                    parts.append(next(replacements, ""))
             elif self.generated[index]:
                 if previous is None or self.chars[previous] != LINE_END_HYPHEN:
                     parts.append(" ")
@@ -141,7 +145,7 @@ def _page_text(page: pdfium.PdfPage, form_paths: list[StreamKey]) -> PageText:
         if not generated:
             result.grid[_cell((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)].append(index)
         text_object = pdfium_c.FPDFText_GetTextObject(textpage.raw, index)
-        result.actual.append(_actual_text(text_object) if text_object else None)
+        result.actual.append(_actual_text_mark(text_object) if text_object else None)
         if not text_object:
             continue
         mcid = pdfium_c.FPDFPageObj_GetMarkedContentID(text_object)
@@ -155,19 +159,13 @@ def _address(pointer) -> int:
     return ctypes.cast(pointer, ctypes.c_void_p).value or 0
 
 
-def _actual_text(text_object) -> tuple[int, str] | None:
-    """The /ActualText of marked content around a text object, with that
-    marked content's identity."""
+def _actual_text_mark(text_object) -> int | None:
+    """The identity of marked content with /ActualText around a text object."""
     for index in range(pdfium_c.FPDFPageObj_CountMarks(text_object)):
         mark = pdfium_c.FPDFPageObj_GetMark(text_object, index)
         length = ctypes.c_ulong()
-        key = b"ActualText"
-        if not pdfium_c.FPDFPageObjMark_GetParamStringValue(mark, key, None, 0, length):
-            continue
-        buffer = (ctypes.c_ushort * (length.value // 2))()
-        pdfium_c.FPDFPageObjMark_GetParamStringValue(mark, key, buffer, length, length)
-        text = bytes(buffer).decode("utf-16-le").rstrip("\x00")
-        return _address(mark), text
+        if pdfium_c.FPDFPageObjMark_GetParamStringValue(mark, b"ActualText", None, 0, length):
+            return _address(mark)
     return None
 
 

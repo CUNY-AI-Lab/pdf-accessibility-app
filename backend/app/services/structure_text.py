@@ -160,7 +160,10 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
                 previous[0] != page or page_text.breaks_between(previous[1], indices[0])
             ):
                 out.append(" ")
-            out.append(page_text.text(indices))
+            actual_texts = [
+                item for item in marked[page].get((path, mcid), []) if isinstance(item, str)
+            ]
+            out.append(page_text.text(indices, actual_texts))
             last_read[0] = (page, indices[-1])
 
         def inline(node, page) -> str:

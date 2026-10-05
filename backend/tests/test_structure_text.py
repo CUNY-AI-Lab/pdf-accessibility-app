@@ -213,3 +213,17 @@ def test_page_text_joins_utf16_surrogate_pairs():
 
     page = PageText(chars=["\ud835", "\udc00"], generated=[False, False], actual=[None, None])
     assert page.text([0, 1]) == "\U0001d400"
+
+
+def test_marked_content_actual_text_in_utf16_is_read(tmp_path):
+    """/ActualText with characters outside PDFDocEncoding is stored as
+    UTF-16; it must read as its text."""
+    text = pikepdf.String("Fc_103\u2013130 \u010cesk\u00fd")
+    content = (
+        b"/P <</MCID 0 /ActualText " + text.unparse() + b">> BDC "
+        b"BT /F1 12 Tf 20 250 Td (Fc_103-130 Cesky) Tj ET EMC"
+    )
+    path = tmp_path / "utf16_actual_text.pdf"
+    _paragraph_pdf(path, content)
+
+    assert " ".join(screen_reader_text(path).split()) == "Fc_103\u2013130 \u010cesk\u00fd"
