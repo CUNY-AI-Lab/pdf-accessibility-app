@@ -51,8 +51,14 @@ def synthetic_scan(source: Path, output: Path, *, name: str) -> None:
         pages = [scan_page(page.render(scale=PPI / 72).to_pil(), rng) for page in document]
     finally:
         document.close()
+    image_pdf(pages, output, ppi=PPI)
+
+
+def image_pdf(images: list[bytes], output: Path, *, ppi: int) -> None:
+    """An image-only PDF of ``images``, one per page at ``ppi``, the images
+    embedded unchanged and the file byte-identical on every rebuild."""
     converted = img2pdf.convert(
-        pages, layout_fun=img2pdf.get_fixed_dpi_layout_fun((PPI, PPI)), nodate=True
+        images, layout_fun=img2pdf.get_fixed_dpi_layout_fun((ppi, ppi)), nodate=True
     )
     # img2pdf gives each file a random /ID, and qpdf keeps an existing first
     # half; drop it so the whole /ID comes from the content.

@@ -1,4 +1,12 @@
 {
+  "scorers": {
+    "opendataloader_bench": {
+      "repo": "https://github.com/opendataloader-project/opendataloader-bench",
+      "commit": "7af1d8f4d0c09f51ea1a5c6ba5f66e993286d109",
+      "license": "Apache-2.0"
+    },
+    "olmocr_bench": "olmocr[bench]==0.4.27"
+  },
   "olmocr_bench": {
     "dataset": "allenai/olmOCR-bench",
     "revision": "54a96a6fb6a2bd3b297e59869491db4d3625b711",
@@ -23,6 +31,24 @@
         "name": "tables_s60",
         "tests": "bench_data/table_tests.jsonl",
         "sample": 60
+      },
+      {
+        "name": "multi_column_s60_scan",
+        "tests": "bench_data/multi_column.jsonl",
+        "sample": 60,
+        "scan": true
+      },
+      {
+        "name": "headers_footers_s60_scan",
+        "tests": "bench_data/headers_footers.jsonl",
+        "sample": 60,
+        "scan": true
+      },
+      {
+        "name": "tables_s60_scan",
+        "tests": "bench_data/table_tests.jsonl",
+        "sample": 60,
+        "scan": true
       }
     ]
   },

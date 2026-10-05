@@ -28,6 +28,7 @@ tests as `data/eval/olmocr-bench/<subset>.jsonl` and its PDFs in
 | `gold_rt` | 224 (11 documents) | structure round-trip | Well-tagged PDFs: seven from the PDF/UA Reference Suite 1.1, the Matterhorn Protocol 1.1, Ross Moore's tagged PDF/UA paper, a NOAA report, and a table set |
 | `cuny_rt` | 282 (19 documents) | structure round-trip | Well-tagged CUNY documents from [CUNY Academic Works](https://academicworks.cuny.edu/): five syllabi, two OER textbook chapters, three assignments, three lesson plans, two conference papers, lecture slides, a book chapter, a master's capstone, and a library newsletter |
 | `cuny_rt_scan` | 282 (19 documents) | structure round-trip | The `cuny_rt` documents as image-only scans (`scripts/synthetic_scan.py`), scored against the same tags |
+| `tables_s60_scan`, `multi_column_s60_scan`, `headers_footers_s60_scan` | 60 each | as their born-digital samples | The same pages as image-only scans under the same tests, which check text, order and tables and so hold for a scan too |
 
 olmOCR-Bench ([allenai/olmOCR-bench](https://huggingface.co/datasets/allenai/olmOCR-bench),
 ODC-BY) is read at revision `54a96a6f`, the revision used for the September
@@ -69,3 +70,6 @@ fit in a month. Adobe's tagged outputs are kept in the Lab's copy under
   results in `docs/evaluation.md` are re-measured on the changed corpus.
 - Measurements name the docling-serve version they ran against; structure
   results depend on it.
+- Scorers are pinned in `corpus.json`: `olmocr[bench]` by version, and
+  opendataloader-bench (for `score_structure.py`) by commit, which the
+  fetcher checks out in `data/eval/sources/opendataloader-bench`.

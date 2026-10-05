@@ -9,7 +9,7 @@ The evaluators come from a checkout of opendataloader-bench (Apache 2.0) at
 commit 7af1d8f, passed with ``--odl-bench``:
 
     uv run --with apted --with beautifulsoup4 --with lxml \\
-        python scripts/score_structure.py --odl-bench ../opendataloader-bench \\
+        python scripts/score_structure.py --odl-bench data/eval/sources/opendataloader-bench \\
         data/eval/olmocr-bench/gold_rt data/eval/olmocr-bench/bench_data/pipe_v3/gold_rt
 
 The gold directory holds ``<document>.md`` (see ``prepare_gold_roundtrip.py``);

@@ -21,7 +21,8 @@ checked against its sha256 here; the manifest's origin URLs record where each
 came from. Adobe's results, kept there because they cost free-tier quota to
 remake, are restored as the ``adobe_ocr_autotag`` candidate. Downloads and
 the Lab's copy are kept in ``--sources`` (default ``data/eval/sources``), so a
-rebuild fetches nothing new.
+rebuild fetches nothing new. The structure scorer's opendataloader-bench is
+checked out there at its pinned commit too.
 
     uv run python scripts/fetch_eval_corpus.py [--subsets old_print gold_rt]
 """
@@ -30,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import io
 import json
 import random
 import shutil
@@ -39,8 +39,7 @@ import sys
 from pathlib import Path
 
 import httpx
-import img2pdf
-import pikepdf
+from synthetic_scan import image_pdf, synthetic_scan
 
 BACKEND = Path(__file__).resolve().parent.parent
 MANIFEST = BACKEND / "eval" / "corpus.json"
@@ -120,7 +119,10 @@ def build_olmocr(
             source = cached(
                 client, f"{base}/bench_data/pdfs/{pdf}", cache / "bench_data" / "pdfs" / pdf
             )
-            shutil.copyfile(source, out / Path(pdf).name)
+            if subset.get("scan"):
+                synthetic_scan(source, out / Path(pdf).name, name=f"{name}/{Path(pdf).name}")
+            else:
+                shutil.copyfile(source, out / Path(pdf).name)
         write_tests(bench, name, tests)
         print(f"{name}: {len(chosen)} PDFs, {len(tests)} tests")
 
@@ -130,14 +132,7 @@ def build_old_print(spec: dict, bench: Path, lab: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     for page in spec["pages"]:
         image = checked(lab / "old_print" / f"{page['id']}.jpg", page["sha256"])
-        layout = img2pdf.get_fixed_dpi_layout_fun((page["ppi"], page["ppi"]))
-        converted = img2pdf.convert(image.read_bytes(), layout_fun=layout, nodate=True)
-        # img2pdf gives each file a random /ID, and qpdf keeps an existing
-        # first half; drop it so the whole /ID comes from the content and a
-        # rebuild is byte-identical.
-        with pikepdf.open(io.BytesIO(converted)) as pdf:
-            del pdf.trailer["/ID"]
-            pdf.save(out / f"{page['id']}.pdf", deterministic_id=True)
+        image_pdf([image.read_bytes()], out / f"{page['id']}.pdf", ppi=page["ppi"])
     tests = [
         json.loads(line) for line in (BACKEND / "eval" / spec["tests"]).read_text().splitlines()
     ]
@@ -159,6 +154,14 @@ def build_roundtrip(spec: dict, wanted: set[str], bench: Path, lab: Path) -> Non
     if (scan := spec.get("scan_subset")) in wanted:
         prepare_args = ["--bench", str(bench), "--subset", scan, "--scan", *pairs]
         subprocess.run([*prepare, *prepare_args], check=True, cwd=BACKEND)
+
+
+def fetch_scorer(spec: dict, sources: Path) -> None:
+    """opendataloader-bench at its pinned commit, for score_structure.py."""
+    checkout = sources / "opendataloader-bench"
+    if not checkout.exists():
+        subprocess.run(["git", "clone", "--quiet", spec["repo"], str(checkout)], check=True)
+    subprocess.run(["git", "-C", str(checkout), "checkout", "--quiet", spec["commit"]], check=True)
 
 
 def restore_adobe(wanted: set[str], bench: Path, lab: Path) -> None:
@@ -197,6 +200,7 @@ def main() -> None:
         timeout=120, follow_redirects=True, headers={"User-Agent": USER_AGENT}
     ) as client:
         build_olmocr(client, corpus["olmocr_bench"], wanted, options.bench, options.sources)
+    fetch_scorer(corpus["scorers"]["opendataloader_bench"], options.sources)
     lab = lab_copy(options.sources)
     if "old_print" in wanted:
         build_old_print(corpus["old_print"], options.bench, lab)
