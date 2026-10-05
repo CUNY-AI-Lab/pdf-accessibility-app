@@ -15,7 +15,6 @@ import logging
 import math
 import mimetypes
 import re
-from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
 from difflib import SequenceMatcher
@@ -35,7 +34,7 @@ from app.pipeline.element_text import accounts_for, readable
 from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
 from app.pipeline.page_glyphs import MeasuredGlyph, MeasuredTextOp, PdfGlyphReader, union_bbox
 from app.pipeline.pdf_repair import add_missing_icc_components
-from app.pipeline.pdfium_text import PageText, read_page_text
+from app.pipeline.pdfium_text import PdfiumText
 
 logger = logging.getLogger(__name__)
 
@@ -3182,6 +3181,8 @@ class StructTreeBuilder:
                     "/P": row_elem,
                     "/K": pikepdf.Array([]),
                 }
+                if cell.get("glyph_text"):
+                    cell_elem_dict["/ActualText"] = pikepdf.String(cell["glyph_text"])
                 attrs = pikepdf.Dictionary({"/O": pikepdf.Name("/Table")})
                 row_span = _as_positive_int(cell.get("row_span", 1), default=1)
                 col_span = _as_positive_int(cell.get("col_span", 1), default=1)
@@ -3696,11 +3697,6 @@ def _allocate_fragment_mcid(
         )
 
     builder.remember_source_element(elem, stream_owner or page_ref, mcid)
-    if elem.get("glyph_text"):
-        # Each fragment's marked content carries its own glyphs' text (see
-        # _rewrite_content_stream_with_fragmented_text), which, unlike an
-        # element's /ActualText, does not hide a Link nested in the element.
-        actual_text = None
     if actual_text and elem_type != "formula":
         # An element's text covers all of its fragments. On the first
         # fragment's marked content it would be read, and then the later
@@ -3892,9 +3888,6 @@ def _rewrite_content_stream_with_fragmented_text(
     text_run_assignments: dict[int, int],
     table_cell_assignments: dict[int, TableCellRunAssignment],
     stream_owner: pikepdf.Object | None = None,
-    cell_glyphs: dict[int, list[MeasuredGlyph]] | None = None,
-    glyphs_by_instruction: dict[int, list[MeasuredGlyph]] | None = None,
-    page_text: PageText | None = None,
 ) -> set[int]:
     """Rewrite a stream using word-level OCR text anchors when BT blocks are giant."""
     table_cell_mark_lookup: dict[tuple[str, int, int, int], TableCellRunAssignment] = {}
@@ -3944,9 +3937,6 @@ def _rewrite_content_stream_with_fragmented_text(
     )
     matched_element_indices.update(decorative_covered)
 
-    fragment_text = _fragment_glyph_texts(
-        mark_by_idx, len(instructions), elements, glyphs_by_instruction or {}, page_text
-    )
     new_instructions = []
     active_mark: int | tuple[str, int, int, int] | None = None
 
@@ -3997,7 +3987,6 @@ def _rewrite_content_stream_with_fragmented_text(
                     active_mark = FRAGMENTED_TEXT_MARK_ARTIFACT
                 else:
                     tag, mcid, actual_text = allocated
-                    actual_text = fragment_text.get(idx, actual_text)
                     new_instructions.append(_make_bdc(tag, mcid, actual_text=actual_text))
                     active_mark = mark
             else:
@@ -4011,9 +4000,6 @@ def _rewrite_content_stream_with_fragmented_text(
             new_instructions.append(instr)
 
     close_active()
-    _set_table_cell_glyph_text(
-        builder, elements, table_cell_assignments, cell_glyphs or {}, page_text
-    )
     for source_region, elem_idx in overlay_targets:
         overlay = _make_clipped_image_figure_instructions(
             source_region,
@@ -4057,7 +4043,6 @@ def _rewrite_content_stream(
     stream_owner: pikepdf.Object | None = None,
     passthrough_regions: list[ContentRegion] | None = None,
     measured_ops: list[MeasuredTextOp] | None = None,
-    page_text: PageText | None = None,
 ) -> set[int]:
     """Insert BDC/EMC markers into the page's content stream using position-based matching."""
     try:
@@ -4104,8 +4089,6 @@ def _rewrite_content_stream(
             regions, matches, elements, text_runs, text_run_assignments
         ),
     )
-    if measured is not None:
-        _prefer_glyph_text(elements, _glyphs_by_element(measured, elements), page_text)
     if fragmented:
         return _rewrite_content_stream_with_fragmented_text(
             pdf,
@@ -4122,19 +4105,6 @@ def _rewrite_content_stream(
             text_run_assignments=text_run_assignments,
             table_cell_assignments=table_cell_assignments,
             stream_owner=stream_owner,
-            cell_glyphs=(
-                {
-                    run_idx: measured[run.instruction_idx].glyphs
-                    for run_idx, run in enumerate(text_runs)
-                    if run_idx in table_cell_assignments and run.instruction_idx in measured
-                }
-                if measured is not None
-                else None
-            ),
-            glyphs_by_instruction=(
-                {idx: op.glyphs for idx, op in measured.items()} if measured is not None else None
-            ),
-            page_text=page_text,
         )
     matched_element_indices = set(matches.values())
 
@@ -4347,117 +4317,25 @@ def _element_accessible_text(elem: dict) -> str:
 GLYPH_TEXT_ELEMENT_TYPES = LINK_TEXT_ELEMENT_TYPES - {"formula"}
 
 
-def _fragment_glyph_texts(
-    mark_by_idx: dict[int, int | tuple[str, int, int, int]],
-    instruction_count: int,
-    elements: list[dict],
-    glyphs_by_instruction: dict[int, list[MeasuredGlyph]],
-    page_text: PageText | None,
-) -> dict[int, str]:
-    """For each run of instructions marked for one element whose glyph text
-    accounts for its text (it has a ``glyph_text``), keyed by its first
-    instruction, the text of its glyphs.
-
-    Marked-content /ActualText is read as written, with no space implied
-    after it, so each of an element's runs but its last ends with the word
-    break."""
-    runs_by_element: dict[int, list[tuple[int, str]]] = defaultdict(list)
-    idx = 0
-    while idx < instruction_count:
-        mark = mark_by_idx.get(idx)
-        end = idx + 1
-        while end < instruction_count and mark_by_idx.get(end) == mark:
-            end += 1
-        if (
-            isinstance(mark, int)
-            and 0 <= mark < len(elements)
-            and elements[mark].get("glyph_text")
-        ):
-            glyphs = [g for i in range(idx, end) for g in glyphs_by_instruction.get(i, [])]
-            if text := _glyphs_text(page_text, glyphs):
-                runs_by_element[mark].append((idx, text))
-        idx = end
-    texts: dict[int, str] = {}
-    for runs in runs_by_element.values():
-        for start, text in runs[:-1]:
-            texts[start] = text + " "
-        last_start, last_text = runs[-1]
-        texts[last_start] = last_text
-    return texts
-
-
-def _set_table_cell_glyph_text(
-    builder: "StructTreeBuilder",
-    elements: list[dict],
-    table_cell_assignments: dict[int, TableCellRunAssignment],
-    glyphs_by_run: dict[int, list[MeasuredGlyph]],
-    page_text: PageText | None,
-) -> None:
-    """Give each table cell the text of its glyphs as /ActualText when they
-    account for the structure step's cell text, so letter-spaced, overdrawn,
-    or run-together cell text reads as words (see element_text)."""
-    cells: dict[tuple[int, int, int], tuple[dict, list[MeasuredGlyph]]] = {}
-    for run_idx, assignment in sorted(table_cell_assignments.items()):
-        key = (assignment.table_elem_idx, assignment.row, assignment.col)
-        cells.setdefault(key, (assignment.cell, []))[1].extend(glyphs_by_run.get(run_idx, []))
-    for (table_idx, row, col), (cell, glyphs) in cells.items():
-        if not glyphs or not 0 <= table_idx < len(elements):
-            continue
-        cell_elem = builder._ensure_fragmented_table(elements[table_idx]).get((row, col))
-        text = _glyphs_text(page_text, glyphs)
-        if cell_elem is not None and accounts_for(text, str(cell.get("text") or "")):
-            cell_elem["/ActualText"] = pikepdf.String(text)
-
-
-def _glyphs_by_element(
-    measured: dict[int, MeasuredTextOp], elements: list[dict]
-) -> dict[int, list[MeasuredGlyph]]:
-    """Each measured glyph, in drawing order, under the smallest text element
-    box (an element's own or one where Docling continues it) that holds its
-    center, however the content stream splits them."""
-    boxes = sorted(
-        (
-            (_bbox_area(box), elem_idx, box)
-            for elem_idx, elem in enumerate(elements)
-            if elem.get("type") in GLYPH_TEXT_ELEMENT_TYPES and isinstance(elem.get("bbox"), dict)
-            for box in [elem["bbox"], *elem.get("extra_bboxes", [])]
-        ),
-        key=lambda entry: entry[0],
-    )
-    glyphs_by_element: dict[int, list[MeasuredGlyph]] = defaultdict(list)
-    for _idx, op in sorted(measured.items()):
-        for glyph in op.glyphs:
-            cx, cy = _bbox_center(glyph.bbox)
-            for _area, elem_idx, box in boxes:
-                if _point_in_bbox(cx, cy, box, margin=1.0):
-                    glyphs_by_element[elem_idx].append(glyph)
-                    break
-    return glyphs_by_element
-
-
-def _glyphs_text(page_text: PageText | None, glyphs: list[MeasuredGlyph]) -> str:
-    """What these glyphs read as by pdfium's text extraction (see
-    pdfium_text), with spacing accents made readable."""
-    if page_text is None or not glyphs:
-        return ""
-    return readable(page_text.text_in_glyphs(glyphs))
-
-
-def _prefer_glyph_text(
-    elements: list[dict],
-    glyphs_by_element: dict[int, list[MeasuredGlyph]],
-    page_text: PageText | None,
-) -> None:
-    """Give each text element whose measured glyphs account for its structure
-    text a ``glyph_text`` (see element_text): the PDF's own characters and
-    word breaks, which _element_accessible_text prefers to Docling's text."""
-    for elem_idx, glyphs in glyphs_by_element.items():
-        elem = elements[elem_idx]
-        if elem.get("type") not in GLYPH_TEXT_ELEMENT_TYPES:
-            continue
-        text = _glyphs_text(page_text, glyphs)
-        if accounts_for(text, str(elem.get("text") or "")):
-            elem["glyph_text"] = text
+def _attach_glyph_text(pages_elements: dict[int, list[dict]], pdfium_text: PdfiumText) -> None:
+    """Give each text element, and each table cell, a ``glyph_text`` when the
+    text pdfium extracts inside its boxes accounts for the structure step's
+    text: the PDF's own characters and word breaks, which
+    _element_accessible_text (and a table cell's /ActualText) prefer to
+    Docling's text (see element_text)."""
+    for page_index, elements in pages_elements.items():
+        for elem in elements:
+            boxes = [elem.get("bbox"), *elem.get("extra_bboxes", [])]
+            if elem.get("type") in GLYPH_TEXT_ELEMENT_TYPES and isinstance(boxes[0], dict):
+                text = readable(pdfium_text.in_boxes(page_index, boxes))
+                if accounts_for(text, str(elem.get("text") or "")):
+                    elem["glyph_text"] = text
+            if elem.get("type") == "table":
+                for cell in elem.get("cells") or []:
+                    if isinstance(cell, dict) and (box := _table_cell_bbox(elem, cell)):
+                        text = readable(pdfium_text.in_boxes(page_index, [box]))
+                        if accounts_for(text, str(cell.get("text") or "")):
+                            cell["glyph_text"] = text
 
 
 def _element_actual_text(elem: dict) -> str | None:
@@ -4656,9 +4534,9 @@ def _make_bdc(
     actual_text: str | None = None,
 ) -> pikepdf.ContentStreamInstruction:
     attributes = pikepdf.Dictionary({"/MCID": mcid})
-    # Kept as given: a trailing space is a fragment's word break.
-    if str(actual_text or "").strip():
-        attributes["/ActualText"] = pikepdf.String(actual_text)
+    normalized_actual_text = str(actual_text or "").strip()
+    if normalized_actual_text:
+        attributes["/ActualText"] = pikepdf.String(normalized_actual_text)
     return pikepdf.ContentStreamInstruction(
         [pikepdf.Name(f"/{struct_type}"), attributes],
         pikepdf.Operator("BDC"),
@@ -5694,8 +5572,11 @@ async def tag_pdf(
         except Exception as e:
             logger.warning(f"docling-parse unavailable for {input_path.name}: {e}")
 
-        pages_text = read_page_text(input_path)
-        with PdfGlyphReader(input_path) as glyph_reader, pikepdf.open(str(input_path)) as pdf:
+        with (
+            PdfiumText(input_path) as pdfium_text,
+            PdfGlyphReader(input_path) as glyph_reader,
+            pikepdf.open(str(input_path)) as pdf,
+        ):
             elements = structure_json.get("elements", [])
             source_figure_alt_lookup = _source_figure_alt_lookup(pdf, elements)
 
@@ -5760,6 +5641,7 @@ async def tag_pdf(
                 if pg not in pages_elements:
                     pages_elements[pg] = []
                 pages_elements[pg].append(elem)
+            _attach_glyph_text(pages_elements, pdfium_text)
 
             figures_tagged = 0
             headings_tagged = 0
@@ -5820,7 +5702,6 @@ async def tag_pdf(
                         docling_page_lines=page_lines,
                         passthrough_regions=ocr_passthrough_regions,
                         measured_ops=page_glyphs.ops.get(()),
-                        page_text=pages_text[page_index],
                     )
                     page_tagged_elements.extend(
                         page_elems[idx]
@@ -5851,7 +5732,6 @@ async def tag_pdf(
                             measured_ops=page_glyphs.ops.get(
                                 (invocation.xobject_name.lstrip("/"),)
                             ),
-                            page_text=pages_text[page_index],
                         )
                         page_tagged_elements.extend(
                             remaining_elems[idx]
@@ -5889,7 +5769,6 @@ async def tag_pdf(
                         decorative_figures=decorative_figures,
                         docling_page_lines=None,
                         measured_ops=page_glyphs.ops.get(()),
-                        page_text=pages_text[page_index],
                     )
 
                 _ensure_annotation_baseline(page)

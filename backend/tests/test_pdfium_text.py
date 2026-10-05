@@ -1,13 +1,12 @@
-"""Text by glyph position as pdfium extracts it: the behaviors the tagger
-relies on for element text."""
+"""Text inside a box as pdfium extracts it: the behaviors the tagger relies
+on for element text."""
 
 from pathlib import Path
 
 import pikepdf
 import pytest
 
-from app.pipeline.page_glyphs import PdfGlyphReader
-from app.pipeline.pdfium_text import read_page_text
+from app.pipeline.pdfium_text import PdfiumText
 from tests.pdf_fixtures import helvetica
 
 
@@ -18,9 +17,8 @@ def _page_text(tmp_path: Path, content: bytes) -> str:
     page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
     page.Contents = pdf.make_stream(content)
     pdf.save(path)
-    with PdfGlyphReader(path) as reader:
-        glyphs = [glyph for op in reader.page(0).ops[()] for glyph in op.glyphs]
-    return read_page_text(path)[0].text_in_glyphs(glyphs)
+    with PdfiumText(path) as pdfium_text:
+        return pdfium_text.in_boxes(0, [{"l": 0, "b": 0, "r": 400, "t": 300}])
 
 
 @pytest.mark.parametrize(
@@ -41,5 +39,5 @@ def _page_text(tmp_path: Path, content: bytes) -> str:
         (b"BT /F1 12 Tf 20 250 Td (\x93aircraft\x94) Tj ET", "“aircraft”"),
     ],
 )
-def test_text_in_glyphs(tmp_path, content, heard):
+def test_text_in_boxes(tmp_path, content, heard):
     assert _page_text(tmp_path, content) == heard

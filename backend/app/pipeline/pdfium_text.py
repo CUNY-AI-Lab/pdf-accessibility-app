@@ -1,4 +1,4 @@
-"""Page text as pdfium extracts it, by marked content or by glyph position.
+"""Page text as pdfium extracts it: by marked content, or inside a box.
 
 pdfium is the PDF engine of Chrome, whose accessibility tree screen readers
 read. Its text page infers each word space from the font's own space width,
@@ -7,14 +7,15 @@ marks a hyphen that breaks a word at a line end. Each character belongs to
 the text object that drew it, and so to that object's marked content. pdfium
 tells which characters lie under marked content with /ActualText, but its
 mark API does not decode the text reliably (it drops characters past U+00FF),
-so the text itself comes from the caller's own parse of the content stream. The screen-reader scorer reads marked
-content this way, and the tagger gives elements the text of their glyphs this
-way, so what the tagger writes is what the scorer reads.
+so the text itself comes from the caller's own parse of the content stream.
+The screen-reader scorer reads marked content this way, and the tagger takes
+an element's text from inside its box this way.
 """
 
 from __future__ import annotations
 
 import ctypes
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,7 +24,7 @@ import pikepdf
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 
-from app.pipeline.page_glyphs import MeasuredGlyph, StreamKey
+from app.pipeline.page_glyphs import StreamKey
 
 # pdfium's code for a hyphen that breaks a word at a line end.
 LINE_END_HYPHEN = "\x02"
@@ -36,10 +37,6 @@ class PageText:
     generated: list[bool] = field(default_factory=list)
     # The marked content with /ActualText covering each character, or None.
     actual: list[int | None] = field(default_factory=list)
-    # Each character's box (left, bottom, right, top) in PDF user space.
-    boxes: list[tuple[float, float, float, float]] = field(default_factory=list)
-    # Characters drawn (not inferred) by GRID_SIZE grid cell of their center.
-    grid: dict[tuple[int, int], list[int]] = field(default_factory=lambda: defaultdict(list))
     # The character indices of each marked-content sequence, in pdfium's order.
     marked: dict[tuple[StreamKey, int], list[int]] = field(
         default_factory=lambda: defaultdict(list)
@@ -72,24 +69,6 @@ class PageText:
         text = "".join(parts).encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
         return " ".join(text.split())
 
-    def text_in_glyphs(self, glyphs: list[MeasuredGlyph]) -> str:
-        """The text of the characters whose centers lie in any of these
-        glyphs' boxes (the tagger's glyphs, measured by page_glyphs), in
-        pdfium's order."""
-        chosen: set[int] = set()
-        for glyph in glyphs:
-            box = glyph.bbox
-            for cell in _cells(box["l"], box["b"], box["r"], box["t"]):
-                for index in self.grid.get(cell, ()):
-                    left, bottom, right, top = self.boxes[index]
-                    cx, cy = (left + right) / 2, (bottom + top) / 2
-                    if (
-                        box["l"] - 0.5 <= cx <= box["r"] + 0.5
-                        and box["b"] - 0.5 <= cy <= box["t"] + 0.5
-                    ):
-                        chosen.add(index)
-        return self.text(sorted(chosen))
-
     def breaks_between(self, before: int, after: int) -> bool:
         """Whether a word break falls between two characters: other text
         lies between them, or pdfium inferred a space or line break at or
@@ -101,24 +80,33 @@ class PageText:
         return any(self.generated[i] for i in range(before, after + 1))
 
 
-GRID_SIZE = 12.0
+class PdfiumText:
+    """The text pdfium extracts inside boxes on a document's pages."""
 
+    def __init__(self, pdf_path: Path) -> None:
+        self.document = pdfium.PdfDocument(pdf_path)
+        self.textpages: dict[int, pdfium.PdfTextPage] = {}
 
-def _cell(x: float, y: float) -> tuple[int, int]:
-    return int(x // GRID_SIZE), int(y // GRID_SIZE)
+    def __enter__(self) -> PdfiumText:
+        return self
 
+    def __exit__(self, *_exc) -> None:
+        self.document.close()
 
-def _cells(left: float, bottom: float, right: float, top: float):
-    """The grid cells a box overlaps, with half a point to spare."""
-    (x0, y0), (x1, y1) = _cell(left - 0.5, bottom - 0.5), _cell(right + 0.5, top + 0.5)
-    for x in range(x0, x1 + 1):
-        for y in range(y0, y1 + 1):
-            yield x, y
+    def in_boxes(self, page_index: int, boxes: list[dict[str, float]]) -> str:
+        """The text inside these boxes (left, bottom, right, top in PDF user
+        space), box after box, with a word hyphenated at a line end joined."""
+        if page_index not in self.textpages:
+            self.textpages[page_index] = self.document[page_index].get_textpage()
+        textpage = self.textpages[page_index]
+        text = " ".join(
+            textpage.get_text_bounded(box["l"], box["b"], box["r"], box["t"]) for box in boxes
+        )
+        return " ".join(re.sub(LINE_END_HYPHEN + r"\s*", "", text).split())
 
 
 def read_page_text(pdf_path: Path) -> list[PageText]:
-    """Each page's characters, with their boxes and the marked content that
-    drew them."""
+    """Each page's characters, with the marked content that drew them."""
     pages: list[PageText] = []
     document = pdfium.PdfDocument(pdf_path)
     try:
@@ -138,12 +126,6 @@ def _page_text(page: pdfium.PdfPage, form_paths: list[StreamKey]) -> PageText:
         result.chars.append(chr(pdfium_c.FPDFText_GetUnicode(textpage.raw, index)))
         generated = bool(pdfium_c.FPDFText_IsGenerated(textpage.raw, index))
         result.generated.append(generated)
-        left, right, bottom, top = (ctypes.c_double() for _ in range(4))
-        pdfium_c.FPDFText_GetCharBox(textpage.raw, index, left, right, bottom, top)
-        box = (left.value, bottom.value, right.value, top.value)
-        result.boxes.append(box)
-        if not generated:
-            result.grid[_cell((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)].append(index)
         text_object = pdfium_c.FPDFText_GetTextObject(textpage.raw, index)
         result.actual.append(_actual_text_mark(text_object) if text_object else None)
         if not text_object:
