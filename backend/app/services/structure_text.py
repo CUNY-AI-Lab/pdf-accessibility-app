@@ -2,9 +2,9 @@
 
 Walks the structure tree in logical order. An element with ``/ActualText``
 contributes that text and hides its descendants; otherwise each marked-content
-reference contributes what that marked content reads as (its glyphs joined
-into words by position, or the ``/ActualText`` of marked content that carries
-one; see ``app/pipeline/page_glyphs.py``). Artifacts and untagged content are not in the structure tree, so
+reference contributes what that marked content reads as: its text as pdfium,
+Chrome's PDF engine, extracts it (``marked_text``), or the ``/ActualText`` of
+marked content that carries one (``app/pipeline/page_glyphs.py``). Artifacts and untagged content are not in the structure tree, so
 they are not read. Figure ``/Alt`` text is left out: it describes an image, not
 page text. Text drawn inside a Figure is not read either, unless
 ``figure_text`` asks for the reading some screen readers give a Figure that
@@ -25,13 +25,8 @@ from pathlib import Path
 
 import pikepdf
 
-from app.pipeline.page_glyphs import (
-    MeasuredGlyph,
-    PdfGlyphReader,
-    StreamKey,
-    join_glyphs,
-    separated,
-)
+from app.pipeline.page_glyphs import MeasuredGlyph, PdfGlyphReader, StreamKey
+from app.services.marked_text import read_marked_text
 
 BLOCK_ROLES = {
     "P",
@@ -130,27 +125,43 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
         root = pdf.Root.get("/StructTreeRoot")
         if root is None:
             return ""
+        pages_text = read_marked_text(pdf_path)
         role_map = root.get("/RoleMap")
         blocks: list[str] = []
         marked: dict[int, dict[tuple[StreamKey, int], list[MeasuredGlyph | str]]] = {}
         form_paths: dict[int, dict[tuple[int, int], StreamKey]] = {}
-        # The last glyph read, to decide whether the next marked content
-        # starts a new word; None after a block break or /ActualText.
-        last_glyph: list[MeasuredGlyph | None] = [None]
+        # Where the last marked content read ended (page, character index),
+        # to decide whether the next starts a new word; None after a block
+        # break or /ActualText.
+        last_read: list[tuple[int, int] | None] = [None]
 
         def read_mcid(page: int, stream: pikepdf.Object | None, mcid: int, out: list[str]) -> None:
             if page not in marked:
                 marked[page] = glyphs.page(page).marked
                 form_paths[page] = _form_paths(pdf.pages[page].obj)
             path = () if stream is None else form_paths[page].get(stream.objgen)
-            items = marked[page].get((path, mcid), []) if path is not None else []
-            if not items:
+            if path is None:
                 return
-            first = items[0] if isinstance(items[0], MeasuredGlyph) else None
-            if last_glyph[0] is not None and (first is None or separated(last_glyph[0], first)):
+            page_text = pages_text[page]
+            indices = page_text.marked.get((path, mcid))
+            if not indices:
+                # Marked content that draws no text may still carry /ActualText.
+                actual_texts = [
+                    item for item in marked[page].get((path, mcid), []) if isinstance(item, str)
+                ]
+                if actual_texts:
+                    if last_read[0] is not None:
+                        out.append(" ")
+                    out.append(" ".join(actual_texts))
+                    last_read[0] = None
+                return
+            previous = last_read[0]
+            if previous is not None and (
+                previous[0] != page or page_text.breaks_between(previous[1], indices[0])
+            ):
                 out.append(" ")
-            out.append(join_glyphs(items))
-            last_glyph[0] = items[-1] if isinstance(items[-1], MeasuredGlyph) else None
+            out.append(page_text.text(indices))
+            last_read[0] = (page, indices[-1])
 
         def inline(node, page) -> str:
             parts: list[str] = []
@@ -210,7 +221,7 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
                 return
             if "/ActualText" in node:
                 out.append(str(node.ActualText))
-                last_glyph[0] = None
+                last_read[0] = None
                 if role in BLOCK_ROLES:
                     out.append("\n")
                 return
@@ -223,7 +234,7 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
                 walk(kids, page, out)
             if role in BLOCK_ROLES:
                 out.append("\n\n" if markdown else "\n")
-                last_glyph[0] = None
+                last_read[0] = None
 
         walk(root.get("/K"), None, blocks)
     text = "".join(blocks)

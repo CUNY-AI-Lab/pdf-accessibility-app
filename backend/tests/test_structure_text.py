@@ -130,14 +130,19 @@ def test_a_page_with_an_icc_profile_missing_its_component_count_is_read(tmp_path
         assert int(pdf.pages[0].Resources.ColorSpace.CS0[1].N) == 3
 
 
-def _paragraph_pdf(path: Path, content: bytes) -> None:
-    """One P element over MCID 0, drawn by the given content."""
+def _paragraph_pdf(path: Path, content: bytes, kids: list[int] | None = None) -> None:
+    """One P element over MCID 0 (or ``kids``), drawn by the given content."""
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(300, 300))
     font = helvetica(pdf)
     page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
     page.Contents = pdf.make_stream(content)
-    paragraph = pikepdf.Dictionary(Type=pikepdf.Name.StructElem, S=pikepdf.Name.P, Pg=page.obj, K=0)
+    paragraph = pikepdf.Dictionary(
+        Type=pikepdf.Name.StructElem,
+        S=pikepdf.Name.P,
+        Pg=page.obj,
+        K=pikepdf.Array(kids) if kids else 0,
+    )
     pdf.Root.StructTreeRoot = pdf.make_indirect(
         pikepdf.Dictionary(Type=pikepdf.Name.StructTreeRoot, K=pdf.make_indirect(paragraph))
     )
@@ -166,3 +171,38 @@ def test_marked_content_actual_text_is_read_in_place_of_its_glyphs(tmp_path, con
     path = tmp_path / "actual_text.pdf"
     _paragraph_pdf(path, content)
     assert " ".join(screen_reader_text(path).split()) == heard
+
+
+def test_words_spaced_only_by_position_are_read_as_words(tmp_path):
+    """Text placed word by word with no space characters, as OCR text
+    layers and many typeset PDFs draw it, reads with its word spaces."""
+    content = (
+        b"/P <</MCID 0>> BDC BT /F1 12 Tf 20 250 Td "
+        b"[(In) -600 (addition,) -600 (the) -600 (speakers)] TJ ET EMC"
+    )
+    path = tmp_path / "spaced_by_position.pdf"
+    _paragraph_pdf(path, content)
+
+    assert screen_reader_text(path) == "In addition, the speakers"
+
+
+def test_a_word_hyphenated_at_a_line_end_is_read_whole(tmp_path):
+    content = (
+        b"/P <</MCID 0>> BDC BT /F1 12 Tf 20 250 Td (The results were evalu-) Tj "
+        b"0 -14 Td (ated again.) Tj ET EMC"
+    )
+    path = tmp_path / "hyphenated.pdf"
+    _paragraph_pdf(path, content)
+
+    assert " ".join(screen_reader_text(path).split()) == "The results were evaluated again."
+
+
+def test_words_split_between_two_marked_contents_keep_their_space(tmp_path):
+    content = (
+        b"/P <</MCID 0>> BDC BT /F1 12 Tf 20 250 Td [(The) -600] TJ ET EMC "
+        b"/P <</MCID 1>> BDC BT /F1 12 Tf 52 250 Td (office) Tj ET EMC"
+    )
+    path = tmp_path / "two_marked.pdf"
+    _paragraph_pdf(path, content, kids=[0, 1])
+
+    assert " ".join(screen_reader_text(path).split()) == "The office"
