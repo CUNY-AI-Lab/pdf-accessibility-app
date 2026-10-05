@@ -82,10 +82,6 @@ def test_glyph_text_reads_overdrawn_text_once():
     assert glyph_text(word + shadow) == "Errors"
 
 
-def test_accounts_for_a_reference_that_read_overdrawn_text_twice():
-    assert accounts_for("CUNY Academic Works", "CUNY Academic Works CUNY Academic Works")
-
-
 def test_glyph_text_joins_letters_ocr_read_as_one_letter_words():
     glyphs = []
     for index, char in enumerate("367"):

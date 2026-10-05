@@ -152,9 +152,6 @@ def accounts_for(glyph_text: str, reference: str) -> bool:
     ours, theirs = _letters(glyph_text), _letters(reference)
     if not ours or not theirs:
         return False
-    if theirs == ours + ours:
-        # The reference read a string drawn twice (fake bold) twice.
-        return True
     allowed = max(MAX_DIFFERENCE_FLOOR, MAX_DIFFERENCE_SHARE * len(theirs))
     return Levenshtein.distance(ours, theirs, score_cutoff=int(allowed) + 1) <= allowed
 

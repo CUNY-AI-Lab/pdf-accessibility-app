@@ -3695,7 +3695,7 @@ def _allocate_fragment_mcid(
         )
 
     builder.remember_source_element(elem, stream_owner or page_ref, mcid)
-    if elem.get("glyph_text_trusted"):
+    if elem.get("glyph_text"):
         # Each fragment's marked content carries its own glyphs' text (see
         # _rewrite_content_stream_with_fragmented_text), which, unlike an
         # element's /ActualText, does not hide a Link nested in the element.
@@ -4332,8 +4332,7 @@ def _element_accessible_text(elem: dict) -> str:
         or elem.get("resolved_text")
         or elem.get("semantic_text_hint")
         or elem.get("glyph_text")
-        or elem.get("text")
-        or ""
+        or readable(str(elem.get("text") or ""))
     ).strip()
 
 
@@ -4349,7 +4348,8 @@ def _fragment_glyph_texts(
     glyphs_by_instruction: dict[int, list[MeasuredGlyph]],
 ) -> dict[int, str]:
     """For each run of instructions marked for one element whose glyph text
-    is trusted, keyed by its first instruction, the text of its glyphs.
+    accounts for its text (it has a ``glyph_text``), keyed by its first
+    instruction, the text of its glyphs.
 
     Marked-content /ActualText is read as written, with no space implied
     after it, so each of an element's runs but its last ends with the word
@@ -4365,7 +4365,7 @@ def _fragment_glyph_texts(
         if (
             isinstance(mark, int)
             and 0 <= mark < len(elements)
-            and elements[mark].get("glyph_text_trusted")
+            and elements[mark].get("glyph_text")
         ):
             glyphs = [g for i in range(idx, end) for g in glyphs_by_instruction.get(i, [])]
             if text := glyph_text(glyphs):
@@ -4435,22 +4435,16 @@ def _glyphs_by_element(
 def _prefer_glyph_text(
     elements: list[dict], glyphs_by_element: dict[int, list[MeasuredGlyph]]
 ) -> None:
-    """Give each text element a ``glyph_text`` (see element_text), which
-    _element_accessible_text prefers to Docling's text: its measured glyphs'
-    text when that accounts for Docling's (the PDF's own characters and word
-    breaks), otherwise Docling's text with ligatures and spacing accents made
-    readable."""
-    for elem_idx, elem in enumerate(elements):
+    """Give each text element whose measured glyphs account for its structure
+    text a ``glyph_text`` (see element_text): the PDF's own characters and
+    word breaks, which _element_accessible_text prefers to Docling's text."""
+    for elem_idx, glyphs in glyphs_by_element.items():
+        elem = elements[elem_idx]
         if elem.get("type") not in GLYPH_TEXT_ELEMENT_TYPES:
             continue
-        docling_text = str(elem.get("text") or "")
-        text = glyph_text(glyphs_by_element.get(elem_idx, []))
-        if accounts_for(text, docling_text):
+        text = glyph_text(glyphs)
+        if accounts_for(text, str(elem.get("text") or "")):
             elem["glyph_text"] = text
-            elem["glyph_text_trusted"] = True
-        elif "glyph_text" not in elem:
-            # Its glyphs may be in another content stream, tagged later.
-            elem["glyph_text"] = readable(docling_text)
 
 
 def _element_actual_text(elem: dict) -> str | None:
