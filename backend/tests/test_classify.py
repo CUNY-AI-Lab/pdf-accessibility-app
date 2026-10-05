@@ -23,6 +23,7 @@ def _write_text_image_pdf(
     creator: str | None = None,
     producer: str | None = None,
     text: str = "Recognized text",
+    render_mode: int = 0,
 ) -> None:
     pdf = pikepdf.new()
     font = pdf.make_indirect(
@@ -51,7 +52,7 @@ def _write_text_image_pdf(
         )
         page.obj["/Contents"] = pdf.make_stream(
             b"q 612 0 0 792 0 0 cm /Im0 Do Q\n"
-            + b"BT /F1 12 Tf 72 720 Td ("
+            + f"BT /F1 12 Tf {render_mode} Tr 72 720 Td (".encode()
             + text.encode("latin-1")
             + b") Tj ET\n"
         )
@@ -130,6 +131,25 @@ async def test_classify_pdf_ocrs_pages_whose_text_is_in_their_images(monkeypatch
     assert result.pages_with_text == 3
     assert result.image_heavy_pages == 3
     assert result.ocr_scan_like is False
+
+
+@pytest.mark.asyncio
+async def test_classify_pdf_leaves_a_page_with_an_ocr_layer_alone(monkeypatch, tmp_path):
+    """Invisible text over a page image is an earlier OCR layer; --redo-ocr
+    would replace it, so the page is not OCR'd again."""
+    pdf_path = tmp_path / "clipping.pdf"
+    _write_text_image_pdf(pdf_path, pages=1, producer="Report generator", render_mode=3)
+
+    async def fake_probe_ocr(_path):
+        return None
+
+    monkeypatch.setattr(classify, "_detect_language_from_text", lambda _path: None)
+    monkeypatch.setattr(classify, "_probe_ocr_detect", fake_probe_ocr)
+
+    result = await classify.classify_pdf(pdf_path)
+
+    assert result.type == "digital"
+    assert result.ocr_pages == []
 
 
 @pytest.mark.asyncio

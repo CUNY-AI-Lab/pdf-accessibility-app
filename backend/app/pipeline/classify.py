@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pikepdf
+import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_c
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTChar, LTContainer, LTImage
 
@@ -44,7 +46,8 @@ _TEXT_DETECT_TIMEOUT_SECONDS = 20.0
 _PROBE_OCR_TIMEOUT_SECONDS = 90.0
 # A page whose images cover this share of it while it carries fewer native
 # characters than this has its text in the images (a pictured table, a scanned
-# insert), so a born-digital document with such a page is OCR'd there.
+# insert), so a born-digital document with such a page is OCR'd there, unless
+# the page already carries an invisible OCR layer.
 _IMAGE_TEXT_PAGE_COVERAGE = 0.25
 _IMAGE_TEXT_PAGE_MAX_CHARS = 1500
 # Pages with less image data than this are not inspected for image text.
@@ -135,11 +138,14 @@ def _detect_language_from_text(pdf_path: Path) -> str | None:
 
 def _image_text_pages(pdf_path: Path, candidates: list[int]) -> list[int]:
     """Of ``candidates`` (0-based), the pages whose images cover at least a
-    quarter of the page while the page carries little native text."""
+    quarter of the page while the page carries little native text and no
+    invisible text. Invisible text is an earlier OCR layer, which OCRmyPDF's
+    --redo-ocr would replace."""
     if not candidates:
         return []
     found = []
-    with pdfminer_readable(pdf_path) as readable:
+    document = pdfium.PdfDocument(pdf_path)
+    with document, pdfminer_readable(pdf_path) as readable:
         for page_index, layout in zip(
             candidates, extract_pages(readable, page_numbers=candidates), strict=False
         ):
@@ -160,9 +166,19 @@ def _image_text_pages(pdf_path: Path, candidates: list[int]) -> list[int]:
             if (
                 image_area / page_area >= _IMAGE_TEXT_PAGE_COVERAGE
                 and chars < _IMAGE_TEXT_PAGE_MAX_CHARS
+                and not _has_invisible_text(document[page_index])
             ):
                 found.append(page_index)
     return found
+
+
+def _has_invisible_text(page: pdfium.PdfPage) -> bool:
+    return any(
+        page_object.type == pdfium_c.FPDF_PAGEOBJ_TEXT
+        and pdfium_c.FPDFTextObj_GetTextRenderMode(page_object.raw)
+        == pdfium_c.FPDF_TEXTRENDERMODE_INVISIBLE
+        for page_object in page.get_objects(max_depth=15)
+    )
 
 
 def _inspect_workload(pdf_path: Path) -> PdfUploadPreflightReport | None:
@@ -272,9 +288,7 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
             ):
                 classification = "ocr_scan"
                 image_heavy_ratio = (
-                    workload.image_heavy_pages / max(workload.page_count, 1)
-                    if workload
-                    else 0.0
+                    workload.image_heavy_pages / max(workload.page_count, 1) if workload else 0.0
                 )
                 confidence = min(1.0, max(0.75, (ratio + image_heavy_ratio) / 2))
             elif ratio > 0.9 and not image_text_pages:
