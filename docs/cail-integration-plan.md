@@ -186,18 +186,23 @@ Done so far (branch `agent/cail-integration-plan`), each measured in
 - ICC profiles missing /N no longer break text extraction.
 - Optional OCR through the Gateway (`OCR_ENGINE=gateway`); it helps
   handwriting, not printed books, so Tesseract stays the default.
+- Elements read as the PDF's own glyphs instead of Docling's text, sibling
+  headings kept at one level, and captions tagged as text (October 2026):
+  multi-column 58.0% → 66.7%, scanned multi-column 49.8% → 62.1%, printed
+  books 92.5% → 93.1%, and CUNY heading levels (MHS-L) 0.310 → 0.381, above
+  v1's 0.345.
 
 Next, from the evaluation and from peer tools (opendataloader-pdf, olmOCR,
 the ASU/AWS remediation pipeline):
 
-- Heading levels on CUNY documents, the suite's one regression: MHS-L 0.310
-  on `cuny_rt` against v1's 0.345. Part is an artifact of gold tagged with
-  every heading at level 1, but the conference papers lose with two-level
-  gold.
 - Reading order on printed pages: Adobe orders `old_print` at 93.9%, the
-  branch at 88.4%.
-- Reading order on scanned multi-column articles: 49.8% on
-  `multi_column_s60_scan` against 58.0% on the same pages born digital.
+  branch at 90.5%.
+- Tables: 43 of the 119 failing `tables_s60` tests are on pages where no
+  table reaches the output; about 50 more find no cell with the expected
+  text.
+- Text Docling's layout swallows into a figure region, and text inside
+  images on pages classified as born digital (no OCR runs).
+- The Academic Works cover sheet's lines are tagged as headings.
 
 - Running heads and footers detected across pages (recto/verso, page-number
   sequences), not only per page.

@@ -61,6 +61,48 @@ production, whose tagger carries OCR text that way (printed books appeared to
 go from 30.5% to 91.7%). Every number below was measured with the corrected
 reader.
 
+## Results: October 2026 fixes
+
+Three changes to what a screen reader hears (branch
+`agent/glyph-element-text`), each measured on the whole suite with the AI
+steps off and docling-serve 1.35.0:
+
+- **Element text from the PDF's glyphs.** Every tagged element's
+  `/ActualText` was Docling's text, which straightens quotes and runs words
+  together where the PDF spaces them by position. It now comes from the
+  element's own glyphs, collected by position (word breaks from the gaps,
+  line-end hyphenation joined, ligatures and spacing accents made readable)
+  whenever those glyphs account for Docling's text.
+- **Sibling headings stay siblings.** Closing skipped levels used to
+  staircase headings Docling put at one deep level (H3, H4, H5 for three
+  sections).
+- **Captions are text.** Figure and table captions were never made elements
+  and were tagged as artifacts.
+
+| Subset | Production (v1) | Branch before | Branch after |
+|---|---|---|---|
+| `old_print` (509 tests) | 92.1% | 92.5% | **93.1%** |
+| `multi_column_s60` (219) | 41.1% | 58.0% | **66.7%** |
+| `multi_column_s60_scan` (219) | 50.7% | 49.8% | **62.1%** |
+| `tables_s60` (336) | 10.1% | **64.8%** | **64.8%** |
+| `tables_s60_scan` (336) | 22.7% | **56.1%** | **56.1%** |
+| `headers_footers_s60` (170) | 95.3% | **95.9%** | **95.9%** |
+| `headers_footers_s60_scan` (170) | 90.5% | 89.9% | **90.5%** |
+| `old_scans` (526) | 25.3% | **25.5%** | 25.3% |
+
+| Round trip | NID | TEDS | MHS | MHS-L |
+|---|---|---|---|---|
+| `gold_rt`, branch before → after | 0.875 → **0.885** | 0.449 → 0.449 | 0.620 → **0.628** | 0.361 → **0.438** |
+| `cuny_rt`, branch before → after | 0.956 → **0.962** | 0.715 → 0.715 | 0.513 → **0.515** | 0.310 → **0.381** |
+| `cuny_rt_scan`, branch before → after | 0.934 → **0.938** | 0.610 → 0.600 | 0.516 → **0.518** | 0.305 → **0.338** |
+
+Heading levels on CUNY documents, the suite's one regression against v1
+(0.345), now beat it. On handwritten letters (`old_scans`) the branch's
+Tesseract text and Docling's own OCR differ word by word; one test is lost
+net. The scanned CUNY TEDS change is one document's table
+that neither version recovers: both outputs hold identical tables, and the
+scorer matched the gold table to a different one of them.
+
 ## Results: printed books (`old_print`, 49 pages, 509 tests)
 
 What a screen reader hears after the full pipeline:
