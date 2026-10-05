@@ -49,16 +49,26 @@ def glyph_text(glyphs: Iterable[MeasuredGlyph]) -> str:
     (fake bold, shadows) read once, ligatures as letters, and spacing accents
     on their letters.
 
-    A word break is a new line or a gap wider than the element's usual gap
-    between letters by 0.15 em; measuring from the usual gap keeps letter-
-    spaced text ("A S I S T E N C I A L" as drawn) one word."""
+    A word break is a new line, a gap wider than the element's usual gap
+    between letters by 0.15 em, or a space glyph; measuring from the usual
+    gap keeps letter-spaced text one word ("A S I S T E N C I A L" as drawn,
+    or as OCR read it, letter by letter with spaces between), so in letter-
+    spaced text a space glyph counts only across a wider gap too."""
     drawn = _without_overdrawn([glyph for glyph in glyphs if glyph.text])
-    letter_gap = _usual_letter_gap(drawn)
+    letters = [glyph for glyph in drawn if not glyph.text.isspace()]
+    letter_gap = _usual_letter_gap(letters)
+    spaced_after = {
+        id(previous)
+        for previous, glyph in zip(drawn, drawn[1:], strict=False)
+        if glyph.text.isspace() and not previous.text.isspace()
+    }
     parts: list[str] = []
     previous: MeasuredGlyph | None = None
-    for glyph in drawn:
-        if previous is not None and parts and _word_break(previous, glyph, letter_gap):
-            so_far = "".join(parts).rstrip()
+    for glyph in letters:
+        if previous is not None and _word_break(
+            previous, glyph, letter_gap, spaced=id(previous) in spaced_after
+        ):
+            so_far = "".join(parts)
             hyphenated = len(so_far) >= 2 and so_far[-1] in HYPHENS and so_far[-2].isalpha()
             if _new_line(previous, glyph) and hyphenated and glyph.text[:1].isalpha():
                 # A word broken at the line end: "pres-" + "ence" is one word.
@@ -67,8 +77,7 @@ def glyph_text(glyphs: Iterable[MeasuredGlyph]) -> str:
             else:
                 parts.append(" ")
         parts.append(glyph.text)
-        if not glyph.text.isspace():
-            previous = glyph
+        previous = glyph
     return readable(" ".join("".join(parts).split()))
 
 
@@ -95,12 +104,12 @@ def _without_overdrawn(glyphs: list[MeasuredGlyph]) -> list[MeasuredGlyph]:
     return kept
 
 
-def _usual_letter_gap(glyphs: list[MeasuredGlyph]) -> float:
-    """The median gap, in em, between glyphs drawn side by side on a line;
-    0 with fewer than two such gaps."""
+def _usual_letter_gap(letters: list[MeasuredGlyph]) -> float:
+    """The median gap, in em, between neighbouring glyphs on a line (space
+    glyphs aside); 0 with fewer than two such gaps."""
     gaps = []
-    for previous, glyph in zip(glyphs, glyphs[1:], strict=False):
-        if previous.text.isspace() or glyph.text.isspace() or _new_line(previous, glyph):
+    for previous, glyph in zip(letters, letters[1:], strict=False):
+        if _new_line(previous, glyph):
             continue
         gap = (glyph.bbox["l"] - previous.bbox["r"]) / _size(previous, glyph)
         if gap > -0.5:
@@ -111,11 +120,19 @@ def _usual_letter_gap(glyphs: list[MeasuredGlyph]) -> float:
     return max(0.0, gaps[len(gaps) // 2])
 
 
-def _word_break(previous: MeasuredGlyph, glyph: MeasuredGlyph, letter_gap: float) -> bool:
+# A usual gap between letters this wide (in em) marks letter-spaced text.
+LETTER_SPACED_GAP = 0.1
+
+
+def _word_break(
+    previous: MeasuredGlyph, glyph: MeasuredGlyph, letter_gap: float, *, spaced: bool
+) -> bool:
     if _new_line(previous, glyph):
         return True
     gap = (glyph.bbox["l"] - previous.bbox["r"]) / _size(previous, glyph)
-    return gap > letter_gap + 0.15
+    if gap > letter_gap + 0.15:
+        return True
+    return spaced and letter_gap < LETTER_SPACED_GAP
 
 
 def readable(text: str) -> str:
