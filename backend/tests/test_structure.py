@@ -566,3 +566,25 @@ def test_normalize_docling_elements_keeps_picture_and_table_captions_as_text():
         ("table", None),
         ("paragraph", "Body text."),
     ]
+
+
+def test_normalize_docling_elements_keeps_the_boxes_of_text_continued_in_another_column():
+    doc_dict = {
+        "body": {"children": [{"$ref": "#/texts/0"}]},
+        "texts": [
+            {
+                "label": "text",
+                "text": "A paragraph that runs on into the next column.",
+                "prov": [
+                    {"page_no": 1, "bbox": {"l": 50, "b": 100, "r": 290, "t": 140}},
+                    {"page_no": 1, "bbox": {"l": 320, "b": 680, "r": 560, "t": 720}},
+                    {"page_no": 2, "bbox": {"l": 50, "b": 680, "r": 290, "t": 720}},
+                ],
+            }
+        ],
+    }
+
+    (element,) = _normalize_docling_elements(doc_dict)
+
+    assert element["bbox"] == {"l": 50, "b": 100, "r": 290, "t": 140}
+    assert element["extra_bboxes"] == [{"l": 320, "b": 680, "r": 560, "t": 720}]

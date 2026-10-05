@@ -4410,12 +4410,14 @@ def _glyphs_by_element(
     measured: dict[int, MeasuredTextOp], elements: list[dict]
 ) -> dict[int, list[MeasuredGlyph]]:
     """Each measured glyph, in drawing order, under the smallest text element
-    whose box holds its center, however the content stream splits them."""
+    box (an element's own or one where Docling continues it) that holds its
+    center, however the content stream splits them."""
     boxes = sorted(
         (
-            (_bbox_area(elem["bbox"]), elem_idx, elem["bbox"])
+            (_bbox_area(box), elem_idx, box)
             for elem_idx, elem in enumerate(elements)
             if elem.get("type") in GLYPH_TEXT_ELEMENT_TYPES and isinstance(elem.get("bbox"), dict)
+            for box in [elem["bbox"], *elem.get("extra_bboxes", [])]
         ),
         key=lambda entry: entry[0],
     )

@@ -262,6 +262,10 @@ def _page_height(doc_dict: dict, page_index: int) -> float | None:
     return float(height) if height else None
 
 
+def _prov_page(entry) -> int | None:
+    return entry.get("page_no") if isinstance(entry, dict) else getattr(entry, "page_no", None)
+
+
 def _extract_bbox(prov: list[dict]) -> dict | None:
     """Extract bounding box from Docling provenance data.
 
@@ -313,6 +317,7 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
     for item in _walk_body_tree(doc_dict):
         label = item.get("label", "")
         prov = item.get("prov", [])
+        elements_before = len(elements)
         # Docling uses 1-based page numbers; convert to 0-based for pikepdf
         page = (prov[0]["page_no"] - 1) if prov else 0
         text = item.get("text", item.get("orig", ""))
@@ -476,6 +481,17 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
                 "artifact_type": label,
             })
 
+        # Text Docling continues in another column of the page has a box
+        # there too; the tagger reads the element's glyphs from all of them.
+        if len(elements) > elements_before and len(prov) > 1:
+            first_page = _prov_page(prov[0])
+            extra = [
+                box
+                for entry in prov[1:]
+                if _prov_page(entry) == first_page and (box := _extract_bbox([entry]))
+            ]
+            if extra:
+                elements[-1]["extra_bboxes"] = extra
     return elements
 
 
