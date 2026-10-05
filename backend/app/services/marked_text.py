@@ -58,7 +58,9 @@ class PageText:
                     parts.append(" ")
             elif self.chars[index] != LINE_END_HYPHEN:
                 parts.append(self.chars[index])
-        return " ".join("".join(parts).split())
+        # pdfium gives UTF-16 code units; join surrogate pairs into characters.
+        text = "".join(parts).encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+        return " ".join(text.split())
 
     def breaks_between(self, before: int, after: int) -> bool:
         """Whether a word break falls between two characters: other text

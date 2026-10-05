@@ -206,3 +206,10 @@ def test_words_split_between_two_marked_contents_keep_their_space(tmp_path):
     _paragraph_pdf(path, content, kids=[0, 1])
 
     assert " ".join(screen_reader_text(path).split()) == "The office"
+
+
+def test_page_text_joins_utf16_surrogate_pairs():
+    from app.services.marked_text import PageText
+
+    page = PageText(chars=["\ud835", "\udc00"], generated=[False, False], actual=[None, None])
+    assert page.text([0, 1]) == "\U0001d400"
