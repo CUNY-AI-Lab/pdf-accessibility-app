@@ -492,8 +492,11 @@ def _as_positive_int(value: Any, default: int = 1) -> int:
 
 
 def _normalize_heading_hierarchy(elements: list[dict]) -> None:
-    """Shift heading levels so the shallowest is H1, and close skipped levels
-    (an H4 right after an H2 becomes an H3), keeping the relative nesting."""
+    """Close skipped heading levels while keeping the nesting: each heading
+    ends the open sections at its level or deeper and goes one below the
+    section still open, so the outline starts at H1, an H4 right after an H2
+    becomes an H3, and headings at one level stay siblings (H1, H2, H5, H5
+    become H1, H2, H3, H3, not a staircase)."""
     headings = [el for el in elements if el.get("type") == "heading"]
     if not headings:
         return
@@ -506,13 +509,15 @@ def _normalize_heading_hierarchy(elements: list[dict]) -> None:
             _safe_float((h.get("bbox") or {}).get("l", 0.0)),
         ),
     )
-    shift = min(_as_positive_int(h.get("level", 1), default=1) for h in headings) - 1
-
-    previous_level = 0
+    # The open sections, outermost first: (level given, level assigned).
+    open_sections: list[tuple[int, int]] = []
     for heading in sorted_headings:
-        level = _as_positive_int(heading.get("level", 1), default=1) - shift
-        heading["level"] = max(1, min(6, level, previous_level + 1))
-        previous_level = heading["level"]
+        level = _as_positive_int(heading.get("level", 1), default=1)
+        while open_sections and open_sections[-1][0] >= level:
+            open_sections.pop()
+        assigned = min(6, open_sections[-1][1] + 1 if open_sections else 1)
+        open_sections.append((level, assigned))
+        heading["level"] = assigned
 
 
 def _visible_link_contents_from_page_elements(
