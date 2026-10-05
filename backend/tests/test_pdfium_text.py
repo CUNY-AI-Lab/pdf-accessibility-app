@@ -45,7 +45,7 @@ def test_text_in_boxes(tmp_path, content, heard):
     assert _page_text(tmp_path, content) == heard
 
 
-def test_box_holds_the_words_it_overlaps(tmp_path):
+def test_box_holds_the_words_it_mostly_covers(tmp_path):
     # "Improvement" in 12 pt Helvetica runs from x=20 to about x=85; a cell
     # box (as Docling gives on scans) that stops at x=70 still holds it,
     # and the word in the next column is left out.
@@ -58,3 +58,16 @@ def test_box_leaves_out_the_line_below(tmp_path):
     content = b"BT /F1 12 Tf 20 250 Td (First line) Tj 0 -14 Td (second line) Tj ET"
     box = {"l": 15, "b": 248, "r": 200, "t": 262}
     assert _page_text(tmp_path, content, box) == "First line"
+
+
+def test_box_leaves_out_a_word_it_only_grazes(tmp_path):
+    # The box's bottom edge dips a point into the next line's glyphs.
+    content = b"BT /F1 12 Tf 20 250 Td (First line) Tj 0 -12 Td (second line) Tj ET"
+    box = {"l": 15, "b": 246, "r": 200, "t": 262}
+    assert _page_text(tmp_path, content, box) == "First line"
+
+
+def test_box_holds_its_half_of_a_word_hyphenated_at_a_line_end(tmp_path):
+    content = b"BT /F1 12 Tf 20 250 Td (evalu-) Tj 0 -14 Td (ated next) Tj ET"
+    box = {"l": 15, "b": 248, "r": 200, "t": 262}
+    assert _page_text(tmp_path, content, box) == "evalu"

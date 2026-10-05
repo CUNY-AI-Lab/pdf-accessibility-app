@@ -85,7 +85,8 @@ Box = tuple[float, float, float, float]
 @dataclass
 class Word:
     """A run of characters pdfium did not separate with a space or line
-    break, and the box around their glyphs (left, bottom, right, top)."""
+    break, and the box around their glyphs (left, bottom, right, top). A
+    word hyphenated at a line end is two words, one on each line."""
 
     start: int
     end: int
@@ -107,10 +108,12 @@ class PdfiumText:
 
     def in_boxes(self, page_index: int, boxes: list[dict[str, float]]) -> str:
         """The text of the words inside these boxes (left, bottom, right, top
-        in PDF user space), box after box. A word is inside a box it
-        overlaps, as Docling gives a table cell each word that overlaps it:
-        layout boxes are approximate, a scan's above all, and one that stops
-        short of a word's last letters still holds the word."""
+        in PDF user space), box after box. A word is inside a box that holds
+        at least half of it, as Docling gives a word to the layout region
+        holding the largest share of it: layout boxes are approximate, a
+        scan's above all, and one that stops short of a word's last letters
+        still holds the word, while one that grazes the next line does not
+        take its words."""
         if page_index not in self.pages:
             self.pages[page_index] = _page_words(self.document[page_index])
         page, words = self.pages[page_index]
@@ -120,15 +123,25 @@ class PdfiumText:
             indices = [
                 index
                 for word in words
-                if _overlaps(word.box, area)
+                if _share_inside(word.box, area) >= 0.5
                 for index in range(word.start, word.end)
             ]
             texts.append(page.text(indices))
         return " ".join(" ".join(texts).split())
 
 
-def _overlaps(a: Box, b: Box) -> bool:
-    return min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
+def _share_inside(word: Box, box: Box) -> float:
+    """The share of the word's box inside the box; along an axis on which
+    the word has no extent, all of it or none."""
+    share = 1.0
+    for low, high in ((0, 2), (1, 3)):
+        extent = word[high] - word[low]
+        inside = min(word[high], box[high]) - max(word[low], box[low])
+        if extent > 0:
+            share *= max(inside, 0.0) / extent
+        elif inside < 0:
+            return 0.0
+    return share
 
 
 def _page_words(page: pdfium.PdfPage) -> tuple[PageText, list[Word]]:
@@ -144,7 +157,7 @@ def _page_words(page: pdfium.PdfPage) -> tuple[PageText, list[Word]]:
         if generated or char.isspace():
             continue
         box = textpage.get_charbox(index)
-        if words and words[-1].end == index:
+        if words and words[-1].end == index and result.chars[index - 1] != LINE_END_HYPHEN:
             word = words[-1]
             word.end = index + 1
             word.box = (
