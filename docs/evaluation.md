@@ -25,24 +25,35 @@ can be kept as HTML so their cell structure is scored.
   public-domain books printed 1794–1925, from Internet Archive scans, with
   tests taken from Project Gutenberg transcriptions of the same editions and
   checked by eye against each page image. Sources are listed in
-  `backend/data/eval/olmocr-bench/old_print_sources.md`.
+  [backend/eval/old_print/sources.md](../backend/eval/old_print/sources.md).
+- **`cuny_rt`** (our addition, 19 documents, 282 pages): well-tagged CUNY
+  course materials and papers from CUNY Academic Works, scored like the gold
+  round-trip below; `cuny_rt_scan` is the same documents as image-only scans.
+  How they were chosen is in [backend/eval/README.md](../backend/eval/README.md).
 - **OCR stage:** `backend/scripts/ocr_bench.py` runs the app's own OCRmyPDF
   command inside the production image and reads the raw text layer.
 - **Full pipeline:** `backend/scripts/run_pipeline_bench.sh` runs
   `run_pipeline` (classify, OCR, Docling structure through docling-serve as in
   production, tagging, validation) on each page and reads the tagged result.
   The app's AI steps are off unless a run names a Gateway model (`--llm`).
+  Every pipeline result here used docling-serve 1.35.0 (Docling 2.130) on
+  CPU; production's actual-dell runs 1.12.0 (Docling 2.72) until it is
+  upgraded, which loses heading levels.
 - **AI steps:** `backend/scripts/score_semantics.py` compares the title,
   language, and figure alt text of each remediated gold document with the
   author's. A judge model (`deepseek-v4-pro-0813` on the Gateway) scores
   titles and alt text 1–5 for how much of what the author's version tells a
   reader the remediated one tells them too; wording may differ.
 - **Adobe:** `backend/scripts/adobe_bench.py` runs Adobe PDF Services OCR then
-  Auto-Tag, two transactions per page. The free tier ran out after 44
-  `old_scans` pages in September 2026.
-- **Data** lived in `backend/data/eval/` (git-ignored) and was lost with its
-  worktree in late September 2026. The results below stand as measured, but
-  none can be re-run until the corpus is rebuilt (plan, Phase 2 step 6).
+  Auto-Tag within the free tier of 500 transactions a month. Auto-Tag costs
+  ten transactions a page, so about 45 pages fit in a month: `old_scans` (44
+  pages) in September 2026, `old_print` (all 49) in October.
+- **Corpus:** defined in [backend/eval/](../backend/eval/README.md) and
+  rebuilt byte for byte by `backend/scripts/fetch_eval_corpus.py`. The
+  original data was git-ignored and lost with its worktree in late September
+  2026; on 2026-10-04 the rebuilt corpus reproduced every September
+  measurement that could be re-run (NID within 0.002, all else exactly).
+  Adobe's `old_scans` outputs were lost and wait for a month's free tier.
 
 **Correction (2026-09-24).** Results published here before this date read the
 structure tree without marked-content `/ActualText`, so they badly understated
@@ -56,12 +67,17 @@ What a screen reader hears after the full pipeline:
 
 | Candidate | Score | Present | Order | Absent |
 |---|---|---|---|---|
-| Production (v1) | 92.1% ± 2.5 | 94.1% | 86.4% | 95.9% |
-| Current branch, Tesseract | **92.5% ± 2.3** | 93.8% | 88.4% | 95.9% |
+| Production (v1) | 92.1% ± 2.3 | 94.1% | 86.4% | 95.9% |
+| Current branch, Tesseract | **92.5% ± 2.3** | 93.8% | 88.4% | **95.9%** |
+| Adobe OCR + Auto-Tag (October 2026) | 83.7% ± 3.0 | **95.8%** | **93.9%** | 15.1% |
 | Current branch, Gateway OCR (Qwen3-VL-235B) | 83.3% ± 3.3 | 83.7% | 76.2% | 95.9% |
 
 Production already handles printed books well. Gateway OCR does worse than
-Tesseract here, so Tesseract stays the default.
+Tesseract here, so Tesseract stays the default. Adobe reads the words and
+their order better than any candidate (order 93.9% against the branch's
+88.4%), but it leaves running heads, folios, and catchwords in what a screen
+reader hears, so it fails most absent tests. Reading order on printed pages
+is the gap v2 has to close.
 
 OCR stage alone (raw text layer read by pdfminer; its own layout guessing
 scrambles Tesseract's order, so these understate what the pipeline hears):
@@ -84,6 +100,24 @@ The branch takes positions and text from pdfminer's measurement of each text
 operator (`app/pipeline/page_glyphs.py`) and splits a `TJ` that spans several
 cells into one per cell, which renders identically.
 
+## Results: scanned articles (the same samples as image-only scans)
+
+The born-digital samples above, rendered at 300 ppi in greyscale, turned a
+fraction of a degree, softened, given noise, and saved as JPEG
+(`scripts/synthetic_scan.py`), under the same tests.
+
+| Subset (tests) | Production (v1) | Current branch |
+|---|---|---|
+| `tables_s60_scan` (336) | 22.7% ± 4.5 | **56.1% ± 5.4** |
+| `multi_column_s60_scan` (219) | 50.7% ± 6.2 | 49.8% ± 6.8 |
+| `headers_footers_s60_scan` (170) | 90.5% ± 4.4 | 89.9% ± 4.4 |
+
+The branch keeps most of its table gain on scans but none of its
+multi-column gain, which came from measuring born-digital text positions; on
+a scan both versions read Tesseract's text layer. Scanned multi-column
+articles, about half right in either version, are the largest gap left
+among the documents that matter most.
+
 ## Results: structure round-trip (11 gold documents)
 
 Gold documents (the PDF/UA reference suite, the Matterhorn Protocol, a NOAA
@@ -101,6 +135,33 @@ MHS-L, which also counts heading levels.
 
 For scale, opendataloader-bench reports NID about 0.90 and TEDS 0.887 for
 Docling's own output on its corpus.
+
+## Results: CUNY documents (`cuny_rt`, 19 documents, 282 pages)
+
+The same round trip on well-tagged CUNY documents from Academic Works:
+syllabi, OER chapters, assignments, lesson plans, slides, two conference
+papers, a book chapter, a capstone, and a library newsletter.
+
+| | NID | TEDS | MHS | MHS-L |
+|---|---|---|---|---|
+| Production (v1) | 0.879 | 0.467 | 0.498 | **0.345** |
+| Current branch | **0.956** | **0.715** | **0.513** | 0.310 |
+| Production (v1), scanned (`cuny_rt_scan`) | 0.893 | 0.409 | 0.501 | **0.344** |
+| Current branch, scanned | **0.934** | **0.610** | **0.516** | 0.305 |
+
+The scans are the same pages rendered at 300 ppi in greyscale, turned a
+fraction of a degree, softened, given noise, and saved as JPEG, so the
+pipeline has to recognize them with Tesseract. v1 orders the scans better
+than the born-digital originals, because there it reads Tesseract's text
+layer instead of guessing positions from the content stream.
+
+The branch reads CUNY documents in a far better order and recovers their
+tables, but it nests headings worse than v1 by MHS-L, the one regression in
+the suite. Four of the seven documents that lose most were tagged by their
+authors with every heading at level 1 (two syllabi, an assignment, the
+newsletter); v1 also puts every heading at level 1, so it matches them,
+while the branch nests. The two conference papers lose with two-level gold,
+so part of the loss is real.
 
 ## Results: AI steps (model bake-off, gold documents)
 
@@ -167,5 +228,10 @@ cap, and occasional malformed JSON; such pages fall back to Tesseract.
 
 ## Not yet measured
 
-- Adobe on printed books and born-digital pages (free-tier quota).
-- veraPDF failures on the gold set.
+- Adobe on born-digital pages, the gold and CUNY round trips, and
+  `old_scans` again (its September outputs were lost): about 45 pages per
+  month of free tier.
+- The AI steps (title, language, alt text) on the CUNY documents.
+- veraPDF failures on the gold and CUNY sets.
+- CUNY documents in languages other than English, and pages of untagged
+  CUNY articles and dissertations with per-page tests.

@@ -190,6 +190,15 @@ Done so far (branch `agent/cail-integration-plan`), each measured in
 Next, from the evaluation and from peer tools (opendataloader-pdf, olmOCR,
 the ASU/AWS remediation pipeline):
 
+- Heading levels on CUNY documents, the suite's one regression: MHS-L 0.310
+  on `cuny_rt` against v1's 0.345. Part is an artifact of gold tagged with
+  every heading at level 1, but the conference papers lose with two-level
+  gold.
+- Reading order on printed pages: Adobe orders `old_print` at 93.9%, the
+  branch at 88.4%.
+- Reading order on scanned multi-column articles: 49.8% on
+  `multi_column_s60_scan` against 58.0% on the same pages born digital.
+
 - Running heads and footers detected across pages (recto/verso, page-number
   sequences), not only per page.
 - Picture classification (already requested from Docling, never read) as
