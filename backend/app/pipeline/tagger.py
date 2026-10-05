@@ -10,6 +10,7 @@ non-sequential content stream ordering.
 """
 
 import asyncio
+import copy
 import dataclasses
 import logging
 import math
@@ -32,6 +33,7 @@ from scipy.optimize import linear_sum_assignment
 
 from app.pipeline.element_text import accounts_for, readable
 from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
+from app.pipeline.page_frame import PageFrame
 from app.pipeline.page_glyphs import MeasuredGlyph, MeasuredTextOp, PdfGlyphReader, union_bbox
 from app.pipeline.pdf_repair import add_missing_icc_components
 from app.pipeline.pdfium_text import PdfiumText
@@ -4317,6 +4319,38 @@ def _element_accessible_text(elem: dict) -> str:
 GLYPH_TEXT_ELEMENT_TYPES = LINK_TEXT_ELEMENT_TYPES - {"formula"}
 
 
+def _elements_in_user_space(elements: list[dict], frames: list[PageFrame]) -> list[dict]:
+    """Copies of the structure elements with their boxes moved from Docling's
+    page frame into PDF user space (see page_frame), where the tagger
+    measures the page's content."""
+    converted = []
+    for element in elements:
+        element = copy.deepcopy(element)
+        page = element.get("page")
+        if isinstance(page, int) and 0 <= page < len(frames):
+            frame = frames[page]
+            for owner in [element, *(element.get("cells") or [])]:
+                if isinstance(owner.get("bbox"), dict):
+                    owner["bbox"] = frame.to_user_space(owner["bbox"])
+            if element.get("extra_bboxes"):
+                element["extra_bboxes"] = [
+                    frame.to_user_space(box) for box in element["extra_bboxes"]
+                ]
+        converted.append(element)
+    return converted
+
+
+def _items_in_user_space(items: list[dict], frame: PageFrame) -> list[dict]:
+    """docling-parse's lines, words, links, or widgets, their boxes moved from
+    Docling's page frame into PDF user space."""
+    return [
+        {**item, "bbox": frame.to_user_space(item["bbox"])}
+        if isinstance(item.get("bbox"), dict)
+        else item
+        for item in items
+    ]
+
+
 def _attach_glyph_text(pages_elements: dict[int, list[dict]], pdfium_text: PdfiumText) -> None:
     """Give each text element, and each table cell, a ``glyph_text`` when the
     text pdfium extracts inside its boxes accounts for the structure step's
@@ -5577,7 +5611,8 @@ async def tag_pdf(
             PdfGlyphReader(input_path) as glyph_reader,
             pikepdf.open(str(input_path)) as pdf,
         ):
-            elements = structure_json.get("elements", [])
+            frames = [PageFrame.of(page) for page in pdfium_text.document]
+            elements = _elements_in_user_space(structure_json.get("elements", []), frames)
             source_figure_alt_lookup = _source_figure_alt_lookup(pdf, elements)
 
             # 1. Mark PDF as tagged
@@ -5654,25 +5689,21 @@ async def tag_pdf(
             for page_index, page in enumerate(pdf.pages):
                 page_elems = pages_elements.get(page_index, [])
                 page_glyphs = glyph_reader.page(page_index)
-                page_lines = _build_docling_parse_page_lines(
-                    parser_doc,
-                    page_index,
-                    docling_parse_cache,
+                page_lines = _items_in_user_space(
+                    _build_docling_parse_page_lines(parser_doc, page_index, docling_parse_cache),
+                    frames[page_index],
                 )
-                page_words = _build_docling_parse_page_words(
-                    parser_doc,
-                    page_index,
-                    docling_parse_word_cache,
+                page_words = _items_in_user_space(
+                    _build_docling_parse_page_words(parser_doc, page_index, docling_parse_word_cache),
+                    frames[page_index],
                 )
-                page_hyperlinks = _build_docling_parse_page_hyperlinks(
-                    parser_doc,
-                    page_index,
-                    docling_parse_hyperlink_cache,
+                page_hyperlinks = _items_in_user_space(
+                    _build_docling_parse_page_hyperlinks(parser_doc, page_index, docling_parse_hyperlink_cache),
+                    frames[page_index],
                 )
-                page_widgets = _build_docling_parse_page_widgets(
-                    parser_doc,
-                    page_index,
-                    docling_parse_widget_cache,
+                page_widgets = _items_in_user_space(
+                    _build_docling_parse_page_widgets(parser_doc, page_index, docling_parse_widget_cache),
+                    frames[page_index],
                 )
                 page["/Tabs"] = pikepdf.Name("/S")
                 page_tagged_elements: list[dict] = []
