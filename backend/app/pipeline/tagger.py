@@ -3695,6 +3695,11 @@ def _allocate_fragment_mcid(
         )
 
     builder.remember_source_element(elem, stream_owner or page_ref, mcid)
+    if elem.get("glyph_text_trusted"):
+        # Each fragment's marked content carries its own glyphs' text (see
+        # _rewrite_content_stream_with_fragmented_text), which, unlike an
+        # element's /ActualText, does not hide a Link nested in the element.
+        actual_text = None
     if actual_text and elem_type != "formula":
         # An element's text covers all of its fragments. On the first
         # fragment's marked content it would be read, and then the later
@@ -3887,6 +3892,7 @@ def _rewrite_content_stream_with_fragmented_text(
     table_cell_assignments: dict[int, TableCellRunAssignment],
     stream_owner: pikepdf.Object | None = None,
     cell_glyphs: dict[int, list[MeasuredGlyph]] | None = None,
+    glyphs_by_instruction: dict[int, list[MeasuredGlyph]] | None = None,
 ) -> set[int]:
     """Rewrite a stream using word-level OCR text anchors when BT blocks are giant."""
     table_cell_mark_lookup: dict[tuple[str, int, int, int], TableCellRunAssignment] = {}
@@ -3936,6 +3942,9 @@ def _rewrite_content_stream_with_fragmented_text(
     )
     matched_element_indices.update(decorative_covered)
 
+    fragment_text = _fragment_glyph_texts(
+        mark_by_idx, len(instructions), elements, glyphs_by_instruction or {}
+    )
     new_instructions = []
     active_mark: int | tuple[str, int, int, int] | None = None
 
@@ -3986,6 +3995,7 @@ def _rewrite_content_stream_with_fragmented_text(
                     active_mark = FRAGMENTED_TEXT_MARK_ARTIFACT
                 else:
                     tag, mcid, actual_text = allocated
+                    actual_text = fragment_text.get(idx, actual_text)
                     new_instructions.append(_make_bdc(tag, mcid, actual_text=actual_text))
                     active_mark = mark
             else:
@@ -4115,6 +4125,9 @@ def _rewrite_content_stream(
                 }
                 if measured is not None
                 else None
+            ),
+            glyphs_by_instruction=(
+                {idx: op.glyphs for idx, op in measured.items()} if measured is not None else None
             ),
         )
     matched_element_indices = set(matches.values())
@@ -4329,6 +4342,48 @@ def _element_accessible_text(elem: dict) -> str:
 GLYPH_TEXT_ELEMENT_TYPES = LINK_TEXT_ELEMENT_TYPES - {"formula"}
 
 
+def _fragment_glyph_texts(
+    mark_by_idx: dict[int, int | tuple[str, int, int, int]],
+    instruction_count: int,
+    elements: list[dict],
+    glyphs_by_instruction: dict[int, list[MeasuredGlyph]],
+) -> dict[int, str]:
+    """For each run of instructions marked for one element whose glyph text
+    is trusted, keyed by its first instruction, the text of its glyphs.
+
+    Marked-content /ActualText is read as written, with no space implied
+    after it, so each of an element's runs but its last ends with the word
+    break, or, when it ends a word hyphenated at the line end that the next
+    run finishes, with the word left open ("evalu" then "ated")."""
+    runs_by_element: dict[int, list[tuple[int, str]]] = defaultdict(list)
+    idx = 0
+    while idx < instruction_count:
+        mark = mark_by_idx.get(idx)
+        end = idx + 1
+        while end < instruction_count and mark_by_idx.get(end) == mark:
+            end += 1
+        if (
+            isinstance(mark, int)
+            and 0 <= mark < len(elements)
+            and elements[mark].get("glyph_text_trusted")
+        ):
+            glyphs = [g for i in range(idx, end) for g in glyphs_by_instruction.get(i, [])]
+            if text := glyph_text(glyphs):
+                runs_by_element[mark].append((idx, text))
+        idx = end
+    texts: dict[int, str] = {}
+    for runs in runs_by_element.values():
+        for (start, text), (_next_start, following) in zip(runs, runs[1:], strict=False):
+            hyphenated = len(text) >= 2 and text[-1] == "-" and text[-2].isalpha()
+            if hyphenated and following[:1].islower():
+                texts[start] = text[:-1]
+            else:
+                texts[start] = text + " "
+        last_start, last_text = runs[-1]
+        texts[last_start] = last_text
+    return texts
+
+
 def _set_table_cell_glyph_text(
     builder: "StructTreeBuilder",
     elements: list[dict],
@@ -4390,6 +4445,7 @@ def _prefer_glyph_text(
         text = glyph_text(glyphs_by_element.get(elem_idx, []))
         if accounts_for(text, docling_text):
             elem["glyph_text"] = text
+            elem["glyph_text_trusted"] = True
         elif "glyph_text" not in elem:
             # Its glyphs may be in another content stream, tagged later.
             elem["glyph_text"] = readable(docling_text)
@@ -4591,9 +4647,9 @@ def _make_bdc(
     actual_text: str | None = None,
 ) -> pikepdf.ContentStreamInstruction:
     attributes = pikepdf.Dictionary({"/MCID": mcid})
-    normalized_actual_text = str(actual_text or "").strip()
-    if normalized_actual_text:
-        attributes["/ActualText"] = pikepdf.String(normalized_actual_text)
+    # Kept as given: a trailing space is a fragment's word break.
+    if str(actual_text or "").strip():
+        attributes["/ActualText"] = pikepdf.String(actual_text)
     return pikepdf.ContentStreamInstruction(
         [pikepdf.Name(f"/{struct_type}"), attributes],
         pikepdf.Operator("BDC"),
