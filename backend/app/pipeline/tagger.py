@@ -3886,6 +3886,7 @@ def _rewrite_content_stream_with_fragmented_text(
     text_run_assignments: dict[int, int],
     table_cell_assignments: dict[int, TableCellRunAssignment],
     stream_owner: pikepdf.Object | None = None,
+    cell_glyphs: dict[int, list[MeasuredGlyph]] | None = None,
 ) -> set[int]:
     """Rewrite a stream using word-level OCR text anchors when BT blocks are giant."""
     table_cell_mark_lookup: dict[tuple[str, int, int, int], TableCellRunAssignment] = {}
@@ -3998,6 +3999,7 @@ def _rewrite_content_stream_with_fragmented_text(
             new_instructions.append(instr)
 
     close_active()
+    _set_table_cell_glyph_text(builder, elements, table_cell_assignments, cell_glyphs or {})
     for source_region, elem_idx in overlay_targets:
         overlay = _make_clipped_image_figure_instructions(
             source_region,
@@ -4105,6 +4107,15 @@ def _rewrite_content_stream(
             text_run_assignments=text_run_assignments,
             table_cell_assignments=table_cell_assignments,
             stream_owner=stream_owner,
+            cell_glyphs=(
+                {
+                    run_idx: measured[run.instruction_idx].glyphs
+                    for run_idx, run in enumerate(text_runs)
+                    if run_idx in table_cell_assignments and run.instruction_idx in measured
+                }
+                if measured is not None
+                else None
+            ),
         )
     matched_element_indices = set(matches.values())
 
@@ -4316,6 +4327,28 @@ def _element_accessible_text(elem: dict) -> str:
 # Element types whose text is read as /ActualText; a formula's is its alt
 # text, which stays Docling's.
 GLYPH_TEXT_ELEMENT_TYPES = LINK_TEXT_ELEMENT_TYPES - {"formula"}
+
+
+def _set_table_cell_glyph_text(
+    builder: "StructTreeBuilder",
+    elements: list[dict],
+    table_cell_assignments: dict[int, TableCellRunAssignment],
+    glyphs_by_run: dict[int, list[MeasuredGlyph]],
+) -> None:
+    """Give each table cell the text of its glyphs as /ActualText when they
+    account for the structure step's cell text, so letter-spaced, overdrawn,
+    or run-together cell text reads as words (see element_text)."""
+    cells: dict[tuple[int, int, int], tuple[dict, list[MeasuredGlyph]]] = {}
+    for run_idx, assignment in sorted(table_cell_assignments.items()):
+        key = (assignment.table_elem_idx, assignment.row, assignment.col)
+        cells.setdefault(key, (assignment.cell, []))[1].extend(glyphs_by_run.get(run_idx, []))
+    for (table_idx, row, col), (cell, glyphs) in cells.items():
+        if not glyphs or not 0 <= table_idx < len(elements):
+            continue
+        cell_elem = builder._ensure_fragmented_table(elements[table_idx]).get((row, col))
+        text = glyph_text(glyphs)
+        if cell_elem is not None and accounts_for(text, str(cell.get("text") or "")):
+            cell_elem["/ActualText"] = pikepdf.String(text)
 
 
 def _glyphs_by_element(

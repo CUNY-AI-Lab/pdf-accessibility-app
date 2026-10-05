@@ -64,3 +64,23 @@ def test_accounts_for_rejects_empty_text():
     assert not accounts_for("", "text")
     assert not accounts_for("text", "")
 
+
+def test_glyph_text_keeps_letter_spaced_text_one_word():
+    spaced = _line("ASISTENCIAL", gaps={i: 4.0 for i in range(1, 11)})
+    assert glyph_text(spaced) == "ASISTENCIAL"
+
+
+def test_glyph_text_breaks_letter_spaced_words_at_wider_gaps():
+    gaps = {i: 4.0 for i in range(1, 9)}
+    gaps[4] = 4.0 + 8.0
+    assert glyph_text(_line("AUXIADMI", gaps=gaps)) == "AUXI ADMI"
+
+
+def test_glyph_text_reads_overdrawn_text_once():
+    word = _line("Errors")
+    shadow = _line("Errors", left=0.4)
+    assert glyph_text(word + shadow) == "Errors"
+
+
+def test_accounts_for_a_reference_that_read_overdrawn_text_twice():
+    assert accounts_for("CUNY Academic Works", "CUNY Academic Works CUNY Academic Works")
