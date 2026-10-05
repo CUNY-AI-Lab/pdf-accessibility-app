@@ -22,6 +22,7 @@ def _write_text_image_pdf(
     image_height: int = 3000,
     creator: str | None = None,
     producer: str | None = None,
+    text: str = "Recognized text",
 ) -> None:
     pdf = pikepdf.new()
     font = pdf.make_indirect(
@@ -50,7 +51,9 @@ def _write_text_image_pdf(
         )
         page.obj["/Contents"] = pdf.make_stream(
             b"q 612 0 0 792 0 0 cm /Im0 Do Q\n"
-            b"BT /F1 12 Tf 72 720 Td (Recognized text) Tj ET\n"
+            + b"BT /F1 12 Tf 72 720 Td ("
+            + text.encode("latin-1")
+            + b") Tj ET\n"
         )
     if creator is not None:
         pdf.docinfo["/Creator"] = creator
@@ -107,10 +110,11 @@ async def test_classify_pdf_detects_ocr_scan_with_existing_text_layer(
 
 
 @pytest.mark.asyncio
-async def test_classify_pdf_keeps_image_rich_text_pdf_digital_without_ocr_metadata(
-    monkeypatch, tmp_path
-):
-    pdf_path = tmp_path / "image-rich-digital.pdf"
+async def test_classify_pdf_ocrs_pages_whose_text_is_in_their_images(monkeypatch, tmp_path):
+    """A page that is one large image and a line of native text has its text
+    in the image: the document is mixed and those pages are OCR'd (with
+    --redo-ocr, which keeps the native line)."""
+    pdf_path = tmp_path / "image-pages.pdf"
     _write_text_image_pdf(pdf_path, pages=3, producer="Report generator")
 
     async def fake_probe_ocr(_path):
@@ -121,10 +125,30 @@ async def test_classify_pdf_keeps_image_rich_text_pdf_digital_without_ocr_metada
 
     result = await classify.classify_pdf(pdf_path)
 
-    assert result.type == "digital"
+    assert result.type == "mixed"
+    assert result.ocr_pages == [0, 1, 2]
     assert result.pages_with_text == 3
     assert result.image_heavy_pages == 3
     assert result.ocr_scan_like is False
+
+
+@pytest.mark.asyncio
+async def test_classify_pdf_keeps_a_text_rich_page_with_a_large_image_digital(
+    monkeypatch, tmp_path
+):
+    pdf_path = tmp_path / "figure-page.pdf"
+    _write_text_image_pdf(pdf_path, pages=1, text="A sentence of native body text. " * 60)
+
+    async def fake_probe_ocr(_path):
+        return None
+
+    monkeypatch.setattr(classify, "_detect_language_from_text", lambda _path: None)
+    monkeypatch.setattr(classify, "_probe_ocr_detect", fake_probe_ocr)
+
+    result = await classify.classify_pdf(pdf_path)
+
+    assert result.type == "digital"
+    assert result.ocr_pages == []
 
 
 @pytest.mark.asyncio

@@ -43,6 +43,7 @@ def build_ocrmypdf_args(
     jobs: int | None = None,
     max_image_mpixels: int | None = None,
     engine: str = "tesseract",
+    pages: list[int] | None = None,
 ) -> list[str]:
     settings = get_settings()
     default_jobs = settings.ocr_gateway_jobs if engine == "gateway" else settings.ocrmypdf_jobs
@@ -93,6 +94,9 @@ def build_ocrmypdf_args(
         if deskew:
             args.append("--deskew")
         args.append("--skip-text")
+    if pages:
+        # OCRmyPDF numbers pages from 1.
+        args.extend(["--pages", ",".join(str(page + 1) for page in pages)])
     args.extend([str(input_path), str(output_path)])
     return args
 
@@ -109,6 +113,7 @@ async def run_ocr(
     jobs: int | None = None,
     max_image_mpixels: int | None = None,
     engine: str = "tesseract",
+    pages: list[int] | None = None,
 ) -> OcrResult:
     """Run OCRmyPDF as a subprocess to add text layer to scanned PDFs.
 
@@ -126,6 +131,7 @@ async def run_ocr(
         jobs=jobs,
         max_image_mpixels=max_image_mpixels,
         engine=engine,
+        pages=pages,
     )
     env = enriched_subprocess_env()
     if engine == "gateway":

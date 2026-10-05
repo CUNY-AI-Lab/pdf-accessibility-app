@@ -165,3 +165,19 @@ async def test_gateway_engine_gives_ocrmypdf_the_connection_and_time_for_every_p
     # 25 pages at 8 at a time is 4 rounds, each within the page limit plus
     # time for a Tesseract fallback: more than the configured 900 s.
     assert seen["timeout"] == 4 * (300 + ocr.GATEWAY_PAGE_FALLBACK_SECONDS)
+
+
+def test_build_ocrmypdf_args_limits_redo_ocr_to_the_given_pages():
+    args = build_ocrmypdf_args(
+        input_path=Path("in.pdf"),
+        output_path=Path("out.pdf"),
+        language="eng",
+        mode="redo",
+        rotate_pages=True,
+        deskew=True,
+        pages=[0, 2, 5],
+    )
+
+    assert "--redo-ocr" in args
+    assert args[args.index("--pages") + 1] == "1,3,6"
+    assert args[-2:] == ["in.pdf", "out.pdf"]

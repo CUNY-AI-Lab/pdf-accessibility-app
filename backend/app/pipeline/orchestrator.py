@@ -5159,10 +5159,14 @@ async def run_pipeline(
                     input_path,
                     ocr_output,
                     job.ocr_language or settings.ocr_language,
+                    # Pages whose text is in their images also have native
+                    # text, which --redo-ocr leaves out of OCR.
+                    mode="redo" if classification.ocr_pages else "skip",
                     rotate_pages=settings.ocr_rotate_pages,
                     deskew=settings.ocr_deskew,
                     timeout_seconds=settings.subprocess_timeout_ocr,
                     engine=settings.ocr_engine,
+                    pages=classification.ocr_pages or None,
                 )
 
                 if ocr_result.success:
