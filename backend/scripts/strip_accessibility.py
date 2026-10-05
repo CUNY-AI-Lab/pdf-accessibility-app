@@ -304,7 +304,7 @@ def strip_accessibility(
             _rewrite_page_and_form_streams(page, pdf, report, visited_form_streams)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        pdf.save(str(output_path))
+        pdf.save(str(output_path), deterministic_id=True)
 
     return report
 

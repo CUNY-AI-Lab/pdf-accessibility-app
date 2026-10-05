@@ -1,0 +1,657 @@
+{
+  "olmocr_bench": {
+    "dataset": "allenai/olmOCR-bench",
+    "revision": "54a96a6fb6a2bd3b297e59869491db4d3625b711",
+    "license": "ODC-BY-1.0",
+    "seed": 20260923,
+    "subsets": [
+      {
+        "name": "old_scans",
+        "tests": "bench_data/old_scans.jsonl"
+      },
+      {
+        "name": "multi_column_s60",
+        "tests": "bench_data/multi_column.jsonl",
+        "sample": 60
+      },
+      {
+        "name": "headers_footers_s60",
+        "tests": "bench_data/headers_footers.jsonl",
+        "sample": 60
+      },
+      {
+        "name": "tables_s60",
+        "tests": "bench_data/table_tests.jsonl",
+        "sample": 60
+      }
+    ]
+  },
+  "old_print": {
+    "tests": "old_print/tests.jsonl",
+    "pages": [
+      {
+        "id": "dalton1827_p018",
+        "url": "https://archive.org/download/newsystemofchemi0002john/page/n33.jpg",
+        "ppi": 360,
+        "pixels": "1792x2876",
+        "sha256": "5d6a0b8ecfba72315396d7b668c425410fb0d66d9f5102f64c58ebfc999f4fa4"
+      },
+      {
+        "id": "dalton1827_p038",
+        "url": "https://archive.org/download/newsystemofchemi0002john/page/n53.jpg",
+        "ppi": 360,
+        "pixels": "1804x2860",
+        "sha256": "ebb8e59be7db574e7557fe1b2e2bb4bf2b5573b6b26c04915f199b10bb0abb36"
+      },
+      {
+        "id": "dalton1827_p091",
+        "url": "https://archive.org/download/newsystemofchemi0002john/page/n106.jpg",
+        "ppi": 360,
+        "pixels": "1752x2840",
+        "sha256": "eda1f02f4ddd6f29448bad4016d4db43df452ab626ab719ba092f0a26ed0f52f"
+      },
+      {
+        "id": "dalton1827_p217",
+        "url": "https://archive.org/download/newsystemofchemi0002john/page/n232.jpg",
+        "ppi": 360,
+        "pixels": "1756x2860",
+        "sha256": "6e1f711b0901073fd8c5d1cc28bca3adea7c3810fe81c661d05ad21fb5f9d5f9"
+      },
+      {
+        "id": "dalton1827_p274",
+        "url": "https://archive.org/download/newsystemofchemi0002john/page/n289.jpg",
+        "ppi": 360,
+        "pixels": "1752x2876",
+        "sha256": "720f87695b2c1783785d5d0b2c4266d4ec48a02ffc4855c4c4bab200a8475319"
+      },
+      {
+        "id": "dalton1827_p303",
+        "url": "https://archive.org/download/newsystemofchemi0002john/page/n318.jpg",
+        "ppi": 360,
+        "pixels": "1792x2840",
+        "sha256": "f5707939829e9be2b4ab472c59711603201b987e07d71b1b78b9de1154fa0875"
+      },
+      {
+        "id": "dreammaker1925_p012",
+        "url": "https://archive.org/download/dreammakerman0000fann/page/n21.jpg",
+        "ppi": 360,
+        "pixels": "1636x2444",
+        "sha256": "83ec42ce61282915203d95d9284e054aa3676ecc82fe8ab27b5cca52aa4b83ea"
+      },
+      {
+        "id": "dreammaker1925_p051",
+        "url": "https://archive.org/download/dreammakerman0000fann/page/n60.jpg",
+        "ppi": 360,
+        "pixels": "1560x2472",
+        "sha256": "a017bfe6f75e29f37ad23f7dc4d0b7b5f675a5c7a8f559c7a2b04f335718b5fb"
+      },
+      {
+        "id": "dreammaker1925_p102",
+        "url": "https://archive.org/download/dreammakerman0000fann/page/n111.jpg",
+        "ppi": 360,
+        "pixels": "1660x2444",
+        "sha256": "81ab43eb07126e1a68d52e84a35a7890fc7af9974ee2b51a7f7bb3944117356c"
+      },
+      {
+        "id": "dreammaker1925_p180",
+        "url": "https://archive.org/download/dreammakerman0000fann/page/n189.jpg",
+        "ppi": 360,
+        "pixels": "1628x2418",
+        "sha256": "ae7399bcca3dfaa0069981a4572d503a05c6e913bd4e052024a98d1b3440cbd0"
+      },
+      {
+        "id": "dreammaker1925_p240",
+        "url": "https://archive.org/download/dreammakerman0000fann/page/n249.jpg",
+        "ppi": 360,
+        "pixels": "1628x2418",
+        "sha256": "3904e7f35dc296fe80b9d8f2313da9930a46f00a0d7b3dc6ba252280c357d0d2"
+      },
+      {
+        "id": "eb1911v6_p262",
+        "url": "https://archive.org/download/encyclopaediabrit06chisrich/page/n289.jpg",
+        "ppi": 300,
+        "pixels": "2340x3210",
+        "sha256": "e4981fe4715aeb23f559eff60aea6264a1e79fc4f4eb46ff34bcff5284f5eb83"
+      },
+      {
+        "id": "eb1911v6_p305",
+        "url": "https://archive.org/download/encyclopaediabrit06chisrich/page/n332.jpg",
+        "ppi": 300,
+        "pixels": "2340x3210",
+        "sha256": "8bd47af6f7dd89471aad9af16e0e8cb50082f1036fbffcb0a44ed2a6b6629726"
+      },
+      {
+        "id": "eb1911v6_p373",
+        "url": "https://archive.org/download/encyclopaediabrit06chisrich/page/n400.jpg",
+        "ppi": 300,
+        "pixels": "2340x3210",
+        "sha256": "f6512cd9883b1aedf88d964c1474276a62ecc8b6840f54b22fa18ac8fb107915"
+      },
+      {
+        "id": "eb1911v6_p431",
+        "url": "https://archive.org/download/encyclopaediabrit06chisrich/page/n458.jpg",
+        "ppi": 300,
+        "pixels": "2340x3210",
+        "sha256": "ee8515db8e86690198b51ad18e359c5bfc913a5671eae3884af159d1f0a3ed64"
+      },
+      {
+        "id": "eb1911v6_p460",
+        "url": "https://archive.org/download/encyclopaediabrit06chisrich/page/n487.jpg",
+        "ppi": 300,
+        "pixels": "2340x3210",
+        "sha256": "eb9b4713ba173b24fd22c5561580f54d49154b4a218787b8c11041da2f286744"
+      },
+      {
+        "id": "fulhame1794_p045",
+        "url": "https://archive.org/download/bim_eighteenth-century_an-essay-on-combustion-_fulhame-mrs_1794/page/n60.jpg",
+        "ppi": 800,
+        "pixels": "4415x7318",
+        "sha256": "cef39b34c53a33cfa59126cf2f90cfb484d97e86beb597f5211b7454737d9004"
+      },
+      {
+        "id": "fulhame1794_p150",
+        "url": "https://archive.org/download/bim_eighteenth-century_an-essay-on-combustion-_fulhame-mrs_1794/page/n165.jpg",
+        "ppi": 800,
+        "pixels": "4382x7527",
+        "sha256": "51e0ba1f9578243e05f8507dbbc7b9b1e6e0ec8a365bd071764b87af00deb685"
+      },
+      {
+        "id": "gilbert1877_p004",
+        "url": "https://archive.org/download/reportongeologyo00gilb/page/n21.jpg",
+        "ppi": 300,
+        "pixels": "3030x3943",
+        "sha256": "f0daee79a7121753c5e74fb52702a6e3c74307bac2d988f8fbdb34dd7c857ee8"
+      },
+      {
+        "id": "gilbert1877_p029",
+        "url": "https://archive.org/download/reportongeologyo00gilb/page/n60.jpg",
+        "ppi": 300,
+        "pixels": "3030x3943",
+        "sha256": "2739019ff58595b174c5be0923f555c064df6f2e42280d33759f8c348ac7c67e"
+      },
+      {
+        "id": "gilbert1877_p077",
+        "url": "https://archive.org/download/reportongeologyo00gilb/page/n134.jpg",
+        "ppi": 300,
+        "pixels": "3030x3943",
+        "sha256": "2293e9e3a327089cb95619f4f52b8aa7f7cd9be5673557ab0a6306dff512c885"
+      },
+      {
+        "id": "gilbert1877_p100",
+        "url": "https://archive.org/download/reportongeologyo00gilb/page/n157.jpg",
+        "ppi": 300,
+        "pixels": "3030x3943",
+        "sha256": "77a9bbb8a21a00344560e8afd51562bfe7f9eca3fc35342754c6acc82e3a609a"
+      },
+      {
+        "id": "green1870_p063",
+        "url": "https://archive.org/download/shakemblem00greeuoft/page/n104.jpg",
+        "ppi": 300,
+        "pixels": "1951x3071",
+        "sha256": "c3c7b0ae1999777e252d5dbd38135f6bf53c823417f44c56717ced54017f4a6c"
+      },
+      {
+        "id": "green1870_p065",
+        "url": "https://archive.org/download/shakemblem00greeuoft/page/n106.jpg",
+        "ppi": 300,
+        "pixels": "1951x3071",
+        "sha256": "3e75c8f2c012e494fa9908c52bba519df3bc40420fee5be998b661049cab5035"
+      },
+      {
+        "id": "green1870_p066",
+        "url": "https://archive.org/download/shakemblem00greeuoft/page/n107.jpg",
+        "ppi": 300,
+        "pixels": "1951x3071",
+        "sha256": "df3cf131fb39ba093868c088a9c338663d77382adbc7c682e773c9d52f8cf77a"
+      },
+      {
+        "id": "green1870_p242",
+        "url": "https://archive.org/download/shakemblem00greeuoft/page/n289.jpg",
+        "ppi": 300,
+        "pixels": "1951x3071",
+        "sha256": "63aa8296166fa688a237383bcf8e909996fd376a7e31beef4d533c13e63ebcf3"
+      },
+      {
+        "id": "imagist1917_p007",
+        "url": "https://archive.org/download/someimagistpoets00aldi/page/n20.jpg",
+        "ppi": 500,
+        "pixels": "2483x3604",
+        "sha256": "703073e670e0059b31dc13ef48a5641580816698bcaa360d7dab0790cb486ba0"
+      },
+      {
+        "id": "imagist1917_p027",
+        "url": "https://archive.org/download/someimagistpoets00aldi/page/n40.jpg",
+        "ppi": 500,
+        "pixels": "2483x3606",
+        "sha256": "340e6501b91bf2a0ca47cbfae3fce61378ceab7a088091bfa0b21cc2e2d24897"
+      },
+      {
+        "id": "imagist1917_p047",
+        "url": "https://archive.org/download/someimagistpoets00aldi/page/n60.jpg",
+        "ppi": 500,
+        "pixels": "2539x3612",
+        "sha256": "c315e95a4531917769bc83c0d68ea53273cbc4ee023355c0e6fb7d48e183ec25"
+      },
+      {
+        "id": "imagist1917_p057",
+        "url": "https://archive.org/download/someimagistpoets00aldi/page/n70.jpg",
+        "ppi": 500,
+        "pixels": "2539x3612",
+        "sha256": "a96bfd3bcef07a23a2c591f3075ddd4bb235ac21a0d6f4a96d09dfd345ef5506"
+      },
+      {
+        "id": "johnston1842_p030",
+        "url": "https://archive.org/download/elementsofagricu00john/page/n35.jpg",
+        "ppi": 400,
+        "pixels": "1737x2946",
+        "sha256": "93fe2dcd635da40b3d27c05066fdc8d85985a41c924fdbdbfd5fb740971db490"
+      },
+      {
+        "id": "johnston1842_p095",
+        "url": "https://archive.org/download/elementsofagricu00john/page/n100.jpg",
+        "ppi": 400,
+        "pixels": "1737x2946",
+        "sha256": "f3355698378371eab85cfdcf17e8a1435ca74a11d9dbad68216a30001b66eb86"
+      },
+      {
+        "id": "johnston1842_p200",
+        "url": "https://archive.org/download/elementsofagricu00john/page/n205.jpg",
+        "ppi": 400,
+        "pixels": "1737x2946",
+        "sha256": "779dc0c26e161d2b8d2ba7fcc50a54ce1c8c4e222eabeefb64688d1dfb29ce02"
+      },
+      {
+        "id": "johnston1842_p240",
+        "url": "https://archive.org/download/elementsofagricu00john/page/n245.jpg",
+        "ppi": 400,
+        "pixels": "1737x2946",
+        "sha256": "7e24843413511826fbc45ed4b4d03484a954fa57ab56adc6383451d57643e1e5"
+      },
+      {
+        "id": "rupertgodwin1890_p024",
+        "url": "https://archive.org/download/rupertgodwinnove00brad/page/n31.jpg",
+        "ppi": 400,
+        "pixels": "1609x2619",
+        "sha256": "80124471ad8fdc0eec37cb952773f29686d70b1c7deb6128b35c761712b0b447"
+      },
+      {
+        "id": "rupertgodwin1890_p093",
+        "url": "https://archive.org/download/rupertgodwinnove00brad/page/n100.jpg",
+        "ppi": 400,
+        "pixels": "1609x2619",
+        "sha256": "2bafecc657fa5b7d40989bd661d769944ccebfdbd941545c2ef1fe4e08bc7a04"
+      },
+      {
+        "id": "rupertgodwin1890_p150",
+        "url": "https://archive.org/download/rupertgodwinnove00brad/page/n157.jpg",
+        "ppi": 400,
+        "pixels": "1614x2660",
+        "sha256": "b3015581cb0acc34512ec970bfe48a2eb53bd57d3e2a1dea2f3c54602b020709"
+      },
+      {
+        "id": "rupertgodwin1890_p212",
+        "url": "https://archive.org/download/rupertgodwinnove00brad/page/n219.jpg",
+        "ppi": 400,
+        "pixels": "1614x2660",
+        "sha256": "ec290643eced0d51b73e2e0263fb5ce3b12c484a2857dc1df97124e91774bb5c"
+      },
+      {
+        "id": "rupertgodwin1890_p277",
+        "url": "https://archive.org/download/rupertgodwinnove00brad/page/n284.jpg",
+        "ppi": 400,
+        "pixels": "1614x2660",
+        "sha256": "797df44e57c48a8eb4e2c5a01be1484b2a83fab22f6319bf9457c14278317def"
+      },
+      {
+        "id": "snowberries1867_p012",
+        "url": "https://archive.org/download/snowberries00caryrich/page/n27.jpg",
+        "ppi": 500,
+        "pixels": "2124x3016",
+        "sha256": "65eb93fa41769777aca27ee25d424611c6438d4a712dd98ad21115351b99ca2e"
+      },
+      {
+        "id": "snowberries1867_p045",
+        "url": "https://archive.org/download/snowberries00caryrich/page/n60.jpg",
+        "ppi": 500,
+        "pixels": "2124x3016",
+        "sha256": "9f290a8a56bc3de11a82f580bf782d6a96e944f86610cc7bc1df50852e063f8f"
+      },
+      {
+        "id": "snowberries1867_p078",
+        "url": "https://archive.org/download/snowberries00caryrich/page/n95.jpg",
+        "ppi": 500,
+        "pixels": "2124x3016",
+        "sha256": "f0f7840e36cb445a01a91e92fee42c76c99223715162f0808e36d4bee683ec49"
+      },
+      {
+        "id": "snowberries1867_p120",
+        "url": "https://archive.org/download/snowberries00caryrich/page/n141.jpg",
+        "ppi": 500,
+        "pixels": "2124x3016",
+        "sha256": "8e38970fd7aa7c9b7a678d7ead8c24293ddb67454c6e9e8e4d1eef0c163833be"
+      },
+      {
+        "id": "snowberries1867_p190",
+        "url": "https://archive.org/download/snowberries00caryrich/page/n215.jpg",
+        "ppi": 500,
+        "pixels": "2124x3016",
+        "sha256": "ecacf8148d5cefb60e7ea79911e6a766a3119a47716c7a22f9e958a0b64b0125"
+      },
+      {
+        "id": "wallace1920_p015",
+        "url": "https://archive.org/download/agriculturalpric00wall/page/n18.jpg",
+        "ppi": 400,
+        "pixels": "2105x3430",
+        "sha256": "11c6f97f3d9f2f194adf5bc4ce0b6f4042f877f0147742597ab72f2ddc44f5d9"
+      },
+      {
+        "id": "wallace1920_p030",
+        "url": "https://archive.org/download/agriculturalpric00wall/page/n33.jpg",
+        "ppi": 400,
+        "pixels": "2105x3430",
+        "sha256": "a08c52b6b5b9c77882d49d0096bc5dcaca00fe4a5e20298a3da74b65931f8e6d"
+      },
+      {
+        "id": "wallace1920_p046",
+        "url": "https://archive.org/download/agriculturalpric00wall/page/n49.jpg",
+        "ppi": 400,
+        "pixels": "2105x3430",
+        "sha256": "70db81cdbda6cceaaf76a2e3bd970a7ddea917dac7fdecf909c2430e41d10764"
+      },
+      {
+        "id": "wallace1920_p081",
+        "url": "https://archive.org/download/agriculturalpric00wall/page/n84.jpg",
+        "ppi": 400,
+        "pixels": "2105x3430",
+        "sha256": "7f3724317eead150276f8ac4b9bfcb756344a61f2d6d2de9bb9e2e0c06b9bab4"
+      },
+      {
+        "id": "wallace1920_p125",
+        "url": "https://archive.org/download/agriculturalpric00wall/page/n128.jpg",
+        "ppi": 400,
+        "pixels": "2105x3430",
+        "sha256": "b349cda27c961f91b87f1fcf5e0ec8bdaba8679c0ea113868f4e774551cc06d0"
+      }
+    ]
+  },
+  "roundtrip": [
+    {
+      "subset": "gold_rt",
+      "documents": [
+        {
+          "name": "ref_magazine_da",
+          "file": "PDFUA-Ref-2-01_Magazine-danish.pdf",
+          "pages": 32,
+          "sha256": "aef89af13c9c94fc4f4e1a8c5872450cc4c8fff7de544d8ada6a0912425aa434",
+          "origin": "https://pdfa.org/resource/pdf-ua-reference-suite/"
+        },
+        {
+          "name": "ref_invoice",
+          "file": "PDFUA-Ref-2-02_Invoice.pdf",
+          "pages": 1,
+          "sha256": "fbae08464f192f532205833215505b78266e86df6283d9b0c439cb06927ce0b9",
+          "origin": "https://pdfa.org/resource/pdf-ua-reference-suite/"
+        },
+        {
+          "name": "ref_academic_abstract",
+          "file": "PDFUA-Ref-2-03_AcademicAbstract.pdf",
+          "pages": 2,
+          "sha256": "e61257d371261867926eb006f8895569a95fcfbcb93fca3be04b8b9187cb93a0",
+          "origin": "https://pdfa.org/resource/pdf-ua-reference-suite/"
+        },
+        {
+          "name": "ref_presentation",
+          "file": "PDFUA-Ref-2-04_Presentation.pdf",
+          "pages": 8,
+          "sha256": "90acb829ca8bfa037796592539d15010e9099d1cd2622aac1fce7d9fd3ae7575",
+          "origin": "https://pdfa.org/resource/pdf-ua-reference-suite/"
+        },
+        {
+          "name": "ref_book_chapter_de",
+          "file": "PDFUA-Ref-2-05_BookChapter-german.pdf",
+          "pages": 21,
+          "sha256": "fc525b8899da31779b6143c16053779cd560d4417018a901472de33c71252352",
+          "origin": "https://pdfa.org/resource/pdf-ua-reference-suite/"
+        },
+        {
+          "name": "ref_brochure",
+          "file": "PDFUA-Ref-2-06_Brochure.pdf",
+          "pages": 2,
+          "sha256": "aefd5ab48a908b9996ffadcb14d8ff31a2c653657cbe011a46f4cf61396a589e",
+          "origin": "https://pdfa.org/resource/pdf-ua-reference-suite/"
+        },
+        {
+          "name": "ref_book_chapter",
+          "file": "PDFUA-Ref-2-08_BookChapter.pdf",
+          "pages": 32,
+          "sha256": "2b958600daec79373736f413f2712fcd9c604de2c352cbc1ec9d67cc5d7932f1",
+          "origin": "https://pdfa.org/resource/pdf-ua-reference-suite/"
+        },
+        {
+          "name": "moore_pdfua_paper",
+          "file": "moore-pdfua-paper-tagged17-18Sept.pdf",
+          "pages": 10,
+          "sha256": "07c48166e2800b6a8b8f18cb469ff4b70ca5ace8c35841160edf8f10b5af4a08",
+          "origin": "https://web.science.mq.edu.au/~ross/TaggedPDF/DEIMS2024/moore-pdfua-paper-tagged17-18Sept.pdf"
+        },
+        {
+          "name": "matterhorn_protocol",
+          "file": "pdfa-matterhorn-protocol-1.1.pdf",
+          "pages": 20,
+          "sha256": "b8bf0b00fd789ef8d8548d2eeb7e83194db394d9f1be741f2d0ef1d62bff50c6",
+          "origin": "https://pdfa.org/resource/the-matterhorn-protocol/"
+        },
+        {
+          "name": "noaa_spring_mt_2023",
+          "file": "SpringMT2023.pdf",
+          "pages": 84,
+          "sha256": "876d778f5aca8ee5e4ac17955497b4282646fa5177926b3c9b2a2bf95f6ec41d",
+          "origin": "https://web.science.mq.edu.au/~ross/TaggedPDF/SpringMT2023/SpringMT2023.pdf"
+        },
+        {
+          "name": "fish_tables",
+          "file": "FishTables-only.pdf",
+          "pages": 12,
+          "sha256": "39d6f799be1239609e866d419614b7724e890eb75111fdbaa3bd7c8f91c635f1",
+          "origin": "https://web.science.mq.edu.au/~ross/TaggedPDF/TUG2022/FishTables-only.pdf"
+        }
+      ]
+    },
+    {
+      "subset": "cuny_rt",
+      "scan_subset": "cuny_rt_scan",
+      "documents": [
+        {
+          "name": "le_oers_102",
+          "file": "le_oers_102.pdf",
+          "pages": 8,
+          "sha256": "cba9f22ed3af0b14cbff8bb074e95806217e12489334380d0ef9511c4cc7ff06",
+          "origin": "https://academicworks.cuny.edu/le_oers/102",
+          "type": "Syllabi",
+          "title": "SPA 111 - Elementary Spanish I",
+          "license": "http://creativecommons.org/licenses/by/4.0"
+        },
+        {
+          "name": "qc_oers_10",
+          "file": "qc_oers_10.pdf",
+          "pages": 10,
+          "sha256": "688907b1b68c68c2e372f1257d525f5f197f4c3ef8c34867529bec71ce9176b8",
+          "origin": "https://academicworks.cuny.edu/qc_oers/10",
+          "type": "Syllabi",
+          "title": "Anthropology 240 Essentials of Archaeology",
+          "license": "http://creativecommons.org/licenses/by-nc-sa/4.0"
+        },
+        {
+          "name": "sps_oers_17",
+          "file": "sps_oers_17.pdf",
+          "pages": 7,
+          "sha256": "5c294d44b4db67600237a3bcfa4dac76f67082488ac543af0539e790b1fcd1b0",
+          "origin": "https://academicworks.cuny.edu/sps_oers/17",
+          "type": "Syllabi",
+          "title": "HIST 102: Origins of the Modern World: 1500-present",
+          "license": "http://creativecommons.org/licenses/by-nc/4.0"
+        },
+        {
+          "name": "cc_oers_420",
+          "file": "cc_oers_420.pdf",
+          "pages": 7,
+          "sha256": "5b2cad99acb5e41fff318d09c5c3587c5889b9c48ab176c0c00abe0c80cf4eb1",
+          "origin": "https://academicworks.cuny.edu/cc_oers/420",
+          "type": "Syllabi",
+          "title": "Web Design",
+          "license": "http://creativecommons.org/licenses/by/4.0"
+        },
+        {
+          "name": "sps_oers_10",
+          "file": "sps_oers_10.pdf",
+          "pages": 9,
+          "sha256": "682f3147a9ab4d051b5e55cc63217c4da2ae9ce4f60bfa9ada3281c772a110c2",
+          "origin": "https://academicworks.cuny.edu/sps_oers/10",
+          "type": "Syllabi",
+          "title": "PHIL 110: Critical Thinking",
+          "license": "http://creativecommons.org/licenses/by-nc/4.0"
+        },
+        {
+          "name": "ny_oers_33",
+          "file": "ny_oers_33.pdf",
+          "pages": 40,
+          "sha256": "5c1112cda9beaf1f99ca889b1014274dfc3e863d665c20c1a21ad06a40c3975c",
+          "origin": "https://academicworks.cuny.edu/ny_oers/33",
+          "type": "Textbooks",
+          "title": "Chapter 5: Essential Aspects of Physical Design and Implementation of Relational Databases",
+          "license": "http://creativecommons.org/licenses/by-nc-sa/4.0"
+        },
+        {
+          "name": "qb_oers_7",
+          "file": "qb_oers_7.pdf",
+          "pages": 14,
+          "sha256": "a2ec9b4bc0aef3e8308af4e32f822450e8c3d6f43351775787c619ac3a422dc9",
+          "origin": "https://academicworks.cuny.edu/qb_oers/7",
+          "type": "Textbooks",
+          "title": "Mathematics in Contemporary Society Chapter 5",
+          "license": "http://creativecommons.org/licenses/by/4.0"
+        },
+        {
+          "name": "qb_oers_222",
+          "file": "qb_oers_222.pdf",
+          "pages": 43,
+          "sha256": "a102a2c49e549fa95d6425806edfb708b0bf6288531dc9a69b7c83a1adf3ddfc",
+          "origin": "https://academicworks.cuny.edu/qb_oers/222",
+          "type": "Assignments",
+          "title": "A Writer’s Notebook and Journal Entries: Student-Centered Guide for ENGL 102 (English Composition II)",
+          "license": "http://creativecommons.org/licenses/by-nc-sa/4.0"
+        },
+        {
+          "name": "kb_oers_36",
+          "file": "kb_oers_36.pdf",
+          "pages": 13,
+          "sha256": "29b50f7e7a08251f4b8e7f4dad3e2e9d9b45cec52a752f38a85e88289ab8b360",
+          "origin": "https://academicworks.cuny.edu/kb_oers/36",
+          "type": "Assignments",
+          "title": "Course Project Overview Biology 1400, General Biology II",
+          "license": "http://creativecommons.org/licenses/by-nc-sa/4.0"
+        },
+        {
+          "name": "bb_oers_125",
+          "file": "bb_oers_125.pdf",
+          "pages": 7,
+          "sha256": "0da6106c512d8f1686fa93c2355ca29eb5639b0e1a8ba94af3c58166b9b7dab9",
+          "origin": "https://academicworks.cuny.edu/bb_oers/125",
+          "type": "Assignments",
+          "title": "Email Synthesis Assignment: Using AI to Assist Us in Creating Effective Business Communication",
+          "license": "http://creativecommons.org/licenses/by-nc-sa/4.0"
+        },
+        {
+          "name": "ho_oers_47",
+          "file": "ho_oers_47.pdf",
+          "pages": 14,
+          "sha256": "c4089ec0f99d6836bd6abffb5c9808fb4ecd599ec0e4d908577f2557088a1fe1",
+          "origin": "https://academicworks.cuny.edu/ho_oers/47",
+          "type": "Lesson Plans",
+          "title": "From Wikipedia Tables to Public Data Visualizations",
+          "license": "http://creativecommons.org/licenses/by/4.0"
+        },
+        {
+          "name": "lg_oers_113",
+          "file": "lg_oers_113.pdf",
+          "pages": 4,
+          "sha256": "6c9d6ab7fa5b0fbca37a13fbe403dfc8c42455826531516908717af933c3240e",
+          "origin": "https://academicworks.cuny.edu/lg_oers/113",
+          "type": "Lesson Plans",
+          "title": "Health Sciences First Year Seminar Library Lesson Plan (HSF90)",
+          "license": "http://creativecommons.org/licenses/by/4.0"
+        },
+        {
+          "name": "lg_oers_98",
+          "file": "lg_oers_98.pdf",
+          "pages": 3,
+          "sha256": "00801f9974ee618225819f20abe6f07aa6b8be2ae16524ac1b48bb749980f6ca",
+          "origin": "https://academicworks.cuny.edu/lg_oers/98",
+          "type": "Lesson Plans",
+          "title": "Visual Literacy Lesson Plan: Color Photography",
+          "license": "http://creativecommons.org/licenses/by/4.0"
+        },
+        {
+          "name": "cc_conf_hic_216",
+          "file": "cc_conf_hic_216.pdf",
+          "pages": 9,
+          "sha256": "fdad80924d795d9d6b98975544baee8df6b32a792f66832358bccbef7210cec5",
+          "origin": "https://academicworks.cuny.edu/cc_conf_hic/216",
+          "type": "Presentations",
+          "title": "Near Real-Time Detection Of Pipe Burst Events In Cascading District Metered Areas",
+          "license": "none stated (all rights reserved)"
+        },
+        {
+          "name": "cc_conf_hic_340",
+          "file": "cc_conf_hic_340.pdf",
+          "pages": 8,
+          "sha256": "9189cab0b6dcb88e4a6893ac922744af8c0de97770c0d3e6c023d68f1cbea89e",
+          "origin": "https://academicworks.cuny.edu/cc_conf_hic/340",
+          "type": "Presentations",
+          "title": "Delaware Reservoirs’ Drought Risk Assessment: A Paleo View",
+          "license": "none stated (all rights reserved)"
+        },
+        {
+          "name": "kb_oers_29",
+          "file": "kb_oers_29.pdf",
+          "pages": 11,
+          "sha256": "60957f54627086c461cf18cf8e7a3ad7f43bd2398e9be37af3360927b4a6df28",
+          "origin": "https://academicworks.cuny.edu/kb_oers/29",
+          "type": "Lectures and Presentations",
+          "title": "ECO 2200: Module 8",
+          "license": "http://creativecommons.org/licenses/by-nc-sa/4.0"
+        },
+        {
+          "name": "gc_pubs_581",
+          "file": "gc_pubs_581.pdf",
+          "pages": 12,
+          "sha256": "3b1cdd4849086ef52fb4191fffee1640c5af43069fc443cd41dbdec98fb30fc0",
+          "origin": "https://academicworks.cuny.edu/gc_pubs/581",
+          "type": "Book Chapters or Sections",
+          "title": "International Organizations, Free Trade and Environmental Citizenship: Mexico and Chile In Comparative Perspective",
+          "license": "none stated (all rights reserved)"
+        },
+        {
+          "name": "gc_etds_6742",
+          "file": "gc_etds_6742.pdf",
+          "pages": 44,
+          "sha256": "465566dbe164d25c05a14b78a1e0d97832c9d7bbd0c236674da2ef2134b6ceb0",
+          "origin": "https://academicworks.cuny.edu/gc_etds/6742",
+          "type": "Master's Capstone Projects",
+          "title": "Pedagogy of Care: Exploring Climate Justice Frameworks in CUNY Undergraduate Courses",
+          "license": "none stated (all rights reserved)"
+        },
+        {
+          "name": "jj_arch_pubs_99",
+          "file": "jj_arch_pubs_99.pdf",
+          "pages": 19,
+          "sha256": "2a61f13f2f6c1f0556bee98abfd3bb422dbbd51b72f4824ffdde29830dcd0465",
+          "origin": "https://academicworks.cuny.edu/jj_arch_pubs/99",
+          "type": "Newsletters",
+          "title": "Classified Information",
+          "license": "none stated (all rights reserved)"
+        }
+      ]
+    }
+  ]
+}

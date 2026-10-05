@@ -103,13 +103,26 @@ long-running consumer needs only the Gateway, which re-checks every call.
    most), Kimi K2.5, and Gemma 3 27B (timeouts) were dropped early.
 5. **Ship to v1.** Merge the branch and deploy v1 on NML with the Lab's own
    Gateway key in place of the direct Gemini key, so v1 users get the
-   remediation gains before v2 exists. Step 3 follows.
+   remediation gains before v2 exists. First upgrade actual-dell's
+   docling-serve from 1.12.0 (Docling 2.72) to 1.35.0 (Docling 2.130), the
+   version every measurement in [evaluation.md](evaluation.md) used: the
+   older server ignores the heading-hierarchy option, so every heading comes
+   back as level 1. Step 3 follows.
 6. **Rebuild the evaluation data.** The corpus in `backend/data/eval/` was
-   git-ignored and was lost with its worktree in late September 2026. The
-   olmOCR-Bench subsets and the gold documents can be fetched again; the
-   `old_print` tests (checked by eye) and the Adobe outputs (free tier spent)
-   cannot. Keep test definitions and source lists in the repository and fetch
-   the PDFs by script, so the suite survives a checkout.
+   git-ignored and was lost with its worktree in late September 2026. Done
+   2026-10-04: everything but Adobe's outputs was recovered from the build
+   session's transcripts, and the corpus is now defined in
+   [backend/eval/](../backend/eval/README.md) (sources with checksums or a
+   pinned dataset revision, and our own tests) and rebuilt byte for byte by
+   `scripts/fetch_eval_corpus.py`. Files that cannot be re-downloaded
+   reliably live in the Lab's private copy,
+   CUNY-AI-Lab/pdf-accessibility-eval-data. Adobe is re-run within the free
+   tier, about 45 pages a month (Auto-Tag costs ten transactions a page).
+7. **A CUNY corpus.** Add documents CUNY people actually remediate, from CUNY
+   Academic Works: well-tagged course materials (syllabi, OER textbooks,
+   slides, assignments) as a structure round-trip, each also as an
+   image-only scan scored against the same tags; then pages of untagged
+   articles and dissertations with per-page tests.
 
 ### 3. Worker version behind Doorway
 

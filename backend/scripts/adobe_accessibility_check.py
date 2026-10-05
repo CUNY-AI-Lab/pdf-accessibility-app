@@ -115,6 +115,7 @@ def _record_usage(
     pdf_path: Path,
     report_path: Path,
     result_path: Path,
+    transactions: int = 1,
     now: datetime | None = None,
 ) -> None:
     data = _read_ledger(path)
@@ -127,10 +128,11 @@ def _record_usage(
     if not isinstance(runs, list):
         runs = []
         entry["runs"] = runs
-    entry["transactions"] = int(entry.get("transactions", 0) or 0) + 1
+    entry["transactions"] = int(entry.get("transactions", 0) or 0) + transactions
     runs.append(
         {
             "timestamp": (now or datetime.now(UTC)).isoformat(),
+            "transactions": transactions,
             "pdf": str(pdf_path),
             "report": str(report_path),
             "result_pdf": str(result_path),
