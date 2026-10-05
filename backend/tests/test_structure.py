@@ -515,3 +515,54 @@ def test_figures_use_doclings_own_images_without_page_images(tmp_path):
     assert [figure.index for figure in figures] == [0]
     assert Image.open(figures[0].path).size == (40, 30)
     assert figures[0].page == 0
+
+
+def _prov(b: float, t: float) -> list[dict]:
+    return [{"page_no": 1, "bbox": {"l": 72, "b": b, "r": 540, "t": t}}]
+
+
+def test_normalize_docling_elements_keeps_picture_and_table_captions_as_text():
+    """Docling attaches captions to their picture or table, outside the body's
+    children; they are printed text, so each becomes a caption element, in
+    the order printed and only once."""
+    doc_dict = {
+        "body": {
+            "children": [
+                {"$ref": "#/pictures/0"},
+                {"$ref": "#/tables/0"},
+                {"$ref": "#/texts/1"},
+                {"$ref": "#/texts/2"},
+            ],
+        },
+        "texts": [
+            {"label": "caption", "text": "Figure 1. Loans by year.", "prov": _prov(480, 495)},
+            {"label": "caption", "text": "Table 1. Loans by subject.", "prov": _prov(420, 435)},
+            {"label": "text", "text": "Body text.", "prov": _prov(100, 200)},
+        ],
+        "pictures": [
+            {
+                "label": "picture",
+                "prov": _prov(500, 700),
+                "captions": [{"$ref": "#/texts/0"}],
+                "children": [{"$ref": "#/texts/0"}],
+            }
+        ],
+        "tables": [
+            {
+                "label": "table",
+                "prov": _prov(250, 410),
+                "captions": [{"$ref": "#/texts/1"}],
+                "data": {"num_rows": 0, "num_cols": 0, "table_cells": []},
+            }
+        ],
+    }
+
+    elements = _normalize_docling_elements(doc_dict)
+
+    assert [(element["type"], element.get("text")) for element in elements] == [
+        ("figure", None),
+        ("caption", "Figure 1. Loans by year."),
+        ("caption", "Table 1. Loans by subject."),
+        ("table", None),
+        ("paragraph", "Body text."),
+    ]

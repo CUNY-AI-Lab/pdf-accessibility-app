@@ -203,10 +203,18 @@ def _walk_body_tree(doc_dict: dict) -> list[dict]:
     Docling stores document structure as a tree rooted at doc_dict["body"],
     with children referenced via JSON pointers. We do a depth-first traversal
     to get elements in reading order, which maps directly to PDF structure order.
+    A picture's or table's captions and footnotes are its children, not the
+    body's; they are printed text a reader must hear, so each comes out as its
+    own item, before the picture or table when printed above it and after it
+    otherwise. Other children of a picture (text inside a chart) stay part of it.
     """
     items = []
+    seen: set[str] = set()
 
     def _visit(ref_str: str):
+        if ref_str in seen:
+            return
+        seen.add(ref_str)
         item = _resolve_ref(doc_dict, ref_str)
         if item is None:
             return
@@ -217,14 +225,35 @@ def _walk_body_tree(doc_dict: dict) -> list[dict]:
                 _visit(child_ref.get("$ref", ""))
             return
 
-        # It's a content item — add it
+        # It's a content item — add it, with its captions and footnotes
+        attached = []
+        for ref in [*item.get("captions", []), *item.get("footnotes", [])]:
+            attached_ref = ref.get("$ref", "") if isinstance(ref, dict) else ""
+            attached_item = None if attached_ref in seen else _resolve_ref(doc_dict, attached_ref)
+            if attached_item is not None:
+                seen.add(attached_ref)
+                attached.append(attached_item)
+        above = [entry for entry in attached if _printed_above(entry, item)]
+        items.extend(above)
         items.append(item)
+        items.extend(entry for entry in attached if entry not in above)
 
     body = doc_dict.get("body", {})
     for child_ref in body.get("children", []):
         _visit(child_ref.get("$ref", ""))
 
     return items
+
+
+def _printed_above(item: dict, other: dict) -> bool:
+    """Whether ``item`` is printed above ``other`` on the same page."""
+    item_prov, other_prov = item.get("prov") or [], other.get("prov") or []
+    if not item_prov or not other_prov or item_prov[0].get("page_no") != other_prov[0].get("page_no"):
+        return False
+    item_box, other_box = _extract_bbox(item_prov), _extract_bbox(other_prov)
+    if not item_box or not other_box:
+        return False
+    return (item_box["b"] + item_box["t"]) / 2 > other_box["t"]
 
 
 def _page_height(doc_dict: dict, page_index: int) -> float | None:
