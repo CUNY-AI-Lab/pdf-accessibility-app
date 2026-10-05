@@ -15,6 +15,7 @@ import logging
 import math
 import mimetypes
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
 from difflib import SequenceMatcher
@@ -30,6 +31,7 @@ from PIL import Image
 from rtree import index as rtree_index
 from scipy.optimize import linear_sum_assignment
 
+from app.pipeline.element_text import accounts_for, glyph_text
 from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
 from app.pipeline.page_glyphs import MeasuredGlyph, MeasuredTextOp, PdfGlyphReader, union_bbox
 from app.pipeline.pdf_repair import add_missing_icc_components
@@ -4071,7 +4073,7 @@ def _rewrite_content_stream(
     )
     text_run_assignments = _assign_text_show_runs_to_elements(text_runs, elements)
     table_cell_assignments = _assign_text_show_runs_to_table_cells(text_runs, elements)
-    if _should_use_fragmented_text_rewrite(
+    fragmented = _should_use_fragmented_text_rewrite(
         elements=elements,
         normal_matches=matches,
         text_run_assignments=text_run_assignments,
@@ -4079,7 +4081,24 @@ def _rewrite_content_stream(
         region_tagged_runs=_region_path_tagged_runs(
             regions, matches, elements, text_runs, text_run_assignments
         ),
-    ):
+    )
+    if measured is not None:
+        glyphs_by_element: dict[int, list[MeasuredGlyph]] = defaultdict(list)
+        if fragmented:
+            for run_idx, run in enumerate(text_runs):
+                elem_idx = text_run_assignments.get(run_idx)
+                op = measured.get(run.instruction_idx)
+                if elem_idx is not None and run_idx not in table_cell_assignments and op:
+                    glyphs_by_element[elem_idx].extend(op.glyphs)
+        else:
+            for region_idx, elem_idx in sorted(matches.items()):
+                region = regions[region_idx]
+                if region.kind == "text":
+                    for idx in range(region.start_idx, region.end_idx):
+                        if (op := measured.get(idx)) is not None:
+                            glyphs_by_element[elem_idx].extend(op.glyphs)
+        _prefer_glyph_text(elements, glyphs_by_element)
+    if fragmented:
         return _rewrite_content_stream_with_fragmented_text(
             pdf,
             content_owner,
@@ -4297,9 +4316,30 @@ def _element_accessible_text(elem: dict) -> str:
         elem.get("actual_text")
         or elem.get("resolved_text")
         or elem.get("semantic_text_hint")
+        or elem.get("glyph_text")
         or elem.get("text")
         or ""
     ).strip()
+
+
+# Element types whose text is read as /ActualText; a formula's is its alt
+# text, which stays Docling's.
+GLYPH_TEXT_ELEMENT_TYPES = LINK_TEXT_ELEMENT_TYPES - {"formula"}
+
+
+def _prefer_glyph_text(
+    elements: list[dict], glyphs_by_element: dict[int, list[MeasuredGlyph]]
+) -> None:
+    """Give each element whose measured glyphs account for its structure
+    text a ``glyph_text`` (see element_text): the PDF's own characters and
+    word breaks, which _element_accessible_text prefers to Docling's text."""
+    for elem_idx, glyphs in glyphs_by_element.items():
+        elem = elements[elem_idx]
+        if elem.get("type") not in GLYPH_TEXT_ELEMENT_TYPES:
+            continue
+        text = glyph_text(glyphs)
+        if accounts_for(text, str(elem.get("text") or "")):
+            elem["glyph_text"] = text
 
 
 def _element_actual_text(elem: dict) -> str | None:
