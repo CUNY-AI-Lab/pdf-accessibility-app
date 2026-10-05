@@ -4360,8 +4360,7 @@ def _fragment_glyph_texts(
 
     Marked-content /ActualText is read as written, with no space implied
     after it, so each of an element's runs but its last ends with the word
-    break, or, when it ends a word hyphenated at the line end that the next
-    run finishes, with the word left open ("evalu" then "ated")."""
+    break."""
     runs_by_element: dict[int, list[tuple[int, str]]] = defaultdict(list)
     idx = 0
     while idx < instruction_count:
@@ -4380,12 +4379,8 @@ def _fragment_glyph_texts(
         idx = end
     texts: dict[int, str] = {}
     for runs in runs_by_element.values():
-        for (start, text), (_next_start, following) in zip(runs, runs[1:], strict=False):
-            hyphenated = len(text) >= 2 and text[-1] == "-" and text[-2].isalpha()
-            if hyphenated and following[:1].islower():
-                texts[start] = text[:-1]
-            else:
-                texts[start] = text + " "
+        for start, text in runs[:-1]:
+            texts[start] = text + " "
         last_start, last_text = runs[-1]
         texts[last_start] = last_text
     return texts
