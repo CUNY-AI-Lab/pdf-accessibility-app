@@ -156,8 +156,8 @@ def _address(pointer) -> int:
 
 
 def _actual_text(text_object) -> tuple[int, str] | None:
-    """The /ActualText of the outermost marked content around a text object
-    that has one, with that marked content's identity."""
+    """The /ActualText of marked content around a text object, with that
+    marked content's identity."""
     for index in range(pdfium_c.FPDFPageObj_CountMarks(text_object)):
         mark = pdfium_c.FPDFPageObj_GetMark(text_object, index)
         length = ctypes.c_ulong()
@@ -175,7 +175,8 @@ def _text_object_streams(page: pdfium.PdfPage, form_paths: list[StreamKey]) -> d
     """The content stream (see page_glyphs.StreamKey) each text object is
     drawn in. pdfium lists a page's objects, forms' contents included, in
     drawing order, so its forms pair one to one with the page's form Do
-    operators; when they do not, text inside forms is left unread."""
+    operators; when they do not, text inside forms is left unread. A form
+    drawn more than once is read on its first drawing, as page_glyphs does."""
     paths = iter(form_paths)
     forms = sum(
         1
@@ -184,12 +185,17 @@ def _text_object_streams(page: pdfium.PdfPage, form_paths: list[StreamKey]) -> d
     )
     aligned = forms == len(form_paths)
     open_forms: dict[int, StreamKey | None] = {}
+    drawn: set[StreamKey] = set()
     streams: dict[int, StreamKey] = {}
     for page_object in page.get_objects(max_depth=15):
         level = page_object.level
         stream = open_forms.get(level - 1) if level else ()
         if page_object.type == pdfium_c.FPDF_PAGEOBJ_FORM:
-            open_forms[level] = next(paths, None) if aligned else None
+            path = next(paths, None) if aligned else None
+            readable = path is not None and stream is not None and path not in drawn
+            open_forms[level] = path if readable else None
+            if path is not None:
+                drawn.add(path)
         elif page_object.type == pdfium_c.FPDF_PAGEOBJ_TEXT and stream is not None:
             streams[_address(page_object.raw)] = stream
     return streams
