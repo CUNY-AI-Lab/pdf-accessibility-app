@@ -80,9 +80,12 @@ def readable(text: str) -> str:
 def accounts_for(glyph_text: str, reference: str) -> bool:
     """Whether the glyph text holds the reference text's letters and digits,
     in order, within a small tolerance: spacing, punctuation, quote style,
-    and ligatures aside, the same text."""
+    and ligatures aside, the same text. The digits must match exactly, so a
+    page number or footnote mark drawn near the element cannot slip in."""
     ours, theirs = _letters(glyph_text), _letters(reference)
     if not ours or not theirs:
+        return False
+    if [char for char in ours if char.isdigit()] != [char for char in theirs if char.isdigit()]:
         return False
     allowed = max(MAX_DIFFERENCE_FLOOR, MAX_DIFFERENCE_SHARE * len(theirs))
     return Levenshtein.distance(ours, theirs, score_cutoff=int(allowed) + 1) <= allowed

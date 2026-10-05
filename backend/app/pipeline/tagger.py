@@ -31,7 +31,7 @@ from PIL import Image
 from rtree import index as rtree_index
 from scipy.optimize import linear_sum_assignment
 
-from app.pipeline.element_text import accounts_for, glyph_text
+from app.pipeline.element_text import accounts_for, glyph_text, readable
 from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
 from app.pipeline.page_glyphs import MeasuredGlyph, MeasuredTextOp, PdfGlyphReader, union_bbox
 from app.pipeline.pdf_repair import add_missing_icc_components
@@ -4088,21 +4088,7 @@ def _rewrite_content_stream(
         ),
     )
     if measured is not None:
-        glyphs_by_element: dict[int, list[MeasuredGlyph]] = defaultdict(list)
-        if fragmented:
-            for run_idx, run in enumerate(text_runs):
-                elem_idx = text_run_assignments.get(run_idx)
-                op = measured.get(run.instruction_idx)
-                if elem_idx is not None and run_idx not in table_cell_assignments and op:
-                    glyphs_by_element[elem_idx].extend(op.glyphs)
-        else:
-            for region_idx, elem_idx in sorted(matches.items()):
-                region = regions[region_idx]
-                if region.kind == "text":
-                    for idx in range(region.start_idx, region.end_idx):
-                        if (op := measured.get(idx)) is not None:
-                            glyphs_by_element[elem_idx].extend(op.glyphs)
-        _prefer_glyph_text(elements, glyphs_by_element)
+        _prefer_glyph_text(elements, _glyphs_by_element(measured, elements))
     if fragmented:
         return _rewrite_content_stream_with_fragmented_text(
             pdf,
@@ -4332,19 +4318,48 @@ def _element_accessible_text(elem: dict) -> str:
 GLYPH_TEXT_ELEMENT_TYPES = LINK_TEXT_ELEMENT_TYPES - {"formula"}
 
 
+def _glyphs_by_element(
+    measured: dict[int, MeasuredTextOp], elements: list[dict]
+) -> dict[int, list[MeasuredGlyph]]:
+    """Each measured glyph, in drawing order, under the smallest text element
+    whose box holds its center, however the content stream splits them."""
+    boxes = sorted(
+        (
+            (_bbox_area(elem["bbox"]), elem_idx, elem["bbox"])
+            for elem_idx, elem in enumerate(elements)
+            if elem.get("type") in GLYPH_TEXT_ELEMENT_TYPES and isinstance(elem.get("bbox"), dict)
+        ),
+        key=lambda entry: entry[0],
+    )
+    glyphs_by_element: dict[int, list[MeasuredGlyph]] = defaultdict(list)
+    for _idx, op in sorted(measured.items()):
+        for glyph in op.glyphs:
+            cx, cy = _bbox_center(glyph.bbox)
+            for _area, elem_idx, box in boxes:
+                if _point_in_bbox(cx, cy, box, margin=1.0):
+                    glyphs_by_element[elem_idx].append(glyph)
+                    break
+    return glyphs_by_element
+
+
 def _prefer_glyph_text(
     elements: list[dict], glyphs_by_element: dict[int, list[MeasuredGlyph]]
 ) -> None:
-    """Give each element whose measured glyphs account for its structure
-    text a ``glyph_text`` (see element_text): the PDF's own characters and
-    word breaks, which _element_accessible_text prefers to Docling's text."""
-    for elem_idx, glyphs in glyphs_by_element.items():
-        elem = elements[elem_idx]
+    """Give each text element a ``glyph_text`` (see element_text), which
+    _element_accessible_text prefers to Docling's text: its measured glyphs'
+    text when that accounts for Docling's (the PDF's own characters and word
+    breaks), otherwise Docling's text with ligatures and spacing accents made
+    readable."""
+    for elem_idx, elem in enumerate(elements):
         if elem.get("type") not in GLYPH_TEXT_ELEMENT_TYPES:
             continue
-        text = glyph_text(glyphs)
-        if accounts_for(text, str(elem.get("text") or "")):
+        docling_text = str(elem.get("text") or "")
+        text = glyph_text(glyphs_by_element.get(elem_idx, []))
+        if accounts_for(text, docling_text):
             elem["glyph_text"] = text
+        elif "glyph_text" not in elem:
+            # Its glyphs may be in another content stream, tagged later.
+            elem["glyph_text"] = readable(docling_text)
 
 
 def _element_actual_text(elem: dict) -> str | None:
