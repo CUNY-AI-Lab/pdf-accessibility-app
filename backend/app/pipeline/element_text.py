@@ -1,27 +1,22 @@
-"""The text a screen reader should hear for a tagged element, from the glyphs
-the PDF draws for it.
+"""Checking an element's glyph text against its structure text, and making
+text readable.
 
 The tagger gives each element its text as /ActualText so that it reads in
 one piece wherever its glyphs fall in the content stream. Docling's text for
-the element is a fair start, but it straightens curly quotes and runs words
-together where the PDF spaces them by position (often in OCR text layers).
-The element's own measured glyphs carry the real characters and, in their
-positions, the real word breaks; this module turns them into text and checks
-that they account for the element before the tagger prefers them.
+the element straightens curly quotes and runs words together where the PDF
+spaces them by position, so the tagger prefers the text pdfium extracts from
+the element's own glyphs (see pdfium_text) when it accounts for Docling's.
+Either text gets ligatures read as letters and TeX's separate accent glyphs
+put on their letters, which pdfium does not do for the accents.
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
-from collections import defaultdict
-from collections.abc import Iterable
 
 from rapidfuzz.distance import Levenshtein
 
-from app.pipeline.page_glyphs import MeasuredGlyph
-
-HYPHENS = {"-", "­", "‐"}
 # Accents some PDFs (TeX's especially) draw as separate glyphs after the
 # letter, and the combining marks they stand for.
 SPACING_ACCENTS = {
@@ -37,102 +32,10 @@ SPACING_ACCENTS = {
 SPACING_ACCENT_AFTER_LETTER = re.compile("([^\\W\\d_])([" + "".join(SPACING_ACCENTS) + "])")
 # Presentation-form ligatures (ﬀ ﬁ ﬂ ﬃ ﬄ ﬅ ﬆ) read as their letters.
 LIGATURES = {chr(code): unicodedata.normalize("NFKC", chr(code)) for code in range(0xFB00, 0xFB07)}
-# Letters-only comparison tolerates this much difference before the glyphs
-# are judged not to account for the element.
+# Letters-only comparison tolerates this much difference before the glyph
+# text is judged not to account for the element.
 MAX_DIFFERENCE_SHARE = 0.02
 MAX_DIFFERENCE_FLOOR = 2
-
-
-def glyph_text(glyphs: Iterable[MeasuredGlyph]) -> str:
-    """Glyphs in drawing order as text: a space at each word break, a word
-    hyphenated at a line end joined again, a glyph drawn again over itself
-    (fake bold, shadows) read once, ligatures as letters, and spacing accents
-    on their letters.
-
-    A word break is a new line, a gap wider than the element's usual gap
-    between letters by 0.15 em, or a space glyph; measuring from the usual
-    gap keeps letter-spaced text one word ("A S I S T E N C I A L" as drawn,
-    or as OCR read it, letter by letter with spaces between), so in letter-
-    spaced text a space glyph counts only across a wider gap too."""
-    drawn = _without_overdrawn([glyph for glyph in glyphs if glyph.text])
-    letters = [glyph for glyph in drawn if not glyph.text.isspace()]
-    letter_gap = _usual_letter_gap(letters)
-    spaced_after = {
-        id(previous)
-        for previous, glyph in zip(drawn, drawn[1:], strict=False)
-        if glyph.text.isspace() and not previous.text.isspace()
-    }
-    parts: list[str] = []
-    previous: MeasuredGlyph | None = None
-    for glyph in letters:
-        if previous is not None and _word_break(
-            previous, glyph, letter_gap, spaced=id(previous) in spaced_after
-        ):
-            so_far = "".join(parts)
-            hyphenated = len(so_far) >= 2 and so_far[-1] in HYPHENS and so_far[-2].isalpha()
-            if _new_line(previous, glyph) and hyphenated and glyph.text[:1].isalpha():
-                # A word broken at the line end: "pres-" + "ence" is one word.
-                # Before a capital the hyphen is the word's own ("Jean-Paul").
-                parts = [so_far[:-1] if glyph.text[:1].islower() else so_far]
-            else:
-                parts.append(" ")
-        parts.append(glyph.text)
-        previous = glyph
-    return readable(" ".join("".join(parts).split()))
-
-
-def _size(*glyphs: MeasuredGlyph) -> float:
-    return max(max(glyph.bbox["t"] - glyph.bbox["b"] for glyph in glyphs), 1.0)
-
-
-def _without_overdrawn(glyphs: list[MeasuredGlyph]) -> list[MeasuredGlyph]:
-    """Glyphs less any drawn again, same character, within 0.2 em of one
-    already kept."""
-    kept: list[MeasuredGlyph] = []
-    centers_by_text: dict[str, list[tuple[float, float]]] = defaultdict(list)
-    for glyph in glyphs:
-        cx = (glyph.bbox["l"] + glyph.bbox["r"]) / 2
-        cy = (glyph.bbox["b"] + glyph.bbox["t"]) / 2
-        near = 0.2 * _size(glyph)
-        centers = centers_by_text[glyph.text]
-        if not glyph.text.isspace() and any(
-            abs(x - cx) < near and abs(y - cy) < near for x, y in centers
-        ):
-            continue
-        centers.append((cx, cy))
-        kept.append(glyph)
-    return kept
-
-
-def _usual_letter_gap(letters: list[MeasuredGlyph]) -> float:
-    """The median gap, in em, between neighbouring glyphs on a line (space
-    glyphs aside); 0 with fewer than two such gaps."""
-    gaps = []
-    for previous, glyph in zip(letters, letters[1:], strict=False):
-        if _new_line(previous, glyph):
-            continue
-        gap = (glyph.bbox["l"] - previous.bbox["r"]) / _size(previous, glyph)
-        if gap > -0.5:
-            gaps.append(gap)
-    if len(gaps) < 2:
-        return 0.0
-    gaps.sort()
-    return max(0.0, gaps[len(gaps) // 2])
-
-
-# A usual gap between letters this wide (in em) marks letter-spaced text.
-LETTER_SPACED_GAP = 0.1
-
-
-def _word_break(
-    previous: MeasuredGlyph, glyph: MeasuredGlyph, letter_gap: float, *, spaced: bool
-) -> bool:
-    if _new_line(previous, glyph):
-        return True
-    gap = (glyph.bbox["l"] - previous.bbox["r"]) / _size(previous, glyph)
-    if gap > letter_gap + 0.15:
-        return True
-    return spaced and letter_gap < LETTER_SPACED_GAP
 
 
 def readable(text: str) -> str:
@@ -160,8 +63,3 @@ def _letters(text: str) -> str:
     return "".join(
         char for char in unicodedata.normalize("NFKD", readable(text).casefold()) if char.isalnum()
     )
-
-
-def _new_line(previous: MeasuredGlyph, glyph: MeasuredGlyph) -> bool:
-    size = max(glyph.bbox["t"] - glyph.bbox["b"], previous.bbox["t"] - previous.bbox["b"], 1.0)
-    return abs(glyph.bbox["b"] - previous.bbox["b"]) > 0.5 * size

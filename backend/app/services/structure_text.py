@@ -3,7 +3,7 @@
 Walks the structure tree in logical order. An element with ``/ActualText``
 contributes that text and hides its descendants; otherwise each marked-content
 reference contributes what that marked content reads as: its text as pdfium,
-Chrome's PDF engine, extracts it (``marked_text``), or the ``/ActualText`` of
+Chrome's PDF engine, extracts it (``app/pipeline/pdfium_text.py``), or the ``/ActualText`` of
 marked content that carries one (``app/pipeline/page_glyphs.py``). Artifacts and untagged content are not in the structure tree, so
 they are not read. Figure ``/Alt`` text is left out: it describes an image, not
 page text. Text drawn inside a Figure is not read either, unless
@@ -26,7 +26,7 @@ from pathlib import Path
 import pikepdf
 
 from app.pipeline.page_glyphs import MeasuredGlyph, PdfGlyphReader, StreamKey
-from app.services.marked_text import read_marked_text
+from app.pipeline.pdfium_text import read_page_text
 
 BLOCK_ROLES = {
     "P",
@@ -125,7 +125,7 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
         root = pdf.Root.get("/StructTreeRoot")
         if root is None:
             return ""
-        pages_text = read_marked_text(pdf_path)
+        pages_text = read_page_text(pdf_path)
         role_map = root.get("/RoleMap")
         blocks: list[str] = []
         marked: dict[int, dict[tuple[StreamKey, int], list[MeasuredGlyph | str]]] = {}

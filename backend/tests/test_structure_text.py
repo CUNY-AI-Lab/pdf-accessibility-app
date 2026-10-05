@@ -209,7 +209,7 @@ def test_words_split_between_two_marked_contents_keep_their_space(tmp_path):
 
 
 def test_page_text_joins_utf16_surrogate_pairs():
-    from app.services.marked_text import PageText
+    from app.pipeline.pdfium_text import PageText
 
     page = PageText(chars=["\ud835", "\udc00"], generated=[False, False], actual=[None, None])
     assert page.text([0, 1]) == "\U0001d400"
