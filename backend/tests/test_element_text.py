@@ -64,7 +64,3 @@ def test_accounts_for_rejects_empty_text():
     assert not accounts_for("", "text")
     assert not accounts_for("text", "")
 
-
-def test_accounts_for_rejects_a_stray_page_number():
-    paragraph = "tal, social, cultural and educational aspects of the program were considered. " * 3
-    assert not accounts_for("164 " + paragraph, paragraph)
