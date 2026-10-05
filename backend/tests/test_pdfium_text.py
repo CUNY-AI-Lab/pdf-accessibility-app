@@ -9,8 +9,10 @@ import pytest
 from app.pipeline.pdfium_text import PdfiumText
 from tests.pdf_fixtures import helvetica
 
+WHOLE_PAGE = {"l": 0, "b": 0, "r": 400, "t": 300}
 
-def _page_text(tmp_path: Path, content: bytes) -> str:
+
+def _page_text(tmp_path: Path, content: bytes, box: dict[str, float] = WHOLE_PAGE) -> str:
     path = tmp_path / "page.pdf"
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(400, 300))
@@ -18,7 +20,7 @@ def _page_text(tmp_path: Path, content: bytes) -> str:
     page.Contents = pdf.make_stream(content)
     pdf.save(path)
     with PdfiumText(path) as pdfium_text:
-        return pdfium_text.in_boxes(0, [{"l": 0, "b": 0, "r": 400, "t": 300}])
+        return pdfium_text.in_boxes(0, [box])
 
 
 @pytest.mark.parametrize(
@@ -41,3 +43,18 @@ def _page_text(tmp_path: Path, content: bytes) -> str:
 )
 def test_text_in_boxes(tmp_path, content, heard):
     assert _page_text(tmp_path, content) == heard
+
+
+def test_box_holds_the_words_it_overlaps(tmp_path):
+    # "Improvement" in 12 pt Helvetica runs from x=20 to about x=85; a cell
+    # box (as Docling gives on scans) that stops at x=70 still holds it,
+    # and the word in the next column is left out.
+    content = b"BT /F1 12 Tf 20 250 Td (Improvement) Tj 100 0 Td (Decrease) Tj ET"
+    box = {"l": 15, "b": 245, "r": 70, "t": 262}
+    assert _page_text(tmp_path, content, box) == "Improvement"
+
+
+def test_box_leaves_out_the_line_below(tmp_path):
+    content = b"BT /F1 12 Tf 20 250 Td (First line) Tj 0 -14 Td (second line) Tj ET"
+    box = {"l": 15, "b": 248, "r": 200, "t": 262}
+    assert _page_text(tmp_path, content, box) == "First line"

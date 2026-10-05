@@ -9,13 +9,12 @@ tells which characters lie under marked content with /ActualText, but its
 mark API does not decode the text reliably (it drops characters past U+00FF),
 so the text itself comes from the caller's own parse of the content stream.
 The screen-reader scorer reads marked content this way, and the tagger takes
-an element's text from inside its box this way.
+an element's text from the words inside its boxes this way.
 """
 
 from __future__ import annotations
 
 import ctypes
-import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,12 +79,25 @@ class PageText:
         return any(self.generated[i] for i in range(before, after + 1))
 
 
+Box = tuple[float, float, float, float]
+
+
+@dataclass
+class Word:
+    """A run of characters pdfium did not separate with a space or line
+    break, and the box around their glyphs (left, bottom, right, top)."""
+
+    start: int
+    end: int
+    box: Box
+
+
 class PdfiumText:
-    """The text pdfium extracts inside boxes on a document's pages."""
+    """The words pdfium extracts inside boxes on a document's pages."""
 
     def __init__(self, pdf_path: Path) -> None:
         self.document = pdfium.PdfDocument(pdf_path)
-        self.textpages: dict[int, pdfium.PdfTextPage] = {}
+        self.pages: dict[int, tuple[PageText, list[Word]]] = {}
 
     def __enter__(self) -> PdfiumText:
         return self
@@ -94,15 +106,56 @@ class PdfiumText:
         self.document.close()
 
     def in_boxes(self, page_index: int, boxes: list[dict[str, float]]) -> str:
-        """The text inside these boxes (left, bottom, right, top in PDF user
-        space), box after box, with a word hyphenated at a line end joined."""
-        if page_index not in self.textpages:
-            self.textpages[page_index] = self.document[page_index].get_textpage()
-        textpage = self.textpages[page_index]
-        text = " ".join(
-            textpage.get_text_bounded(box["l"], box["b"], box["r"], box["t"]) for box in boxes
-        )
-        return " ".join(re.sub(LINE_END_HYPHEN + r"\s*", "", text).split())
+        """The text of the words inside these boxes (left, bottom, right, top
+        in PDF user space), box after box. A word is inside a box it
+        overlaps, as Docling gives a table cell each word that overlaps it:
+        layout boxes are approximate, a scan's above all, and one that stops
+        short of a word's last letters still holds the word."""
+        if page_index not in self.pages:
+            self.pages[page_index] = _page_words(self.document[page_index])
+        page, words = self.pages[page_index]
+        texts = []
+        for box in boxes:
+            area = (box["l"], box["b"], box["r"], box["t"])
+            indices = [
+                index
+                for word in words
+                if _overlaps(word.box, area)
+                for index in range(word.start, word.end)
+            ]
+            texts.append(page.text(indices))
+        return " ".join(" ".join(texts).split())
+
+
+def _overlaps(a: Box, b: Box) -> bool:
+    return min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
+
+
+def _page_words(page: pdfium.PdfPage) -> tuple[PageText, list[Word]]:
+    textpage = page.get_textpage()
+    result = PageText()
+    words: list[Word] = []
+    for index in range(textpage.count_chars()):
+        char = chr(pdfium_c.FPDFText_GetUnicode(textpage.raw, index))
+        generated = bool(pdfium_c.FPDFText_IsGenerated(textpage.raw, index))
+        result.chars.append(char)
+        result.generated.append(generated)
+        result.actual.append(None)
+        if generated or char.isspace():
+            continue
+        box = textpage.get_charbox(index)
+        if words and words[-1].end == index:
+            word = words[-1]
+            word.end = index + 1
+            word.box = (
+                min(word.box[0], box[0]),
+                min(word.box[1], box[1]),
+                max(word.box[2], box[2]),
+                max(word.box[3], box[3]),
+            )
+        else:
+            words.append(Word(index, index + 1, box))
+    return result, words
 
 
 def read_page_text(pdf_path: Path) -> list[PageText]:
