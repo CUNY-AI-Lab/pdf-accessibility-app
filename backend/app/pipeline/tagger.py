@@ -16,6 +16,7 @@ import logging
 import math
 import mimetypes
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal
 from io import BytesIO
@@ -30,7 +31,7 @@ from PIL import Image
 from app.pipeline.element_text import accounts_for, readable
 from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
 from app.pipeline.page_frame import PageFrame
-from app.pipeline.page_glyphs import MeasuredTextOp, PdfGlyphReader, union_bbox
+from app.pipeline.page_glyphs import MeasuredGlyph, MeasuredTextOp, PdfGlyphReader, union_bbox
 from app.pipeline.pdf_repair import add_missing_icc_components
 from app.pipeline.pdfium_text import PdfiumText
 
@@ -499,6 +500,61 @@ def _owner_of(box: dict[str, float], targets: list[ContentTarget]) -> ContentTar
         if share >= 0.5 and area < best_area:
             best, best_area = target, area
     return best
+
+
+# pdfminer's word rule (LAParams.word_margin): characters farther apart than
+# this share of the larger one's size are separate words.
+WORD_MARGIN = 0.1
+
+
+def _glyph_key(glyph: MeasuredGlyph) -> tuple:
+    box = glyph.bbox
+    return (glyph.text, *(round(box[side], 2) for side in "lbrt"))
+
+
+def _word_break(before: dict[str, float], after: dict[str, float]) -> bool:
+    """Whether a word ends between two glyphs drawn one after the other: the
+    second is on another line, or past the first by more than WORD_MARGIN of
+    its size, or well back from it."""
+    if not after["b"] <= (before["b"] + before["t"]) / 2 <= after["t"]:
+        return True
+    size = max(before["r"] - before["l"], before["t"] - before["b"])
+    gap = after["l"] - before["r"]
+    return gap > WORD_MARGIN * size or gap < -size
+
+
+def _word_owners(
+    measured: dict[int, MeasuredTextOp], targets: list[ContentTarget]
+) -> dict[tuple, ContentTarget | None]:
+    """Each glyph's owner, decided for its whole word (see _owner_of), as
+    element text takes whole words: a box that stops short of a word's last
+    letters, or of a "%" drawn on its own, still holds them. Words are the
+    glyphs in drawing order, broken at white space and by _word_break."""
+    words: list[list[MeasuredGlyph]] = []
+    previous: MeasuredGlyph | None = None
+    for idx in sorted(measured):
+        for glyph in measured[idx].glyphs:
+            if not glyph.text.strip():
+                previous = None
+                continue
+            if previous is None or _word_break(previous.bbox, glyph.bbox):
+                words.append([])
+            words[-1].append(glyph)
+            previous = glyph
+    owners: dict[tuple, ContentTarget | None] = {}
+    for word in words:
+        owner = _owner_of(union_bbox(glyph.bbox for glyph in word), targets)
+        for glyph in word:
+            owners[_glyph_key(glyph)] = owner
+    return owners
+
+
+def _owner_of_glyphs(
+    glyphs: list[MeasuredGlyph], word_owners: dict[tuple, ContentTarget | None]
+) -> ContentTarget | None:
+    """The owner most of these glyphs' words have."""
+    counts = Counter(word_owners.get(_glyph_key(glyph)) for glyph in glyphs if glyph.text.strip())
+    return counts.most_common(1)[0][0] if counts else None
 
 
 def _best_bbox_match(
@@ -1767,9 +1823,9 @@ def _measured_by_instruction(
 def _split_text_ops_across_targets(
     instructions: list,
     measured: dict[int, MeasuredTextOp],
-    targets: list[ContentTarget],
+    word_owners: dict[tuple, ContentTarget | None],
 ) -> tuple[list, dict[int, MeasuredTextOp], list[int]]:
-    """Split each TJ whose strings have more than one owner (see _owner_of)
+    """Split each TJ whose strings have more than one owner (see _word_owners)
     into consecutive TJs, one per owner, at TJ array element boundaries, so
     each can be tagged on its own. Rendering is unchanged: the text position
     carries over from one TJ to the next.
@@ -1785,13 +1841,13 @@ def _split_text_ops_across_targets(
         op = measured.get(idx)
         array = instr.operands[0] if str(instr.operator) == "TJ" and instr.operands else None
         owners: dict[int, ContentTarget | None] = {}
-        if op is not None and targets and isinstance(array, pikepdf.Array):
-            boxes: dict[int, list[dict[str, float]]] = {}
+        if op is not None and isinstance(array, pikepdf.Array):
+            strings: dict[int, list[MeasuredGlyph]] = {}
             for glyph in op.glyphs:
-                boxes.setdefault(glyph.element, []).append(glyph.bbox)
+                strings.setdefault(glyph.element, []).append(glyph)
             owners = {
-                element: _owner_of(union_bbox(element_boxes), targets)
-                for element, element_boxes in boxes.items()
+                element: _owner_of_glyphs(glyphs, word_owners)
+                for element, glyphs in strings.items()
             }
         if not isinstance(array, pikepdf.Array) or len(set(owners.values())) < 2:
             if op is not None:
@@ -3839,9 +3895,11 @@ def _rewrite_content_stream(
     passthrough_regions = passthrough_regions or []
     targets = _content_targets(elements)
     measured = _measured_by_instruction(instructions, measured_ops)
+    word_owners: dict[tuple, ContentTarget | None] = {}
     if measured is not None:
+        word_owners = _word_owners(measured, targets)
         instructions, measured, new_index = _split_text_ops_across_targets(
-            instructions, measured, targets
+            instructions, measured, word_owners
         )
         passthrough_regions = [
             dataclasses.replace(
@@ -3856,7 +3914,12 @@ def _rewrite_content_stream(
 
     mark_by_idx: dict[int, ContentTarget | int | str] = {}
     for run in text_runs:
-        owner = _owner_of(run.bbox, targets)
+        op = measured.get(run.instruction_idx) if measured is not None else None
+        owner = (
+            _owner_of_glyphs(op.glyphs, word_owners)
+            if op is not None and op.glyphs
+            else _owner_of(run.bbox, targets)
+        )
         for idx in range(run.segment_start_idx, run.segment_end_idx):
             mark_by_idx[idx] = owner if owner is not None else _ARTIFACT_MARK
     for region in regions:
