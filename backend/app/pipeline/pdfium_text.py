@@ -70,9 +70,12 @@ class PageText:
 
     def breaks_between(self, before: int, after: int) -> bool:
         """Whether a word break falls between two characters: other text
-        lies between them, or pdfium inferred a space or line break at or
-        between them, unless that line break follows a line-end hyphen."""
+        lies between them, either is a space the PDF draws, or pdfium
+        inferred a space or line break at or between them, unless that line
+        break follows a line-end hyphen."""
         if after <= before or any(not self.generated[i] for i in range(before + 1, after)):
+            return True
+        if self.chars[before].isspace() or self.chars[after].isspace():
             return True
         if self.chars[before] == LINE_END_HYPHEN:
             return False

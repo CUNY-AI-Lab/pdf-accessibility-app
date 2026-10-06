@@ -208,6 +208,19 @@ def test_words_split_between_two_marked_contents_keep_their_space(tmp_path):
     assert " ".join(screen_reader_text(path).split()) == "The office"
 
 
+def test_a_space_glyph_ending_one_marked_content_separates_the_next_word(tmp_path):
+    """The PDF draws the space, at the end of the first sequence; the second
+    word starts right after it, with no gap for pdfium to infer a space in."""
+    content = (
+        b"/P <</MCID 0>> BDC BT /F1 12 Tf 20 250 Td (participants ) Tj EMC "
+        b"/P <</MCID 1>> BDC (would) Tj ET EMC"
+    )
+    path = tmp_path / "space_glyph.pdf"
+    _paragraph_pdf(path, content, kids=[0, 1])
+
+    assert " ".join(screen_reader_text(path).split()) == "participants would"
+
+
 def test_page_text_joins_utf16_surrogate_pairs():
     from app.pipeline.pdfium_text import PageText
 
