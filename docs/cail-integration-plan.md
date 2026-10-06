@@ -195,6 +195,27 @@ Done so far (branch `agent/cail-integration-plan`), each measured in
   0.545, and heading levels (MHS-L) 0.361 → 0.430 on gold and 0.317 →
   0.391 on CUNY documents, above v1's 0.350.
 
+In progress (2026-10-06): **one tagging path.** The tagger decides which
+content belongs to which element two ways (whole text objects matched one
+to one by a weighted Hungarian assignment, or text runs scored one by one)
+and picks between them per page; it reads positions from four sources and
+writes `/ActualText` overlays because the result is not reliable alone.
+It also orders the structure tree by the order content is drawn, so
+Docling's reading order is never used. The replacement, each layer
+measured on the whole suite (captured tagger inputs make a re-run take
+minutes):
+
+1. One path: every text-showing unit (a `TJ` string or a `Tj`) goes to the
+   text element or table cell holding at least half of its glyph box (the
+   rule element text uses), splitting `TJ`s at owner changes; images go to
+   the figure holding most of them; everything else is an artifact, a path
+   wrapped whole. OCR form calls pass through to be tagged inside. The
+   region path, its Hungarian matching, and the docling-parse box
+   refinement go.
+2. Structure tree in Docling's reading order instead of drawing order.
+3. Element `/ActualText` overlays removed once the content assignment
+   stands on its own (kept for table cells and formulas where needed).
+
 Next, from the evaluation and from peer tools (opendataloader-pdf, olmOCR,
 the ASU/AWS remediation pipeline):
 
