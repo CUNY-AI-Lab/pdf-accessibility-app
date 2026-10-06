@@ -5,11 +5,10 @@ import textwrap
 import pikepdf
 
 from app.pipeline.tagger import (
-    ContentRegion,
     StructTreeBuilder,
     _add_bookmarks,
+    _allocate_fragment_mcid,
     _clean_bookmark_label,
-    _emit_tagged_region,
     _ensure_annotation_baseline,
     _infer_link_contents,
     _normalize_annotation_rect,
@@ -263,23 +262,7 @@ def test_link_annotation_nests_under_matched_text_struct_element():
 
     builder = StructTreeBuilder(pdf)
     builder.setup()
-    _emit_tagged_region(
-        [],
-        ContentRegion(
-            kind="text",
-            start_idx=0,
-            end_idx=0,
-            instructions=[],
-            bbox=source_element["bbox"],
-            text="read the example link for details",
-        ),
-        source_element,
-        builder,
-        0,
-        page.obj,
-        {},
-        set(),
-    )
+    _allocate_fragment_mcid(builder, source_element, 0, page.obj, {}, set())
 
     tagged = _tag_link_annotations(page, page.obj, builder, page_elements=[source_element])
     builder.finalize()

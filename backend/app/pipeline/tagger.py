@@ -16,25 +16,21 @@ import logging
 import math
 import mimetypes
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
-from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pikepdf
 from docling_core.types.doc.page import TextCellUnit
 from docling_parse.pdf_parser import DoclingPdfParser
 from PIL import Image
-from rtree import index as rtree_index
-from scipy.optimize import linear_sum_assignment
 
 from app.pipeline.element_text import accounts_for, readable
 from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
 from app.pipeline.page_frame import PageFrame
-from app.pipeline.page_glyphs import MeasuredGlyph, MeasuredTextOp, PdfGlyphReader, union_bbox
+from app.pipeline.page_glyphs import MeasuredTextOp, PdfGlyphReader, union_bbox
 from app.pipeline.pdf_repair import add_missing_icc_components
 from app.pipeline.pdfium_text import PdfiumText
 
@@ -46,13 +42,6 @@ logger = logging.getLogger(__name__)
 
 IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
-TEXT_ELEMENT_TYPES = frozenset({
-    "heading", "paragraph", "caption", "list_item", "code", "artifact", "table",
-    "formula", "note", "reference", "bib_entry", "toc_caption", "toc_item",
-    "toc_item_table",
-})
-MATCH_ACCEPT_THRESHOLD = 0.05
-LARGE_COST = 1e6
 BLANK_PAGE_NONWHITE_THRESHOLD = 245
 BLANK_PAGE_MAX_INK_RATIO = 0.001
 OCR_NOISE_ONLY_OPERATORS = frozenset({
@@ -91,10 +80,11 @@ CONTENT_PAINT_OPERATORS = frozenset({
     "sh",
     "INLINE IMAGE",
 })
-FRAGMENTED_TEXT_MIN_ELEMENTS = 2
-FRAGMENTED_TEXT_MIN_COVERAGE_GAIN = 2
-FRAGMENTED_TEXT_MIN_ASSIGNED_RATIO = 0.40
-FRAGMENTED_TEXT_MARK_ARTIFACT = -1
+# Path construction, clipping, and painting operators: a path object runs
+# from its first construction operator to its painting operator and is
+# marked as a whole.
+PATH_CONSTRUCTION_OPERATORS = frozenset({"m", "l", "c", "v", "y", "h", "re", "W", "W*"})
+PATH_PAINTING_OPERATORS = frozenset({"S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n"})
 LINK_SAFE_MAX_CHARS = 160
 LINK_SAFE_MAX_WORDS = 18
 TOC_TRAILING_PAGE_RE = re.compile(
@@ -448,6 +438,67 @@ def _element_boxes(item: dict[str, Any]) -> list[dict[str, float]]:
         for box in (item.get("bbox"), *(item.get("extra_bboxes") or ()))
         if isinstance(box, dict)
     ]
+
+
+@dataclass(frozen=True)
+class ContentTarget:
+    """A box content can belong to: one of a text or artifact element's
+    boxes, or a table cell. Targets of the same element (or cell) are the
+    same owner."""
+
+    elem_idx: int
+    cell_key: tuple[int, int] | None = None
+    box: dict[str, float] = field(default_factory=dict, compare=False, hash=False)
+    cell: dict | None = field(default=None, compare=False, hash=False)
+
+
+def _content_targets(elements: list[dict]) -> list[ContentTarget]:
+    """Every box text can belong to: each cell of a table with cells, and
+    each box of a text or artifact element (a table without cells is read
+    as text)."""
+    targets: list[ContentTarget] = []
+    for idx, elem in enumerate(elements):
+        elem_type = elem.get("type")
+        cells = [cell for cell in elem.get("cells") or [] if isinstance(cell, dict)]
+        if elem_type == "table" and cells:
+            for cell in cells:
+                box = _table_cell_bbox(elem, cell)
+                if box is not None:
+                    key = (
+                        _as_positive_int(cell.get("row", 0), default=0),
+                        _as_positive_int(cell.get("col", 0), default=0),
+                    )
+                    targets.append(ContentTarget(idx, key, box, cell))
+        elif elem_type in LINK_TEXT_ELEMENT_TYPES or elem_type in {"artifact", "table"}:
+            targets.extend(ContentTarget(idx, None, box) for box in _element_boxes(elem))
+    return targets
+
+
+def _owner_of(box: dict[str, float], targets: list[ContentTarget]) -> ContentTarget | None:
+    """The target content belongs to: one whose box holds the middle of the
+    content's height and at least half of its width, as element text takes
+    the words its boxes hold at least half of (see pdfium_text). Glyph boxes
+    run from the font's descent to its ascent, taller than the ink Docling
+    draws its boxes around, so height is judged by the middle. Of several
+    (nested boxes, such as line numbers inside a paragraph's box), the
+    smallest."""
+    middle = (box["b"] + box["t"]) / 2
+    width = box["r"] - box["l"]
+    best: ContentTarget | None = None
+    best_area = math.inf
+    for target in targets:
+        target_box = target.box
+        if not target_box["b"] <= middle <= target_box["t"]:
+            continue
+        if width > 0:
+            overlap = min(box["r"], target_box["r"]) - max(box["l"], target_box["l"])
+            share = max(overlap, 0.0) / width
+        else:
+            share = 1.0 if target_box["l"] <= box["l"] <= target_box["r"] else 0.0
+        area = _bbox_area(target_box)
+        if share >= 0.5 and area < best_area:
+            best, best_area = target, area
+    return best
 
 
 def _best_bbox_match(
@@ -1196,24 +1247,6 @@ def _bookmark_plan_entries(
     return entries
 
 
-def _table_has_consistent_column_count(cells: list[dict]) -> bool:
-    """Check whether table rows appear to have a consistent column count."""
-    if not cells:
-        return False
-
-    row_widths: dict[int, int] = {}
-    for cell in cells:
-        row = _as_positive_int(cell.get("row", 0), default=0)
-        col_span = _as_positive_int(cell.get("col_span", 1), default=1)
-        row_widths[row] = row_widths.get(row, 0) + col_span
-
-    if len(row_widths) <= 1:
-        return True
-
-    widths = list(row_widths.values())
-    return min(widths) == max(widths)
-
-
 def _complete_table_grid_cells(
     cells: Any,
     *,
@@ -1396,16 +1429,6 @@ class TextShowRun:
     bbox: dict[str, float]
     text: str = ""
     render_mode: int = 0
-
-
-@dataclass(frozen=True)
-class TableCellRunAssignment:
-    """A text-showing run assigned to a detected table cell."""
-
-    table_elem_idx: int
-    row: int
-    col: int
-    cell: dict
 
 
 @dataclass
@@ -1630,15 +1653,6 @@ def _page_content_bbox(content_owner) -> dict[str, float] | None:
     return None
 
 
-def _point_in_bbox(x: float, y: float, bbox: dict[str, float] | None, *, margin: float = 0.0) -> bool:
-    if not bbox:
-        return False
-    return (
-        bbox["l"] - margin <= x <= bbox["r"] + margin
-        and bbox["b"] - margin <= y <= bbox["t"] + margin
-    )
-
-
 def _extract_text_show_runs(
     instructions: list,
     *,
@@ -1753,37 +1767,16 @@ def _measured_by_instruction(
 def _split_text_ops_across_targets(
     instructions: list,
     measured: dict[int, MeasuredTextOp],
-    elements: list[dict],
+    targets: list[ContentTarget],
 ) -> tuple[list, dict[int, MeasuredTextOp], list[int]]:
-    """Split each TJ whose glyphs land in more than one table cell or text
-    element into consecutive TJs, one per cell or element, at TJ array
-    element boundaries, so each can be tagged on its own. Rendering is
-    unchanged: the text position carries over from one TJ to the next.
+    """Split each TJ whose strings have more than one owner (see _owner_of)
+    into consecutive TJs, one per owner, at TJ array element boundaries, so
+    each can be tagged on its own. Rendering is unchanged: the text position
+    carries over from one TJ to the next.
 
     Returns the new instructions, their measurements, and for each original
     instruction index (and one past the end) its new index, so positions
     found before the split can be moved."""
-    cell_boxes = [
-        box
-        for table_idx in _fragmented_table_element_indices(elements)
-        for cell in elements[table_idx].get("cells", [])
-        if isinstance(cell, dict)
-        and (box := _table_cell_bbox(elements[table_idx], cell)) is not None
-    ]
-    element_boxes = [
-        box
-        for _idx, element in _eligible_fragmented_text_elements(elements)
-        for box in _element_boxes(element)
-    ]
-    targets = cell_boxes + element_boxes
-
-    def target_of(glyph: MeasuredGlyph) -> int | None:
-        cx, cy = _bbox_center(glyph.bbox)
-        return next(
-            (index for index, box in enumerate(targets) if _point_in_bbox(cx, cy, box, margin=1.0)),
-            None,
-        )
-
     new_instructions: list = []
     new_measured: dict[int, MeasuredTextOp] = {}
     new_index: list[int] = []
@@ -1791,28 +1784,33 @@ def _split_text_ops_across_targets(
         new_index.append(len(new_instructions))
         op = measured.get(idx)
         array = instr.operands[0] if str(instr.operator) == "TJ" and instr.operands else None
-        element_targets: dict[int, int | None] = {}
-        if op is not None and targets:
+        owners: dict[int, ContentTarget | None] = {}
+        if op is not None and targets and isinstance(array, pikepdf.Array):
+            boxes: dict[int, list[dict[str, float]]] = {}
             for glyph in op.glyphs:
-                element_targets.setdefault(glyph.element, target_of(glyph))
-        if not isinstance(array, pikepdf.Array) or len(set(element_targets.values())) < 2:
+                boxes.setdefault(glyph.element, []).append(glyph.bbox)
+            owners = {
+                element: _owner_of(union_bbox(element_boxes), targets)
+                for element, element_boxes in boxes.items()
+            }
+        if not isinstance(array, pikepdf.Array) or len(set(owners.values())) < 2:
             if op is not None:
                 new_measured[len(new_instructions)] = op
             new_instructions.append(instr)
             continue
-        # Group array elements by target. A number (a position adjustment)
+        # Group array elements by owner. A number (a position adjustment)
         # stays with the elements before it; either side renders the same.
         groups: list[list[int]] = [[]]
-        group_target: int | None = None
+        group_owner: ContentTarget | None = None
         for element_index in range(len(array)):
-            drawn = element_index in element_targets
-            target = element_targets.get(element_index, group_target)
-            group_drawn = any(i in element_targets for i in groups[-1])
-            if drawn and group_drawn and target != group_target:
+            drawn = element_index in owners
+            owner = owners.get(element_index, group_owner)
+            group_drawn = any(i in owners for i in groups[-1])
+            if drawn and group_drawn and owner != group_owner:
                 groups.append([])
             groups[-1].append(element_index)
             if drawn:
-                group_target = target
+                group_owner = owner
         for group in groups:
             members = set(group)
             new_measured[len(new_instructions)] = MeasuredTextOp(
@@ -1871,66 +1869,6 @@ def _text_runs_look_like_hidden_ocr_layer(runs: list[TextShowRun]) -> bool:
     return hidden / max(len(runs), 1) >= 0.8
 
 
-def _eligible_fragmented_text_elements(elements: list[dict]) -> list[tuple[int, dict]]:
-    """Return semantic text elements that can be anchored to OCR text show runs."""
-    return [
-        (idx, elem)
-        for idx, elem in enumerate(elements)
-        if elem.get("type") in LINK_TEXT_ELEMENT_TYPES and isinstance(elem.get("bbox"), dict)
-    ]
-
-
-def _assign_text_show_runs_to_elements(
-    runs: list[TextShowRun],
-    elements: list[dict],
-) -> dict[int, int]:
-    """Assign positioned text show runs to containing semantic elements."""
-    eligible = _eligible_fragmented_text_elements(elements)
-    if not runs or not eligible:
-        return {}
-
-    assignments: dict[int, int] = {}
-    for run_idx, run in enumerate(runs):
-        best_elem_idx: int | None = None
-        best_score = -1.0
-        for elem_idx, elem in eligible:
-            for ebbox in _element_boxes(elem):
-                point_inside = _point_in_bbox(run.cx, run.cy, ebbox, margin=4.0)
-                relaxed_overlap = _bbox_intersection(_expand_bbox(run.bbox, 2.0), ebbox)
-                if not point_inside and relaxed_overlap <= 0:
-                    continue
-
-                spatial = max(
-                    _containment_ratio(run.bbox, ebbox),
-                    _bbox_iou(run.bbox, ebbox),
-                    _distance_score(run.bbox, ebbox),
-                )
-                text = _text_similarity(run.text, elem.get("text", ""))
-                area_penalty = min(_bbox_area(ebbox) / 2_000_000.0, 0.20)
-                score = (
-                    (1.0 if point_inside else 0.0) + 0.70 * spatial + 0.10 * text - area_penalty
-                )
-                if score > best_score:
-                    best_score = score
-                    best_elem_idx = elem_idx
-
-        if best_elem_idx is not None:
-            assignments[run_idx] = best_elem_idx
-
-    return assignments
-
-
-def _fragmented_table_element_indices(elements: list[dict]) -> set[int]:
-    return {
-        idx
-        for idx, elem in enumerate(elements)
-        if elem.get("type") == "table"
-        and isinstance(elem.get("bbox"), dict)
-        and isinstance(elem.get("cells"), list)
-        and elem.get("cells")
-    }
-
-
 def _table_cell_bbox(table: dict, cell: dict) -> dict[str, float] | None:
     """The cell's own box when the structure step has one (Docling's, fitted
     to the cell text); otherwise an even share of the table's box."""
@@ -1966,135 +1904,6 @@ def _table_cell_bbox(table: dict, cell: dict) -> dict[str, float] | None:
         "t": top - row * row_h,
         "b": top - min(num_rows, row + row_span) * row_h,
     }
-
-
-def _table_cell_text_score(run_text: str, cell_text: str) -> float:
-    run_norm = _normalize_text(run_text)
-    cell_norm = _normalize_text(cell_text)
-    if not run_norm or not cell_norm:
-        return 0.0
-    if run_norm in cell_norm:
-        return 1.0
-    return _text_similarity(run_norm, cell_norm)
-
-
-def _assign_text_show_runs_to_table_cells(
-    runs: list[TextShowRun],
-    elements: list[dict],
-) -> dict[int, TableCellRunAssignment]:
-    """Assign OCR word runs inside detected table bboxes to inferred table cells."""
-    table_element_indices = _fragmented_table_element_indices(elements)
-    table_targets: list[tuple[int, dict, dict, dict[str, float]]] = []
-    for elem_idx, table in enumerate(elements):
-        if elem_idx not in table_element_indices:
-            continue
-        for cell in table.get("cells", []):
-            if not isinstance(cell, dict):
-                continue
-            cell_bbox = _table_cell_bbox(table, cell)
-            if cell_bbox is None:
-                continue
-            table_targets.append((elem_idx, table, cell, cell_bbox))
-
-    if not runs or not table_targets:
-        return {}
-
-    assignments: dict[int, TableCellRunAssignment] = {}
-    for run_idx, run in enumerate(runs):
-        best: tuple[int, dict, dict, dict[str, float]] | None = None
-        best_score = -1.0
-        for elem_idx, table, cell, cell_bbox in table_targets:
-            point_inside = _point_in_bbox(run.cx, run.cy, cell_bbox, margin=3.0)
-            relaxed_overlap = _bbox_intersection(_expand_bbox(run.bbox, 1.0), cell_bbox)
-            if not point_inside and relaxed_overlap <= 0:
-                continue
-
-            spatial = max(
-                _containment_ratio(run.bbox, cell_bbox),
-                _bbox_iou(run.bbox, cell_bbox),
-                _distance_score(run.bbox, cell_bbox),
-            )
-            text = _table_cell_text_score(run.text, str(cell.get("text") or ""))
-            score = (1.0 if point_inside else 0.0) + 0.65 * spatial + 0.25 * text
-            if score > best_score:
-                best_score = score
-                best = (elem_idx, table, cell, cell_bbox)
-
-        if best is None:
-            continue
-        elem_idx, _table, cell, _cell_bbox = best
-        assignments[run_idx] = TableCellRunAssignment(
-            table_elem_idx=elem_idx,
-            row=_as_positive_int(cell.get("row", 0), default=0),
-            col=_as_positive_int(cell.get("col", 0), default=0),
-            cell=cell,
-        )
-
-    return assignments
-
-
-def _region_path_tagged_runs(
-    regions: list[ContentRegion],
-    normal_matches: dict[int, int],
-    elements: list[dict],
-    text_runs: list[TextShowRun],
-    text_run_assignments: dict[int, int],
-) -> int:
-    """How many text runs region matching would tag as the element they
-    belong to.
-
-    Region matching pairs each content region with at most one element. When
-    a paragraph is drawn as several text objects (one per OCR line), only one
-    of them is tagged and the rest become artifacts; when one text object
-    draws several elements, all of it is tagged as one of them.
-    """
-    region_element = {
-        (regions[region_idx].start_idx, regions[region_idx].end_idx): elem_idx
-        for region_idx, elem_idx in normal_matches.items()
-        if 0 <= region_idx < len(regions)
-        and 0 <= elem_idx < len(elements)
-        and elements[elem_idx].get("type") != "artifact"
-    }
-    return sum(
-        1
-        for run_idx, run in enumerate(text_runs)
-        for (start, end), elem_idx in region_element.items()
-        if start <= run.instruction_idx < end
-        and text_run_assignments.get(run_idx, elem_idx) == elem_idx
-    )
-
-
-def _should_use_fragmented_text_rewrite(
-    *,
-    elements: list[dict],
-    normal_matches: dict[int, int],
-    text_run_assignments: dict[int, int],
-    table_cell_assignments: dict[int, TableCellRunAssignment],
-    region_tagged_runs: int,
-) -> bool:
-    """Decide whether tagging text runs one by one (the fragmented path)
-    beats matching whole text objects to elements (the region path)."""
-    if len(set(text_run_assignments) | set(table_cell_assignments)) > region_tagged_runs:
-        # Region matching would drop recognized text from the structure tree.
-        return True
-    if table_cell_assignments:
-        # Region matching tags a table as one block; only the fragmented
-        # path puts text into its cells.
-        return True
-
-    eligible = {idx for idx, _elem in _eligible_fragmented_text_elements(elements)}
-    if len(eligible) < FRAGMENTED_TEXT_MIN_ELEMENTS:
-        return False
-    normally_matched = {idx for idx in normal_matches.values() if idx in eligible}
-    fragmented_matched = {idx for idx in text_run_assignments.values() if idx in eligible}
-    if len(fragmented_matched) < FRAGMENTED_TEXT_MIN_ELEMENTS:
-        return False
-    assigned_ratio = len(fragmented_matched) / len(eligible)
-    gained = len(fragmented_matched) - len(normally_matched)
-    return (
-        gained >= FRAGMENTED_TEXT_MIN_COVERAGE_GAIN
-        and assigned_ratio >= FRAGMENTED_TEXT_MIN_ASSIGNED_RATIO
-    )
 
 
 def _matrix_tuple(value: Any) -> tuple[float, float, float, float, float, float]:
@@ -2270,136 +2079,6 @@ def _distance(x1: float, y1: float, x2: float, y2: float) -> float:
     return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
 
 
-def _text_similarity(a: str, b: str) -> float:
-    """Compute fuzzy text similarity for tie-breaking ambiguous spatial matches."""
-    a_norm = _normalize_text(a)
-    b_norm = _normalize_text(b)
-    if not a_norm or not b_norm:
-        return 0.0
-    if a_norm in b_norm or b_norm in a_norm:
-        shorter = min(len(a_norm), len(b_norm))
-        longer = max(len(a_norm), len(b_norm))
-        containment = shorter / longer if longer else 0.0
-    else:
-        containment = 0.0
-    ratio = SequenceMatcher(None, a_norm, b_norm).ratio()
-    return max(containment, ratio)
-
-
-def _distance_score(a: dict[str, float] | None, b: dict[str, float] | None) -> float:
-    """Convert center distance into a normalized [0,1] score."""
-    if not a or not b:
-        return 0.0
-    ax, ay = _bbox_center(a)
-    bx, by = _bbox_center(b)
-    dist = _distance(ax, ay, bx, by)
-    diag = math.sqrt((b["r"] - b["l"]) ** 2 + (b["t"] - b["b"]) ** 2)
-    norm = dist / max(diag * 2, 1.0)
-    return max(0.0, 1.0 - norm)
-
-
-def _matching_score(region: ContentRegion, element: dict) -> float:
-    """Score a region-element pair using containment/IoU + text similarity."""
-    rbbox = _region_bbox(region)
-    boxes = _element_boxes(element)
-    if not rbbox or not boxes:
-        return 0.0
-
-    spatial, dist = max(
-        (
-            max(
-                _containment_ratio(rbbox, ebbox),
-                0.6 * _bbox_iou(rbbox, ebbox) + 0.4 * _containment_ratio(ebbox, rbbox),
-            ),
-            _distance_score(rbbox, ebbox),
-        )
-        for ebbox in boxes
-    )
-
-    if region.kind == "text":
-        text = _text_similarity(region.text, element.get("text", ""))
-        return 0.65 * spatial + 0.25 * text + 0.10 * dist
-
-    text = _text_similarity(region.text, element.get("caption", ""))
-    return 0.85 * spatial + 0.10 * dist + 0.05 * text
-
-
-def _candidate_element_positions(
-    region_bbox: dict[str, float],
-    spatial_index: rtree_index.Index,
-    bbox_element_positions: list[int],
-) -> list[int]:
-    """Query nearby candidate elements via R-tree with bounded expansion."""
-    candidates = list(spatial_index.intersection(_bbox_tuple(_expand_bbox(region_bbox, 24))))
-    if not candidates:
-        candidates = list(spatial_index.intersection(_bbox_tuple(_expand_bbox(region_bbox, 96))))
-    if not candidates:
-        candidates = bbox_element_positions.copy()
-    return list(dict.fromkeys(candidates))
-
-
-def _optimal_match(
-    regions: list[tuple[int, ContentRegion]],
-    elements: list[tuple[int, dict]],
-) -> dict[int, int]:
-    """Globally optimal region-element assignment via Hungarian algorithm."""
-    if not regions or not elements:
-        return {}
-
-    spatial_index = rtree_index.Index()
-    bbox_element_positions: list[int] = []
-    for epos, (_elem_idx, elem) in enumerate(elements):
-        boxes = _element_boxes(elem)
-        for ebbox in boxes:
-            spatial_index.insert(epos, _bbox_tuple(ebbox))
-        if boxes:
-            bbox_element_positions.append(epos)
-
-    cost = np.full((len(regions), len(elements)), LARGE_COST, dtype=np.float64)
-    for rpos, (_region_idx, region) in enumerate(regions):
-        rbbox = _region_bbox(region)
-        if not rbbox:
-            continue
-        candidates = _candidate_element_positions(
-            rbbox,
-            spatial_index,
-            bbox_element_positions,
-        )
-        for epos in candidates:
-            _elem_idx, elem = elements[epos]
-            score = _matching_score(region, elem)
-            cost[rpos, epos] = 1.0 - score
-
-    row_idx, col_idx = linear_sum_assignment(cost)
-    matches: dict[int, int] = {}
-    for rpos, epos in zip(row_idx, col_idx, strict=False):
-        score = 1.0 - cost[rpos, epos]
-        if score < MATCH_ACCEPT_THRESHOLD:
-            continue
-        region_idx = regions[rpos][0]
-        elem_idx = elements[epos][0]
-        matches[region_idx] = elem_idx
-    return matches
-
-
-def _build_docling_parse_page_lines(
-    parser_doc: Any | None,
-    page_index: int,
-    cache: dict[int, list[dict]],
-) -> list[dict]:
-    """Extract line-level text cells from docling-parse for one page."""
-    page = _get_docling_parse_page(parser_doc, page_index)
-    if page is None:
-        cache[page_index] = []
-        return []
-    if page_index in cache:
-        return cache[page_index]
-
-    lines = _extract_docling_parse_text_cells(page, TextCellUnit.LINE)
-    cache[page_index] = lines
-    return lines
-
-
 def _get_docling_parse_page(parser_doc: Any | None, page_index: int) -> Any | None:
     """Return a docling-parse page object for a 0-indexed page, if available."""
     if parser_doc is None:
@@ -2524,92 +2203,6 @@ def _build_docling_parse_page_widgets(
     cache[page_index] = widgets
     return widgets
 
-
-def _refine_text_regions_with_docling_parse(
-    text_regions: list[tuple[int, ContentRegion]],
-    page_lines: list[dict],
-) -> None:
-    """Use docling-parse line boxes to improve region bboxes in Docling coordinates."""
-    if not text_regions or not page_lines:
-        return
-
-    spatial_index = rtree_index.Index()
-    for i, line in enumerate(page_lines):
-        spatial_index.insert(i, _bbox_tuple(line["bbox"]))
-
-    for _, region in text_regions:
-        rbbox = _region_bbox(region)
-        if not rbbox:
-            continue
-        candidates = list(spatial_index.intersection(_bbox_tuple(_expand_bbox(rbbox, 24))))
-        if not candidates:
-            candidates = list(spatial_index.intersection(_bbox_tuple(_expand_bbox(rbbox, 96))))
-        if not candidates:
-            continue
-
-        best_line = None
-        best_score = 0.0
-        best_spatial = 0.0
-        best_text = 0.0
-        for cand in candidates:
-            line = page_lines[cand]
-            lbbox = line["bbox"]
-            spatial = max(
-                _containment_ratio(rbbox, lbbox),
-                _containment_ratio(lbbox, rbbox),
-                _bbox_iou(rbbox, lbbox),
-            )
-            text = _text_similarity(region.text, line["text"])
-            score = 0.6 * spatial + 0.4 * text
-            if score > best_score:
-                best_score = score
-                best_line = line
-                best_spatial = spatial
-                best_text = text
-
-        if not best_line:
-            continue
-        # Only trust docling-parse replacement on strong evidence.
-        if best_text < 0.65 and best_spatial < 0.8:
-            continue
-
-        region.bbox = best_line["bbox"]
-        region.cx, region.cy = _bbox_center(region.bbox)
-        region.width = max(0.0, region.bbox["r"] - region.bbox["l"])
-        region.height = max(0.0, region.bbox["t"] - region.bbox["b"])
-        if not region.text and best_line["text"]:
-            region.text = best_line["text"]
-
-
-def _match_regions_to_elements(
-    regions: list[ContentRegion],
-    elements: list[dict],
-    docling_page_lines: list[dict] | None = None,
-) -> dict[int, int]:
-    """Match content regions to Docling elements with robust global assignment.
-
-    Returns: dict mapping region_index -> element_index.
-    """
-    text_elements = [(i, el) for i, el in enumerate(elements)
-                     if el.get("type") in TEXT_ELEMENT_TYPES]
-    figure_elements = [(i, el) for i, el in enumerate(elements)
-                       if el.get("type") == "figure"]
-
-    text_regions = [(i, r) for i, r in enumerate(regions) if r.kind == "text"]
-    image_regions = [(i, r) for i, r in enumerate(regions) if r.kind == "image"]
-
-    if docling_page_lines:
-        _refine_text_regions_with_docling_parse(text_regions, docling_page_lines)
-
-    matches: dict[int, int] = {}
-    matches.update(_optimal_match(text_regions, text_elements))
-    matches.update(_optimal_match(image_regions, figure_elements))
-    return matches
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Structure tree builder
-# ──────────────────────────────────────────────────────────────────────────────
 
 class StructTreeBuilder:
     """Manages MCID allocation, StructElem creation, and ParentTree construction."""
@@ -3728,7 +3321,10 @@ def _is_full_page_scan_image_region(
 ) -> bool:
     if region.kind != "image" or not region.bbox:
         return False
-    if not _eligible_fragmented_text_elements(elements):
+    if not any(
+        elem.get("type") in LINK_TEXT_ELEMENT_TYPES and isinstance(elem.get("bbox"), dict)
+        for elem in elements
+    ):
         return False
     content_bbox = _page_content_bbox(content_owner)
     if not content_bbox:
@@ -3737,24 +3333,6 @@ def _is_full_page_scan_image_region(
         _containment_ratio(region.bbox, content_bbox) >= 0.85
         and _containment_ratio(content_bbox, region.bbox) >= 0.85
     )
-
-
-def _fragmented_image_matches(
-    regions: list[ContentRegion],
-    elements: list[dict],
-    content_owner,
-) -> dict[int, int]:
-    image_regions = [
-        (region_idx, region)
-        for region_idx, region in enumerate(regions)
-        if region.kind == "image" and not _is_full_page_scan_image_region(region, content_owner, elements)
-    ]
-    figure_elements = [
-        (elem_idx, elem)
-        for elem_idx, elem in enumerate(elements)
-        if elem.get("type") == "figure"
-    ]
-    return _optimal_match(image_regions, figure_elements)
 
 
 def _resolved_figure_alt_for_tagging(elem: dict, alt_lookup: dict[int, str]) -> str:
@@ -3884,436 +3462,6 @@ def _make_clipped_image_figure_instructions(
         _make_emc(),
     ]
 
-
-def _rewrite_content_stream_with_fragmented_text(
-    pdf: pikepdf.Pdf,
-    content_owner,
-    page_index: int,
-    elements: list[dict],
-    builder: StructTreeBuilder,
-    page_ref: pikepdf.Object,
-    alt_lookup: dict[int, str],
-    decorative_figures: set[int],
-    *,
-    instructions: list,
-    regions: list[ContentRegion],
-    text_runs: list[TextShowRun],
-    text_run_assignments: dict[int, int],
-    table_cell_assignments: dict[int, TableCellRunAssignment],
-    stream_owner: pikepdf.Object | None = None,
-) -> set[int]:
-    """Rewrite a stream using word-level OCR text anchors when BT blocks are giant."""
-    table_cell_mark_lookup: dict[tuple[str, int, int, int], TableCellRunAssignment] = {}
-    mark_by_idx: dict[int, int | tuple[str, int, int, int]] = {}
-    for run_idx, run in enumerate(text_runs):
-        table_assignment = table_cell_assignments.get(run_idx)
-        if table_assignment is not None:
-            mark = (
-                "table_cell",
-                table_assignment.table_elem_idx,
-                table_assignment.row,
-                table_assignment.col,
-            )
-            table_cell_mark_lookup[mark] = table_assignment
-        else:
-            mark = text_run_assignments.get(run_idx, FRAGMENTED_TEXT_MARK_ARTIFACT)
-        for idx in range(run.segment_start_idx, run.segment_end_idx):
-            mark_by_idx[idx] = mark
-
-    image_matches = _fragmented_image_matches(regions, elements, content_owner)
-    for region_idx, region in enumerate(regions):
-        if region.kind != "image":
-            continue
-        mark = image_matches.get(region_idx, FRAGMENTED_TEXT_MARK_ARTIFACT)
-        for idx in range(region.start_idx, region.end_idx):
-            mark_by_idx[idx] = mark
-
-    overlay_targets: list[tuple[ContentRegion, int]] = []
-    decorative_covered: set[int] = set()
-    if stream_owner is None and _text_runs_look_like_hidden_ocr_layer(text_runs):
-        overlay_targets, decorative_covered = _scan_figure_overlay_targets(
-            regions,
-            elements,
-            content_owner,
-            alt_lookup,
-            decorative_figures,
-        )
-    matched_element_indices = {
-        elem_idx
-        for elem_idx in text_run_assignments.values()
-        if elem_idx != FRAGMENTED_TEXT_MARK_ARTIFACT
-    }
-    matched_element_indices.update(
-        elem_idx
-        for elem_idx in image_matches.values()
-        if elem_idx != FRAGMENTED_TEXT_MARK_ARTIFACT
-    )
-    matched_element_indices.update(decorative_covered)
-
-    new_instructions = []
-    active_mark: int | tuple[str, int, int, int] | None = None
-
-    def close_active() -> None:
-        nonlocal active_mark
-        if active_mark is not None:
-            new_instructions.append(_make_emc())
-            active_mark = None
-
-    for idx, instr in enumerate(instructions):
-        mark = mark_by_idx.get(idx)
-        if mark != active_mark:
-            close_active()
-            if mark == FRAGMENTED_TEXT_MARK_ARTIFACT:
-                new_instructions.append(_make_bmc_artifact())
-                active_mark = mark
-            elif isinstance(mark, tuple) and mark[0] == "table_cell":
-                assignment = table_cell_mark_lookup.get(mark)
-                allocated = None
-                if assignment is not None and 0 <= assignment.table_elem_idx < len(elements):
-                    allocated = builder.add_table_cell_fragment(
-                        page_index,
-                        page_ref,
-                        elements[assignment.table_elem_idx],
-                        assignment.cell,
-                        stream_owner=stream_owner,
-                    )
-                if allocated is None:
-                    new_instructions.append(_make_bmc_artifact())
-                    active_mark = FRAGMENTED_TEXT_MARK_ARTIFACT
-                else:
-                    tag, mcid = allocated
-                    new_instructions.append(_make_bdc(tag, mcid))
-                    matched_element_indices.add(assignment.table_elem_idx)
-                    active_mark = mark
-            elif mark is not None and 0 <= mark < len(elements):
-                allocated = _allocate_fragment_mcid(
-                    builder,
-                    elements[mark],
-                    page_index,
-                    page_ref,
-                    alt_lookup,
-                    decorative_figures,
-                    stream_owner=stream_owner,
-                )
-                if allocated is None:
-                    new_instructions.append(_make_bmc_artifact())
-                    active_mark = FRAGMENTED_TEXT_MARK_ARTIFACT
-                else:
-                    tag, mcid, actual_text = allocated
-                    new_instructions.append(_make_bdc(tag, mcid, actual_text=actual_text))
-                    active_mark = mark
-            else:
-                active_mark = None
-
-        if mark is None and _instruction_paints_content(instr):
-            new_instructions.append(_make_bmc_artifact())
-            new_instructions.append(instr)
-            new_instructions.append(_make_emc())
-        else:
-            new_instructions.append(instr)
-
-    close_active()
-    for source_region, elem_idx in overlay_targets:
-        overlay = _make_clipped_image_figure_instructions(
-            source_region,
-            elements[elem_idx],
-            builder,
-            page_index,
-            page_ref,
-            alt_lookup,
-            decorative_figures,
-            stream_owner=stream_owner,
-        )
-        if overlay:
-            new_instructions.extend(overlay)
-            matched_element_indices.add(elem_idx)
-
-    try:
-        new_stream = pikepdf.unparse_content_stream(new_instructions)
-        if isinstance(content_owner, pikepdf.Page):
-            content_owner["/Contents"] = pdf.make_stream(new_stream)
-        else:
-            content_owner.write(new_stream)
-    except Exception as e:
-        logger.error(f"Failed to write fragmented text content stream for page {page_index}: {e}")
-        return set()
-
-    return matched_element_indices
-
-
-def _rewrite_content_stream(
-    pdf: pikepdf.Pdf,
-    content_owner,
-    page_index: int,
-    elements: list[dict],
-    builder: StructTreeBuilder,
-    page_ref: pikepdf.Object,
-    alt_lookup: dict[int, str],
-    decorative_figures: set[int] | None = None,
-    docling_page_lines: list[dict] | None = None,
-    *,
-    initial_ctm: tuple[float, float, float, float, float, float] = IDENTITY,
-    stream_owner: pikepdf.Object | None = None,
-    passthrough_regions: list[ContentRegion] | None = None,
-    measured_ops: list[MeasuredTextOp] | None = None,
-) -> set[int]:
-    """Insert BDC/EMC markers into the page's content stream using position-based matching."""
-    try:
-        instructions = list(pikepdf.parse_content_stream(content_owner))
-    except Exception as e:
-        logger.warning(f"Could not parse content stream for page {page_index}: {e}")
-        return set()
-
-    instructions = _strip_existing_markers(instructions)
-    if not instructions:
-        return set()
-
-    passthrough_regions = passthrough_regions or []
-    measured = _measured_by_instruction(instructions, measured_ops)
-    if measured is not None:
-        instructions, measured, new_index = _split_text_ops_across_targets(
-            instructions, measured, elements
-        )
-        passthrough_regions = [
-            dataclasses.replace(
-                region, start_idx=new_index[region.start_idx], end_idx=new_index[region.end_idx]
-            )
-            for region in passthrough_regions
-        ]
-    regions = _extract_content_regions(instructions, content_owner, initial_ctm=initial_ctm)
-    text_runs = _extract_text_show_runs(instructions, initial_ctm=initial_ctm)
-    if measured is not None:
-        _apply_measured_geometry(regions, text_runs, measured)
-    regions.extend(passthrough_regions)
-    regions.sort(key=lambda region: region.start_idx)
-    matches = _match_regions_to_elements(
-        regions,
-        elements,
-        docling_page_lines=docling_page_lines,
-    )
-    text_run_assignments = _assign_text_show_runs_to_elements(text_runs, elements)
-    table_cell_assignments = _assign_text_show_runs_to_table_cells(text_runs, elements)
-    fragmented = _should_use_fragmented_text_rewrite(
-        elements=elements,
-        normal_matches=matches,
-        text_run_assignments=text_run_assignments,
-        table_cell_assignments=table_cell_assignments,
-        region_tagged_runs=_region_path_tagged_runs(
-            regions, matches, elements, text_runs, text_run_assignments
-        ),
-    )
-    if fragmented:
-        return _rewrite_content_stream_with_fragmented_text(
-            pdf,
-            content_owner,
-            page_index,
-            elements,
-            builder,
-            page_ref,
-            alt_lookup,
-            decorative_figures or set(),
-            instructions=instructions,
-            regions=regions,
-            text_runs=text_runs,
-            text_run_assignments=text_run_assignments,
-            table_cell_assignments=table_cell_assignments,
-            stream_owner=stream_owner,
-        )
-    matched_element_indices = set(matches.values())
-
-    # Map instruction start indices to region indices
-    region_by_start: dict[int, int] = {
-        region.start_idx: ri for ri, region in enumerate(regions)
-    }
-
-    # Walk instructions, inserting markers
-    new_instructions = []
-    i = 0
-    while i < len(instructions):
-        if i in region_by_start:
-            ri = region_by_start[i]
-            region = regions[ri]
-            elem_idx = matches.get(ri)
-
-            if region.kind == "passthrough":
-                new_instructions.extend(region.instructions)
-            elif elem_idx is not None:
-                _emit_tagged_region(
-                    new_instructions, region, elements[elem_idx],
-                    builder, page_index, page_ref, alt_lookup, decorative_figures or set(),
-                    stream_owner=stream_owner,
-                )
-            else:
-                new_instructions.append(_make_bmc_artifact())
-                new_instructions.extend(region.instructions)
-                new_instructions.append(_make_emc())
-
-            i = region.end_idx
-        else:
-            artifact_chunk = []
-            while i < len(instructions) and i not in region_by_start:
-                artifact_chunk.append(instructions[i])
-                i += 1
-            if artifact_chunk:
-                new_instructions.append(_make_bmc_artifact())
-                new_instructions.extend(artifact_chunk)
-                new_instructions.append(_make_emc())
-
-    try:
-        new_stream = pikepdf.unparse_content_stream(new_instructions)
-        if isinstance(content_owner, pikepdf.Page):
-            content_owner["/Contents"] = pdf.make_stream(new_stream)
-        else:
-            content_owner.write(new_stream)
-    except Exception as e:
-        logger.error(f"Failed to write content stream for page {page_index}: {e}")
-        return set()
-
-    return matched_element_indices
-
-
-def _emit_tagged_region(
-    new_instructions: list,
-    region: ContentRegion,
-    elem: dict,
-    builder: StructTreeBuilder,
-    page_index: int,
-    page_ref: pikepdf.Object,
-    alt_lookup: dict[int, str],
-    decorative_figures: set[int],
-    *,
-    stream_owner: pikepdf.Object | None = None,
-):
-    """Emit a tagged content region based on the matched element type."""
-    elem_type = elem.get("type", "")
-    actual_text = _element_actual_text(elem)
-    accessible_text = _element_accessible_text(elem)
-
-    # Types that wrap content as artifact (no struct elem needed)
-    if elem_type == "artifact":
-        new_instructions.append(_make_bmc_artifact(elem))
-        new_instructions.extend(region.instructions)
-        new_instructions.append(_make_emc())
-        return
-
-    # Tables: struct tree built separately, content stream wrapped as artifact
-    if elem_type == "table":
-        builder.add_table(page_index, page_ref, elem, stream_owner=stream_owner)
-        new_instructions.append(_make_bmc_artifact())
-        new_instructions.extend(region.instructions)
-        new_instructions.append(_make_emc())
-        return
-
-    # List items: use cached list groups to avoid duplicates
-    if elem_type == "list_item":
-        mcid = builder.add_list_item(
-            page_index,
-            page_ref,
-            elem.get("list_group_ref"),
-            parent_list_group_ref=elem.get("parent_list_group_ref"),
-            marker=elem.get("marker"),
-            enumerated=bool(elem.get("enumerated", False)),
-            stream_owner=stream_owner,
-        )
-        if hasattr(builder, "remember_source_element"):
-            builder.remember_source_element(elem, stream_owner or page_ref, mcid)
-        new_instructions.append(_make_bdc("LBody", mcid, actual_text=actual_text))
-        new_instructions.extend(region.instructions)
-        new_instructions.append(_make_emc())
-        return
-
-    # All other types: allocate struct elem, wrap with BDC/EMC
-    elem_lang = elem.get("lang")  # per-element language (may be None)
-
-    if elem_type == "heading":
-        level = max(1, min(6, _as_positive_int(elem.get("level", 1), default=1)))
-        mcid = builder.add_heading(
-            level,
-            page_index,
-            page_ref,
-            accessible_text,
-            lang=elem_lang,
-            stream_owner=stream_owner,
-        )
-        tag = f"H{level}"
-    elif elem_type == "figure":
-        fig_idx = elem.get("figure_index")
-        if fig_idx in decorative_figures:
-            new_instructions.append(_make_bmc_artifact())
-            new_instructions.extend(region.instructions)
-            new_instructions.append(_make_emc())
-            return
-        alt = (
-            alt_lookup.get(fig_idx)
-            or elem.get("caption")
-            or elem.get("text")
-        )
-        if isinstance(alt, str):
-            alt = alt.strip()
-        mcid = builder.add_figure(
-            page_index,
-            page_ref,
-            alt_text=alt or None,
-            stream_owner=stream_owner,
-        )
-        tag = "Figure"
-    elif elem_type == "code":
-        mcid = builder.add_code(page_index, page_ref, lang=elem_lang, stream_owner=stream_owner)
-        tag = "Code"
-    elif elem_type == "formula":
-        alt = _formula_alt_text(actual_text or accessible_text)
-        if isinstance(alt, str):
-            alt = alt.strip()
-        mcid = builder.add_formula(
-            page_index,
-            page_ref,
-            alt_text=alt or None,
-            stream_owner=stream_owner,
-        )
-        tag = "Formula"
-    elif elem_type == "note":
-        mcid = builder.add_note(page_index, page_ref, stream_owner=stream_owner)
-        tag = "Note"
-    elif elem_type == "reference":
-        mcid = builder.add_reference(page_index, page_ref, stream_owner=stream_owner)
-        tag = "Reference"
-    elif elem_type == "bib_entry":
-        mcid = builder.add_bib_entry(page_index, page_ref, stream_owner=stream_owner)
-        tag = "BibEntry"
-    elif elem_type == "caption":
-        mcid = builder.add_caption(page_index, page_ref, stream_owner=stream_owner)
-        tag = "Caption"
-    elif elem_type == "toc_caption":
-        mcid = builder.add_toc_caption(
-            page_index,
-            page_ref,
-            elem.get("toc_group_ref"),
-            stream_owner=stream_owner,
-        )
-        tag = "Caption"
-    elif elem_type in {"toc_item", "toc_item_table"}:
-        mcid = builder.add_toc_item(
-            page_index,
-            page_ref,
-            elem.get("toc_group_ref"),
-            stream_owner=stream_owner,
-        )
-        tag = "TOCI"
-    else:
-        # paragraph or unknown → /P
-        mcid = builder.add_paragraph(page_index, page_ref, lang=elem_lang, stream_owner=stream_owner)
-        tag = "P"
-
-    if hasattr(builder, "remember_source_element"):
-        builder.remember_source_element(elem, stream_owner or page_ref, mcid)
-    new_instructions.append(_make_bdc(tag, mcid, actual_text=actual_text))
-    new_instructions.extend(region.instructions)
-    new_instructions.append(_make_emc())
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# BDC/EMC instruction constructors
-# ──────────────────────────────────────────────────────────────────────────────
 
 def _element_accessible_text(elem: dict) -> str:
     return str(
@@ -4590,6 +3738,225 @@ def _make_bdc(
 
 def _make_emc() -> pikepdf.ContentStreamInstruction:
     return pikepdf.ContentStreamInstruction([], pikepdf.Operator("EMC"))
+
+
+def _figure_of(
+    region: ContentRegion,
+    elements: list[dict],
+    content_owner,
+) -> int | None:
+    """The figure an image belongs to: the one whose box and the image's
+    overlap by at least half of the smaller of the two (an image cropped to
+    the figure, or a figure made of several images). A full-page scan
+    behind a page's text belongs to none."""
+    box = _region_bbox(region)
+    if not box or _is_full_page_scan_image_region(region, content_owner, elements):
+        return None
+    best: int | None = None
+    best_share = 0.5
+    for idx, elem in enumerate(elements):
+        figure_box = elem.get("bbox")
+        if elem.get("type") != "figure" or not isinstance(figure_box, dict):
+            continue
+        smaller = min(_bbox_area(box), _bbox_area(figure_box))
+        share = _bbox_intersection(box, figure_box) / smaller if smaller > 0 else 0.0
+        if share >= best_share:
+            best, best_share = idx, share
+    return best
+
+
+_ARTIFACT_MARK = "artifact"
+_PASSTHROUGH_MARK = "passthrough"
+
+
+def _rewrite_content_stream(
+    pdf: pikepdf.Pdf,
+    content_owner,
+    page_index: int,
+    elements: list[dict],
+    builder: StructTreeBuilder,
+    page_ref: pikepdf.Object,
+    alt_lookup: dict[int, str],
+    decorative_figures: set[int] | None = None,
+    *,
+    initial_ctm: tuple[float, float, float, float, float, float] = IDENTITY,
+    stream_owner: pikepdf.Object | None = None,
+    passthrough_regions: list[ContentRegion] | None = None,
+    measured_ops: list[MeasuredTextOp] | None = None,
+) -> set[int]:
+    """Mark a content stream's content for the elements it belongs to.
+
+    Each text-showing unit (a TJ string, or a whole Tj) belongs to the text
+    element or table cell holding at least half of it (see _owner_of), TJs
+    being split where the owner changes; each image belongs to the figure it
+    overlaps (see _figure_of). Consecutive content with one owner is one
+    marked-content sequence. Everything else that paints is an artifact, a
+    path object wrapped whole; OCR form calls pass through unmarked, to be
+    tagged inside the form. Returns the indices of the elements tagged."""
+    try:
+        instructions = list(pikepdf.parse_content_stream(content_owner))
+    except Exception as e:
+        logger.warning(f"Could not parse content stream for page {page_index}: {e}")
+        return set()
+
+    instructions = _strip_existing_markers(instructions)
+    if not instructions:
+        return set()
+
+    decorative_figures = decorative_figures or set()
+    passthrough_regions = passthrough_regions or []
+    targets = _content_targets(elements)
+    measured = _measured_by_instruction(instructions, measured_ops)
+    if measured is not None:
+        instructions, measured, new_index = _split_text_ops_across_targets(
+            instructions, measured, targets
+        )
+        passthrough_regions = [
+            dataclasses.replace(
+                region, start_idx=new_index[region.start_idx], end_idx=new_index[region.end_idx]
+            )
+            for region in passthrough_regions
+        ]
+    regions = _extract_content_regions(instructions, content_owner, initial_ctm=initial_ctm)
+    text_runs = _extract_text_show_runs(instructions, initial_ctm=initial_ctm)
+    if measured is not None:
+        _apply_measured_geometry(regions, text_runs, measured)
+
+    mark_by_idx: dict[int, ContentTarget | int | str] = {}
+    for run in text_runs:
+        owner = _owner_of(run.bbox, targets)
+        for idx in range(run.segment_start_idx, run.segment_end_idx):
+            mark_by_idx[idx] = owner if owner is not None else _ARTIFACT_MARK
+    for region in regions:
+        if region.kind == "image":
+            figure = _figure_of(region, elements, content_owner)
+            for idx in range(region.start_idx, region.end_idx):
+                mark_by_idx[idx] = figure if figure is not None else _ARTIFACT_MARK
+    for region in passthrough_regions:
+        for idx in range(region.start_idx, region.end_idx):
+            mark_by_idx[idx] = _PASSTHROUGH_MARK
+
+    overlay_targets: list[tuple[ContentRegion, int]] = []
+    decorative_covered: set[int] = set()
+    if stream_owner is None and _text_runs_look_like_hidden_ocr_layer(text_runs):
+        overlay_targets, decorative_covered = _scan_figure_overlay_targets(
+            regions,
+            elements,
+            content_owner,
+            alt_lookup,
+            decorative_figures,
+        )
+    tagged: set[int] = set(decorative_covered)
+
+    new_instructions: list = []
+    active: ContentTarget | int | str | None = None
+    pending_path: list = []
+
+    def close_active() -> None:
+        nonlocal active
+        if active is not None:
+            new_instructions.append(_make_emc())
+            active = None
+
+    def open_mark(mark: ContentTarget | int | str) -> None:
+        """Open the marked content for a mark, or an artifact if no
+        structure element can hold it."""
+        nonlocal active
+        if mark == _ARTIFACT_MARK:
+            new_instructions.append(_make_bmc_artifact())
+            active = mark
+            return
+        elem_idx = mark if isinstance(mark, int) else mark.elem_idx
+        elem = elements[elem_idx]
+        if elem.get("type") == "artifact":
+            new_instructions.append(_make_bmc_artifact(elem))
+            active = mark
+            return
+        allocated: tuple[str, int, str | None] | None = None
+        if isinstance(mark, ContentTarget) and mark.cell is not None:
+            cell = builder.add_table_cell_fragment(
+                page_index, page_ref, elem, mark.cell, stream_owner=stream_owner
+            )
+            allocated = (*cell, None) if cell is not None else None
+        else:
+            allocated = _allocate_fragment_mcid(
+                builder,
+                elem,
+                page_index,
+                page_ref,
+                alt_lookup,
+                decorative_figures,
+                stream_owner=stream_owner,
+            )
+        if allocated is None:
+            new_instructions.append(_make_bmc_artifact())
+            active = _ARTIFACT_MARK
+            return
+        tag, mcid, actual_text = allocated
+        new_instructions.append(_make_bdc(tag, mcid, actual_text=actual_text))
+        tagged.add(elem_idx)
+        active = mark
+
+    def flush_path(painted: bool) -> None:
+        if painted:
+            new_instructions.append(_make_bmc_artifact())
+            new_instructions.extend(pending_path)
+            new_instructions.append(_make_emc())
+        else:
+            new_instructions.extend(pending_path)
+        pending_path.clear()
+
+    for idx, instr in enumerate(instructions):
+        mark = mark_by_idx.get(idx)
+        if mark != active:
+            close_active()
+            if mark is not None and mark != _PASSTHROUGH_MARK:
+                open_mark(mark)
+        if mark is not None:
+            new_instructions.append(instr)
+            continue
+        op = str(instr.operator)
+        if op in PATH_CONSTRUCTION_OPERATORS or (pending_path and op in PATH_PAINTING_OPERATORS):
+            pending_path.append(instr)
+            if op in PATH_PAINTING_OPERATORS:
+                flush_path(painted=op != "n")
+            continue
+        if pending_path:
+            flush_path(painted=False)
+        if _instruction_paints_content(instr):
+            new_instructions.extend([_make_bmc_artifact(), instr, _make_emc()])
+        else:
+            new_instructions.append(instr)
+
+    if pending_path:
+        flush_path(painted=False)
+    close_active()
+    for source_region, elem_idx in overlay_targets:
+        overlay = _make_clipped_image_figure_instructions(
+            source_region,
+            elements[elem_idx],
+            builder,
+            page_index,
+            page_ref,
+            alt_lookup,
+            decorative_figures,
+            stream_owner=stream_owner,
+        )
+        if overlay:
+            new_instructions.extend(overlay)
+            tagged.add(elem_idx)
+
+    try:
+        new_stream = pikepdf.unparse_content_stream(new_instructions)
+        if isinstance(content_owner, pikepdf.Page):
+            content_owner["/Contents"] = pdf.make_stream(new_stream)
+        else:
+            content_owner.write(new_stream)
+    except Exception as e:
+        logger.error(f"Failed to write content stream for page {page_index}: {e}")
+        return set()
+
+    return tagged
 
 
 def _make_bmc_artifact(
@@ -5603,7 +4970,6 @@ async def tag_pdf(
     def _tag():
         tags_added = 0
         parser_doc = None
-        docling_parse_cache: dict[int, list[dict]] = {}
         docling_parse_word_cache: dict[int, list[dict]] = {}
         docling_parse_hyperlink_cache: dict[int, list[dict]] = {}
         docling_parse_widget_cache: dict[int, list[dict]] = {}
@@ -5700,10 +5066,6 @@ async def tag_pdf(
             for page_index, page in enumerate(pdf.pages):
                 page_elems = pages_elements.get(page_index, [])
                 page_glyphs = glyph_reader.page(page_index)
-                page_lines = _items_in_user_space(
-                    _build_docling_parse_page_lines(parser_doc, page_index, docling_parse_cache),
-                    frames[page_index],
-                )
                 page_words = _items_in_user_space(
                     _build_docling_parse_page_words(parser_doc, page_index, docling_parse_word_cache),
                     frames[page_index],
@@ -5741,7 +5103,6 @@ async def tag_pdf(
                         pdf, page, page_index, page_elems,
                         builder, page.obj, alt_lookup,
                         decorative_figures=decorative_figures,
-                        docling_page_lines=page_lines,
                         passthrough_regions=ocr_passthrough_regions,
                         measured_ops=page_glyphs.ops.get(()),
                     )
@@ -5768,7 +5129,6 @@ async def tag_pdf(
                             page.obj,
                             alt_lookup,
                             decorative_figures=decorative_figures,
-                            docling_page_lines=page_lines,
                             initial_ctm=invocation.initial_ctm,
                             stream_owner=invocation.stream,
                             measured_ops=page_glyphs.ops.get(
@@ -5809,7 +5169,6 @@ async def tag_pdf(
                         pdf, page, page_index, [],
                         builder, page.obj, alt_lookup,
                         decorative_figures=decorative_figures,
-                        docling_page_lines=None,
                         measured_ops=page_glyphs.ops.get(()),
                     )
 
