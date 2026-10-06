@@ -10,6 +10,7 @@ from app.pipeline.tagger import (
     _table_summary_text,
     tag_pdf,
 )
+from app.services.structure_text import screen_reader_text
 from tests.fixtures import TEST_SAMPLE_PDF
 from tests.pdf_fixtures import helvetica
 
@@ -1276,3 +1277,36 @@ async def test_a_drawn_path_is_marked_whole_construction_and_paint(tmp_path):
                 outside.append(op)
         assert outside == []
         assert _unmarked_paint_operators(tagged.pages[0]) == []
+
+
+@pytest.mark.asyncio
+async def test_structure_follows_docling_reading_order_not_drawing_order(tmp_path):
+    """The page draws the second column first; the structure tree, and so a
+    screen reader, follows Docling's reading order."""
+    input_pdf = tmp_path / "columns.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
+    page.Contents = pdf.make_stream(
+        b"BT /F1 12 Tf 320 720 Td (Second column) Tj ET\n"
+        b"BT /F1 12 Tf 72 720 Td (First column) Tj ET\n"
+    )
+    pdf.save(input_pdf)
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {"type": "paragraph", "text": "First column", "page": 0,
+                 "bbox": {"l": 70, "b": 715, "r": 160, "t": 732}},
+                {"type": "paragraph", "text": "Second column", "page": 0,
+                 "bbox": {"l": 318, "b": 715, "r": 420, "t": 732}},
+            ],
+        },
+        alt_texts=[],
+        language="en",
+    )
+
+    assert screen_reader_text(output_pdf).split("\n") == ["First column", "Second column"]

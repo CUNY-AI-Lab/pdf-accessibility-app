@@ -2223,6 +2223,12 @@ class StructTreeBuilder:
         self._source_element_structs: dict[int, pikepdf.Object] = {}
         self._headings: list[dict] = []
         self._struct_elems_created = 0
+        # The reading-order position (see _elements_in_user_space) of the
+        # element whose content is being tagged, and that of each element
+        # added to /Document, so a page's elements can be put in reading
+        # order (see order_page_kids).
+        self.reading_order: int | None = None
+        self._reading_order_of: dict[tuple[int, int], int] = {}
         self._list_cache: dict[str, tuple[pikepdf.Object, pikepdf.Object | None]] = {}
         self._note_counter = 0
         self._table_counter = 0
@@ -2308,6 +2314,8 @@ class StructTreeBuilder:
 
     def _append_child(self, parent: pikepdf.Object, child: pikepdf.Object):
         """Append a child element to a parent's /K array."""
+        if parent == self.doc_elem and self.reading_order is not None:
+            self._reading_order_of[child.objgen] = self.reading_order
         parent_k = parent.get("/K")
         if isinstance(parent_k, pikepdf.Array):
             parent_k.append(child)
@@ -2315,6 +2323,23 @@ class StructTreeBuilder:
             parent["/K"] = pikepdf.Array([parent_k, child])
         else:
             parent["/K"] = pikepdf.Array([child])
+
+    def order_page_kids(self, start: int) -> None:
+        """Put the elements added to /Document since position ``start`` (one
+        page's) in reading order. The content stream draws them in whatever
+        order its producer chose; Docling orders them as they are read. An
+        element without a position keeps its place after the one before it.
+        """
+        kids = self.doc_elem.get("/K")
+        if not isinstance(kids, pikepdf.Array) or len(kids) - start < 2:
+            return
+        page_kids = [kids[i] for i in range(start, len(kids))]
+        keys: list[float] = []
+        for kid in page_kids:
+            order = self._reading_order_of.get(kid.objgen)
+            keys.append(order if order is not None else (keys[-1] if keys else -1))
+        ordered = [kid for _key, _i, kid in sorted(zip(keys, range(len(keys)), page_kids))]
+        self.doc_elem["/K"] = pikepdf.Array([kids[i] for i in range(start)] + ordered)
 
     def _struct_elem_for_mcid(self, owner: pikepdf.Object, mcid: int) -> pikepdf.Object | None:
         owner_key = self._content_owner_key(owner)
@@ -3483,8 +3508,9 @@ def _elements_in_user_space(elements: list[dict], frames: list[PageFrame]) -> li
     page frame into PDF user space (see page_frame), where the tagger
     measures the page's content."""
     converted = []
-    for element in elements:
+    for order, element in enumerate(elements):
         element = copy.deepcopy(element)
+        element["reading_order"] = order
         page = element.get("page")
         if isinstance(page, int) and 0 <= page < len(frames):
             frame = frames[page]
@@ -3868,6 +3894,7 @@ def _rewrite_content_stream(
             return
         elem_idx = mark if isinstance(mark, int) else mark.elem_idx
         elem = elements[elem_idx]
+        builder.reading_order = elem.get("reading_order")
         if elem.get("type") == "artifact":
             new_instructions.append(_make_bmc_artifact(elem))
             active = mark
@@ -3932,6 +3959,7 @@ def _rewrite_content_stream(
         flush_path(painted=False)
     close_active()
     for source_region, elem_idx in overlay_targets:
+        builder.reading_order = elements[elem_idx].get("reading_order")
         overlay = _make_clipped_image_figure_instructions(
             source_region,
             elements[elem_idx],
@@ -5080,6 +5108,7 @@ async def tag_pdf(
                 )
                 page["/Tabs"] = pikepdf.Name("/S")
                 page_tagged_elements: list[dict] = []
+                first_page_kid = len(builder.doc_elem.get("/K") or [])
                 if page_elems:
                     try:
                         raw_page_instructions = list(pikepdf.parse_content_stream(page))
@@ -5172,6 +5201,8 @@ async def tag_pdf(
                         measured_ops=page_glyphs.ops.get(()),
                     )
 
+                builder.order_page_kids(first_page_kid)
+                builder.reading_order = None
                 _ensure_annotation_baseline(page)
                 links_tagged += _tag_link_annotations(
                     page,
