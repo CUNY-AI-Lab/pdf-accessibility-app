@@ -2812,8 +2812,6 @@ class StructTreeBuilder:
                     "/P": row_elem,
                     "/K": pikepdf.Array([]),
                 }
-                if cell.get("glyph_text"):
-                    cell_elem_dict["/ActualText"] = pikepdf.String(cell["glyph_text"])
                 attrs = pikepdf.Dictionary({"/O": pikepdf.Name("/Table")})
                 row_span = _as_positive_int(cell.get("row_span", 1), default=1)
                 col_span = _as_positive_int(cell.get("col_span", 1), default=1)
@@ -3227,7 +3225,11 @@ def _allocate_fragment_mcid(
 
     elem_type = elem.get("type", "")
     elem_lang = elem.get("lang")
-    actual_text = _element_actual_text(elem)
+    # A formula's glyphs are often a math font's, which a screen reader
+    # cannot read, so its text is always its /ActualText.
+    actual_text = (
+        _element_accessible_text(elem) if elem_type == "formula" else _element_actual_text(elem)
+    ) or None
 
     if elem_type == "heading":
         mcid = builder.add_heading(
@@ -3558,8 +3560,12 @@ def _attach_glyph_text(pages_elements: dict[int, list[dict]], pdfium_text: Pdfiu
 
 
 def _element_actual_text(elem: dict) -> str | None:
-    actual_text = _element_accessible_text(elem)
-    return actual_text or None
+    """Text to read instead of the element's glyphs: only a correction the
+    structure or AI steps made deliberately (a letter-spaced heading read as
+    a word). Otherwise the glyphs, tagged to the element, are what a screen
+    reader reads, as the Tagged PDF Best Practice Guide asks."""
+    text = elem.get("actual_text") or elem.get("resolved_text") or elem.get("semantic_text_hint")
+    return str(text).strip() or None if text else None
 
 
 FORMULA_GREEK_WORDS = {
