@@ -11,7 +11,7 @@ from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTChar
 
 from app.pipeline.page_glyphs import PdfGlyphReader
-from app.pipeline.tagger import tag_pdf
+from app.pipeline.tagger import TextShowRun, _assign_text_show_runs_to_elements, tag_pdf
 from app.services.structure_text import screen_reader_text
 from tests.pdf_fixtures import helvetica, rendered
 
@@ -215,3 +215,22 @@ def test_estimated_text_leaves_out_tj_position_adjustments():
 
     array = pikepdf.Array([pikepdf.String("Year"), -5124.6, pikepdf.String("Crop"), 12])
     assert _extract_text_from_operands("TJ", [array]) == "YearCrop"
+
+
+def test_runs_in_a_paragraphs_continuation_box_belong_to_it():
+    """Docling gives a paragraph that continues in the next column a second
+    box; text in that box is the paragraph's, not unassigned."""
+    def run(index, x, y):
+        box = {"l": x, "b": y, "r": x + 100, "t": y + 10}
+        return TextShowRun(index, index, index + 1, x + 50, y + 5, box, "words")
+
+    paragraph = {
+        "type": "paragraph",
+        "text": "words",
+        "bbox": {"l": 40, "b": 60, "r": 300, "t": 150},
+        "extra_bboxes": [{"l": 310, "b": 260, "r": 570, "t": 420}],
+    }
+    other = {"type": "paragraph", "text": "else", "bbox": {"l": 310, "b": 60, "r": 570, "t": 250}}
+    runs = [run(0, 50, 100), run(1, 320, 300), run(2, 320, 100)]
+
+    assert _assign_text_show_runs_to_elements(runs, [paragraph, other]) == {0: 0, 1: 0, 2: 1}

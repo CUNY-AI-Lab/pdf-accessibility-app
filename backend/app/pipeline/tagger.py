@@ -440,6 +440,16 @@ def _expand_bbox(bbox: dict[str, float], margin: float) -> dict[str, float]:
     }
 
 
+def _element_boxes(item: dict[str, Any]) -> list[dict[str, float]]:
+    """Every box an element occupies on the page. Docling gives a paragraph
+    that continues in another column one box for each part."""
+    return [
+        box
+        for box in (item.get("bbox"), *(item.get("extra_bboxes") or ()))
+        if isinstance(box, dict)
+    ]
+
+
 def _best_bbox_match(
     target_bbox: dict[str, float] | None,
     items: list[dict[str, Any]] | None,
@@ -456,22 +466,19 @@ def _best_bbox_match(
     for item in items:
         if not isinstance(item, dict):
             continue
-        bbox = item.get("bbox")
-        if not isinstance(bbox, dict):
-            continue
-
-        overlap = _bbox_intersection(target_bbox, bbox)
-        relaxed_overlap = _bbox_intersection(expanded_bbox, bbox)
-        score = max(
-            _bbox_iou(target_bbox, bbox),
-            _containment_ratio(target_bbox, bbox),
-            _containment_ratio(bbox, target_bbox),
-        )
-        if overlap <= 0 and relaxed_overlap <= 0 and score < 0.5:
-            continue
-        if score > best_score:
-            best_item = item
-            best_score = score
+        for bbox in _element_boxes(item):
+            overlap = _bbox_intersection(target_bbox, bbox)
+            relaxed_overlap = _bbox_intersection(expanded_bbox, bbox)
+            score = max(
+                _bbox_iou(target_bbox, bbox),
+                _containment_ratio(target_bbox, bbox),
+                _containment_ratio(bbox, target_bbox),
+            )
+            if overlap <= 0 and relaxed_overlap <= 0 and score < 0.5:
+                continue
+            if score > best_score:
+                best_item = item
+                best_score = score
     return best_item
 
 
@@ -547,27 +554,26 @@ def _visible_link_contents_from_page_elements(
         elem_type = str(element.get("type") or "").strip()
         if elem_type not in LINK_TEXT_ELEMENT_TYPES:
             continue
-        element_bbox = element.get("bbox")
-        if not isinstance(element_bbox, dict):
-            continue
         text = " ".join(_element_accessible_text(element).split()).strip()
         if not text:
             continue
-
-        overlap = _bbox_intersection(annotation_bbox, element_bbox)
-        relaxed_overlap = _bbox_intersection(expanded_bbox, element_bbox)
-        score = max(
-            _bbox_iou(annotation_bbox, element_bbox),
-            _containment_ratio(annotation_bbox, element_bbox),
-            _containment_ratio(element_bbox, annotation_bbox),
-        )
-        if overlap <= 0 and relaxed_overlap <= 0 and score < 0.5:
-            continue
-        if score > best_score or (math.isclose(score, best_score) and len(text) > len(best_text)):
-            best_text = text
-            best_score = score
-            best_element_type = elem_type
-            best_element_bbox = element_bbox
+        for element_bbox in _element_boxes(element):
+            overlap = _bbox_intersection(annotation_bbox, element_bbox)
+            relaxed_overlap = _bbox_intersection(expanded_bbox, element_bbox)
+            score = max(
+                _bbox_iou(annotation_bbox, element_bbox),
+                _containment_ratio(annotation_bbox, element_bbox),
+                _containment_ratio(element_bbox, annotation_bbox),
+            )
+            if overlap <= 0 and relaxed_overlap <= 0 and score < 0.5:
+                continue
+            if score > best_score or (
+                math.isclose(score, best_score) and len(text) > len(best_text)
+            ):
+                best_text = text
+                best_score = score
+                best_element_type = elem_type
+                best_element_bbox = element_bbox
 
     if not best_text:
         return "", ""
@@ -1767,7 +1773,7 @@ def _split_text_ops_across_targets(
     element_boxes = [
         box
         for _idx, element in _eligible_fragmented_text_elements(elements)
-        if (box := element.get("bbox"))
+        for box in _element_boxes(element)
     ]
     targets = cell_boxes + element_boxes
 
@@ -1888,26 +1894,25 @@ def _assign_text_show_runs_to_elements(
         best_elem_idx: int | None = None
         best_score = -1.0
         for elem_idx, elem in eligible:
-            ebbox = elem.get("bbox")
-            if not isinstance(ebbox, dict):
-                continue
+            for ebbox in _element_boxes(elem):
+                point_inside = _point_in_bbox(run.cx, run.cy, ebbox, margin=4.0)
+                relaxed_overlap = _bbox_intersection(_expand_bbox(run.bbox, 2.0), ebbox)
+                if not point_inside and relaxed_overlap <= 0:
+                    continue
 
-            point_inside = _point_in_bbox(run.cx, run.cy, ebbox, margin=4.0)
-            relaxed_overlap = _bbox_intersection(_expand_bbox(run.bbox, 2.0), ebbox)
-            if not point_inside and relaxed_overlap <= 0:
-                continue
-
-            spatial = max(
-                _containment_ratio(run.bbox, ebbox),
-                _bbox_iou(run.bbox, ebbox),
-                _distance_score(run.bbox, ebbox),
-            )
-            text = _text_similarity(run.text, elem.get("text", ""))
-            area_penalty = min(_bbox_area(ebbox) / 2_000_000.0, 0.20)
-            score = (1.0 if point_inside else 0.0) + 0.70 * spatial + 0.10 * text - area_penalty
-            if score > best_score:
-                best_score = score
-                best_elem_idx = elem_idx
+                spatial = max(
+                    _containment_ratio(run.bbox, ebbox),
+                    _bbox_iou(run.bbox, ebbox),
+                    _distance_score(run.bbox, ebbox),
+                )
+                text = _text_similarity(run.text, elem.get("text", ""))
+                area_penalty = min(_bbox_area(ebbox) / 2_000_000.0, 0.20)
+                score = (
+                    (1.0 if point_inside else 0.0) + 0.70 * spatial + 0.10 * text - area_penalty
+                )
+                if score > best_score:
+                    best_score = score
+                    best_elem_idx = elem_idx
 
         if best_elem_idx is not None:
             assignments[run_idx] = best_elem_idx
@@ -2296,15 +2301,20 @@ def _distance_score(a: dict[str, float] | None, b: dict[str, float] | None) -> f
 def _matching_score(region: ContentRegion, element: dict) -> float:
     """Score a region-element pair using containment/IoU + text similarity."""
     rbbox = _region_bbox(region)
-    ebbox = element.get("bbox")
-    if not rbbox or not ebbox:
+    boxes = _element_boxes(element)
+    if not rbbox or not boxes:
         return 0.0
 
-    containment = _containment_ratio(rbbox, ebbox)
-    reverse_containment = _containment_ratio(ebbox, rbbox)
-    iou = _bbox_iou(rbbox, ebbox)
-    dist = _distance_score(rbbox, ebbox)
-    spatial = max(containment, 0.6 * iou + 0.4 * reverse_containment)
+    spatial, dist = max(
+        (
+            max(
+                _containment_ratio(rbbox, ebbox),
+                0.6 * _bbox_iou(rbbox, ebbox) + 0.4 * _containment_ratio(ebbox, rbbox),
+            ),
+            _distance_score(rbbox, ebbox),
+        )
+        for ebbox in boxes
+    )
 
     if region.kind == "text":
         text = _text_similarity(region.text, element.get("text", ""))
@@ -2339,9 +2349,10 @@ def _optimal_match(
     spatial_index = rtree_index.Index()
     bbox_element_positions: list[int] = []
     for epos, (_elem_idx, elem) in enumerate(elements):
-        ebbox = elem.get("bbox")
-        if ebbox:
+        boxes = _element_boxes(elem)
+        for ebbox in boxes:
             spatial_index.insert(epos, _bbox_tuple(ebbox))
+        if boxes:
             bbox_element_positions.append(epos)
 
     cost = np.full((len(regions), len(elements)), LARGE_COST, dtype=np.float64)
