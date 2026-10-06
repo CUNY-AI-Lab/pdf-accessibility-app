@@ -16,6 +16,7 @@ import logging
 import math
 import mimetypes
 import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -529,12 +530,17 @@ def _word_owners(
     """Each glyph's owner, decided for its whole word (see _owner_of), as
     element text takes whole words: a box that stops short of a word's last
     letters, or of a "%" drawn on its own, still holds them. Words are the
-    glyphs in drawing order, broken at white space and by _word_break."""
+    glyphs in drawing order, broken at white space and by _word_break. A
+    space glyph (some PDFs draw every word space) goes with the word before
+    it, or the first word if none precedes it, so the words around it stay
+    apart when read."""
     words: list[list[MeasuredGlyph]] = []
+    spaces: list[tuple[MeasuredGlyph, int]] = []
     previous: MeasuredGlyph | None = None
     for idx in sorted(measured):
         for glyph in measured[idx].glyphs:
             if not glyph.text.strip():
+                spaces.append((glyph, len(words) - 1))
                 previous = None
                 continue
             if previous is None or _word_break(previous.bbox, glyph.bbox):
@@ -542,10 +548,15 @@ def _word_owners(
             words[-1].append(glyph)
             previous = glyph
     owners: dict[tuple, ContentTarget | None] = {}
+    word_owner: list[ContentTarget | None] = []
     for word in words:
         owner = _owner_of(union_bbox(glyph.bbox for glyph in word), targets)
+        word_owner.append(owner)
         for glyph in word:
             owners[_glyph_key(glyph)] = owner
+    for glyph, word_index in spaces:
+        if word_owner:
+            owners[_glyph_key(glyph)] = word_owner[max(word_index, 0)]
     return owners
 
 
@@ -554,6 +565,8 @@ def _owner_of_glyphs(
 ) -> ContentTarget | None:
     """The owner most of these glyphs' words have."""
     counts = Counter(word_owners.get(_glyph_key(glyph)) for glyph in glyphs if glyph.text.strip())
+    if not counts:
+        counts = Counter(word_owners.get(_glyph_key(glyph)) for glyph in glyphs)
     return counts.most_common(1)[0][0] if counts else None
 
 
@@ -3604,9 +3617,15 @@ def _attach_glyph_text(pages_elements: dict[int, list[dict]], pdfium_text: Pdfiu
         for elem in elements:
             boxes = [elem.get("bbox"), *elem.get("extra_bboxes", [])]
             if elem.get("type") in GLYPH_TEXT_ELEMENT_TYPES and isinstance(boxes[0], dict):
-                text = readable(pdfium_text.in_boxes(page_index, boxes))
+                raw = pdfium_text.in_boxes(page_index, boxes)
+                text = readable(raw)
                 if accounts_for(text, str(elem.get("text") or "")):
                     elem["glyph_text"] = text
+                    if text != unicodedata.normalize("NFC", raw):
+                        # The glyphs read differently (an accent drawn as its
+                        # own glyph after the letter): the readable text is
+                        # a correction.
+                        elem["resolved_text"] = elem.get("resolved_text") or text
             if elem.get("type") == "table":
                 for cell in elem.get("cells") or []:
                     if isinstance(cell, dict) and (box := _table_cell_bbox(elem, cell)):
