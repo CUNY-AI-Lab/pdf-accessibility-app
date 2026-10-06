@@ -29,6 +29,8 @@ tests as `data/eval/olmocr-bench/<subset>.jsonl` and its PDFs in
 | `cuny_rt` | 282 (19 documents) | structure round-trip | Well-tagged CUNY documents from [CUNY Academic Works](https://academicworks.cuny.edu/): five syllabi, two OER textbook chapters, three assignments, three lesson plans, two conference papers, lecture slides, a book chapter, a master's capstone, and a library newsletter |
 | `cuny_rt_scan` | 282 (19 documents) | structure round-trip | The `cuny_rt` documents as image-only scans (`scripts/synthetic_scan.py`), scored against the same tags |
 | `tables_s60_scan`, `multi_column_s60_scan`, `headers_footers_s60_scan` | 60 each | as their born-digital samples | The same pages as image-only scans under the same tests, which check text, order and tables and so hold for a scan too |
+| `multi_column`, `headers_footers`, `tables` | 231, 266, 188 | 884, 760, 1,022 | olmOCR-Bench's whole categories, the samples' sources: 3 to 4.5 times the samples' tests, for confidence intervals about 3 points wide instead of 5–6 |
+| `multi_column_scan`, `headers_footers_scan`, `tables_scan` | 231, 266, 188 | as their born-digital sets | The whole categories as image-only scans |
 
 olmOCR-Bench ([allenai/olmOCR-bench](https://huggingface.co/datasets/allenai/olmOCR-bench),
 ODC-BY) is read at revision `54a96a6f`, the revision used for the September

@@ -4,10 +4,10 @@ Writes the layout the bench and scoring scripts read, under ``--bench``
 (default ``data/eval/olmocr-bench``): each subset's tests as
 ``<subset>.jsonl`` and its PDFs in ``bench_data/pdfs/<subset>/``.
 
-- olmOCR-Bench subsets come from the dataset at the pinned revision. A subset
-  with ``sample`` keeps that many PDFs, drawn as they were in September 2026:
-  ``random.Random(seed).sample`` over the sorted PDFs that have a non-baseline
-  test, with all of a chosen PDF's tests.
+- olmOCR-Bench subsets come from the dataset at the pinned revision: a whole
+  category, or with ``sample`` that many of its PDFs, drawn as they were in
+  September 2026: ``random.Random(seed).sample`` over the sorted PDFs that
+  have a non-baseline test, with all of a chosen PDF's tests.
 - ``old_print`` pages are Internet Archive page images, each embedded
   unchanged in a one-page PDF at the scan's resolution.
 - Round-trip sets (``gold_rt``, ``cuny_rt``) are prepared by
@@ -106,13 +106,13 @@ def build_olmocr(
         if "sample" in subset:
             pdfs = sorted({test["pdf"] for test in tests if test["type"] != "baseline"})
             chosen = set(random.Random(spec["seed"]).sample(pdfs, subset["sample"]))
-            tests = [
-                dict(test, pdf=f"{name}/{Path(test['pdf']).name}")
-                for test in tests
-                if test["pdf"] in chosen
-            ]
         else:
             chosen = {test["pdf"] for test in tests}
+        tests = [
+            dict(test, pdf=f"{name}/{Path(test['pdf']).name}")
+            for test in tests
+            if test["pdf"] in chosen
+        ]
         out = bench / "bench_data" / "pdfs" / name
         out.mkdir(parents=True, exist_ok=True)
         for pdf in sorted(chosen):

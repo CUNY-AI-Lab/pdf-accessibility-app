@@ -49,6 +49,33 @@
         "tests": "bench_data/table_tests.jsonl",
         "sample": 60,
         "scan": true
+      },
+      {
+        "name": "multi_column",
+        "tests": "bench_data/multi_column.jsonl"
+      },
+      {
+        "name": "multi_column_scan",
+        "tests": "bench_data/multi_column.jsonl",
+        "scan": true
+      },
+      {
+        "name": "headers_footers",
+        "tests": "bench_data/headers_footers.jsonl"
+      },
+      {
+        "name": "headers_footers_scan",
+        "tests": "bench_data/headers_footers.jsonl",
+        "scan": true
+      },
+      {
+        "name": "tables",
+        "tests": "bench_data/table_tests.jsonl"
+      },
+      {
+        "name": "tables_scan",
+        "tests": "bench_data/table_tests.jsonl",
+        "scan": true
       }
     ]
   },
