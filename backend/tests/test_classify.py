@@ -153,6 +153,34 @@ async def test_classify_pdf_leaves_a_page_with_an_ocr_layer_alone(monkeypatch, t
 
 
 @pytest.mark.asyncio
+async def test_classify_pdf_ocrs_a_scanned_page_in_a_born_digital_document(monkeypatch, tmp_path):
+    """Eleven text pages and one picture of a page: the document is OCR'd
+    (OCRmyPDF's --skip-text then recognizes only the picture page)."""
+    pdf_path = tmp_path / "with-scanned-insert.pdf"
+    _write_text_image_pdf(pdf_path, pages=1, text="")
+    with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+        scanned = pdf.pages[0]
+        scanned.obj["/Contents"] = pdf.make_stream(b"q 612 0 0 792 0 0 cm /Im0 Do Q\n")
+        font = scanned.obj["/Resources"]["/Font"]
+        for _ in range(11):
+            page = pdf.add_blank_page(page_size=(612, 792))
+            page.obj["/Resources"] = pikepdf.Dictionary({"/Font": font})
+            page.obj["/Contents"] = pdf.make_stream(b"BT /F1 12 Tf 72 720 Td (Body text) Tj ET\n")
+        pdf.save(pdf_path)
+
+    async def fake_probe_ocr(_path):
+        return None
+
+    monkeypatch.setattr(classify, "_detect_language_from_text", lambda _path: None)
+    monkeypatch.setattr(classify, "_probe_ocr_detect", fake_probe_ocr)
+
+    result = await classify.classify_pdf(pdf_path)
+
+    assert result.pages_with_text == 11
+    assert result.type == "mixed"
+
+
+@pytest.mark.asyncio
 async def test_classify_pdf_keeps_a_text_rich_page_with_a_large_image_digital(
     monkeypatch, tmp_path
 ):

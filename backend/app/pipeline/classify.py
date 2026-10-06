@@ -269,6 +269,14 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
             ratio = pages_with_text / total
             workload = _inspect_workload(pdf_path)
             no_text_pages = sorted(set(range(total)) - set(text_pages))
+            # Pages that are pictures with no text at all (a scanned insert in
+            # a born-digital document); the OCR step is the only one that
+            # recognizes text, so the document is OCR'd there.
+            image_only_pages = [
+                index
+                for index in no_text_pages
+                if page_image_pixels_of(pdf.pages[index]) >= _IMAGE_TEXT_PAGE_MIN_PIXELS
+            ]
             image_text_pages = _image_text_pages(
                 pdf_path,
                 [
@@ -291,7 +299,7 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
                     workload.image_heavy_pages / max(workload.page_count, 1) if workload else 0.0
                 )
                 confidence = min(1.0, max(0.75, (ratio + image_heavy_ratio) / 2))
-            elif ratio > 0.9 and not image_text_pages:
+            elif ratio > 0.9 and not image_text_pages and not image_only_pages:
                 classification = "digital"
                 confidence = ratio
             else:

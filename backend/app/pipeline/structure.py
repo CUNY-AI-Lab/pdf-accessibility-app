@@ -1365,6 +1365,9 @@ async def _convert_via_docling_serve(
         data = {
             "to_formats": "json",
             "ocr_engine": ocr_engine,
+            # The OCR step has already given every page a text layer; Docling
+            # reads it instead of recognizing the page a second time.
+            "do_ocr": "false",
             "do_table_structure": "true",
             "do_picture_classification": "true",
             # Heading levels from bookmarks, section numbering, and font
