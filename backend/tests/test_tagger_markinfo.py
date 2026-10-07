@@ -1310,3 +1310,39 @@ async def test_structure_follows_docling_reading_order_not_drawing_order(tmp_pat
     )
 
     assert screen_reader_text(output_pdf).split("\n") == ["First column", "Second column"]
+
+
+@pytest.mark.asyncio
+async def test_a_paragraph_continued_on_the_next_page_is_one_structure_element(tmp_path):
+    input_pdf = tmp_path / "two_pages.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    pdf = pikepdf.new()
+    for words in (b"A paragraph that runs", b"onto the next page"):
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
+        page.Contents = pdf.make_stream(b"BT /F1 12 Tf 72 720 Td (" + words + b") Tj ET\n")
+    pdf.save(input_pdf)
+    paragraph = {"type": "paragraph", "text": "A paragraph that runs onto the next page",
+                 "page": 0, "bbox": {"l": 70, "b": 715, "r": 220, "t": 732},
+                 "continued_ref": "#/texts/0"}
+    continuation = {**paragraph, "page": 1, "continuation": True}
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={"elements": [paragraph, continuation]},
+        alt_texts=[],
+        language="en",
+    )
+
+    with pikepdf.open(output_pdf) as tagged:
+        root_kids = tagged.Root.StructTreeRoot.K
+        document = root_kids[0] if isinstance(root_kids, pikepdf.Array) else root_kids
+        kids = document.K
+        paragraphs = [kid for kid in (kids if isinstance(kids, pikepdf.Array) else [kids])
+                      if kid.get("/S") == pikepdf.Name("/P")]
+        assert len(paragraphs) == 1
+        assert len(paragraphs[0].K) == 2
+    assert " ".join(screen_reader_text(output_pdf).split()) == (
+        "A paragraph that runs onto the next page"
+    )

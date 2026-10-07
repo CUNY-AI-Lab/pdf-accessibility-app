@@ -2273,6 +2273,13 @@ def _build_docling_parse_page_widgets(
     return widgets
 
 
+def _source_key(source_element: dict[str, Any]) -> Any:
+    """The structure element an element's content goes to: its own, or, for
+    text Docling continues on a later page, the one it continues
+    (continued_ref, see structure)."""
+    return source_element.get("continued_ref") or id(source_element)
+
+
 class StructTreeBuilder:
     """Manages MCID allocation, StructElem creation, and ParentTree construction."""
 
@@ -2289,7 +2296,7 @@ class StructTreeBuilder:
         self._content_owner_order = 0
         self._struct_parents_counter = 0
         self._object_parent_entries: list[tuple[pikepdf.Object, pikepdf.Object]] = []
-        self._source_element_structs: dict[int, pikepdf.Object] = {}
+        self._source_element_structs: dict[Any, pikepdf.Object] = {}
         self._headings: list[dict] = []
         self._struct_elems_created = 0
         # The reading-order position (see _elements_in_user_space) of the
@@ -2429,12 +2436,12 @@ class StructTreeBuilder:
         """Remember which StructElem represents a structure-json element."""
         elem = self._struct_elem_for_mcid(owner, mcid)
         if elem is not None:
-            self._source_element_structs[id(source_element)] = elem
+            self._source_element_structs[_source_key(source_element)] = elem
 
     def source_element_struct(self, source_element: dict[str, Any] | None) -> pikepdf.Object | None:
         if source_element is None:
             return None
-        return self._source_element_structs.get(id(source_element))
+        return self._source_element_structs.get(_source_key(source_element))
 
     def add_mcr_to_struct_elem(
         self,
@@ -5162,7 +5169,7 @@ async def tag_pdf(
                     alt_lookup[fig_idx] = source_alt
 
             # Group elements by page
-            _normalize_heading_hierarchy(elements)
+            _normalize_heading_hierarchy([elem for elem in elements if not elem.get("continuation")])
             pages_elements: dict[int, list[dict]] = {}
             for elem in elements:
                 pg = elem.get("page", 0)
@@ -5310,7 +5317,7 @@ async def tag_pdf(
             bookmarks_added = _add_bookmarks(
                 pdf,
                 builder._headings,
-                elements,
+                [elem for elem in elements if not elem.get("continuation")],
                 structure_json.get("bookmark_plan"),
                 structure_json.get("native_toc"),
                 structure_json.get("title"),

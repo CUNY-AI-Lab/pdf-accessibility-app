@@ -482,16 +482,28 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
             })
 
         # Text Docling continues in another column of the page has a box
-        # there too; the tagger reads the element's glyphs from all of them.
+        # there too, and text it continues on a later page has boxes there;
+        # the tagger reads the element's glyphs from all of them, the later
+        # page's through a continuation element that shares its structure
+        # element (continued_ref).
         if len(elements) > elements_before and len(prov) > 1:
-            first_page = _prov_page(prov[0])
-            extra = [
-                box
-                for entry in prov[1:]
-                if _prov_page(entry) == first_page and (box := _extract_bbox([entry]))
-            ]
-            if extra:
-                elements[-1]["extra_bboxes"] = extra
+            element = elements[-1]
+            boxes_by_page: dict[int, list[dict]] = {}
+            for entry in prov[1:]:
+                if (box := _extract_bbox([entry])) and (entry_page := _prov_page(entry)):
+                    boxes_by_page.setdefault(entry_page - 1, []).append(box)
+            if same_page := boxes_by_page.pop(element["page"], None):
+                element["extra_bboxes"] = same_page
+            if boxes_by_page and element["type"] not in {"table", "figure", "artifact"}:
+                element["continued_ref"] = item.get("self_ref") or str(len(elements))
+                for later_page, (first_box, *more_boxes) in sorted(boxes_by_page.items()):
+                    continuation = {
+                        **element, "page": later_page, "bbox": first_box, "continuation": True
+                    }
+                    continuation.pop("extra_bboxes", None)
+                    if more_boxes:
+                        continuation["extra_bboxes"] = more_boxes
+                    elements.append(continuation)
     return elements
 
 

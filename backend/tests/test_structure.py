@@ -568,7 +568,7 @@ def test_normalize_docling_elements_keeps_picture_and_table_captions_as_text():
     ]
 
 
-def test_normalize_docling_elements_keeps_the_boxes_of_text_continued_in_another_column():
+def test_normalize_docling_elements_keeps_the_boxes_of_text_continued_elsewhere():
     doc_dict = {
         "body": {"children": [{"$ref": "#/texts/0"}]},
         "texts": [
@@ -584,7 +584,14 @@ def test_normalize_docling_elements_keeps_the_boxes_of_text_continued_in_another
         ],
     }
 
-    (element,) = _normalize_docling_elements(doc_dict)
+    element, continuation = _normalize_docling_elements(doc_dict)
 
     assert element["bbox"] == {"l": 50, "b": 100, "r": 290, "t": 140}
     assert element["extra_bboxes"] == [{"l": 320, "b": 680, "r": 560, "t": 720}]
+    # The part on the next page is a continuation sharing the element's
+    # structure element.
+    assert continuation["page"] == 1
+    assert continuation["bbox"] == {"l": 50, "b": 680, "r": 290, "t": 720}
+    assert "extra_bboxes" not in continuation
+    assert continuation["continuation"] is True
+    assert continuation["continued_ref"] == element["continued_ref"]
