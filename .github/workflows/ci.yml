@@ -63,12 +63,9 @@ jobs:
 
           docker run --detach --name "$container_name" \
             --publish "127.0.0.1:${host_port}:8001" \
-            --env GEMINI_API_KEY= \
-            --env GOOGLE_API_KEY= \
             --env LLM_API_KEY=check-only \
             --env LLM_BASE_URL=http://127.0.0.1:8000/v1 \
-            --env LLM_MODEL=gemini-check \
-            --env USE_DIRECT_GEMINI_PDF=false \
+            --env LLM_MODEL=check-model \
             --env DOCLING_SERVE_URL= \
             --env DOCLING_SERVE_TOKEN= \
             pdf-accessibility-app:ci

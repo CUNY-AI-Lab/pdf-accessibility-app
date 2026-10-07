@@ -1,28 +1,23 @@
-import base64
 import copy
 import json
 import logging
 from collections.abc import Iterable
-from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-import pikepdf
-
+from app.config import get_settings
 from app.models import Job
-from app.services.gemini_direct import (
-    direct_gemini_pdf_enabled,
-    request_direct_gemini_content_json_with_response,
-)
-from app.services.llm_client import LlmClient, is_retryable_llm_exception
-from app.services.local_semantic import (
-    local_semantic_enabled,
-    request_local_semantic_content_json_with_response,
-)
+from app.services.llm_client import LlmClient, is_retryable_llm_exception, make_llm_client
 from app.services.path_safety import validate_path_within_allowed_roots
 from app.services.pdf_preview import render_page_jpeg_data_url
 
 logger = logging.getLogger(__name__)
+
+# Models that refused json_schema output (the Gateway offers it only for
+# models with the structured-output capability); their later requests ask for
+# json_object directly instead of being refused again.
+JSON_SCHEMA_REFUSED_MODELS: set[str] = set()
 
 
 def _should_try_alternate_response_format(exc: BaseException) -> bool:
@@ -64,81 +59,6 @@ def context_json_part(payload: Any, *, prefix: str = "Context JSON:\n") -> dict[
     }
 
 
-def _normalize_pdf_page_numbers(page_numbers: Iterable[int] | None, *, total_pages: int) -> list[int]:
-    if page_numbers is None:
-        return list(range(1, total_pages + 1))
-
-    normalized: list[int] = []
-    seen: set[int] = set()
-    for raw_page_number in page_numbers:
-        if not isinstance(raw_page_number, int):
-            continue
-        page_number = int(raw_page_number)
-        if page_number <= 0 or page_number > total_pages or page_number in seen:
-            continue
-        seen.add(page_number)
-        normalized.append(page_number)
-    return normalized
-
-
-def pdf_file_bytes(pdf_path: Path, page_numbers: Iterable[int] | None = None) -> bytes:
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-
-    with pikepdf.Pdf.open(pdf_path) as source_pdf:
-        total_pages = len(source_pdf.pages)
-        normalized_pages = _normalize_pdf_page_numbers(page_numbers, total_pages=total_pages)
-        if not normalized_pages:
-            raise ValueError("No valid PDF pages were selected for LLM document input")
-        if normalized_pages == list(range(1, total_pages + 1)):
-            return pdf_path.read_bytes()
-
-        subset_pdf = pikepdf.Pdf.new()
-        for page_number in normalized_pages:
-            subset_pdf.pages.append(source_pdf.pages[page_number - 1])
-        output = BytesIO()
-        subset_pdf.save(output)
-        return output.getvalue()
-
-
-def pdf_file_data_url(pdf_path: Path, page_numbers: Iterable[int] | None = None) -> str:
-    encoded = base64.b64encode(pdf_file_bytes(pdf_path, page_numbers)).decode("ascii")
-    return f"data:application/pdf;base64,{encoded}"
-
-
-def pdf_file_parts(
-    job: Job | Any | None,
-    page_numbers: Iterable[int] | None = None,
-    *,
-    filename: str | None = None,
-) -> list[dict[str, Any]]:
-    if job is None:
-        return []
-    try:
-        pdf_path = job_pdf_path(job)
-    except Exception:
-        logger.warning("Could not resolve PDF path for PDF document input (job %s)", getattr(job, "id", "?"))
-        return []
-
-    resolved_filename = (filename or getattr(job, "original_filename", None) or pdf_path.name).strip()
-    if not resolved_filename.lower().endswith(".pdf"):
-        resolved_filename = f"{resolved_filename}.pdf"
-
-    try:
-        return [
-            {
-                "type": "file",
-                "file": {
-                    "filename": resolved_filename,
-                    "file_data": pdf_file_data_url(pdf_path, page_numbers),
-                },
-            }
-        ]
-    except Exception:
-        logger.debug("Failed to prepare PDF document input for intelligence", exc_info=True)
-        return []
-
-
 def page_preview_parts(job: Job | Any | None, page_numbers: Iterable[int]) -> list[dict[str, Any]]:
     if job is None:
         return []
@@ -167,15 +87,20 @@ def page_preview_parts(job: Job | Any | None, page_numbers: Iterable[int]) -> li
     return parts
 
 
-def semantic_page_parts(
-    job: Job | Any | None,
-    page_numbers: Iterable[int],
-    *,
-    filename: str | None = None,
-) -> list[dict[str, Any]]:
-    if local_semantic_enabled():
-        return page_preview_parts(job, page_numbers)
-    return pdf_file_parts(job, page_numbers, filename=filename)
+def extract_message_json(message: Any) -> dict[str, Any]:
+    """The JSON object in a chat-completions message: from its content, or,
+    for reasoning models that leave content empty, its reasoning_content."""
+    if not isinstance(message, dict):
+        raise ValueError("Unexpected LLM message format")
+    content = str(message.get("content") or "").strip()
+    reasoning = str(message.get("reasoning_content") or "").strip()
+    if content:
+        try:
+            return extract_json_object(content)
+        except ValueError:
+            if not reasoning:
+                raise
+    return extract_json_object(reasoning)
 
 
 def extract_json_object(raw_text: str) -> dict[str, Any]:
@@ -226,7 +151,7 @@ def preferred_cache_breakpoint_index(content: list[dict[str, Any]]) -> int | Non
     for index, item in enumerate(content):
         if not isinstance(item, dict):
             continue
-        if item.get("type") in {"image_url", "file"}:
+        if item.get("type") == "image_url":
             last_media_index = index
 
     if last_media_index is not None:
@@ -263,37 +188,6 @@ async def request_llm_json_with_response(
     cache_breakpoint_index: int | None = None,
     conversation_prefix: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    if (
-        conversation_prefix is None
-        and local_semantic_enabled()
-        and any(
-            isinstance(item, dict) and item.get("type") == "image_url"
-            for item in content
-        )
-        and not any(
-            isinstance(item, dict) and item.get("type") == "file"
-            for item in content
-        )
-    ):
-        response_schema_payload = response_schema if (response_schema and schema_name) else response_schema
-        return await request_local_semantic_content_json_with_response(
-            content=content,
-            response_schema=response_schema_payload,
-            system_instruction=(
-                "You are evaluating PDF accessibility and document semantics. "
-                "Stay grounded in the provided page evidence and return JSON only."
-            ),
-        )
-    if direct_gemini_pdf_enabled() and conversation_prefix is None:
-        response_schema_payload = response_schema if (response_schema and schema_name) else response_schema
-        return await request_direct_gemini_content_json_with_response(
-            content=content,
-            response_schema=response_schema_payload,
-            system_instruction=(
-                "You are evaluating PDF accessibility and document semantics. "
-                "Stay grounded in the provided document and return JSON only."
-            ),
-        )
     repair_note: str | None = None
 
     async def _request_once(request_content: list[dict[str, Any]]) -> Any:
@@ -306,7 +200,8 @@ async def request_llm_json_with_response(
             "temperature": 0,
         }
         response = None
-        if response_schema and schema_name:
+        model = str(llm_client.model)
+        if response_schema and schema_name and model not in JSON_SCHEMA_REFUSED_MODELS:
             try:
                 response = await llm_client.chat_completion(
                     **request_kwargs,
@@ -322,7 +217,8 @@ async def request_llm_json_with_response(
             except Exception as exc:
                 if not _should_try_alternate_response_format(exc):
                     raise
-                logger.debug("Structured json_schema LLM call failed, falling back to json_object")
+                logger.info("%s refused json_schema output; asking for json_object", model)
+                JSON_SCHEMA_REFUSED_MODELS.add(model)
                 response = None
         if response is None:
             try:
@@ -357,11 +253,11 @@ async def request_llm_json_with_response(
         response = await _request_once(prepared_content)
 
         try:
-            message_content = response["choices"][0]["message"]["content"]
+            message = response["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
             raise ValueError(f"Unexpected LLM response format: {exc}") from exc
         try:
-            return extract_json_object(str(message_content)), response
+            return extract_message_json(message), response
         except ValueError as exc:
             if attempt == 1:
                 raise
@@ -369,3 +265,35 @@ async def request_llm_json_with_response(
             logger.info("Retrying malformed JSON LLM response: %s", repair_note)
 
     raise RuntimeError("Unreachable")
+
+
+async def request_pdf_pages_json(
+    *,
+    pdf_path: str | Path,
+    page_numbers: list[int],
+    prompt: str,
+    context_payload: Any | None = None,
+    response_schema: dict[str, Any] | None = None,
+    schema_name: str = "document_decision",
+    system_instruction: str,
+) -> dict[str, Any]:
+    """Ask the model lane about some pages of a PDF, shown as rendered page
+    images."""
+    job = SimpleNamespace(id=None, output_path=None, input_path=str(pdf_path))
+    content: list[dict[str, Any]] = [
+        {"type": "text", "text": prompt},
+        *page_preview_parts(job, page_numbers),
+    ]
+    if context_payload is not None:
+        content.append(context_json_part(context_payload))
+    client = make_llm_client(get_settings())
+    try:
+        return await request_llm_json(
+            llm_client=client,
+            content=content,
+            schema_name=schema_name if response_schema else None,
+            response_schema=response_schema,
+            conversation_prefix=[{"role": "system", "content": system_instruction}],
+        )
+    finally:
+        await client.close()

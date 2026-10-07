@@ -24,7 +24,7 @@ def test_docling_structure_escalation_prefers_docling_title_and_native_toc():
     assert plan["title"]["reason"] == "docling_title_present"
     assert plan["bookmarks"]["decision"] == "docling"
     assert plan["bookmarks"]["reason"] == "docling_native_toc_present"
-    assert plan["toc"]["decision"] == "gemini"
+    assert plan["toc"]["decision"] == "model"
     assert plan["language"]["decision"] == "docling"
 
 
@@ -41,13 +41,13 @@ def test_docling_structure_escalation_routes_title_when_early_evidence_extends_i
         }
     )
 
-    assert plan["title"]["decision"] == "gemini"
+    assert plan["title"]["decision"] == "model"
     assert plan["title"]["reason"] == "early_title_evidence_requires_adjudication"
     assert plan["title"]["signal"] == "Part 1"
     assert plan["title"]["evidence"] == ["Part 1", "Visible Main Title", "Visible Subtitle"]
 
 
-def test_docling_structure_escalation_uses_gemini_when_docling_signals_are_missing():
+def test_docling_structure_escalation_uses_the_model_when_docling_signals_are_missing():
     plan = docling_structure_escalation_plan(
         {
             "title": "",
@@ -55,9 +55,9 @@ def test_docling_structure_escalation_uses_gemini_when_docling_signals_are_missi
         }
     )
 
-    assert plan["title"]["decision"] == "gemini"
+    assert plan["title"]["decision"] == "model"
     assert plan["title"]["reason"] == "missing_docling_title"
-    assert plan["bookmarks"]["decision"] == "gemini"
+    assert plan["bookmarks"]["decision"] == "model"
     assert plan["bookmarks"]["reason"] == "missing_docling_native_toc"
 
 
@@ -163,10 +163,10 @@ def test_docling_pretag_ambiguity_router_routes_only_unresolved_units(monkeypatc
         structure_json={"elements": []},
     )
 
-    assert router["plan"]["forms"]["decision"] == "gemini"
+    assert router["plan"]["forms"]["decision"] == "model"
     assert router["plan"]["forms"]["candidate_count"] == 1
     assert router["plan"]["forms"]["pages"] == [1]
-    assert router["plan"]["tables"]["decision"] == "gemini"
+    assert router["plan"]["tables"]["decision"] == "model"
     assert router["plan"]["tables"]["pages"] == [3]
-    assert router["plan"]["widgets"]["decision"] == "gemini"
+    assert router["plan"]["widgets"]["decision"] == "model"
     assert router["plan"]["widgets"]["pages"] == [2]

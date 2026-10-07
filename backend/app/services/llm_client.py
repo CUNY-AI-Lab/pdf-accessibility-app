@@ -53,7 +53,9 @@ def track_llm_usage():
 
 
 def _is_retryable(exc: BaseException) -> bool:
-    if isinstance(exc, httpx.TransportError):
+    # Repeat only a request that never reached the provider. After a read
+    # timeout the model may have run, and been paid for, anyway.
+    if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout | httpx.PoolTimeout):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in RETRYABLE_STATUS_CODES
@@ -205,7 +207,8 @@ class LlmClient:
                     max_backoff_seconds=self.max_backoff_seconds,
                 )
                 logger.warning(
-                    "LLM request failed (%s), retrying in %.1fs [attempt %s/%s]",
+                    "LLM request failed (%s: %s), retrying in %.1fs [attempt %s/%s]",
+                    type(exc).__name__,
                     exc,
                     delay,
                     attempt_number,
@@ -222,6 +225,13 @@ class LlmClient:
                 "/chat/completions",
                 json={"model": self.model, "messages": messages, **kwargs},
             )
+            if response.is_error:
+                logger.warning(
+                    "LLM request to %s refused (%s): %s",
+                    self.model,
+                    response.status_code,
+                    _error_message(response),
+                )
             response.raise_for_status()
             payload = response.json()
             _record_response_usage(payload)
@@ -229,6 +239,17 @@ class LlmClient:
 
     async def close(self):
         await self.client.aclose()
+
+
+def _error_message(response: httpx.Response) -> str:
+    """The provider's own explanation of a refused request, if it gave one."""
+    try:
+        error = response.json().get("error")
+    except ValueError:
+        return response.text[:300]
+    if isinstance(error, dict):
+        return str(error.get("message") or error)[:300]
+    return str(error or response.text)[:300]
 
 
 def make_llm_client(settings: Any) -> LlmClient:
@@ -244,12 +265,9 @@ def make_llm_client_with_overrides(
     max_backoff_seconds: float | None = None,
     max_concurrency: int | None = None,
 ) -> LlmClient:
-    api_key = (getattr(settings, "llm_api_key", "") or "").strip() or (
-        getattr(settings, "gemini_api_key", "") or ""
-    ).strip()
     return LlmClient(
         base_url=settings.llm_base_url,
-        api_key=api_key,
+        api_key=settings.llm_api_key,
         model=settings.llm_model,
         timeout=settings.llm_timeout if timeout is None else timeout,
         max_retries=settings.llm_max_retries if max_retries is None else max_retries,

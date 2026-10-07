@@ -1,0 +1,310 @@
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+from app.config import get_settings
+from app.models import Job
+from app.services.intelligence_llm_utils import (
+    context_json_part,
+    page_preview_parts,
+    preferred_cache_breakpoint_index,
+    request_llm_json_with_response,
+)
+from app.services.intelligence_normalize import confidence_label, confidence_score
+from app.services.intelligence_semantics import adjudicate_semantic_unit
+from app.services.llm_client import LlmClient
+from app.services.semantic_units import SemanticUnit
+
+FORM_BATCH_PROMPT = """You are a PDF accessibility form-label assistant.
+
+You will receive exactly one PDF page and a list of form-field candidates from that same page.
+
+Goal:
+- choose the accessible field label that assistive technology should announce for each field
+- preserve visible meaning
+- use the page image and local evidence together
+
+Rules:
+- Return one decision per provided field_review_id when possible.
+- Prefer labels that preserve the same meaning a screen reader user needs, even when that means including short section or group context.
+- Treat context_blocks as candidate governing section or group evidence. Use a context block only when it genuinely applies to the field; ignore merely adjacent labels or unrelated page text.
+- When a governing context block clearly identifies the field's section, group, party, or question, include that context in accessible_label instead of returning a bare short label.
+- When a short visible label would be ambiguous on its own, include the nearby section, group, or question text that disambiguates it.
+- For checkbox and radio controls, combine nearby group text and option text when that is what a screen reader should hear.
+- Preserve short visible action cues when they are clearly supported by the control type and nearby text.
+- Do not shorten a clearly helpful accessible label just because a shorter visible label exists.
+- Do not copy long instruction paragraphs verbatim when a shorter faithful label is visible.
+- Use confirm_current_label only when the current accessible label is already good.
+- Use set_field_label when a better faithful label is clearly supported.
+- Use manual_only when the field is ambiguous from the page image and nearby context.
+"""
+
+FORM_BATCH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "task_type": {"type": "string", "enum": ["form_page_intelligence"]},
+        "page": {"type": "integer", "minimum": 1},
+        "summary": {"type": "string"},
+        "decisions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "field_review_id": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "suggested_action": {
+                        "type": "string",
+                        "enum": ["confirm_current_label", "set_field_label", "manual_only"],
+                    },
+                    "reason": {"type": "string"},
+                    "accessible_label": {"type": "string"},
+                },
+                "required": [
+                    "field_review_id",
+                    "summary",
+                    "confidence",
+                    "suggested_action",
+                    "reason",
+                ],
+            },
+        },
+    },
+    "required": ["task_type", "page", "summary", "decisions"],
+}
+
+
+def _normalize_form_intelligence_result(
+    *,
+    field_review_id: str,
+    page_number: int,
+    current_accessible_name: str,
+    current_field_name: str,
+    raw: dict[str, Any],
+    batch_generated: bool = False,
+) -> dict[str, Any]:
+    suggested_action = str(raw.get("suggested_action") or "manual_only").strip() or "manual_only"
+    accessible_label = str(raw.get("accessible_label") or "").strip()
+    if suggested_action == "set_field_label" and not accessible_label:
+        suggested_action = "manual_only"
+    confidence = confidence_label(raw.get("confidence"))
+    return {
+        "task_type": "form_intelligence",
+        "summary": str(raw.get("summary") or "").strip(),
+        "confidence": confidence,
+        "confidence_score": confidence_score(confidence),
+        "suggested_action": suggested_action,
+        "reason": str(raw.get("reason") or "").strip(),
+        "field_review_id": field_review_id,
+        "page": page_number,
+        "accessible_label": accessible_label,
+        "current_accessible_name": current_accessible_name,
+        "current_field_name": current_field_name,
+        "batch_generated": batch_generated,
+    }
+
+
+def _batch_prompt_target(target: dict[str, Any]) -> dict[str, Any]:
+    nearby_blocks = []
+    for block in list(target.get("nearby_blocks") or [])[:2]:
+        if not isinstance(block, dict):
+            continue
+        text = str(block.get("text") or "").strip()
+        if not text:
+            continue
+        nearby_blocks.append(
+            {
+                "review_id": str(block.get("review_id") or "").strip(),
+                "type": str(block.get("type") or "").strip(),
+                "text": text[:120],
+            }
+        )
+    nearby_fields = []
+    for field in list(target.get("nearby_fields") or [])[:3]:
+        if not isinstance(field, dict):
+            continue
+        nearby_fields.append(
+            {
+                "field_review_id": str(field.get("field_review_id") or "").strip(),
+                "field_type": str(field.get("field_type") or "").strip(),
+                "accessible_name": str(field.get("accessible_name") or "").strip(),
+                "label_quality": str(field.get("label_quality") or "").strip(),
+            }
+        )
+    return {
+        "field_review_id": str(target.get("field_review_id") or "").strip(),
+        "bbox": target.get("bbox") if isinstance(target.get("bbox"), dict) else None,
+        "field_type": str(target.get("field_type") or "").strip(),
+        "field_name": str(target.get("field_name") or "").strip(),
+        "accessible_name": str(target.get("accessible_name") or "").strip(),
+        "label_quality": str(target.get("label_quality") or "").strip(),
+        "value_text": str(target.get("value_text") or "").strip()[:120],
+        "nearby_blocks": nearby_blocks,
+        "context_blocks": [
+            {
+                "review_id": str(block.get("review_id") or "").strip(),
+                "type": str(block.get("type") or "").strip(),
+                "text": str(block.get("text") or "").strip()[:180],
+                "context_role": str(block.get("context_role") or "").strip(),
+            }
+            for block in list(target.get("context_blocks") or [])[:4]
+            if isinstance(block, dict) and str(block.get("text") or "").strip()
+        ],
+        "nearby_fields": nearby_fields,
+    }
+
+
+def _page_target_batches(targets: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Fields to ask about per request: a page's fields in batches, so each
+    request stays small enough to answer well."""
+    if not targets:
+        return []
+    batch_size = max(1, int(get_settings().llm_page_candidate_batch_size))
+    return [targets[index : index + batch_size] for index in range(0, len(targets), batch_size)]
+
+
+async def _request_form_intelligence_batch(
+    *,
+    job: Job,
+    page_number: int,
+    batch: list[dict[str, Any]],
+    llm_client: LlmClient,
+) -> dict[str, dict[str, Any]]:
+    payload = {
+        "job_filename": getattr(job, "original_filename", ""),
+        "page": page_number,
+        "fields": [_batch_prompt_target(target) for target in batch],
+    }
+    content = [
+        {"type": "text", "text": FORM_BATCH_PROMPT},
+        *page_preview_parts(job, [page_number]),
+        context_json_part(payload),
+    ]
+    parsed, _response = await request_llm_json_with_response(
+        llm_client=llm_client,
+        content=content,
+        schema_name="form_page_intelligence",
+        response_schema=FORM_BATCH_SCHEMA,
+        cache_breakpoint_index=preferred_cache_breakpoint_index(content),
+    )
+    decision_map: dict[str, dict[str, Any]] = {}
+    decisions = parsed.get("decisions")
+    if not isinstance(decisions, list):
+        return decision_map
+    for item in decisions:
+        if not isinstance(item, dict):
+            continue
+        field_review_id = str(item.get("field_review_id") or "").strip()
+        if not field_review_id:
+            continue
+        decision_map[field_review_id] = item
+    return decision_map
+
+
+async def generate_form_intelligence(
+    *,
+    job: Job,
+    target: dict[str, Any],
+    nearby_blocks: list[dict[str, Any]],
+    llm_client: LlmClient,
+    reviewer_feedback: str | None = None,
+    previous_intelligence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    unit = SemanticUnit(
+        unit_id=str(target.get("field_review_id") or "").strip(),
+        unit_type="form_field",
+        page=int(target.get("page")) if isinstance(target.get("page"), int) else 1,
+        accessibility_goal=(
+            "Choose the accessible field label that assistive technology should announce, "
+            "including group-label context for related controls when needed."
+        ),
+        bbox=target.get("bbox") if isinstance(target.get("bbox"), dict) else None,
+        nearby_context=nearby_blocks,
+        structure_context=list(target.get("context_blocks") or []),
+        current_semantics={
+            "accessible_label": str(target.get("accessible_name") or "").strip(),
+            "field_name": str(target.get("field_name") or "").strip(),
+            "field_type": str(target.get("field_type") or "").strip(),
+            "label_quality": str(target.get("label_quality") or "").strip(),
+        },
+        metadata={
+            "field_review_target": target,
+            "context_blocks": list(target.get("context_blocks") or []),
+            "nearby_fields": list(target.get("nearby_fields") or []),
+            "reviewer_feedback": reviewer_feedback or "",
+            "previous_intelligence": previous_intelligence or {},
+        },
+    )
+    decision = await adjudicate_semantic_unit(
+        job=job,
+        unit=unit,
+        llm_client=llm_client,
+    )
+    return _normalize_form_intelligence_result(
+        field_review_id=unit.unit_id,
+        page_number=unit.page,
+        current_accessible_name=str(target.get("accessible_name") or "").strip(),
+        current_field_name=str(target.get("field_name") or "").strip(),
+        raw={
+            "summary": decision.summary,
+            "confidence": decision.confidence,
+            "suggested_action": decision.suggested_action,
+            "reason": decision.reason,
+            "accessible_label": decision.accessible_label or "",
+        },
+    )
+
+
+async def generate_form_intelligence_for_page(
+    *,
+    job: Job,
+    page_number: int,
+    targets: list[dict[str, Any]],
+    llm_client: LlmClient,
+) -> list[dict[str, Any]]:
+    if not targets:
+        return []
+    decision_map: dict[str, dict[str, Any]] = {}
+    batches = _page_target_batches(targets)
+    if len(batches) > 1:
+        settings = get_settings()
+        semaphore = asyncio.Semaphore(max(1, int(settings.llm_max_concurrency)))
+
+        async def _run_batch(batch: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+            async with semaphore:
+                return await _request_form_intelligence_batch(
+                    job=job,
+                    page_number=page_number,
+                    batch=batch,
+                    llm_client=llm_client,
+                )
+
+        batch_results = await asyncio.gather(*[_run_batch(batch) for batch in batches])
+        for batch_result in batch_results:
+            decision_map.update(batch_result)
+    else:
+        for batch in batches:
+            decision_map.update(
+                await _request_form_intelligence_batch(
+                    job=job,
+                    page_number=page_number,
+                    batch=batch,
+                    llm_client=llm_client,
+                )
+            )
+
+    results = [
+        _normalize_form_intelligence_result(
+            field_review_id=str(target.get("field_review_id") or "").strip(),
+            page_number=page_number,
+            current_accessible_name=str(target.get("accessible_name") or "").strip(),
+            current_field_name=str(target.get("field_name") or "").strip(),
+            raw=decision_map.get(str(target.get("field_review_id") or "").strip()) or {},
+            batch_generated=True,
+        )
+        for target in targets
+    ]
+    return results

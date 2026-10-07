@@ -59,7 +59,7 @@ def _title_decision(structure: dict[str, Any]) -> dict[str, Any]:
     title = _normalize_text(structure.get("title"))
     if not title:
         return {
-            "decision": "gemini",
+            "decision": "model",
             "reason": "missing_docling_title",
             "signal": "",
         }
@@ -78,7 +78,7 @@ def _title_decision(structure: dict[str, Any]) -> dict[str, Any]:
     short_or_fragment_like = _word_count(title) <= 4
     if short_or_fragment_like and title_matches_evidence and extra_title_evidence:
         return {
-            "decision": "gemini",
+            "decision": "model",
             "reason": "early_title_evidence_requires_adjudication",
             "signal": title,
             "evidence": evidence,
@@ -98,12 +98,12 @@ def docling_structure_escalation_plan(structure_json: dict[str, Any] | None) -> 
     return {
         "title": _title_decision(structure),
         "toc": {
-            "decision": "gemini",
+            "decision": "model",
             "reason": "visible_toc_page_semantics_not_docling_authoritative",
             "signal": "visible_toc_requires_page_semantics",
         },
         "bookmarks": {
-            "decision": "docling" if has_native_toc else "gemini",
+            "decision": "docling" if has_native_toc else "model",
             "reason": (
                 "docling_native_toc_present"
                 if has_native_toc
@@ -169,7 +169,7 @@ def _lane_plan(
         }
     )
     return {
-        "decision": "gemini" if targets else "docling",
+        "decision": "model" if targets else "docling",
         "reason": ambiguous_reason if targets else resolved_reason,
         "candidate_count": len(targets),
         "pages": pages,

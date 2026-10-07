@@ -9,13 +9,14 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from app.services.intelligence_gemini_figures import (
+from app.services.local_semantic import _extract_json_from_message
+
+from app.services.intelligence_figures import (
     FIGURE_BATCH_PROMPT,
     FIGURE_BATCH_SCHEMA,
 )
 from app.services.intelligence_llm_utils import context_json_part
 from app.services.llm_client import LlmClient
-from app.services.local_semantic import _extract_json_from_message
 from app.services.pdf_preview import (
     render_bbox_preview_png_data_url,
     render_page_jpeg_data_url,
@@ -417,7 +418,7 @@ def main() -> int:
     parser.add_argument(
         "--reference-db",
         default="",
-        help="Optional reference workflow_benchmark.sqlite3 to compare against (for example the Gemini run)",
+        help="Optional reference workflow_benchmark.sqlite3 to compare against (for example a run with another model)",
     )
     parser.add_argument(
         "--model",

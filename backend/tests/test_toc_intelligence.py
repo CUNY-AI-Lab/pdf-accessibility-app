@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
-from app.services.intelligence_gemini_toc import generate_toc_group_intelligence
+from app.services.intelligence_toc import generate_toc_group_intelligence
 from app.services.toc_intelligence import (
     apply_toc_intelligence,
     collect_toc_candidates,
@@ -227,11 +227,11 @@ def test_enhance_toc_structure_chunks_large_existing_toc_groups(monkeypatch, tmp
     assert audit["chunk_count"] == 2
 
 
-def test_generate_toc_group_intelligence_can_use_direct_gemini(monkeypatch, tmp_path):
+def test_generate_toc_group_intelligence_asks_the_model_about_the_toc_pages(monkeypatch, tmp_path):
     pdf_path = tmp_path / "sample.pdf"
     pdf_path.write_bytes(b"%PDF-1.4\n% test\n")
 
-    async def _fake_direct_request(**kwargs):
+    async def _fake_pages_request(**kwargs):
         assert kwargs["page_numbers"] == [1, 2]
         assert kwargs["context_payload"]["semantic_unit"]["caption_index"] == 0
         return {
@@ -247,8 +247,8 @@ def test_generate_toc_group_intelligence_can_use_direct_gemini(monkeypatch, tmp_
         }
 
     monkeypatch.setattr(
-        "app.services.intelligence_gemini_toc.request_direct_gemini_pdf_json",
-        _fake_direct_request,
+        "app.services.intelligence_toc.request_pdf_pages_json",
+        _fake_pages_request,
     )
 
     result = asyncio.run(

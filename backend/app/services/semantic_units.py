@@ -24,6 +24,11 @@ class SemanticUnit:
         data = asdict(self)
         if not self.bbox:
             data.pop("bbox", None)
+        # Images go to the model as image parts; as text, one figure's data
+        # URL alone can fill the model's context.
+        data["metadata"] = {
+            key: value for key, value in data["metadata"].items() if key != "extra_image_data_urls"
+        }
         return data
 
 
