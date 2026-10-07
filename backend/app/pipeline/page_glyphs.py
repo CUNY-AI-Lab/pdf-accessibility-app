@@ -30,9 +30,11 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pdfminer.cmapdb import IdentityCMap, IdentityCMapByte
 from pdfminer.converter import PDFLayoutAnalyzer
 from pdfminer.layout import LTChar
 from pdfminer.pdfdocument import PDFDocument, PDFNoPageLabels
+from pdfminer.pdffont import PDFSimpleFont
 from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
 from pdfminer.pdfpage import PDFPage
 from pdfminer.pdfparser import PDFParser
@@ -56,6 +58,29 @@ class MeasuredGlyph:
     bbox: dict[str, float]
     # Index of the TJ array element that drew the glyph (0 for Tj, ', ").
     element: int = 0
+    # The glyph's code: its byte span in that string, so a string can be cut
+    # between glyphs.
+    code: tuple[int, int] = (0, 0)
+
+
+def code_spans(font, string: bytes) -> list[tuple[int, int]]:
+    """The byte span of each glyph code in a string, as the font reads it:
+    one byte for a simple font, two for an Identity CMap, and otherwise
+    wherever decoding a longer prefix yields another code."""
+    if isinstance(font, PDFSimpleFont) or isinstance(getattr(font, "cmap", None), IdentityCMapByte):
+        width = 1
+    elif isinstance(getattr(font, "cmap", None), IdentityCMap):
+        width = 2
+    else:
+        spans: list[tuple[int, int]] = []
+        start = seen = 0
+        for end in range(1, len(string) + 1):
+            count = len(list(font.decode(string[:end])))
+            if count > seen:
+                spans.append((start, end))
+                start, seen = end, count
+        return spans
+    return [(i, i + width) for i in range(0, len(string) - width + 1, width)]
 
 
 def union_bbox(boxes: Iterable[dict[str, float]]) -> dict[str, float] | None:
@@ -187,12 +212,13 @@ class _Recorder(PDFLayoutAnalyzer):
         stream, recording = self.streams[-1]
         if recording:
             self.page.ops[stream].append(self.op)
-        # The TJ element of each glyph pdfminer will draw, in order.
+        # The TJ element and code span of each glyph pdfminer will draw, in
+        # order.
         self.op_elements = [
-            index
+            (index, span)
             for index, element in enumerate(seq)
             if isinstance(element, bytes) and font is not None
-            for _cid in font.decode(element)
+            for span in code_spans(font, element)
         ]
 
     def render_char(self, matrix, font, fontsize, scaling, rise, cid, ncs, graphicstate):
@@ -200,10 +226,12 @@ class _Recorder(PDFLayoutAnalyzer):
         char = self.cur_item._objs[-1]
         if not isinstance(char, LTChar) or self.op is None:
             return advance
+        element, code = self.op_elements[len(self.op.glyphs)]
         glyph = MeasuredGlyph(
             text=char.get_text(),
             bbox={"l": char.x0, "b": char.y0, "r": char.x1, "t": char.y1},
-            element=self.op_elements[len(self.op.glyphs)],
+            element=element,
+            code=code,
         )
         self.op.glyphs.append(glyph)
         target = self._target()

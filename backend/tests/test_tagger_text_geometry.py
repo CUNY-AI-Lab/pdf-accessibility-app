@@ -4,13 +4,15 @@ tag a table row drawn by one TJ cell by cell without changing how the page
 looks."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pikepdf
 import pytest
+from pdfminer.cmapdb import CMap, IdentityCMap, IdentityCMapByte
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTChar
 
-from app.pipeline.page_glyphs import PdfGlyphReader
+from app.pipeline.page_glyphs import PdfGlyphReader, code_spans
 from app.pipeline.tagger import _content_targets, _owner_of, tag_pdf
 from app.services.structure_text import screen_reader_text
 from tests.pdf_fixtures import helvetica, rendered
@@ -132,6 +134,82 @@ async def test_a_row_drawn_by_one_tj_is_tagged_cell_by_cell(tmp_path):
     for row in CELLS[1:]:
         assert "".join(f"<td>{text}</td>" for text in row) in heard
     assert rendered(tagged) == rendered(source)
+
+
+@pytest.mark.asyncio
+async def test_a_row_drawn_by_one_string_is_tagged_cell_by_cell(tmp_path):
+    """Some producers draw a row as one string, spaces and all. The string is
+    cut between glyphs, so each cell holds its own number."""
+    source = tmp_path / "row.pdf"
+    tagged = tmp_path / "tagged.pdf"
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
+    page.Contents = pdf.make_stream(b"BT /F1 10 Tf 72 700 Td (55 54 60) Tj ET")
+    pdf.save(source)
+    glyphs = [
+        glyph
+        for op in PdfGlyphReader(source).page(0).ops[()]
+        for glyph in op.glyphs
+        if glyph.text.strip()
+    ]
+    cells = []
+    for col in range(3):
+        drawn = glyphs[2 * col : 2 * col + 2]
+        cells.append(
+            {
+                "text": "".join(glyph.text for glyph in drawn),
+                "row": 0,
+                "col": col,
+                "row_span": 1,
+                "col_span": 1,
+                "bbox": {
+                    "l": drawn[0].bbox["l"] - 1,
+                    "b": drawn[0].bbox["b"] - 1,
+                    "r": drawn[-1].bbox["r"] + 1,
+                    "t": drawn[0].bbox["t"] + 1,
+                },
+            }
+        )
+    structure = {
+        "title": "Row",
+        "elements": [
+            {
+                "type": "table",
+                "page": 0,
+                "bbox": {"l": 60, "b": 690, "r": 200, "t": 715},
+                "num_rows": 1,
+                "num_cols": 3,
+                "cells": cells,
+            }
+        ],
+    }
+
+    await tag_pdf(
+        input_path=source,
+        output_path=tagged,
+        structure_json=structure,
+        alt_texts=[],
+        language="en",
+        original_filename=source.name,
+    )
+
+    assert "<td>55</td><td>54</td><td>60</td>" in screen_reader_text(tagged, markdown=True)
+    assert rendered(tagged) == rendered(source)
+
+
+def test_code_spans_follow_the_fonts_code_length():
+    one_byte = SimpleNamespace(cmap=IdentityCMapByte())
+    two_byte = SimpleNamespace(cmap=IdentityCMap())
+    mixed = CMap()
+    mixed.code2cid = {0x81: {0x40: 1}, 0x41: 2}
+    assert code_spans(one_byte, b"ab") == [(0, 1), (1, 2)]
+    assert code_spans(two_byte, b"\x00\x01\x00\x02") == [(0, 2), (2, 4)]
+    assert code_spans(SimpleNamespace(cmap=mixed, decode=mixed.decode), b"A\x81\x40A") == [
+        (0, 1),
+        (1, 3),
+        (3, 4),
+    ]
 
 
 def _page_with_ocr_form(path: Path) -> None:

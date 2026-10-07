@@ -1838,10 +1838,13 @@ def _split_text_ops_across_targets(
     measured: dict[int, MeasuredTextOp],
     word_owners: dict[tuple, ContentTarget | None],
 ) -> tuple[list, dict[int, MeasuredTextOp], list[int]]:
-    """Split each TJ whose strings have more than one owner (see _word_owners)
-    into consecutive TJs, one per owner, at TJ array element boundaries, so
-    each can be tagged on its own. Rendering is unchanged: the text position
-    carries over from one TJ to the next.
+    """Split each Tj or TJ whose glyphs have more than one owner (see
+    _word_owners) into consecutive TJs, one per owner, so each can be tagged
+    on its own. A string is cut between glyph codes where the owner changes,
+    as opendataloader-pdf does for a string that crosses table cells; a
+    number (a position adjustment) stays with the string before it.
+    Rendering is unchanged: the text position carries over from one TJ to
+    the next.
 
     Returns the new instructions, their measurements, and for each original
     instruction index (and one past the end) its new index, so positions
@@ -1852,46 +1855,59 @@ def _split_text_ops_across_targets(
     for idx, instr in enumerate(instructions):
         new_index.append(len(new_instructions))
         op = measured.get(idx)
-        array = instr.operands[0] if str(instr.operator) == "TJ" and instr.operands else None
-        owners: dict[int, ContentTarget | None] = {}
-        if op is not None and isinstance(array, pikepdf.Array):
-            strings: dict[int, list[MeasuredGlyph]] = {}
-            for glyph in op.glyphs:
-                strings.setdefault(glyph.element, []).append(glyph)
-            owners = {
-                element: _owner_of_glyphs(glyphs, word_owners)
-                for element, glyphs in strings.items()
-            }
-        if not isinstance(array, pikepdf.Array) or len(set(owners.values())) < 2:
+        operator = str(instr.operator)
+        owners = (
+            [word_owners.get(_glyph_key(glyph)) for glyph in op.glyphs]
+            if op is not None and operator in ("Tj", "TJ") and instr.operands
+            else []
+        )
+        if len(set(owners)) < 2:
             if op is not None:
                 new_measured[len(new_instructions)] = op
             new_instructions.append(instr)
             continue
-        # Group array elements by owner. A number (a position adjustment)
-        # stays with the elements before it; either side renders the same.
-        groups: list[list[int]] = [[]]
+        array = list(instr.operands[0]) if operator == "TJ" else [instr.operands[0]]
+        drawn: dict[int, list[tuple[MeasuredGlyph, ContentTarget | None]]] = {}
+        for glyph, owner in zip(op.glyphs, owners, strict=True):
+            drawn.setdefault(glyph.element, []).append((glyph, owner))
+        # The array in pieces: a number or undrawn string as it is, a drawn
+        # string cut where its glyphs' owner changes. Each piece keeps its
+        # glyphs, their code spans moved to the piece's start.
+        pieces: list[tuple[object, list[MeasuredGlyph], ContentTarget | None]] = []
+        for element_index, item in enumerate(array):
+            glyphs = drawn.get(element_index)
+            if not glyphs:
+                pieces.append((item, [], None))
+                continue
+            data = bytes(item)
+            cut, run, run_owner = 0, [], glyphs[0][1]
+            for glyph, owner in glyphs:
+                if owner != run_owner:
+                    pieces.append((pikepdf.String(data[cut : glyph.code[0]]), run, run_owner))
+                    cut, run, run_owner = glyph.code[0], [], owner
+                start, stop = glyph.code
+                run.append(dataclasses.replace(glyph, code=(start - cut, stop - cut)))
+            pieces.append((pikepdf.String(data[cut:]), run, run_owner))
+        groups: list[list[tuple[object, list[MeasuredGlyph], ContentTarget | None]]] = [[]]
         group_owner: ContentTarget | None = None
-        for element_index in range(len(array)):
-            drawn = element_index in owners
-            owner = owners.get(element_index, group_owner)
-            group_drawn = any(i in owners for i in groups[-1])
-            if drawn and group_drawn and owner != group_owner:
+        for piece in pieces:
+            _, glyphs, owner = piece
+            if glyphs and any(member[1] for member in groups[-1]) and owner != group_owner:
                 groups.append([])
-            groups[-1].append(element_index)
-            if drawn:
+            groups[-1].append(piece)
+            if glyphs:
                 group_owner = owner
         for group in groups:
-            members = set(group)
             new_measured[len(new_instructions)] = MeasuredTextOp(
                 glyphs=[
-                    dataclasses.replace(glyph, element=group.index(glyph.element))
-                    for glyph in op.glyphs
-                    if glyph.element in members
+                    dataclasses.replace(glyph, element=position)
+                    for position, (_, glyphs, _) in enumerate(group)
+                    for glyph in glyphs
                 ]
             )
             new_instructions.append(
                 pikepdf.ContentStreamInstruction(
-                    [pikepdf.Array([array[i] for i in group])], pikepdf.Operator("TJ")
+                    [pikepdf.Array([item for item, _, _ in group])], pikepdf.Operator("TJ")
                 )
             )
     new_index.append(len(new_instructions))
