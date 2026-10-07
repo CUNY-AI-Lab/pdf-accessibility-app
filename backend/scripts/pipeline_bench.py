@@ -8,12 +8,21 @@ produced nothing for gets ``<stem>.failed`` holding the job's status and
 error. Either file marks the PDF done, so an interrupted run resumes where it
 stopped; delete ``.failed`` files to retry them. The scorers read the tagged
 PDFs.
+
+What the tagger was given for the tagged result is kept beside it in
+``<stem>.tag-inputs/`` (the PDF it tagged, the structure, the alt text, and
+its other arguments), so ``retag_bench.py`` can tag every page again with
+other tagger code in about a minute, without OCR and Docling. Where the
+pipeline rewrote the tagged PDF afterwards (its font repairs), the inputs of
+its last tagger call are kept, marked ``rewritten-after-tagging``.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
+import json
 import shutil
 import tempfile
 import uuid
@@ -21,13 +30,32 @@ from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+import app.pipeline.orchestrator as orchestrator
 from app.api.jobs import PIPELINE_STEPS
 from app.config import get_settings
 from app.models import Base, Job, JobStep
-from app.pipeline.orchestrator import run_pipeline
 from app.services.job_manager import JobManager
 
 OWNER = "0" * 64
+TAG_PDF = orchestrator.tag_pdf
+# Each tag_pdf call of the current job: its output path, and a copy of its
+# inputs taken when it was called.
+tag_calls: list[tuple[Path, Path]] = []
+
+
+async def recording_tag_pdf(*args, **kwargs):
+    arguments = dict(inspect.signature(TAG_PDF).bind(*args, **kwargs).arguments)
+    inputs = Path(tempfile.mkdtemp(prefix="tag-inputs-"))
+    shutil.copy(arguments.pop("input_path"), inputs / "input.pdf")
+    output_path = Path(arguments.pop("output_path"))
+    structure = json.dumps(arguments.pop("structure_json"), default=str)
+    (inputs / "structure.json").write_text(structure)
+    (inputs / "arguments.json").write_text(json.dumps(arguments, default=str))
+    tag_calls.append((output_path, inputs))
+    return await TAG_PDF(*args, **kwargs)
+
+
+orchestrator.tag_pdf = recording_tag_pdf
 
 
 async def remediate(
@@ -49,7 +77,7 @@ async def remediate(
         for step in PIPELINE_STEPS:
             db.add(JobStep(job_id=job_id, step_name=step))
         await db.commit()
-    await run_pipeline(job_id, session_maker, settings, job_manager)
+    await orchestrator.run_pipeline(job_id, session_maker, settings, job_manager)
     async with session_maker() as db:
         job = await db.get(Job, job_id)
         if job is None:
@@ -86,11 +114,22 @@ async def main() -> None:
                 failed = out_dir / f"{pdf.stem}.failed"
                 if tagged.exists() or failed.exists():
                     continue
+                tag_calls.clear()
                 output, status, error = await remediate(pdf, session_maker, settings, job_manager)
                 if output is not None and output.exists():
                     shutil.copy(output, tagged)
+                    kept = out_dir / f"{pdf.stem}.tag-inputs"
+                    shutil.rmtree(kept, ignore_errors=True)
+                    final = [inputs for path, inputs in tag_calls if path == output]
+                    if final:
+                        shutil.move(final[-1], kept)
+                    elif tag_calls:
+                        shutil.move(tag_calls[-1][1], kept)
+                        (kept / "rewritten-after-tagging").touch()
                 else:
                     failed.write_text(f"{status}\n{error}\n", encoding="utf-8")
+                for _, inputs in tag_calls:
+                    shutil.rmtree(inputs, ignore_errors=True)
                 print(f"{subset}/{pdf.name}: {status}", flush=True)
         await engine.dispose()
 
