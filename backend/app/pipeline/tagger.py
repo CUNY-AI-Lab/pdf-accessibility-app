@@ -476,20 +476,37 @@ def _content_targets(elements: list[dict]) -> list[ContentTarget]:
     return targets
 
 
-def _owner_of(box: dict[str, float], targets: list[ContentTarget]) -> ContentTarget | None:
+def _upright(box: dict[str, float], turn: int) -> dict[str, float]:
+    """A user-space box turned so that text running `turn` quarter turns
+    counterclockwise (see MeasuredGlyph.turn) runs left to right."""
+    left, bottom, right, top = box["l"], box["b"], box["r"], box["t"]
+    if turn == 1:
+        return {"l": bottom, "b": -right, "r": top, "t": -left}
+    if turn == 2:
+        return {"l": -right, "b": -top, "r": -left, "t": -bottom}
+    if turn == 3:
+        return {"l": -top, "b": left, "r": -bottom, "t": right}
+    return box
+
+
+def _owner_of(
+    box: dict[str, float], targets: list[ContentTarget], turn: int = 0
+) -> ContentTarget | None:
     """The target content belongs to: one whose box holds the middle of the
     content's height and at least half of its width, as element text takes
     the words its boxes hold at least half of (see pdfium_text). Glyph boxes
     run from the font's descent to its ascent, taller than the ink Docling
     draws its boxes around, so height is judged by the middle. Of several
     (nested boxes, such as line numbers inside a paragraph's box), the
-    smallest."""
+    smallest. Height and width are the text's own, for text that runs
+    `turn` quarter turns from left to right."""
+    box = _upright(box, turn)
     middle = (box["b"] + box["t"]) / 2
     width = box["r"] - box["l"]
     best: ContentTarget | None = None
     best_area = math.inf
     for target in targets:
-        target_box = target.box
+        target_box = _upright(target.box, turn)
         if not target_box["b"] <= middle <= target_box["t"]:
             continue
         if width > 0:
@@ -533,7 +550,8 @@ def _word_owners(
     glyphs in drawing order, broken at white space and by _word_break. A
     space glyph (some PDFs draw every word space) goes with the word before
     it, or the first word if none precedes it, so the words around it stay
-    apart when read."""
+    apart when read. Words and boxes are judged in the direction the text
+    runs, as a page drawn sideways for /Rotate runs up."""
     words: list[list[MeasuredGlyph]] = []
     spaces: list[tuple[MeasuredGlyph, int]] = []
     previous: MeasuredGlyph | None = None
@@ -543,14 +561,20 @@ def _word_owners(
                 spaces.append((glyph, len(words) - 1))
                 previous = None
                 continue
-            if previous is None or _word_break(previous.bbox, glyph.bbox):
+            if (
+                previous is None
+                or previous.turn != glyph.turn
+                or _word_break(
+                    _upright(previous.bbox, glyph.turn), _upright(glyph.bbox, glyph.turn)
+                )
+            ):
                 words.append([])
             words[-1].append(glyph)
             previous = glyph
     owners: dict[tuple, ContentTarget | None] = {}
     word_owner: list[ContentTarget | None] = []
     for word in words:
-        owner = _owner_of(union_bbox(glyph.bbox for glyph in word), targets)
+        owner = _owner_of(union_bbox(glyph.bbox for glyph in word), targets, word[0].turn)
         word_owner.append(owner)
         for glyph in word:
             owners[_glyph_key(glyph)] = owner

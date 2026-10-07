@@ -24,6 +24,7 @@ rotation), the frame the tagger's structure elements use.
 from __future__ import annotations
 
 import logging
+import math
 from collections import defaultdict
 from collections.abc import Iterable
 from contextlib import ExitStack
@@ -61,6 +62,10 @@ class MeasuredGlyph:
     # The glyph's code: its byte span in that string, so a string can be cut
     # between glyphs.
     code: tuple[int, int] = (0, 0)
+    # Quarter turns counterclockwise of the direction its text runs, from
+    # its text rendering matrix: 1 for a page drawn sideways to be shown
+    # upright by /Rotate 90.
+    turn: int = 0
 
 
 def code_spans(font, string: bytes) -> list[tuple[int, int]]:
@@ -232,6 +237,7 @@ class _Recorder(PDFLayoutAnalyzer):
             bbox={"l": char.x0, "b": char.y0, "r": char.x1, "t": char.y1},
             element=element,
             code=code,
+            turn=round(math.atan2(char.matrix[1], char.matrix[0]) / (math.pi / 2)) % 4,
         )
         self.op.glyphs.append(glyph)
         target = self._target()

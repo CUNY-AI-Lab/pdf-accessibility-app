@@ -12,7 +12,7 @@ from pdfminer.cmapdb import CMap, IdentityCMap, IdentityCMapByte
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTChar
 
-from app.pipeline.page_glyphs import PdfGlyphReader, code_spans
+from app.pipeline.page_glyphs import PdfGlyphReader, code_spans, union_bbox
 from app.pipeline.tagger import _content_targets, _owner_of, tag_pdf
 from app.services.structure_text import screen_reader_text
 from tests.pdf_fixtures import helvetica, rendered
@@ -136,16 +136,29 @@ async def test_a_row_drawn_by_one_tj_is_tagged_cell_by_cell(tmp_path):
     assert rendered(tagged) == rendered(source)
 
 
+def _displayed(box: dict[str, float], rotation: int, width: float) -> dict[str, float]:
+    """A user-space box on a page of this width as Docling places it, turned
+    by /Rotate (0 or 90)."""
+    if rotation == 90:
+        return {"l": box["b"], "b": width - box["r"], "r": box["t"], "t": width - box["l"]}
+    return box
+
+
 @pytest.mark.asyncio
-async def test_a_row_drawn_by_one_string_is_tagged_cell_by_cell(tmp_path):
+@pytest.mark.parametrize(("rotation", "matrix"), [(0, "1 0 0 1 72 700"), (90, "0 1 -1 0 300 72")])
+async def test_a_row_drawn_by_one_string_is_tagged_cell_by_cell(tmp_path, rotation, matrix):
     """Some producers draw a row as one string, spaces and all. The string is
-    cut between glyphs, so each cell holds its own number."""
+    cut between glyphs, so each cell holds its own number. Each cell's box
+    stops short of its number's last digit, as Docling's often do; the cell
+    still holds the whole word. On a page drawn sideways and shown upright by
+    /Rotate, the text runs up the page, and words are judged that way."""
     source = tmp_path / "row.pdf"
     tagged = tmp_path / "tagged.pdf"
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(612, 792))
+    page.obj["/Rotate"] = rotation
     page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
-    page.Contents = pdf.make_stream(b"BT /F1 10 Tf 72 700 Td (55 54 60) Tj ET")
+    page.Contents = pdf.make_stream(f"BT /F1 10 Tf {matrix} Tm (55 54 60) Tj ET".encode())
     pdf.save(source)
     glyphs = [
         glyph
@@ -155,29 +168,32 @@ async def test_a_row_drawn_by_one_string_is_tagged_cell_by_cell(tmp_path):
     ]
     cells = []
     for col in range(3):
-        drawn = glyphs[2 * col : 2 * col + 2]
+        drawn = _displayed(
+            union_bbox(glyph.bbox for glyph in glyphs[2 * col : 2 * col + 2]), rotation, 612
+        )
         cells.append(
             {
-                "text": "".join(glyph.text for glyph in drawn),
+                "text": "".join(glyph.text for glyph in glyphs[2 * col : 2 * col + 2]),
                 "row": 0,
                 "col": col,
                 "row_span": 1,
                 "col_span": 1,
                 "bbox": {
-                    "l": drawn[0].bbox["l"] - 1,
-                    "b": drawn[0].bbox["b"] - 1,
-                    "r": drawn[-1].bbox["r"] + 1,
-                    "t": drawn[0].bbox["t"] + 1,
+                    "l": drawn["l"] - 1,
+                    "b": drawn["b"] - 1,
+                    "r": drawn["r"] - 3.3,  # 0.6 of a digit's width
+                    "t": drawn["t"] + 1,
                 },
             }
         )
+    table_box = union_bbox(cell["bbox"] for cell in cells)
     structure = {
         "title": "Row",
         "elements": [
             {
                 "type": "table",
                 "page": 0,
-                "bbox": {"l": 60, "b": 690, "r": 200, "t": 715},
+                "bbox": {side: table_box[side] + (5 if side in "rt" else -5) for side in "lbrt"},
                 "num_rows": 1,
                 "num_cols": 3,
                 "cells": cells,
