@@ -8,31 +8,36 @@ handwriting is a side case.
 
 ## Method
 
-Everything is scored on what a screen reader hears: the text reachable
-through the structure tree, in tag order, with artifacts left out
+Everything is scored on what a screen reader that follows the tags hears
+(NVDA or JAWS with Acrobat or Reader): the text reachable through the
+structure tree, in tag order, with artifacts left out
 (`backend/app/services/structure_text.py`). Each marked-content sequence is
-read as pdfium extracts it. pdfium is Chrome's PDF engine, whose
-accessibility tree screen readers read: it infers word spaces from the
-font's space width, expands ligatures, drops a string drawn twice over
-itself (fake bold), and joins a word hyphenated at a line end. Marked-content
-`/ActualText` is read in place of the glyphs it covers. Text inside a Figure
-is left out unless the Figure has no alt text and the lenient reading is
-asked for; tables can be kept as HTML so their cell structure is scored.
+read as pdfium, Chrome's PDF engine, extracts text: it infers word spaces
+from the font's space width, expands ligatures, drops a string drawn twice
+over itself (fake bold), and joins a word hyphenated at a line end.
+Marked-content `/ActualText` is read in place of the glyphs it covers. Text
+inside a Figure is left out unless the Figure has no alt text and the
+lenient reading is asked for; tables can be kept as HTML so their cell
+structure is scored. Chrome's own viewer ignores the tags by default and
+reads pdfium's text in its own order, so there only the text layer counts.
 
 - **Benchmark:** [olmOCR-Bench](https://huggingface.co/datasets/allenai/olmOCR-bench)
   (Ai2, ODC-BY). Each test checks one page: a passage must be present, a
   passage must be absent (running heads, page numbers), one passage must come
   before another, or a table cell must have given neighbors and headings.
   Scores are the share of tests passed, with a 95% bootstrap confidence
-  interval.
+  interval. The samples (`*_s60`, 60 pages each) are compared with every
+  tool; olmOCR-Bench's whole `multi_column`, `tables`, and
+  `headers_footers` categories (685 pages, 2,666 tests) and their scans
+  decide between versions of the tagger.
 - **`old_print`** (our addition, 49 pages, 509 tests): pages from 11
   public-domain books printed 1794–1925, from Internet Archive scans, with
   tests taken from Project Gutenberg transcriptions of the same editions and
   checked by eye against each page image. Sources are listed in
   [backend/eval/old_print/sources.md](../backend/eval/old_print/sources.md).
-- **Scanned samples** (`*_scan`): the born-digital samples rendered at
-  300 ppi in greyscale, turned a fraction of a degree, softened, given noise,
-  and saved as JPEG (`scripts/synthetic_scan.py`), under the same tests.
+- **Scans** (`*_scan`): the born-digital pages rendered at 300 ppi in
+  greyscale, turned a fraction of a degree, softened, given noise, and saved
+  as JPEG (`scripts/synthetic_scan.py`), under the same tests.
 - **Structure round trip:** well-tagged documents have their tags stripped
   (`scripts/strip_accessibility.py`), go through the pipeline, and the
   resulting tag tree is compared with the original, both rendered as
@@ -50,9 +55,19 @@ asked for; tables can be kept as HTML so their cell structure is scored.
   `run_pipeline` (classify, OCR, Docling structure through docling-serve as in
   production, tagging, validation) on each page and reads the tagged result.
   The app's AI steps are off unless a run names a Gateway model (`--llm`).
-  Every pipeline result here used docling-serve 1.35.0 (Docling 2.130) on
-  CPU; production's actual-dell runs 1.12.0 (Docling 2.72) until it is
-  upgraded, which loses heading levels.
+  Pipeline results here used docling-serve 1.35.0 (Docling 2.130), on CPU
+  through October 5 and on the GPU since; production's actual-dell runs
+  1.12.0 (Docling 2.72) until it is upgraded, which loses heading levels.
+- **Re-tagging:** a pipeline run keeps what the tagger was given for each
+  page (`scripts/pipeline_bench.py`), and `scripts/retag_bench.py` tags every
+  page again with other tagger code in about a minute, without OCR and
+  Docling. The whole categories were measured that way, from inputs captured
+  with docling-serve on the Mac Studio's GPU (MPS, one worker: more crash
+  PyTorch's Metal backend), which scores the same as on CPU. Re-tagging does
+  not replay the font repairs the pipeline makes to many born-digital tagged
+  PDFs afterwards (24 of the multi-column sample's 60 pages, 10 of the
+  tables sample's), so on born-digital pages it can differ from a pipeline
+  run by a few tests (two on each of those samples).
 - **OCR stage:** `backend/scripts/ocr_bench.py` runs the app's own OCRmyPDF
   command inside the production image and reads the raw text layer.
 - **AI steps:** `backend/scripts/score_semantics.py` compares the title,
@@ -79,50 +94,70 @@ asked for; tables can be kept as HTML so their cell structure is scored.
 tree without marked-content `/ActualText`, so they badly understated
 production, whose tagger carries OCR text that way (printed books appeared to
 go from 30.5% to 91.7%). Results published before 2026-10-05 put a space
-between glyphs by our own gap rule rather than as a PDF engine does; every
-number below was re-measured with the pdfium reader, which moved scores by
-up to two points (Adobe on printed books 83.7% → 81.5%, v1 on multi-column
-41.1% → 41.6%).
+between glyphs by our own gap rule rather than as a PDF engine does. Results
+published before 2026-10-07 joined two marked-content sequences without a
+space even where the PDF draws a space character at the edge of one, which
+mostly hurt tools that tag without `/ActualText`. Every number below was
+re-measured with the current reader (opendataloader-pdf on multi-column
+pages 56.6% → 64.8%, Adobe on printed books 81.5% → 83.7%).
 
-## Results (2026-10-05)
+## Results (2026-10-07)
 
-What a screen reader hears after each tool, AI steps off. "Branch,
-September" is this branch before the October fixes; "Branch, now" is its
-head.
+What a screen reader hears after each tool, AI steps off. "September" is
+this branch before the October fixes, "October 5" its state when the first
+October fixes were published, and "Now" its head.
 
-| Subset (tests) | Production (v1) | Branch, September | Branch, now | opendataloader-pdf | Adobe |
+| Subset (tests) | Production (v1) | September | October 5 | Now | opendataloader-pdf | Adobe |
+|---|---|---|---|---|---|---|
+| `old_print` (509) | 92.1% | 92.5% | 92.7% | **93.9%** | | 83.7% |
+| `multi_column_s60` (219) | 41.6% | 60.3% | 69.4% | **73.5%** | 64.8% | |
+| `multi_column_s60_scan` (219) | 51.6% | 50.2% | 63.5% | **67.6%** | | |
+| `tables_s60` (336) | 10.4% | 65.1% | **69.9%** | **69.9%** | 27.2% | |
+| `tables_s60_scan` (336) | 23.0% | 56.7% | **57.0%** | 56.7% | | |
+| `headers_footers_s60` (170) | 95.3% | **95.9%** | **95.9%** | **95.9%** | 37.3% | |
+| `headers_footers_s60_scan` (170) | **90.5%** | 89.9% | **90.5%** | 89.3% | | |
+| `old_scans` (526) | 25.3% | 25.5% | **25.9%** | 24.1% | | |
+
+| Round trip (NID / TEDS / MHS / MHS-L) | Production (v1) | September | October 5 | Now | opendataloader-pdf |
 |---|---|---|---|---|---|
-| `old_print` (509) | 92.1% | 92.5% | **92.7%** | | 81.5% |
-| `multi_column_s60` (219) | 41.6% | 59.4% | **69.4%** | 56.6% | |
-| `multi_column_s60_scan` (219) | 51.6% | 50.2% | **63.5%** | | |
-| `tables_s60` (336) | 10.4% | 64.5% | **69.9%** | 26.6% | |
-| `tables_s60_scan` (336) | 23.0% | 56.7% | **57.0%** | | |
-| `headers_footers_s60` (170) | 95.3% | **95.9%** | **95.9%** | 45.0% | |
-| `headers_footers_s60_scan` (170) | **90.5%** | 89.9% | **90.5%** | | |
-| `old_scans` (526) | 25.3% | 25.5% | **25.9%** | | |
-
-| Round trip (NID / TEDS / MHS / MHS-L) | Production (v1) | Branch, September | Branch, now | opendataloader-pdf |
-|---|---|---|---|---|
-| `gold_rt` | 0.791 / 0.302 / 0.576 / 0.339 | 0.875 / 0.449 / **0.619** / 0.361 | **0.886 / 0.545 / 0.619 / 0.430** | 0.845 / 0.287 / 0.521 / 0.327 |
-| `cuny_rt` | 0.877 / 0.512 / 0.511 / 0.350 | 0.956 / 0.683 / 0.527 / 0.317 | **0.960** / 0.683 / **0.528 / 0.391** | **0.960 / 0.739** / 0.418 / 0.328 |
-| `cuny_rt_scan` | 0.893 / 0.409 / 0.501 / **0.344** | 0.934 / **0.610** / 0.516 / 0.305 | **0.938** / 0.600 / **0.518** / 0.338 | |
+| `gold_rt` | 0.791 / 0.300 / 0.576 / 0.339 | 0.875 / 0.448 / **0.619** / 0.361 | **0.886 / 0.545 / 0.619** / 0.430 | 0.864 / 0.544 / 0.577 / **0.436** | 0.844 / 0.287 / 0.520 / 0.327 |
+| `cuny_rt` | 0.877 / 0.512 / 0.511 / 0.350 | 0.956 / 0.683 / 0.527 / 0.317 | 0.960 / 0.683 / 0.528 / 0.391 | **0.963** / 0.683 / **0.534 / 0.397** | 0.961 / **0.739** / 0.420 / 0.330 |
+| `cuny_rt_scan` | 0.893 / 0.409 / 0.501 / 0.344 | 0.934 / **0.610** / 0.516 / 0.305 | 0.938 / 0.600 / **0.518** / 0.338 | **0.947 / 0.610** / 0.507 / **0.358** | |
 
 For scale, opendataloader-bench reports NID about 0.90 and TEDS 0.887 for
 Docling's own output on its corpus.
 
-The branch now scores above v1 on every subset but scanned headers and
-footers, where they tie, and on every round-trip measure but heading levels
-on the scanned CUNY documents (MHS-L 0.338 against 0.344). It beats
-opendataloader-pdf on every born-digital sample and the gold round trip
-(on CUNY documents it ties on order and recovers tables better), and Adobe
-on printed books. Against the September branch it gains most on
-multi-column pages (59.4% → 69.4%) and their scans (50.2% → 63.5%), on
-tables (64.5% → 69.9%; gold TEDS 0.449 → 0.545), and on heading levels
-(MHS-L 0.361 → 0.430 on gold, 0.317 → 0.391 on CUNY documents).
+Since October 5 the branch gains most on multi-column pages (69.4% →
+73.5%) and their scans (63.5% → 67.6%), on printed books (92.7% → 93.9%),
+and in reading order on the CUNY scans (NID 0.938 → 0.947). It loses on the
+gold documents' order and sections (NID 0.886 → 0.864, MHS 0.619 → 0.577),
+the cost of following Docling's reading order (see below), and on
+manuscripts (25.9% → 24.1%), mostly the cost of recognizing text once.
+It beats v1 on every subset but scanned headers and footers and
+manuscripts, and on every round-trip measure. It beats opendataloader-pdf on
+every born-digital sample and the gold round trip, and Adobe on printed
+books.
+
+On olmOCR-Bench's whole categories, re-tagging the same captured inputs:
+
+| Category (tests) | Before the single path | One path | + Docling's order | + glyph text alone | Now |
+|---|---|---|---|---|---|
+| `multi_column` (884) | 68.3% | 68.2% | **71.7%** | 71.6% | 71.6% |
+| `multi_column_scan` (884) | 73.4% | 73.4% | **73.5%** | **73.5%** | **73.5%** |
+| `tables` (1,022) | **69.6%** | 69.3% | 69.3% | 68.3% | 69.1% |
+| `tables_scan` (1,022) | **58.3%** | **58.3%** | **58.3%** | 58.2% | 58.2% |
+| `headers_footers` (760) | 92.6% | 92.6% | **92.7%** | **92.7%** | **92.7%** |
+| `headers_footers_scan` (760) | 90.8% | 90.8% | **91.1%** | 90.8% | 90.8% |
+
+"Before the single path" is commit 2d8a9d7, "One path" 1469380, "+ Docling's
+order" 2fad760, "+ glyph text alone" 47dab17 (element `/ActualText` gone,
+content assigned by word), and "Now" the head.
 
 ## What changed in October
 
 Each change was measured on the whole suite before it was kept.
+
+### To October 5
 
 - **Element text is what pdfium reads in the element's boxes.** Every tagged
   element's `/ActualText` was Docling's text, which straightens quotes and
@@ -156,42 +191,86 @@ Each change was measured on the whole suite before it was kept.
 
 Tried and dropped: requiring the glyph text to keep every digit in Docling's
 text. It restored a list number hanging outside its item's box on one
-printed-book page, but on scans Docling often reads the page with its own
+printed-book page, but on scans Docling often read the page with its own
 OCR, which takes characters for digits that Tesseract's layer does not, so
 it rejected good glyph text and cost scanned multi-column pages about five
 tests.
 
-### On scans the element text is Tesseract's
+### October 6–7: one tagging path
 
-On a scan, the glyph text is Tesseract's text layer, while Docling's text is
-sometimes Tesseract's and sometimes its own RapidOCR reading. Where the two
-agree within the tolerance, the tagger uses Tesseract's, which is also the
-text a reader can search and copy. Each engine misreads different passages
-(Tesseract "Lkept", "fora"; RapidOCR "cylindercovered", "beattracted"), so
-the choice moves printed-book and scanned scores a few tests either way. A
-better OCR engine, not a different choice between the two, is the fix.
+- **Text is recognized once.** Docling read every scanned page again with
+  its own RapidOCR after the OCR step had given it Tesseract's text layer,
+  and where the two disagreed its reading could be what a screen reader
+  heard. Docling now reads the text layer (`do_ocr` off). The scanned
+  multi-column sample rose from 63.5% to 68.5%; manuscripts fell 1.4 points,
+  as RapidOCR read some handwriting better than Tesseract. A document of
+  born-digital pages with one picture page and no text on it (a scanned
+  insert) is now OCR'd rather than treated as born digital.
+- **One rule decides which element content belongs to.** The tagger decided
+  two ways (whole text objects matched one to one by a weighted Hungarian
+  assignment, or text runs scored one by one), picked between them per page,
+  read positions from four sources, and wrote each element's text as
+  `/ActualText` because the result was not reliable alone. Now each word
+  (pdfminer's rule: a gap over a tenth of a glyph's size ends one) goes to
+  the element or table cell whose box holds the middle of its height and at
+  least half its width, the rule element text uses, judged in the direction
+  the text runs; nested boxes go to the smallest. A text operator whose
+  words have different owners is split, between `TJ` array elements or
+  inside a string between glyph codes, as opendataloader-pdf cuts a string
+  that crosses table cells; the page renders identically. Images go to the
+  figure they overlap; drawn paths are wrapped whole as artifacts. The change
+  removed 640 lines from the tagger, and scipy and rtree from the
+  dependencies.
+- **The structure tree follows Docling's reading order**, not the order
+  content is drawn.
+- **`/ActualText` only for corrections.** Elements are read from their own
+  glyphs. `/ActualText` remains for explicit corrections, formulas, and
+  accented letters drawn as a letter and a separate accent. On the whole
+  categories the last build with the overlays (2fad760) and the head differ
+  by at most 0.3 points (scanned headers and footers 91.1% and 90.8%; tables
+  69.3% and 69.1%). The tables tests still lost are text Docling's cell boxes
+  miss (a header's second line, subscripts in a math table), which the
+  overlays covered with Docling's text.
+- **A paragraph continued on the next page is one element.** Docling marks a
+  paragraph or list item that runs across a page break; both parts are now
+  one structure element instead of two.
 
-### Element `/ActualText`: kept, by measurement
+### Reading order: Docling's, at a cost on well-made documents
 
-The PDF Association's Tagged PDF Best Practice Guide puts `/ActualText` on
-spans, not on paragraphs: text a PDF engine can extract should be extracted,
-and `/ActualText` on a paragraph hides a link nested in it. The tagger still
-writes each element's text as `/ActualText` because the glyphs it assigns to
-an element are not yet reliable enough to stand alone. Without the overlays
-(measured on an earlier October build, read by the same pdfium reader),
-multi-column pages score 57.1% against 68.9%,
-headers and footers 93.5% against 95.9%, and the gold round trip's NID 0.877
-against 0.884. Where a Link is nested, the parent's `/ActualText` is removed
-so the link stays readable. Assigning content to elements correctly, so the
-overlays can go, is the long-term fix.
+Following Docling's reading order instead of drawing order (2fad760 alone)
+raises the whole `multi_column` category from 68.2% to 71.7%, moves the
+other categories by at most 0.3 points (on scans the drawing order is
+Tesseract's, already in reading order), leaves the CUNY documents as they
+were, and costs the gold documents: NID 0.887 → 0.862, MHS 0.620 → 0.576,
+MHS-L 0.463 → 0.434. Four of the eleven lose order, most of all the DocEng
+abstract (NID 0.89 → 0.75, MHS 0.79 → 0.37), where Docling reads the right
+column of the first page before the left. The gold documents were made to
+be tagged correctly, and their content is drawn in reading order; many real
+documents are not, and the established auto-taggers (Adobe,
+opendataloader-pdf with XY-Cut++) order by layout too. A better layout
+order, not drawing order, is the fix.
+
+### What established tools do
+
+- **opendataloader-pdf** splits a text operator between glyphs where it
+  crosses table cells, keeping `TJ` position adjustments with their piece,
+  and writes no `/ActualText`. The tagger now does both.
+- **PAVE 2.0** assigns content to the element whose box it overlaps most,
+  close to the tagger's rule.
+- **ISO 32000-1, 14.8.2.5** asks tagged PDF to carry word spaces as real
+  space characters; axesPDF inserts them. The tagger does not yet, so a
+  reader that extracts text without inferring spaces from geometry may run
+  words together where the PDF spaces them by position.
+- **Chrome** builds its accessibility tree from pdfium's text and layout,
+  inventing spaces from geometry and ignoring tags unless asked, so its users
+  hear the text layer, not the structure tree.
 
 ### opendataloader-pdf
 
 On default settings it orders CUNY documents as well as the branch (NID
-0.960) and recovers their tables better (TEDS 0.739 against 0.683), but it
-loses the tables in the olmOCR sample (26.6%), leaves most running heads in
-(45.0%), and nests headings worse. Its reading order (XY-Cut++) is a
-candidate for the branch's multi-column gap.
+0.961 against 0.963) and recovers their tables better (TEDS 0.739 against
+0.683), but it loses the tables in the olmOCR sample (27.2%), leaves most
+running heads in (37.3%), and nests headings worse.
 
 ### Docling's tables
 
@@ -209,16 +288,16 @@ rules as "|", misreads digits, and drops lone characters.
 | Candidate | Score | Present | Order | Absent |
 |---|---|---|---|---|
 | Production (v1) | 92.1% ± 2.3 | 94.1% | 86.4% | 95.9% |
-| Branch, September | 92.5% ± 2.4 | 93.8% | 88.4% | 95.9% |
-| **Branch, now** | **92.7% ± 2.3** | 93.1% | **89.8%** | **97.3%** |
-| Adobe OCR + Auto-Tag (October 2026) | 81.5% ± 3.2 | **94.5%** | 87.8% | 17.8% |
+| Branch, September | 92.5% ± 2.2 | 93.8% | 88.4% | 95.9% |
+| Branch, October 5 | 92.7% ± 2.3 | 93.1% | 89.8% | **97.3%** |
+| **Branch, now** | **93.9% ± 2.2** | 95.2% | 89.8% | **97.3%** |
+| Adobe OCR + Auto-Tag (October 2026) | 83.7% ± 3.0 | **96.2%** | **93.2%** | 15.1% |
 
 Gateway OCR (Qwen3-VL-235B) scored 83.3% here in September, below
-Tesseract, so Tesseract stays the default. Adobe reads the most words, but
-it leaves running heads, folios, and catchwords in what a screen reader
-hears, so it fails most absent tests. The branch now orders printed pages
-better than Adobe (89.8% against 87.8%), though order is still its weakest
-measure there.
+Tesseract, so Tesseract stays the default. Adobe reads the most words and
+orders them best, but it leaves running heads, folios, and catchwords in
+what a screen reader hears, so it fails most absent tests. Order is the
+branch's weakest measure on printed pages.
 
 OCR stage alone (raw text layer read by pdfminer; its own layout guessing
 scrambles Tesseract's order, so these understate what the pipeline hears):
@@ -232,8 +311,9 @@ It guessed text positions from its own content-stream reading (ignoring the
 text matrix's scale on `Td`, font widths, and `TJ` offsets, and reading `TJ`
 offsets as text), and it tagged a table row drawn by one `TJ` as one cell.
 The branch takes positions from pdfminer's measurement of each text operator
-(`app/pipeline/page_glyphs.py`) and splits a `TJ` that spans several cells
-into one per cell, which renders identically.
+(`app/pipeline/page_glyphs.py`) and splits an operator that spans several
+cells into one per cell, inside a string where needed, which renders
+identically.
 
 ## Results: CUNY documents
 
@@ -276,7 +356,9 @@ Gemma 3 27B (repeated timeouts) were dropped before scoring.
 Library of Congress letters (Clara Barton, Theodore Roosevelt, and Joseph Holt
 papers), mostly handwritten, some typed. A side case, kept because Adobe was
 measured here. These numbers predate the pdfium reader; Adobe's outputs were
-lost, so they cannot be re-read.
+lost, so they cannot be re-read. On all 98 pages the branch now scores
+24.1% (October 5: 25.9%), most of the drop from Docling no longer reading
+the scans with its own OCR.
 
 On the 44 pages Adobe finished (240 tests):
 

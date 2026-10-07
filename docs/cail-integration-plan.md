@@ -160,7 +160,6 @@ what needs manual work, validation results, and generated alt text for review.
 
 - Mark placeholder alt text as unapproved in the database, not only in the
   tagger.
-- Run ruff in `scripts/check.sh`; drop the unused `tenacity` dependency.
 - Split `pipeline/orchestrator.py` and `pipeline/tagger.py` along pipeline
   stage boundaries, in steps that each keep the suite green.
 
@@ -177,65 +176,61 @@ Done so far (branch `agent/cail-integration-plan`), each measured in
 - Every OCR line reaches the structure tree once, in order.
 - Text positions come from pdfminer's measurement of each text operator, not
   estimates, and a text operator spanning several table cells is split so
-  each cell is tagged: tables 10.4% → 64.5% of olmOCR-Bench table tests,
-  multi-column reading order 41.6% → 59.4%.
+  each cell is tagged: tables 10.4% → 65.1% of olmOCR-Bench table tests,
+  multi-column reading order 41.6% → 60.3%.
 - Heading levels come from Docling's hierarchy stage and survive tagging.
 - Language detection runs (lingua was never installed).
 - ICC profiles missing /N no longer break text extraction.
 - Optional OCR through the Gateway (`OCR_ENGINE=gateway`); it helps
   handwriting, not printed books, so Tesseract stays the default.
-- October 2026: Docling's boxes are moved into PDF user space before
+- October 1–5: Docling's boxes are moved into PDF user space before
   tagging (rotated pages and offset MediaBoxes were mismatched); element and
   table-cell text is what pdfium reads in the words the element's boxes
   mostly hold, when it matches Docling's; sibling headings stay at one
   level; captions are tagged as text; pictured text in born-digital
   documents is OCR'd unless the page already has an OCR layer.
-  Against the September branch: multi-column pages 59.4% → 69.4%, their
-  scans 50.2% → 63.5%, tables 64.5% → 69.9%, gold tables (TEDS) 0.449 →
+  Against the September branch: multi-column pages 60.3% → 69.4%, their
+  scans 50.2% → 63.5%, tables 65.1% → 69.9%, gold tables (TEDS) 0.448 →
   0.545, and heading levels (MHS-L) 0.361 → 0.430 on gold and 0.317 →
   0.391 on CUNY documents, above v1's 0.350.
+- October 6–7: **one tagging path.** Each word goes to the element or table
+  cell whose box holds it, by the rule element text uses, judged in the
+  direction the text runs; a text operator crossing elements is split,
+  inside a string between glyphs where needed (as opendataloader-pdf does);
+  images go to the figure they overlap; paths are artifacts. This replaced a
+  per-page choice between Hungarian matching and run scoring, 640 lines,
+  and the scipy and rtree dependencies. The structure tree follows Docling's
+  reading order; elements are read from their own glyphs, with
+  `/ActualText` only for corrections, formulas, and composed accents;
+  Docling reads the OCR step's text layer instead of recognizing scans
+  again; a paragraph continued across a page break is one element. Against
+  October 5: multi-column pages 69.4% → 73.5%, their scans 63.5% → 67.6%,
+  printed books 92.7% → 93.9%, CUNY scans' order (NID) 0.938 → 0.947; the
+  gold documents' order 0.886 → 0.864 and manuscripts 25.9% → 24.1%.
 
-In progress (2026-10-06): **one tagging path.** The tagger decides which
-content belongs to which element two ways (whole text objects matched one
-to one by a weighted Hungarian assignment, or text runs scored one by one)
-and picks between them per page; it reads positions from four sources and
-writes `/ActualText` overlays because the result is not reliable alone.
-It also orders the structure tree by the order content is drawn, so
-Docling's reading order is never used. The replacement, each layer
-measured on the whole suite (captured tagger inputs make a re-run take
-minutes):
+Next, from the evaluation and from peer tools (opendataloader-pdf, PAVE,
+axesPDF, olmOCR, the ASU/AWS remediation pipeline):
 
-1. One path: every text-showing unit (a `TJ` string or a `Tj`) goes to the
-   text element or table cell holding at least half of its glyph box (the
-   rule element text uses), splitting `TJ`s at owner changes; images go to
-   the figure holding most of them; everything else is an artifact, a path
-   wrapped whole. OCR form calls pass through to be tagged inside. The
-   region path, its Hungarian matching, and the docling-parse box
-   refinement go.
-2. Structure tree in Docling's reading order instead of drawing order.
-3. Element `/ActualText` overlays removed once the content assignment
-   stands on its own (kept for table cells and formulas where needed).
-
-Next, from the evaluation and from peer tools (opendataloader-pdf, olmOCR,
-the ASU/AWS remediation pipeline):
-
-- Assign content to elements reliably enough to drop the element-level
-  `/ActualText` overlays, which the Tagged PDF Best Practice Guide reserves
-  for spans (multi-column pages score 57.1% without them, 68.9% with).
-- Reading order: the weakest measure on printed pages (89.8%; Adobe 87.8%)
-  and on multi-column pages (69.4%, scanned 63.5%), the largest gaps among
-  the documents that matter most. XY-Cut++ (opendataloader-pdf) and
-  PP-DocLayout are candidates.
+- Reading order: still the weakest measure on multi-column pages (71.6% of
+  the whole category) and printed pages (89.8%; Adobe 93.2%). Docling's
+  order beats drawing order on real documents but misreads some layouts
+  that well-made documents draw in order (gold NID 0.887 → 0.862).
+  XY-Cut++ (opendataloader-pdf) and PP-DocLayout are candidates.
+- Word spaces as real space characters where the PDF spaces words by
+  position (ISO 32000-1, 14.8.2.5; axesPDF inserts them), for readers that
+  extract text without inferring spaces from geometry.
 - OCR: on scans the element text is Tesseract's, which reads table rules as
   "|", misreads digits, and drops lone characters; Docling given the raw
-  scans and its own RapidOCR scores 62.4% on `tables_s60_scan`. An
-  OCRmyPDF engine on RapidOCR, built like the Gateway engine, is the
-  candidate; it must not cost printed books.
+  scans and its own RapidOCR scores 62.4% on `tables_s60_scan` (the
+  pipeline 56.7%). An OCRmyPDF engine on RapidOCR, built like the Gateway
+  engine, is the candidate; it must not cost printed books, where Tesseract
+  reads better.
 - Tables are otherwise mostly Docling's limit (its own output scores 69.0%
   on the sample): borderless tables read as one row of whole columns, and
   pages where no table is found. TableFormer v2 scored worse (41.2%).
 - Text drawn inside Form XObjects other than OCRmyPDF's is never tagged, so
-  an element made of it is lost (one table page in the sample).
+  an element made of it is lost (one table page in the sample);
+  opendataloader-pdf tags it.
 - Text Docling's layout swallows into a figure region, and margin terms
   Docling labels as headings (a textbook chapter's glossary).
 - Running heads and footers detected across pages (recto/verso, page-number
