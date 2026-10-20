@@ -20,9 +20,12 @@ ARG WITH_LOCAL_DOCLING=false
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    UV_SYSTEM_CERTS=true
 
 WORKDIR /app/backend
+
+COPY scripts/check_ca_trust.py /usr/local/libexec/check_ca_trust.py
 
 # Base system packages (always needed)
 RUN apt-get update \
@@ -63,6 +66,10 @@ RUN apt-get update \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
+# Remove the compromised emSign G3 trust path and its AAA cross-sign path from
+# both the system CA bundle and OpenSSL's hashed CA directory.
+RUN python /usr/local/libexec/check_ca_trust.py --remediate-system
+
 # Extra system packages for local Docling (OpenCV needs libgl1 + libglib2.0)
 RUN if [ "$WITH_LOCAL_DOCLING" = "true" ]; then \
         apt-get update \
@@ -70,7 +77,10 @@ RUN if [ "$WITH_LOCAL_DOCLING" = "true" ]; then \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
-RUN pip install --no-cache-dir uv
+ARG UV_VERSION=0.13.4
+RUN python -m pip install --no-cache-dir \
+        "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70" \
+    && python -m pip install --no-cache-dir "uv==${UV_VERSION}"
 RUN groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --create-home --home-dir /home/app app
 RUN mkdir -p \
@@ -177,6 +187,8 @@ RUN mkdir -p /app/data/uploads /app/data/processing /app/data/output /app/data/d
     && rm -rf /app/backend/debug \
     && ln -s /app/data/debug /app/backend/debug \
     && chown -R app:app /app/data /home/app
+
+RUN /app/backend/.venv/bin/python /usr/local/libexec/check_ca_trust.py
 
 ENV PATH="/app/backend/.venv/bin:${PATH}" \
     UVICORN_HOST=0.0.0.0 \

@@ -13,6 +13,7 @@ dependencies = [
     "pydantic-settings>=2.7.0",
     "cryptography>=46.0.0",
     "pikepdf>=9.4.0",
+    "certifi>=2026.10.19",
     "httpx>=0.28.0",
     "sse-starlette>=2.2.0",
     "Pillow>=11.0.0",
