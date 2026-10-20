@@ -29,6 +29,21 @@ def _current_month(now: datetime | None = None) -> str:
     return f"{value.year:04d}-{value.month:02d}"
 
 
+def _console_project_credentials(raw: dict[str, Any]) -> dict[str, str] | None:
+    """The OAuth Server-to-Server credential in an Adobe Developer Console
+    project download (the project page's Download button)."""
+    workspace = (raw.get("project") or {}).get("workspace") or {}
+    for credential in (workspace.get("details") or {}).get("credentials") or []:
+        oauth = credential.get("oauth_server_to_server") if isinstance(credential, dict) else None
+        if isinstance(oauth, dict):
+            secrets = oauth.get("client_secrets") or []
+            return {
+                "client_id": oauth.get("client_id") or "",
+                "client_secret": secrets[0] if secrets else "",
+            }
+    return None
+
+
 def _load_credentials(path: Path) -> AdobeCredentials:
     if path.suffix.lower() == ".zip":
         with zipfile.ZipFile(path) as archive:
@@ -47,6 +62,8 @@ def _load_credentials(path: Path) -> AdobeCredentials:
         raw = json.loads(path.read_text())
 
     client_credentials = raw.get("client_credentials")
+    if client_credentials is None:
+        client_credentials = _console_project_credentials(raw)
     if not isinstance(client_credentials, dict):
         raise ValueError("Credentials file is missing client_credentials.")
 
@@ -98,6 +115,7 @@ def _record_usage(
     pdf_path: Path,
     report_path: Path,
     result_path: Path,
+    transactions: int = 1,
     now: datetime | None = None,
 ) -> None:
     data = _read_ledger(path)
@@ -110,10 +128,11 @@ def _record_usage(
     if not isinstance(runs, list):
         runs = []
         entry["runs"] = runs
-    entry["transactions"] = int(entry.get("transactions", 0) or 0) + 1
+    entry["transactions"] = int(entry.get("transactions", 0) or 0) + transactions
     runs.append(
         {
             "timestamp": (now or datetime.now(UTC)).isoformat(),
+            "transactions": transactions,
             "pdf": str(pdf_path),
             "report": str(report_path),
             "result_pdf": str(result_path),

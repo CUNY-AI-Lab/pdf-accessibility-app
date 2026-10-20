@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any
 
 from app.pipeline.structure import _expand_toc_item_tables
-from app.services.intelligence_gemini_toc import generate_toc_group_intelligence
+from app.services.intelligence_toc import generate_toc_group_intelligence
 from app.services.llm_client import LlmClient
 
 TOC_HEADING_TEXTS = {

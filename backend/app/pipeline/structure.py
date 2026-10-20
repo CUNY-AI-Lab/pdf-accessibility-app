@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import logging
 import re
 import subprocess
@@ -201,10 +203,18 @@ def _walk_body_tree(doc_dict: dict) -> list[dict]:
     Docling stores document structure as a tree rooted at doc_dict["body"],
     with children referenced via JSON pointers. We do a depth-first traversal
     to get elements in reading order, which maps directly to PDF structure order.
+    A picture's or table's captions and footnotes are its children, not the
+    body's; they are printed text a reader must hear, so each comes out as its
+    own item, before the picture or table when printed above it and after it
+    otherwise. Other children of a picture (text inside a chart) stay part of it.
     """
     items = []
+    seen: set[str] = set()
 
     def _visit(ref_str: str):
+        if ref_str in seen:
+            return
+        seen.add(ref_str)
         item = _resolve_ref(doc_dict, ref_str)
         if item is None:
             return
@@ -215,14 +225,45 @@ def _walk_body_tree(doc_dict: dict) -> list[dict]:
                 _visit(child_ref.get("$ref", ""))
             return
 
-        # It's a content item — add it
+        # It's a content item — add it, with its captions and footnotes
+        attached = []
+        for ref in [*item.get("captions", []), *item.get("footnotes", [])]:
+            attached_ref = ref.get("$ref", "") if isinstance(ref, dict) else ""
+            attached_item = None if attached_ref in seen else _resolve_ref(doc_dict, attached_ref)
+            if attached_item is not None:
+                seen.add(attached_ref)
+                attached.append(attached_item)
+        above = [entry for entry in attached if _printed_above(entry, item)]
+        items.extend(above)
         items.append(item)
+        items.extend(entry for entry in attached if entry not in above)
 
     body = doc_dict.get("body", {})
     for child_ref in body.get("children", []):
         _visit(child_ref.get("$ref", ""))
 
     return items
+
+
+def _printed_above(item: dict, other: dict) -> bool:
+    """Whether ``item`` is printed above ``other`` on the same page."""
+    item_prov, other_prov = item.get("prov") or [], other.get("prov") or []
+    if not item_prov or not other_prov or item_prov[0].get("page_no") != other_prov[0].get("page_no"):
+        return False
+    item_box, other_box = _extract_bbox(item_prov), _extract_bbox(other_prov)
+    if not item_box or not other_box:
+        return False
+    return (item_box["b"] + item_box["t"]) / 2 > other_box["t"]
+
+
+def _page_height(doc_dict: dict, page_index: int) -> float | None:
+    page = (doc_dict.get("pages") or {}).get(str(page_index + 1)) or {}
+    height = (page.get("size") or {}).get("height")
+    return float(height) if height else None
+
+
+def _prov_page(entry) -> int | None:
+    return entry.get("page_no") if isinstance(entry, dict) else getattr(entry, "page_no", None)
 
 
 def _extract_bbox(prov: list[dict]) -> dict | None:
@@ -276,6 +317,7 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
     for item in _walk_body_tree(doc_dict):
         label = item.get("label", "")
         prov = item.get("prov", [])
+        elements_before = len(elements)
         # Docling uses 1-based page numbers; convert to 0-based for pikepdf
         page = (prov[0]["page_no"] - 1) if prov else 0
         text = item.get("text", item.get("orig", ""))
@@ -410,7 +452,7 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
                 "caption": _get_caption_text(item, doc_dict),
                 "num_rows": table_data.get("num_rows", 0),
                 "num_cols": table_data.get("num_cols", 0),
-                "cells": _normalize_table_cells(table_data),
+                "cells": _normalize_table_cells(table_data, _page_height(doc_dict, page)),
             })
 
         elif label == "code":
@@ -439,6 +481,29 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
                 "artifact_type": label,
             })
 
+        # Text Docling continues in another column of the page has a box
+        # there too, and text it continues on a later page has boxes there;
+        # the tagger reads the element's glyphs from all of them, the later
+        # page's through a continuation element that shares its structure
+        # element (continued_ref).
+        if len(elements) > elements_before and len(prov) > 1:
+            element = elements[-1]
+            boxes_by_page: dict[int, list[dict]] = {}
+            for entry in prov[1:]:
+                if (box := _extract_bbox([entry])) and (entry_page := _prov_page(entry)):
+                    boxes_by_page.setdefault(entry_page - 1, []).append(box)
+            if same_page := boxes_by_page.pop(element["page"], None):
+                element["extra_bboxes"] = same_page
+            if boxes_by_page and element["type"] not in {"table", "figure", "artifact"}:
+                element["continued_ref"] = item.get("self_ref") or str(len(elements))
+                for later_page, (first_box, *more_boxes) in sorted(boxes_by_page.items()):
+                    continuation = {
+                        **element, "page": later_page, "bbox": first_box, "continuation": True
+                    }
+                    continuation.pop("extra_bboxes", None)
+                    if more_boxes:
+                        continuation["extra_bboxes"] = more_boxes
+                    elements.append(continuation)
     return elements
 
 
@@ -947,11 +1012,27 @@ def _get_caption_text(item: dict, doc_dict: dict) -> str | None:
     return " ".join(texts).strip() or None
 
 
-def _normalize_table_cells(table_data: dict) -> list[dict]:
+def _docling_cell_bbox(cell: dict, page_height: float | None) -> dict | None:
+    """A Docling table cell's box in bottom-left coordinates, like element
+    boxes. Docling gives cell boxes top-left, fitted to the cell's text."""
+    bbox = cell.get("bbox")
+    if not isinstance(bbox, dict):
+        return None
+    left, right = float(bbox.get("l", 0)), float(bbox.get("r", 0))
+    top, bottom = float(bbox.get("t", 0)), float(bbox.get("b", 0))
+    if str(bbox.get("coord_origin", "")).upper() == "TOPLEFT":
+        if not page_height:
+            return None
+        top, bottom = page_height - top, page_height - bottom
+    return {"l": left, "b": min(top, bottom), "r": right, "t": max(top, bottom)}
+
+
+def _normalize_table_cells(table_data: dict, page_height: float | None = None) -> list[dict]:
     """Normalize Docling table cells into a simpler format for the tagger."""
     return [
         {
             "text": cell.get("text", ""),
+            "bbox": _docling_cell_bbox(cell, page_height),
             "row": cell.get("start_row_offset_idx", 0),
             "col": cell.get("start_col_offset_idx", 0),
             "row_span": cell.get("row_span", 1),
@@ -1165,6 +1246,106 @@ def _repair_pdf_with_ghostscript(
     return output_path.exists() and output_path.stat().st_size > 0
 
 
+def _save_docling_figures(doc_dict: dict, figures_dir: Path) -> list[FigureInfo]:
+    """Save an image of each figure Docling found, for alt text: the figure's
+    own image when Docling returns one, else a crop of its page image."""
+    figures: list[FigureInfo] = []
+    figures_dir.mkdir(exist_ok=True)
+
+    dict_pictures = doc_dict.get("pictures", [])
+    pages_dict = doc_dict.get("pages", {})
+
+    # Build page image cache: page_no -> PIL Image
+    page_images: dict[int, Image.Image] = {}
+
+    for i, pic in enumerate(dict_pictures):
+        prov = pic.get("prov", [])
+        if not prov:
+            continue
+        page_no = prov[0].get("page_no")
+        bbox_data = prov[0].get("bbox")
+        if page_no is None or not bbox_data:
+            continue
+
+        caption = _get_caption_text(pic, doc_dict)
+        bbox = _extract_bbox(prov)
+
+        fig_path = figures_dir / f"figure_{i}.png"
+        # Docling's own image of the figure; docling-serve 1.35 returns it but
+        # returns page images only when asked (include_page_images).
+        picture_image = pic.get("image")
+        picture_uri = picture_image.get("uri", "") if isinstance(picture_image, dict) else ""
+        if picture_uri.startswith("data:image/"):
+            fig_path.write_bytes(base64.b64decode(picture_uri.split(",", 1)[1]))
+            figures.append(
+                FigureInfo(index=i, path=fig_path, caption=caption, page=page_no - 1, bbox=bbox)
+            )
+            continue
+
+        # Otherwise crop the figure from its page image.
+        if page_no not in page_images:
+            page_key = str(page_no)
+            page_info = pages_dict.get(page_key, {})
+            page_img_data = page_info.get("image", {})
+            uri = page_img_data.get("uri", "") if isinstance(page_img_data, dict) else ""
+            if uri.startswith("data:image/"):
+                try:
+                    from PIL import Image as PILImage
+
+                    # Strip data URI prefix
+                    b64_str = uri.split(",", 1)[1]
+                    img_bytes = base64.b64decode(b64_str)
+                    page_images[page_no] = PILImage.open(io.BytesIO(img_bytes))
+                except Exception as exc:
+                    logger.warning("Failed to decode page %d image: %s", page_no, exc)
+
+        page_img = page_images.get(page_no)
+        if page_img is not None and bbox_data:
+            try:
+                page_size = pages_dict.get(str(page_no), {}).get("size", {})
+                pdf_w = page_size.get("width", 612)
+                pdf_h = page_size.get("height", 792)
+                img_w, img_h = page_img.size
+
+                # Convert bbox from bottom-left PDF coords to top-left pixel coords
+                scale_x = img_w / pdf_w
+                scale_y = img_h / pdf_h
+                crop_l = bbox_data.get("l", 0) * scale_x
+                crop_r = bbox_data.get("r", 0) * scale_x
+                crop_t = (pdf_h - bbox_data.get("t", 0)) * scale_y
+                crop_b = (pdf_h - bbox_data.get("b", 0)) * scale_y
+
+                cropped = page_img.crop((
+                    int(crop_l), int(crop_t), int(crop_r), int(crop_b),
+                ))
+                cropped.save(str(fig_path), "PNG")
+            except Exception as exc:
+                logger.warning("Failed to crop figure %d: %s", i, exc)
+                fig_path = None  # type: ignore[assignment]
+        else:
+            fig_path = None  # type: ignore[assignment]
+
+        if fig_path and fig_path.exists():
+            figures.append(FigureInfo(
+                index=i,
+                path=fig_path,
+                caption=caption,
+                page=page_no - 1,  # Convert to 0-based
+                bbox=bbox,
+            ))
+        else:
+            logger.warning(
+                "No image for figure %d on page %d; it gets no generated alt text", i, page_no
+            )
+
+    # Close PIL images to free memory
+    for img in page_images.values():
+        img.close()
+    page_images.clear()
+
+    return figures
+
+
 async def _convert_via_docling_serve(
     pdf_path: Path,
     job_dir: Path,
@@ -1180,8 +1361,6 @@ async def _convert_via_docling_serve(
     the same Docling ``export_to_dict()`` structure as the local converter.
     Figure images are cropped from embedded page renders using bbox data.
     """
-    import base64
-    import io
     import time
 
     import httpx
@@ -1198,8 +1377,14 @@ async def _convert_via_docling_serve(
         data = {
             "to_formats": "json",
             "ocr_engine": ocr_engine,
+            # The OCR step has already given every page a text layer; Docling
+            # reads it instead of recognizing the page a second time.
+            "do_ocr": "false",
             "do_table_structure": "true",
             "do_picture_classification": "true",
+            # Heading levels from bookmarks, section numbering, and font
+            # style; without it every heading comes back as level 1.
+            "do_pdf_heading_hierarchy": "true",
         }
         if include_figure_images:
             data.update({
@@ -1266,91 +1451,9 @@ async def _convert_via_docling_serve(
     if processing_time is not None:
         logger.info("docling-serve processing_time=%.1fs", processing_time)
 
-    # Extract figure images by cropping from embedded page renders
-    figures: list[FigureInfo] = []
     if not include_figure_images:
-        return doc_dict, figures
-
-    figures_dir = job_dir / "figures"
-    figures_dir.mkdir(exist_ok=True)
-
-    dict_pictures = doc_dict.get("pictures", [])
-    pages_dict = doc_dict.get("pages", {})
-
-    # Build page image cache: page_no -> PIL Image
-    page_images: dict[int, Image.Image] = {}
-
-    for i, pic in enumerate(dict_pictures):
-        prov = pic.get("prov", [])
-        if not prov:
-            continue
-        page_no = prov[0].get("page_no")
-        bbox_data = prov[0].get("bbox")
-        if page_no is None or not bbox_data:
-            continue
-
-        caption = _get_caption_text(pic, doc_dict)
-        bbox = _extract_bbox(prov)
-
-        # Try to crop figure from page image
-        fig_path = figures_dir / f"figure_{i}.png"
-        if page_no not in page_images:
-            page_key = str(page_no)
-            page_info = pages_dict.get(page_key, {})
-            page_img_data = page_info.get("image", {})
-            uri = page_img_data.get("uri", "") if isinstance(page_img_data, dict) else ""
-            if uri.startswith("data:image/"):
-                try:
-                    from PIL import Image as PILImage
-
-                    # Strip data URI prefix
-                    b64_str = uri.split(",", 1)[1]
-                    img_bytes = base64.b64decode(b64_str)
-                    page_images[page_no] = PILImage.open(io.BytesIO(img_bytes))
-                except Exception as exc:
-                    logger.warning("Failed to decode page %d image: %s", page_no, exc)
-
-        page_img = page_images.get(page_no)
-        if page_img is not None and bbox_data:
-            try:
-                page_size = pages_dict.get(str(page_no), {}).get("size", {})
-                pdf_w = page_size.get("width", 612)
-                pdf_h = page_size.get("height", 792)
-                img_w, img_h = page_img.size
-
-                # Convert bbox from bottom-left PDF coords to top-left pixel coords
-                scale_x = img_w / pdf_w
-                scale_y = img_h / pdf_h
-                crop_l = bbox_data.get("l", 0) * scale_x
-                crop_r = bbox_data.get("r", 0) * scale_x
-                crop_t = (pdf_h - bbox_data.get("t", 0)) * scale_y
-                crop_b = (pdf_h - bbox_data.get("b", 0)) * scale_y
-
-                cropped = page_img.crop((
-                    int(crop_l), int(crop_t), int(crop_r), int(crop_b),
-                ))
-                cropped.save(str(fig_path), "PNG")
-            except Exception as exc:
-                logger.warning("Failed to crop figure %d: %s", i, exc)
-                fig_path = None  # type: ignore[assignment]
-        else:
-            fig_path = None  # type: ignore[assignment]
-
-        if fig_path and fig_path.exists():
-            figures.append(FigureInfo(
-                index=i,
-                path=fig_path,
-                caption=caption,
-                page=page_no - 1,  # Convert to 0-based
-                bbox=bbox,
-            ))
-
-    # Close PIL images to free memory
-    for img in page_images.values():
-        img.close()
-    page_images.clear()
-
-    return doc_dict, figures
+        return doc_dict, []
+    return doc_dict, _save_docling_figures(doc_dict, job_dir / "figures")
 
 
 async def extract_structure(

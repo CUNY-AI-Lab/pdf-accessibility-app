@@ -10,9 +10,6 @@ from app.services.document_intelligence import (
     collect_structure_fragments,
 )
 from app.services.font_unicode_override import inspect_context_font_target
-from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
-from app.services.intelligence_gemini_reading_order import generate_reading_order_intelligence
-from app.services.intelligence_gemini_tables import generate_table_intelligence
 from app.services.intelligence_llm_utils import (
     job_pdf_path,
     preferred_cache_breakpoint_index,
@@ -23,6 +20,9 @@ from app.services.intelligence_merge import (
     apply_table_intelligence,
     document_overlay_for_intelligence,
 )
+from app.services.intelligence_pages import generate_suspicious_text_intelligence
+from app.services.intelligence_reading_order import generate_reading_order_intelligence
+from app.services.intelligence_tables import generate_table_intelligence
 from app.services.llm_client import LlmClient
 from app.services.page_intelligence import suspicious_text_signals
 from app.services.pdf_preview import (

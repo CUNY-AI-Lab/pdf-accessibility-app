@@ -8,7 +8,7 @@ from app.services.bookmark_intelligence import (
     _front_matter_page_candidates,
     collect_bookmark_heading_candidates,
 )
-from app.services.gemini_direct import request_direct_gemini_pdf_json
+from app.services.intelligence_llm_utils import request_pdf_pages_json
 from app.services.llm_client import LlmClient
 from app.services.title_intelligence import _title_candidate_elements
 
@@ -173,7 +173,8 @@ async def enhance_document_title_and_front_matter_with_intelligence(
         "title_candidates": title_candidates,
         "front_matter_pages": front_matter_pages,
     }
-    parsed = await request_direct_gemini_pdf_json(
+    parsed = await request_pdf_pages_json(
+        schema_name="early_pages_decision",
         pdf_path=pdf_path,
         page_numbers=preview_pages,
         prompt=EARLY_PAGES_INTELLIGENCE_PROMPT,

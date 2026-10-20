@@ -116,6 +116,12 @@ def _page_render_pixels(page: pikepdf.Page, *, dpi: int) -> int:
     return int(width_pixels * height_pixels)
 
 
+def page_image_pixels_of(page: Any) -> int:
+    """The pixels of every image a page draws, forms included."""
+    resources = page.get("/Resources", {}) if hasattr(page, "get") else page.obj.get("/Resources")
+    return sum(_iter_resource_image_pixels(resources, visited=set()))
+
+
 def inspect_pdf_upload(path: Path, *, settings: Any) -> PdfUploadPreflightReport:
     dpi = _setting_int(settings, "upload_preflight_render_dpi", 300)
 
@@ -141,17 +147,7 @@ def inspect_pdf_upload(path: Path, *, settings: Any) -> PdfUploadPreflightReport
                     max_page_render_pixels,
                     _page_render_pixels(page, dpi=dpi),
                 )
-                resources = (
-                    page.get("/Resources", {})
-                    if hasattr(page, "get")
-                    else page.obj.get("/Resources")
-                )
-                page_image_pixels = sum(
-                    _iter_resource_image_pixels(
-                        resources,
-                        visited=set(),
-                    )
-                )
+                page_image_pixels = page_image_pixels_of(page)
                 total_image_pixels += page_image_pixels
                 max_image_pixels = max(max_image_pixels, page_image_pixels)
                 if page_image_pixels >= image_heavy_page_min_pixels:

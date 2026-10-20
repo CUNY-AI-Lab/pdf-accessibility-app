@@ -26,7 +26,7 @@ from app.services.applied_changes import (
     list_pending_reviewable_changes,
     parse_json_dict,
 )
-from app.services.intelligence_gemini_figures import generate_figure_intelligence
+from app.services.intelligence_figures import generate_figure_intelligence
 from app.services.job_manager import get_job_manager
 from app.services.job_state import (
     ACTIVE_JOB_STATUSES,

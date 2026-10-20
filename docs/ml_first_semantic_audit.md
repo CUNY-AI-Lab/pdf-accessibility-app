@@ -6,11 +6,10 @@ This audit separates acceptable deterministic logic from places where the app is
 
 This is the current direction for the app's semantic pipeline and bookmark/navigation work.
 
-- Use direct Gemini for PDF-understanding lanes, not a proxy layer, whenever the task depends on document-native evidence.
-- Upload or reuse bounded PDF slices through Gemini's file/document path and context caching when the same slice will support multiple semantic questions.
-- Use Gemini native structured output with JSON Schema instead of prompt-only schema descriptions.
+- Ask an open-weight vision model on the CAIL Gateway, showing it rendered page images and crops, whenever the task depends on visible document evidence.
+- Use structured output with JSON Schema where the model supports it instead of prompt-only schema descriptions.
 - Give the model grounded candidate inventories with stable `candidate_id` values and source provenance, then let the model adjudicate keep/drop, label, level, and parent relationships.
-- Split long-document work by coherent slices or candidate groups when recall depends on many specific items; use caching to preserve economics across those follow-up calls.
+- Split long-document work by coherent slices or candidate groups when recall depends on many specific items.
 - Keep deterministic code limited to evidence gathering, candidate IDs, schema validation, dedupe, safety bounds, audit logging, and PDF writing.
 
 ## Docling-first escalation matrix
@@ -19,19 +18,19 @@ This is the intended default posture for the app.
 
 - Title
   - Default to Docling when the extracted structure already contains a non-empty Docling-native title.
-  - Escalate to Gemini only when Docling title is missing or empty.
+  - Escalate to the model only when Docling title is missing or empty.
 
 - Document language
   - Default to Docling element-language metadata aggregation.
-  - Do not escalate to Gemini for ordinary document-language detection.
+  - Do not escalate to the model for ordinary document-language detection.
 
 - Native outline / bookmark skeleton
   - Default to Docling when the parser-native TOC tree is present.
-  - Escalate to Gemini only when the PDF does not expose a native TOC and bookmark usefulness/hierarchy must be reconstructed from visible evidence.
+  - Escalate to the model only when the PDF does not expose a native TOC and bookmark usefulness/hierarchy must be reconstructed from visible evidence.
 
 - Visible TOC page semantics
   - Do not treat this as Docling-authoritative today.
-  - Escalate to Gemini when visible TOC tagging or TOC row repair is needed, because the current visible TOC lane still depends on page-level semantic interpretation.
+  - Escalate to the model when visible TOC tagging or TOC row repair is needed, because the current visible TOC lane still depends on page-level semantic interpretation.
 
 - Links
   - Default to Docling hyperlink metadata plus geometric correlation.
@@ -44,16 +43,16 @@ This is the intended default posture for the app.
 - Forms
   - Default to deterministic Docling-first gating.
   - Build a Docling-derived unresolved-unit list from fields whose current accessible label is missing or weak.
-  - Escalate only those unresolved field units to Gemini.
+  - Escalate only those unresolved field units to the model.
 
 - Tables
   - Default to deterministic Docling-first gating.
   - Build a Docling-derived unresolved-unit list from tables whose current simple header interpretation is missing or whose visible structure contains merged cells/spans.
-  - Escalate only those unresolved table units to Gemini.
+  - Escalate only those unresolved table units to the model.
 
 - Figures / alt text
   - Do not treat as Docling-decidable except for obvious structural reclassification inputs.
-  - Escalate to Gemini for meaningful/decorative/reclassified figure semantics and substantive alt text.
+  - Escalate to the model for meaningful/decorative/reclassified figure semantics and substantive alt text.
 
 - Reading order
   - Default to Docling for ordinary page order.
@@ -61,7 +60,7 @@ This is the intended default posture for the app.
 
 - Grounded text repair
   - Default to local candidate agreement only for safe, high-confidence spacing/encoding fixes.
-  - Escalate to Gemini for ambiguous or meaning-affecting repairs.
+  - Escalate to the model for ambiguous or meaning-affecting repairs.
 
 This means the app should not drift back toward:
 
