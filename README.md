@@ -14,7 +14,7 @@ Upload a PDF and the app classifies it, runs OCR if needed, extracts structure, 
 - **Deterministic PDF/UA tag writing** via [pikepdf](https://github.com/pikepdf/pikepdf)
 - **Compliance gating** with [veraPDF](https://verapdf.org/) PDF/UA-1 validation
 - **Fidelity checks** for text drift, reading order, table coverage, and form labels
-- **Anonymous sessions** — no login required, jobs scoped to an HTTP-only cookie
+- **CUNY sign-in** through Doorway; each person sees only their own jobs, and model use counts against their own Gateway budget
 
 ## Tech Stack
 
