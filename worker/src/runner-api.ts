@@ -97,9 +97,13 @@ export async function handleRunner(request: Request, env: Env, path: string): Pr
   if (parts[2] === "files" && request.method === "PUT") {
     const name = parts.slice(3).join("/");
     if (!isRunnerFileName(name)) return detail(400, "Unexpected file name");
-    const length = Number(request.headers.get("content-length") ?? "");
-    if (!Number.isInteger(length) || length < 0 || length > MAX_RUNNER_FILE_BYTES || request.body === null) {
-      return detail(413, "File missing or too large");
+    // R2 needs the length up front; Doorway passes it on only when the
+    // runner sent it.
+    const declared = request.headers.get("content-length");
+    if (declared === null || request.body === null) return detail(411, "Content-Length required");
+    const length = Number(declared);
+    if (!Number.isInteger(length) || length < 1 || length > MAX_RUNNER_FILE_BYTES) {
+      return detail(413, "File empty or too large");
     }
     await env.FILES.put(`jobs/${jobId}/r${held.nextRev}/${name}`, request.body, {
       httpMetadata: { contentType: request.headers.get("content-type") ?? "application/octet-stream" },

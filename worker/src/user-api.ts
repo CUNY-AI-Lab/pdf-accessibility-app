@@ -184,7 +184,9 @@ async function readHead(reader: ReadableStreamDefaultReader<Uint8Array>, size: n
 async function upload(request: Request, env: Env, person: Person, now: number): Promise<Response> {
   const filename = safeFilename(new URL(request.url).searchParams.get("filename") ?? "");
   if (!filename.toLowerCase().endsWith(".pdf")) return detail(400, `File '${filename}' is not a PDF`);
-  const length = Number(request.headers.get("content-length") ?? "0");
+  const declared = request.headers.get("content-length");
+  if (declared === null) return detail(411, "Content-Length required");
+  const length = Number(declared);
   if (!Number.isInteger(length) || length <= 0 || request.body === null) return detail(400, "File is empty");
   if (length > MAX_UPLOAD_BYTES) return detail(413, "File too large");
 

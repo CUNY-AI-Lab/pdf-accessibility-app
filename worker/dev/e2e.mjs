@@ -6,7 +6,8 @@
 //
 // It uploads the PDF, waits for the runner to finish it, reads every view,
 // keeps one figure decision, edits one, and checks each result.
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import { generateKeyPairSync, createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -46,16 +47,16 @@ async function sign(audience, seconds) {
     .sign(signingKey);
 }
 
-async function person() {
+async function person(appSeconds = 300) {
   return {
-    "x-cail-identity-jwt": await sign("cail:pdf-accessibility", 300),
+    "x-cail-identity-jwt": await sign("cail:pdf-accessibility", appSeconds),
     "x-cail-gateway-identity-jwt": await sign("cail:gateway", 24 * 3600),
   };
 }
 
 async function api(path, init = {}) {
   const headers = { ...(await person()), ...init.headers };
-  if (init.method && init.method !== "GET") headers.origin = "https://tools.ailab.gc.cuny.edu";
+  if (init.method && init.method !== "GET") headers.origin = ORIGIN;
   return fetch(`${BASE}/api${path}`, { ...init, headers });
 }
 
@@ -122,21 +123,25 @@ try {
   writeFileSync(join(workerDir, "dev/.dev.vars"), `DEV_GATEWAY_KEY=${gatewayKey}\n`);
   const workerLog = start(
     "node_modules/.bin/wrangler",
-    ["dev", "-c", "wrangler.jsonc", "-c", "dev/gateway.jsonc", "--port", String(PORT), "--persist-to", join(scratch, "state")],
+    [
+      "dev",
+      "-c",
+      "wrangler.jsonc",
+      "-c",
+      "dev/gateway.jsonc",
+      "--port",
+      String(PORT),
+      "--persist-to",
+      join(scratch, "state"),
+      // Writes are accepted only from the canonical origin; here that is the dev server.
+      "--var",
+      `CAIL_CANONICAL_ORIGIN:${ORIGIN}`,
+    ],
     { cwd: workerDir, env: { ...process.env, WRANGLER_SEND_METRICS: "false" } },
     "worker",
   );
   await waitFor("the Worker", async () => (await fetch(`${BASE}/health`).catch(() => null))?.ok, 60_000, 1000);
   console.log(`Worker up (log ${workerLog})`);
-
-  const bytes = readFileSync(pdfPath);
-  const created = await apiJson(`/jobs?filename=${encodeURIComponent(basename(pdfPath))}`, {
-    method: "POST",
-    headers: { "content-type": "application/pdf" },
-    body: bytes,
-  });
-  const id = created.jobs[0].id;
-  check(created.jobs[0].status === "queued", `uploaded ${basename(pdfPath)} as job ${id}`);
 
   const data = join(scratch, "data");
   const runnerLog = start(
@@ -160,6 +165,31 @@ try {
     "runner",
   );
   console.log(`Runner started (log ${runnerLog})`);
+
+  let id;
+  if (process.env.E2E_BROWSER === "1") {
+    // The browser keeps one set of headers for the whole run, so its app leg
+    // lasts an hour instead of Doorway's five minutes.
+    const { stdout } = await promisify(execFile)(
+      "uv",
+      ["run", "--frozen", "python", resolve(workerDir, "dev/ui_check.py"), BASE, pdfPath],
+      {
+        cwd: backendDir,
+        env: { ...process.env, E2E_IDENTITY_HEADERS: JSON.stringify(await person(3600)) },
+        timeout: 25 * 60_000,
+      },
+    );
+    id = stdout.trim().split("\n").pop();
+    check(true, `uploaded ${basename(pdfPath)} in the browser and downloaded its result (job ${id})`);
+  } else {
+    const created = await apiJson(`/jobs?filename=${encodeURIComponent(basename(pdfPath))}`, {
+      method: "POST",
+      headers: { "content-type": "application/pdf" },
+      body: readFileSync(pdfPath),
+    });
+    id = created.jobs[0].id;
+    check(created.jobs[0].status === "queued", `uploaded ${basename(pdfPath)} as job ${id}`);
+  }
 
   const job = await finished(id);
   check(job.status !== "failed", `job finished as ${job.status}${job.error ? `: ${job.error}` : ""}`);

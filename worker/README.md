@@ -29,6 +29,10 @@ DOCLING_SERVE_URL=https://actual-dell.taila37893.ts.net:8444 \
 node dev/e2e.mjs path/to/file.pdf
 ```
 
+With `E2E_BROWSER=1` it uploads through the app in Chromium
+(`dev/ui_check.py`, via the backend's Playwright) and follows the job page to
+its download link.
+
 ## Configuration
 
 - Bindings: `GATEWAY` (service `cail-model-api`), `FILES` (R2

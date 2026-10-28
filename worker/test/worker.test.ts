@@ -203,6 +203,24 @@ describe("the runner", () => {
     expect((await env.FILES.list({ prefix: `jobs/${task.job_id}/r1/` })).objects).toHaveLength(0);
   });
 
+  it("asks for the length of a file it would store", async () => {
+    await upload();
+    const task = await claim();
+    if (task === null) throw new Error("no task");
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("{}"));
+        controller.close();
+      },
+    });
+    const response = await runner(`/tasks/${task.job_id}/files/views/report.json`, {
+      method: "PUT",
+      lease: task.lease,
+      body: stream,
+    });
+    expect(response.status).toBe(411);
+  });
+
   it("fails a job whose Gateway leg would expire before the work could start", async () => {
     const id = await createdJobId(await upload());
     await runInDurableObject(jobBoard(env), (_board, state) => {
