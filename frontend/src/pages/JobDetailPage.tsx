@@ -7,8 +7,8 @@ import OutcomeHero from "../components/OutcomeHero";
 import PipelineProgress from "../components/PipelineProgress";
 import RemediationSummary from "../components/RemediationSummary";
 import ValidationReport from "../components/ValidationReport";
-import { useJobProgress } from "../hooks/useJobProgress";
 import { formatBytes, formatClassification } from "../utils/format";
+import { pipelineSteps } from "../utils/steps";
 import { asNumber } from "../utils/typeGuards";
 
 export default function JobDetailPage() {
@@ -18,9 +18,7 @@ export default function JobDetailPage() {
   const deleteJob = useDeleteJob();
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-  const isActive = job?.status === "processing" || job?.status === "queued";
   const canInspectOutput = job?.status === "complete" || job?.status === "manual_remediation";
-  const { steps } = useJobProgress(id!, isActive, job?.steps);
   const hasFinalOutput = job?.status === "complete" || job?.status === "manual_remediation";
   const {
     data: validationReport,
@@ -63,8 +61,8 @@ export default function JobDetailPage() {
   const blockingIssueCount =
     asNumber(fidelitySummary.blocking_tasks) ?? null;
 
-  // Use SSE steps when actively processing, otherwise use API data
-  const displaySteps = isActive ? steps : job?.steps ?? [];
+  // The job query polls every few seconds while the job is active.
+  const displaySteps = pipelineSteps(job?.steps);
   const taggingResult = displaySteps.find((s) => s.step_name === "tagging")?.result;
 
   if (isLoading) {
@@ -141,6 +139,13 @@ export default function JobDetailPage() {
           )}
         </div>
       </div>
+
+      {job.notice && (
+        <div role="status" className="rounded-xl border border-warning/30 bg-warning-light/20 p-5 mb-6">
+          <h2 className="font-display text-lg text-ink mb-1">Your last change was not applied</h2>
+          <p className="text-sm text-ink-muted">{job.notice}</p>
+        </div>
+      )}
 
       {/* Pipeline progress */}
       <div className="rounded-xl border border-ink/6 bg-cream p-6 mb-6">

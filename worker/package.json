@@ -1,0 +1,33 @@
+{
+  "name": "@cuny-ai-lab/pdf-accessibility-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "build:frontend": "cd ../frontend && VITE_APP_BASE_PATH=/pdf-accessibility/ bun run build",
+    "check": "bun run lint && bun run typecheck && bun run build && bun run test",
+    "build": "bun run build:frontend && WRANGLER_LOG=error wrangler deploy --dry-run --strict --outdir dist",
+    "dev": "bun run build:frontend && wrangler dev",
+    "lint": "oxlint .",
+    "test": "node node_modules/vitest/vitest.mjs run",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json"
+  },
+  "dependencies": {
+    "@cuny-ai-lab/cail-identity": "5.2.6",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.3.6",
+    "@cloudflare/workers-types": "5.20260712.1",
+    "@oxlint/plugins": "1.79.0",
+    "jose": "5.10.0",
+    "oxlint": "1.79.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12",
+    "wrangler": "4.147.0"
+  }
+}

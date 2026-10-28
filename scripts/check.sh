@@ -21,3 +21,10 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
   bun run lint
   bun run build
 )
+
+# The v2 Worker: lint, types, its build (with the app at /pdf-accessibility/),
+# and its tests in workerd, which need Node 22.18 or later.
+(
+  cd "$repo_root/worker"
+  bun run check
+)

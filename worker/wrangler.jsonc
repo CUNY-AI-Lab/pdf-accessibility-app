@@ -1,0 +1,38 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cail-pdf-accessibility",
+  "account_id": "452c33847cf5cb1e46f391fca32fd1b5",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+  // Doorway reaches this Worker by service binding, people at
+  // /pdf-accessibility and the runner at /pdf-accessibility/runner. It has no
+  // public hostname of its own.
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": true, "logs": { "enabled": true, "invocation_logs": false } },
+  "version_metadata": { "binding": "CF_VERSION_METADATA" },
+  // The React app, built with base /pdf-accessibility/. The Worker strips the
+  // mount path before asking for an asset.
+  "assets": {
+    "directory": "../frontend/dist",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "single-page-application"
+  },
+  "services": [{ "binding": "GATEWAY", "service": "cail-model-api" }],
+  // jobs/<id>/input.pdf and jobs/<id>/r<revision>/... (views, output, state).
+  // The bucket's lifecycle rule expires every object after 2 days, a backstop
+  // for the 12-hour deletion the JobBoard does itself.
+  "r2_buckets": [{ "binding": "FILES", "bucket_name": "cail-pdf-accessibility-files" }],
+  "durable_objects": { "bindings": [{ "name": "JOB_BOARD", "class_name": "JobBoard" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["JobBoard"] }],
+  // Secrets: CAIL_IDENTITY_JWKS (Doorway's public keys) and RUNNER_TOKEN.
+  "vars": {
+    "CAIL_API_BASE": "https://tools.ailab.gc.cuny.edu",
+    "CAIL_IDENTITY_ISSUER": "https://tools.ailab.gc.cuny.edu/cail-sso",
+    "CAIL_CANONICAL_ORIGIN": "https://tools.ailab.gc.cuny.edu",
+    "BASE_PATH": "/pdf-accessibility"
+  }
+}

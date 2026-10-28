@@ -32,6 +32,9 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.3.14
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.23.4"
       - name: Install backend dependencies
         working-directory: backend
         run: uv sync --locked --extra dev
@@ -40,6 +43,9 @@ jobs:
         run: uv run --frozen playwright install --with-deps chromium
       - name: Install frontend dependencies
         working-directory: frontend
+        run: bun install --frozen-lockfile
+      - name: Install Worker dependencies
+        working-directory: worker
         run: bun install --frozen-lockfile
       - name: Install PDF rendering tools
         env:
