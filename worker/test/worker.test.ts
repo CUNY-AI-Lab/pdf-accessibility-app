@@ -9,12 +9,15 @@ import {
   alice,
   api,
   bob,
+  CHANGES,
   claim,
   createdJobId,
+  finishedJob,
   finishProcess,
   job,
   ORIGIN,
   PDF,
+  putFile,
   runner,
   signedIn,
   upload,
@@ -261,6 +264,32 @@ describe("review", () => {
     expect(sync?.kind).toBe("sync");
     expect(sync?.overrides.changes).toEqual({ "1": "kept" });
     expect((await job(id)).status).toBe("manual_remediation");
+  });
+
+  it("lets the runner's later view replace a status it has already applied", async () => {
+    const id = await reviewable();
+    await api(`/jobs/${id}/applied-changes/1/keep`, { method: "POST", headers: { origin: ORIGIN } });
+    const sync = await claim();
+    if (sync === null) throw new Error("no sync task");
+    expect(sync.overrides_version).toBe(1);
+    // The runner applied the keep, then (say) an edit marked the change undone.
+    const undone = [{ ...CHANGES[0], review_status: "undone" }];
+    await putFile(sync, "views/figure-changes.json", JSON.stringify(undone), "application/json");
+    const done = await runner(`/tasks/${id}/complete`, {
+      method: "POST",
+      lease: sync.lease,
+      body: JSON.stringify({
+        job: finishedJob("manual_remediation"),
+        figures: [],
+        previews: [],
+        files: ["views/figure-changes.json"],
+        has_state: false,
+        overrides_version: sync.overrides_version,
+      }),
+    });
+    expect(done.status).toBe(204);
+    const figures = z.array(z.object({ review_status: z.string() })).parse(await (await api(`/jobs/${id}/figure-changes`)).json());
+    expect(figures[0]?.review_status).toBe("undone");
   });
 
   it("resolves a task once", async () => {

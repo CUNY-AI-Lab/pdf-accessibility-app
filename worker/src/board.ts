@@ -93,6 +93,17 @@ const jobRowSchema = z.object({
 type JobRow = z.infer<typeof jobRowSchema>;
 
 const priorSchema = z.object({ status: z.string(), steps: stepsSchema });
+/**
+ * Keep and resolve, stored as the overrides version each was recorded at. A
+ * task's views include every override up to the version it was claimed with;
+ * when it completes those give way to the views, and only newer ones stay
+ * layered on top.
+ */
+const storedOverridesSchema = z.object({
+  changes: z.record(z.string(), z.number()),
+  tasks: z.record(z.string(), z.number()),
+});
+type StoredOverrides = z.infer<typeof storedOverridesSchema>;
 const pendingReviewSchema = z.object({
   action: reviewActionSchema,
   gateway_jwt: z.string(),
@@ -183,8 +194,22 @@ function parseSteps(raw: string): Step[] {
   return stepsSchema.parse(JSON.parse(raw));
 }
 
+function parseStoredOverrides(raw: string): StoredOverrides {
+  return storedOverridesSchema.parse(JSON.parse(raw));
+}
+
 function parseOverrides(raw: string): Overrides {
-  return overridesSchema.parse(JSON.parse(raw));
+  const stored = parseStoredOverrides(raw);
+  return overridesSchema.parse({
+    changes: Object.fromEntries(Object.keys(stored.changes).map((id) => [id, "kept"])),
+    tasks: Object.fromEntries(Object.keys(stored.tasks).map((id) => [id, "resolved"])),
+  });
+}
+
+function overridesAfter(stored: StoredOverrides, version: number): StoredOverrides {
+  const newer = (entries: { [id: string]: number }) =>
+    Object.fromEntries(Object.entries(entries).filter(([, recorded]) => recorded > version));
+  return { changes: newer(stored.changes), tasks: newer(stored.tasks) };
 }
 
 function iso(ms: number): string {
@@ -369,12 +394,14 @@ export class JobBoard extends DurableObject<Env> {
   async setOverride(owner: string, id: string, kind: "changes" | "tasks", itemId: number, now: number): Promise<JobRecord | null> {
     const row = this.owned(owner, id);
     if (row === null) return null;
-    const overrides = parseOverrides(row.overrides_json);
-    if (kind === "changes") overrides.changes[String(itemId)] = "kept";
-    else overrides.tasks[String(itemId)] = "resolved";
+    const overrides = parseStoredOverrides(row.overrides_json);
+    const version = row.overrides_version + 1;
+    if (kind === "changes") overrides.changes[String(itemId)] = version;
+    else overrides.tasks[String(itemId)] = version;
     this.sql.exec(
-      "UPDATE jobs SET overrides_json = ?, overrides_version = overrides_version + 1, updated_at = ? WHERE id = ?",
+      "UPDATE jobs SET overrides_json = ?, overrides_version = ?, updated_at = ? WHERE id = ?",
       JSON.stringify(overrides),
+      version,
       now,
       id,
     );
@@ -577,7 +604,7 @@ export class JobBoard extends DurableObject<Env> {
     const finished = { status: result.job.status, steps: result.job.steps };
     this.sql.exec(
       `UPDATE jobs SET status = ?, error = ?, job_json = ?, steps_json = ?, prior_json = ?, rev = ?, files_json = ?,
-         has_state = ?, synced_version = ?, updated_at = ? WHERE id = ?`,
+         has_state = ?, synced_version = ?, overrides_json = ?, updated_at = ? WHERE id = ?`,
       waiting ? row.status : result.job.status,
       result.job.error,
       JSON.stringify(viewSummary(result.job)),
@@ -587,6 +614,7 @@ export class JobBoard extends DurableObject<Env> {
       JSON.stringify(files),
       result.has_state ? 1 : 0,
       result.overrides_version,
+      JSON.stringify(overridesAfter(parseStoredOverrides(row.overrides_json), result.overrides_version)),
       now,
       id,
     );
