@@ -92,6 +92,15 @@ jobs:
           previous_version="$(bunx wrangler deployments status --config wrangler.jsonc --json | jq -er '
             if (.versions | length) != 1 or .versions[0].percentage != 100 then error("not one version at 100 percent")
             else .versions[0].version_id end')"
+          # Setting the secrets before the first release leaves a Worker with
+          # no code and no JobBoard; that one still needs `wrangler deploy`.
+          if bunx wrangler versions view "$previous_version" --config wrangler.jsonc --json | jq -e '
+            [.resources.bindings[]? | select(.type == "durable_object_namespace" and .name == "JOB_BOARD")] | length == 0
+          ' >/dev/null; then
+            printf 'first_release=true\n' >> "$GITHUB_ENV"
+            printf 'Version %s has no JobBoard; this release creates it.\n' "$previous_version"
+            exit 0
+          fi
           printf 'previous_version=%s\n' "$previous_version" >> "$GITHUB_ENV"
 
       # A new Durable Object class is created only by `wrangler deploy`, never
@@ -118,15 +127,19 @@ jobs:
       - name: Read back the version's config and bindings
         run: |
           set -euo pipefail
-          bunx wrangler versions view "$version_id" --config wrangler.jsonc --json | jq -e --arg sha "$GITHUB_SHA" '
+          # The first release creates the Worker, so its secrets can only be set
+          # after it; the next release reads them back.
+          bunx wrangler versions view "$version_id" --config wrangler.jsonc --json | jq -e \
+            --arg sha "$GITHUB_SHA" --arg first "${first_release:-false}" '
             def count(f): [.resources.bindings[]? | select(f)] | length;
             .annotations["workers/tag"] == $sha and
             count(.type == "service" and .name == "GATEWAY" and .service == "cail-model-api") == 1 and
             count(.type == "assets" and .name == "ASSETS") == 1 and
             count(.type == "r2_bucket" and .name == "FILES" and .bucket_name == "cail-pdf-accessibility-files") == 1 and
             count(.type == "durable_object_namespace" and .name == "JOB_BOARD" and .class_name == "JobBoard") == 1 and
-            count(.type == "secret_text" and .name == "CAIL_IDENTITY_JWKS") == 1 and
-            count(.type == "secret_text" and .name == "RUNNER_TOKEN") == 1 and
+            ($first == "true" or (
+              count(.type == "secret_text" and .name == "CAIL_IDENTITY_JWKS") == 1 and
+              count(.type == "secret_text" and .name == "RUNNER_TOKEN") == 1)) and
             count(.type == "plain_text" and .name == "BASE_PATH" and .text == "/pdf-accessibility") == 1 and
             count(.type == "plain_text" and .name == "CAIL_IDENTITY_ISSUER" and
               .text == "https://tools.ailab.gc.cuny.edu/cail-sso") == 1 and
@@ -134,6 +147,9 @@ jobs:
             count(.name == "TEST_PRIVATE_JWK") == 0
           ' >/dev/null
           printf 'Version %s carries the required bindings\n' "$version_id"
+          if [ "${first_release:-false}" = "true" ]; then
+            printf '::notice::First release: set CAIL_IDENTITY_JWKS and RUNNER_TOKEN, then release again to read them back.\n'
+          fi
 
       - name: Arm the rollback
         if: env.first_release != 'true'

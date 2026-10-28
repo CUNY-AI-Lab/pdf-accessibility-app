@@ -45,5 +45,6 @@ node dev/e2e.mjs path/to/file.pdf
 `deploy: true`. It checks the Worker, reads back the bucket rule, uploads the
 exact commit, reads back its bindings, promotes it to 100 percent, confirms,
 and rolls back on failure. The first release uses `wrangler deploy`, which
-creates the Durable Object. Deploy this Worker before the Doorway release
-that binds it.
+creates the Worker and its Durable Object; set the two secrets after it
+(`wrangler secret put`) and release again, which reads them back. Deploy
+this Worker before the Doorway release that binds it.
