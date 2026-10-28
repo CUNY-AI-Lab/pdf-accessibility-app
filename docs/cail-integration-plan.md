@@ -192,9 +192,10 @@ Design (2026-10-27), in [architecture.md](architecture.md#version-2):
   Verified on the deployed path: a browser is sent to CUNY sign-in, the API
   and a forged identity are refused with the launch path, a runner claim
   without the token is refused by the Worker, and the runner's claims
-  succeed. Still open: a real sign-in and upload on the deployed path,
-  retiring the NML deployment (kept a few days for rollback, which is
-  recreating the two routes), and the Gateway `tool` claim.
+  succeed. The NML deployment was retired the same day: its
+  container and volumes are removed, its secrets blanked, and its nginx
+  redirects `/pdf-accessibility` to v2. Still open: a real sign-in and upload
+  on the deployed path, and the Gateway `tool` claim.
 
 ### 4. Reliability
 
