@@ -142,6 +142,59 @@ long-running consumer needs only the Gateway, which re-checks every call.
   fleet status.
 - Production cutover needs Stephen's go-ahead after the PRs are green.
 
+Design (2026-10-27), in [architecture.md](architecture.md#version-2):
+
+- **Worker** `cail-pdf-accessibility` (`worker/`): the React app as static
+  assets, the same `/api` paths v1 serves, R2 for files, and one SQLite
+  Durable Object (`JobBoard`) for jobs, leases, and the queue. A Durable
+  Object replaces Workflows: the host pulls work, so a job has no steps for
+  Cloudflare to run, and one object gives the global and per-person job
+  limits and an atomic claim. `workers_dev` is off; Doorway reaches it by
+  service binding.
+- **Runner** (`python -m app.runner` on actual-dell): claims a task, runs the
+  existing pipeline against a per-job SQLite file, reports step progress,
+  uploads the result, and returns. Its model calls go to the Worker's relay
+  with the task's lease token, and the Worker forwards them to the Gateway
+  with the person's `cail:gateway` leg, which never leaves Cloudflare. It
+  reaches the Worker through Doorway at the public route
+  `/pdf-accessibility/runner`, with its own token in `x-pdf-runner-token`
+  (Doorway strips `Authorization`).
+- **Views:** after each task the runner renders what the read routes return
+  (job, review tasks, applied and figure changes, validation report, HTML
+  report, batch-report parts, figure images, and the page previews the
+  review screen asks for) with v1's own code, and stores them in R2 with the
+  job's state (its SQLite file and working files) for later re-runs. The
+  Worker serves them; it does not re-implement the pipeline's response code.
+- **Review actions:** undo, revise, and edit queue a `review` task that
+  re-runs tagging, as in v1. Keep and resolve change the status at once in
+  the Durable Object and queue a `sync` task that re-renders the views and
+  report with the new statuses.
+- **Limits and deadlines:** uploads stream to R2 one file per request (100
+  MB); the page and image preflight runs on the runner before any work. A
+  job's deadline is the earlier of three hours after claim and its Gateway
+  leg's expiry less ten minutes; the Worker refuses to queue work when the
+  leg has under an hour left. Leases last three minutes and are renewed by
+  progress; a job whose host disappears is retried once, then failed. Jobs
+  and files are deleted 12 hours after the last change, with an R2 lifecycle
+  rule as a backstop.
+- **Callers and receivers, in deployment order:** (1) Worker
+  `cail-pdf-accessibility` with its R2 bucket, Durable Object, `GATEWAY`
+  binding, identity JWKS, and runner token; (2) the runner and docling-serve
+  1.35.0 on actual-dell; (3) Doorway with the `PDF_ACCESSIBILITY` binding
+  and routes, without the bypass reconciliation (the two no-script Worker
+  Routes stay, so v1 keeps serving); (4) cutover: delete the two no-script
+  routes. Rollback is recreating them.
+- **Status (2026-10-27):** source done in this repo (#14) and Doorway
+  (cail-tools-admission#362); per-job credential (Phase 2 step 3) done. The
+  R2 bucket and its 2-day expiry rule exist. Verified: the full source gate,
+  26 Worker tests in workerd, and `worker/dev/e2e.mjs` with
+  `E2E_BROWSER=1` (the real Worker and runner, the app in Chromium, model
+  calls relayed to the real Gateway, docling-serve on actual-dell) on a CUNY
+  OER PDF: complete and veraPDF-compliant, with keep, an edit re-run, and
+  delete. Not yet done: the Worker release and its secrets, the runner and
+  docling-serve 1.35.0 on actual-dell, the Doorway release, cutover, and
+  the acceptance check of a real sign-in and upload on the deployed path.
+
 ### 4. Reliability
 
 - An overall job deadline, kept inside the Gateway token's actual expiry.

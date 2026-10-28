@@ -1,0 +1,38 @@
+# PDF Accessibility v2 on actual-dell: the runner, beside docling-serve.
+#
+# Lives at ~/services/pdf-accessibility/ on the host (WSL Ubuntu). The runner
+# makes only outbound calls: it takes work from the Worker through Doorway and
+# sends model calls back through the Worker's relay. See README.md here.
+services:
+  runner:
+    image: ghcr.io/cuny-ai-lab/pdf-accessibility-app:${RUNNER_IMAGE_TAG:?set RUNNER_IMAGE_TAG to a published commit}
+    command: ["python", "-m", "app.runner"]
+    restart: unless-stopped
+    # Host networking reaches docling-serve on 127.0.0.1:5001.
+    network_mode: host
+    env_file:
+      - runner.env
+    environment:
+      RUNNER_WORKER_URL: https://tools.ailab.gc.cuny.edu/pdf-accessibility/runner
+      RUNNER_ALIVE_FILE: /tmp/runner-alive
+      DOCLING_SERVE_URL: http://127.0.0.1:5001
+      UPLOAD_DIR: /app/data/uploads
+      PROCESSING_DIR: /app/data/processing
+      OUTPUT_DIR: /app/data/output
+      DATABASE_URL: sqlite+aiosqlite:////app/data/unused.db
+    volumes:
+      # Working files for the task in hand; the runner removes them after.
+      - runner_data:/app/data
+      - runner_cache:/home/app/.cache
+    healthcheck:
+      test: ["CMD-SHELL", "find /tmp/runner-alive -mmin -3 | grep -q ."]
+      interval: 60s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    mem_limit: 8g
+    stop_grace_period: 30s
+
+volumes:
+  runner_data:
+  runner_cache:

@@ -102,6 +102,16 @@ deployments (e.g., behind a reverse proxy), set
 
 Tesseract language packs included: English, Spanish, French, German, Chinese (Simplified and Traditional), Russian, Arabic, Korean, Bengali, Polish, Hebrew, Yiddish, Haitian Creole, Hindi, Italian, Portuguese, and Japanese. Add others by extending the Dockerfile.
 
+## Version 2 (Worker behind Doorway)
+
+Version 2 serves the app at `https://tools.ailab.gc.cuny.edu/pdf-accessibility/`
+for signed-in CUNY people. A Cloudflare Worker (`worker/`) owns the app, its
+API, jobs, and files; the pipeline runs on actual-dell (`python -m app.runner`)
+and takes work from the Worker. Each person's model calls use their own
+Gateway budget. See [docs/architecture.md](docs/architecture.md#version-2),
+[deploy/actual-dell/README.md](deploy/actual-dell/README.md), and
+[worker/README.md](worker/README.md).
+
 ## NML Deployment
 
 The NML host is reached with the local `nml-ssh` wrapper. The deployed project

@@ -623,3 +623,50 @@ async def test_job_progress_sse_releases_db_session_before_stream(monkeypatch):
 
     assert closed is True
     assert response is not None
+
+
+@pytest.mark.asyncio
+async def test_a_pdf_sent_as_the_body_becomes_one_upload():
+    from starlette.requests import Request
+
+    sent = [b"%PDF-1.7\n", b"rest of the file"]
+
+    async def receive():
+        chunk = sent.pop(0)
+        return {"type": "http.request", "body": chunk, "more_body": bool(sent)}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/jobs",
+            "headers": [(b"content-type", b"application/pdf")],
+            "query_string": b"filename=syllabus.pdf",
+        },
+        receive,
+    )
+    upload = await jobs.raw_pdf_upload(request, filename="syllabus.pdf")
+
+    assert upload is not None
+    assert upload.filename == "syllabus.pdf"
+    assert await upload.read() == b"%PDF-1.7\nrest of the file"
+
+
+@pytest.mark.asyncio
+async def test_a_multipart_upload_is_not_read_as_a_body():
+    from starlette.requests import Request
+
+    async def receive():
+        raise AssertionError("the body must be left for the form parser")
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/jobs",
+            "headers": [(b"content-type", b"multipart/form-data; boundary=x")],
+            "query_string": b"filename=syllabus.pdf",
+        },
+        receive,
+    )
+    assert await jobs.raw_pdf_upload(request, filename="syllabus.pdf") is None

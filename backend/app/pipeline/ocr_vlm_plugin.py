@@ -90,19 +90,38 @@ def _encoded_page(image: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def _complete(base_url: str, api_key: str, body: dict, deadline: float) -> dict:
+def _refused(response: httpx.Response) -> bool:
+    """The Gateway refused the credential itself, so no page can succeed."""
+    if response.status_code in {401, 403}:
+        return True
+    return (
+        response.status_code == 429
+        and response.headers.get("x-should-retry", "").lower() == "false"
+    )
+
+
+_credential_refused = False
+
+
+def _complete(base_url: str, headers: dict[str, str], body: dict, deadline: float) -> dict:
     """One answer, sending the request again only after a status that carries
     no answer, and giving up at the page's deadline."""
+    global _credential_refused
+    if _credential_refused:
+        raise GatewayOcrError("the Gateway refused this job's credential")
     for delay in (*RETRY_DELAYS_SECONDS, None):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise GatewayOcrError("page time limit reached")
         response = httpx.post(
             f"{base_url.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
             json=body,
             timeout=remaining,
         )
+        if _refused(response):
+            _credential_refused = True
+            break
         if response.status_code not in NO_ANSWER_STATUSES or delay is None:
             break
         time.sleep(min(delay, max(deadline - time.monotonic(), 0)))
@@ -114,20 +133,21 @@ def _complete(base_url: str, api_key: str, body: dict, deadline: float) -> dict:
 
 
 def _request_lines(image: Image.Image) -> list[dict]:
-    base_url, api_key, model, page_seconds = (
+    base_url, headers_json, model, page_seconds = (
         os.environ.get(name, "").strip()
         for name in (
             "CAIL_OCR_BASE_URL",
-            "CAIL_OCR_API_KEY",
+            "CAIL_OCR_HEADERS",
             "CAIL_OCR_MODEL",
             "CAIL_OCR_PAGE_SECONDS",
         )
     )
-    if not (base_url and api_key and model and page_seconds):
+    if not (base_url and headers_json and model and page_seconds):
         raise GatewayOcrError(
-            "CAIL_OCR_BASE_URL, CAIL_OCR_API_KEY, CAIL_OCR_MODEL and "
+            "CAIL_OCR_BASE_URL, CAIL_OCR_HEADERS, CAIL_OCR_MODEL and "
             "CAIL_OCR_PAGE_SECONDS are required"
         )
+    headers = json.loads(headers_json)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -151,7 +171,7 @@ def _request_lines(image: Image.Image) -> list[dict]:
             "max_tokens": MAX_OUTPUT_TOKENS,
             "messages": messages,
         }
-        choice = _complete(base_url, api_key, body, deadline)
+        choice = _complete(base_url, headers, body, deadline)
         content = choice["message"]["content"] or ""
         finish = choice.get("finish_reason")
         lines = parse_lines(content)

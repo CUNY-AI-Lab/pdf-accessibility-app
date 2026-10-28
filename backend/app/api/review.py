@@ -315,13 +315,17 @@ def _figure_info_from_change_metadata(
     )
 
 
-async def _apply_revised_figure_change(
+async def apply_revised_figure_change(
     *,
     job: Job,
     change: AppliedChange,
     db: AsyncSession,
     reviewer_feedback: str | None,
 ) -> AppliedChangeActionResponse:
+    """Ask the model again about one figure and record its new decision.
+
+    The caller re-runs tagging afterwards.
+    """
     entry, metadata = await _load_figure_change_context(job=job, change=change, db=db)
     settings = get_settings()
     llm_client = make_llm_client(settings)
@@ -398,7 +402,6 @@ async def _apply_revised_figure_change(
             **previous_state,
         },
     )
-    await _restart_tagging_with_current_state(job=job, db=db)
     return AppliedChangeActionResponse(
         status="reopened",
         message="Retried the figure decision and restarted accessibility processing.",
@@ -406,12 +409,13 @@ async def _apply_revised_figure_change(
     )
 
 
-async def _undo_applied_change(
+async def apply_undo(
     *,
     job: Job,
     change: AppliedChange,
     db: AsyncSession,
 ) -> AppliedChangeActionResponse:
+    """Restore the state an applied change replaced. The caller re-runs tagging."""
     undo_payload = _parse_json(change.undo_payload_json)
     kind = str(undo_payload.get("kind") or "").strip()
     if kind == "alt_text_entry":
@@ -454,13 +458,52 @@ async def _undo_applied_change(
             entry.edited_text = undo_payload.get("edited_text")
             entry.status = str(undo_payload.get("status") or "pending_review")
         change.review_status = "undone"
-        await _restart_tagging_with_current_state(job=job, db=db)
         return AppliedChangeActionResponse(
             status="undone",
             message="Undid the applied figure decision and restarted accessibility processing.",
             job_status="processing",
         )
     raise HTTPException(status_code=400, detail="This change cannot be undone.")
+
+
+async def apply_review_action(
+    *,
+    job: Job,
+    db: AsyncSession,
+    action: str,
+    change_id: int,
+    feedback: str | None = None,
+    text: str | None = None,
+) -> AppliedChangeActionResponse:
+    """Apply one review action with the routes' checks; the caller re-runs tagging.
+
+    The v2 runner uses this: the Worker queued the action, and the job's
+    database here still holds its finished state.
+    """
+    _ensure_job_supports_in_app_review(job)
+    change = await _load_applied_change(job_id=job.id, change_id=change_id, db=db)
+    if action == "edit":
+        if change.review_status not in ("pending_review", "kept"):
+            raise HTTPException(status_code=409, detail=_REVIEW_ACTION_STALE_DETAIL)
+    else:
+        _ensure_change_is_pending_review(change)
+    if action == "undo":
+        return await apply_undo(job=job, change=change, db=db)
+    if change.change_type != "figure_semantics":
+        raise HTTPException(
+            status_code=400,
+            detail=f"This change type cannot be {'edited' if action == 'edit' else 'revised'} in the app.",
+        )
+    if action == "revise":
+        return await apply_revised_figure_change(
+            job=job,
+            change=change,
+            db=db,
+            reviewer_feedback=(feedback or "").strip() or None,
+        )
+    if action == "edit":
+        return await apply_edit(job=job, change=change, db=db, text=text or "")
+    raise HTTPException(status_code=400, detail="Unknown review action.")
 
 
 @router.get("/applied-changes", response_model=list[AppliedChangeResponse])
@@ -522,7 +565,9 @@ async def undo_applied_change(
     change = await _load_applied_change(job_id=job_id, change_id=change_id, db=db)
     _ensure_change_is_pending_review(change)
     _ensure_job_is_not_processing(job)
-    return await _undo_applied_change(job=job, change=change, db=db)
+    response = await apply_undo(job=job, change=change, db=db)
+    await _restart_tagging_with_current_state(job=job, db=db)
+    return response
 
 
 @router.post("/applied-changes/{change_id}/revise", response_model=AppliedChangeActionResponse)
@@ -543,12 +588,14 @@ async def revise_applied_change(
             status_code=400,
             detail="This change type cannot be revised in the app.",
         )
-    return await _apply_revised_figure_change(
+    response = await apply_revised_figure_change(
         job=job,
         change=change,
         db=db,
         reviewer_feedback=(request.feedback.strip() if request and request.feedback else None),
     )
+    await _restart_tagging_with_current_state(job=job, db=db)
+    return response
 
 
 @router.post("/applied-changes/{change_id}/edit", response_model=AppliedChangeActionResponse)
@@ -571,9 +618,21 @@ async def edit_applied_change(
             status_code=400,
             detail="This change type cannot be edited in the app.",
         )
+    response = await apply_edit(job=job, change=change, db=db, text=request.text)
+    await _restart_tagging_with_current_state(job=job, db=db)
+    return response
 
+
+async def apply_edit(
+    *,
+    job: Job,
+    change: AppliedChange,
+    db: AsyncSession,
+    text: str,
+) -> AppliedChangeActionResponse:
+    """Set a figure's description by hand. The caller re-runs tagging."""
     entry, metadata = await _load_figure_change_context(job=job, change=change, db=db)
-    edited_text = request.text.strip()
+    edited_text = text.strip()
     if not edited_text:
         raise HTTPException(status_code=400, detail="Alt text cannot be empty.")
 
@@ -612,7 +671,6 @@ async def edit_applied_change(
             **previous_state,
         },
     )
-    await _restart_tagging_with_current_state(job=job, db=db)
     return AppliedChangeActionResponse(
         status="edited",
         message="Saved the edited figure description and restarted accessibility processing.",

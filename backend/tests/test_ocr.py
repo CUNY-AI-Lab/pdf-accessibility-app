@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -159,7 +160,7 @@ async def test_gateway_engine_gives_ocrmypdf_the_connection_and_time_for_every_p
     assert result.success
     assert "--plugin" in seen["args"]
     assert seen["env"]["CAIL_OCR_BASE_URL"] == "https://gateway.test/v1"
-    assert seen["env"]["CAIL_OCR_API_KEY"] == "sk-app"
+    assert json.loads(seen["env"]["CAIL_OCR_HEADERS"]) == {"Authorization": "Bearer sk-app"}
     assert seen["env"]["CAIL_OCR_MODEL"] == "vision-model"
     assert seen["env"]["CAIL_OCR_PAGE_SECONDS"] == "300"
     # 25 pages at 8 at a time is 4 rounds, each within the page limit plus

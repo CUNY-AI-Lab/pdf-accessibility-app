@@ -1,9 +1,17 @@
 import asyncio
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from app.services.llm_client import LlmClient, track_llm_usage
+from app.services.llm_client import (
+    LlmClient,
+    ModelAccessRefused,
+    ModelEndpoint,
+    job_model_access,
+    make_llm_client,
+    track_llm_usage,
+)
 
 
 def _ok_response(request: httpx.Request, payload: dict | None = None) -> httpx.Response:
@@ -181,3 +189,108 @@ def test_a_read_timeout_is_not_repeated(monkeypatch):
 
     # The model may have run and been charged; the request is not sent again.
     assert attempts["count"] == 1
+
+
+def _refusing_client(monkeypatch, response: httpx.Response, *, max_retries: int = 2):
+    client = LlmClient(
+        base_url="https://gateway.test/v1",
+        api_key="test",
+        model="vision-model",
+        max_retries=max_retries,
+        max_concurrency=1,
+    )
+    posts: list[str] = []
+
+    async def fake_post(path, json):
+        posts.append(path)
+        response.request = client.client.build_request("POST", path, json=json)
+        return response
+
+    async def fake_sleep(delay):
+        return None
+
+    monkeypatch.setattr(client.client, "post", fake_post)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    return client, posts
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "code"),
+    [
+        (401, {}, "invalid_credential"),
+        (403, {}, "insufficient_scope"),
+        (429, {"x-should-retry": "false"}, "quota_exceeded"),
+    ],
+)
+def test_refused_credential_ends_the_jobs_model_calls(monkeypatch, status, headers, code):
+    response = httpx.Response(
+        status,
+        headers=headers,
+        json={"error": {"code": code, "message": "refused"}},
+    )
+    client, posts = _refusing_client(monkeypatch, response)
+
+    async def run():
+        with job_model_access() as access:
+            with pytest.raises(ModelAccessRefused) as first:
+                await client.chat_completion([{"role": "user", "content": "hi"}])
+            with pytest.raises(ModelAccessRefused):
+                await client.chat_completion([{"role": "user", "content": "again"}])
+            return first.value, access.refusal
+
+    refusal, recorded = asyncio.run(run())
+    asyncio.run(client.close())
+
+    assert posts == ["/chat/completions"]
+    assert recorded is refusal
+    assert refusal.status_code == status
+    assert refusal.code == code
+    assert "refused" not in str(refusal)
+
+
+def test_retryable_rate_limit_is_not_a_refusal(monkeypatch):
+    response = httpx.Response(
+        429,
+        headers={"x-should-retry": "true"},
+        json={"error": {"code": "upstream_rate_limited", "message": "busy"}},
+    )
+    client, posts = _refusing_client(monkeypatch, response, max_retries=1)
+
+    async def run():
+        with job_model_access() as access:
+            with pytest.raises(httpx.HTTPStatusError):
+                await client.chat_completion([{"role": "user", "content": "hi"}])
+            return access.refusal
+
+    assert asyncio.run(run()) is None
+    asyncio.run(client.close())
+    assert len(posts) == 2
+
+
+def test_job_endpoint_replaces_the_settings_key():
+    settings = SimpleNamespace(
+        llm_base_url="https://gateway.test/v1",
+        llm_api_key="sk-app",
+        llm_model="vision-model",
+        llm_timeout=30,
+        llm_max_retries=0,
+        llm_retry_backoff_base=2.0,
+        llm_retry_max_backoff_seconds=60.0,
+        llm_max_concurrency=1,
+    )
+    relay = ModelEndpoint(
+        base_url="https://worker.test/pdf-accessibility/runner/tasks/job-1/v1",
+        headers={"x-pdf-runner-token": "host", "x-pdf-job-token": "lease"},
+    )
+
+    app_client = make_llm_client(settings)
+    with job_model_access(relay):
+        job_client = make_llm_client(settings)
+
+    assert str(app_client.client.base_url) == "https://gateway.test/v1/"
+    assert app_client.client.headers["authorization"] == "Bearer sk-app"
+    assert str(job_client.client.base_url) == relay.base_url + "/"
+    assert "authorization" not in job_client.client.headers
+    assert job_client.client.headers["x-pdf-job-token"] == "lease"
+    asyncio.run(app_client.close())
+    asyncio.run(job_client.close())

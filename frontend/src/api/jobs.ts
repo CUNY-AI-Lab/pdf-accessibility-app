@@ -145,15 +145,24 @@ export function useValidation(jobId: string, enabled = true) {
 export function useCreateJobs() {
   const queryClient = useQueryClient();
   return useMutation({
+    // One request per file, with the PDF as the body, so the server can
+    // stream each file to storage.
     mutationFn: async (files: File[]) => {
-      const formData = new FormData();
-      files.forEach((file) => formData.append("files", file));
-      return apiFetch<{ jobs: Job[] }>("/jobs", {
-        method: "POST",
-        body: formData,
-      });
+      const jobs: Job[] = [];
+      for (const file of files) {
+        const created = await apiFetch<{ jobs: Job[] }>(
+          `/jobs?filename=${encodeURIComponent(file.name)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/pdf" },
+            body: file,
+          },
+        );
+        jobs.push(...created.jobs);
+      }
+      return { jobs };
     },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
   });
 }
 

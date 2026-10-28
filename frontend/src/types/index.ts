@@ -40,6 +40,8 @@ export interface Job {
   page_count?: number;
   file_size_bytes?: number;
   error?: string;
+  /** Why the last review action could not be applied, when it could not. */
+  notice?: string | null;
   validation_compliant?: boolean | null;
   created_at: string;
   updated_at: string;
@@ -110,10 +112,3 @@ export interface ValidationReport {
   claims?: Record<string, unknown>;
 }
 
-export interface ProgressEvent {
-  step: StepName | "review" | "error";
-  status: string;
-  timestamp?: string;
-  message?: string;
-  result?: Record<string, unknown>;
-}

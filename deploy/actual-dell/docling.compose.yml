@@ -1,0 +1,36 @@
+# docling-serve for PDF Accessibility, as ~/services/docling/compose.yml on
+# actual-dell. GPU (RTX 5000 Ada) runs the layout and table models; OCR
+# (RapidOCR) runs on CPU threads. Pinned to the version the evaluation used
+# (docs/evaluation.md): older servers ignore the heading-hierarchy option.
+services:
+  docling:
+    image: ghcr.io/docling-project/docling-serve-cu128:v1.35.0
+    container_name: docling-serve
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5001:5001"
+    environment:
+      DOCLING_SERVE_ENABLE_UI: "0"
+      OMP_NUM_THREADS: "4"
+      # Memory (2026-10-27: 44 GB in the server process plus 10 GB in 25 idle
+      # torch compile workers after six days and modest traffic).
+      # One compile thread: no pool of CPU-count subprocesses at ~400 MB each.
+      TORCHINDUCTOR_COMPILE_THREADS: "1"
+      # The two worker threads share one copy of the models.
+      DOCLING_SERVE_ENG_LOC_SHARE_MODELS: "true"
+      # /v1/memory, to watch growth; the port is reachable only on the host
+      # and the tailnet.
+      DOCLING_SERVE_ENABLE_MANAGEMENT_ENDPOINTS: "true"
+    # A cap, so growth cannot starve the runner or the host; if the server
+    # passes it, Docker restarts it and the conversion in flight fails.
+    mem_limit: 24g
+    # No cache volume: the image carries the models its own version expects
+    # under /opt/app-root/src/.cache/docling/models. A volume there hid them
+    # behind 1.12's models, and 1.35.0 failed to start (2026-10-28).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

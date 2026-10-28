@@ -36,9 +36,12 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db():
+    await prepare_schema(get_engine())
+
+
+async def prepare_schema(engine) -> None:
     from app.models import AppliedChange, Base, ReviewTask
 
-    engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_schema, ReviewTask.__table__, AppliedChange.__table__)

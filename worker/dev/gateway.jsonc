@@ -1,0 +1,8 @@
+// Local development only: `wrangler dev -c wrangler.jsonc -c dev/gateway.jsonc`.
+// Put DEV_GATEWAY_KEY (a personal sk-cail key) in dev/.dev.vars.
+{
+  "name": "cail-model-api",
+  "main": "gateway.ts",
+  "compatibility_date": "2026-07-01",
+  "vars": { "UPSTREAM": "https://tools.ailab.gc.cuny.edu" }
+}

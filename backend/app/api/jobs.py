@@ -1,9 +1,10 @@
 import asyncio
 import json
 import logging
+import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only, selectinload
@@ -171,12 +172,33 @@ async def _compensate_failed_job_creation(
     await db.commit()
 
 
+async def raw_pdf_upload(request: Request, filename: str | None = None) -> UploadFile | None:
+    """One PDF sent as the request body, named by ``?filename=``.
+
+    The app uploads this way, one file per request, so the v2 Worker can
+    stream each file to storage; multipart uploads still work here.
+    """
+    if filename is None or request.headers.get("content-type", "").startswith("multipart/"):
+        return None
+    limit = get_settings().max_upload_size_bytes
+    body = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024)
+    async for chunk in request.stream():
+        body.write(chunk)
+        if body.tell() > limit:
+            break
+    body.seek(0)
+    return UploadFile(file=body, filename=filename)
+
+
 @router.post("", response_model=JobCreateResponse, status_code=201)
 async def create_jobs(
-    files: list[UploadFile],
+    files: list[UploadFile] | None = File(None),
+    raw_upload: UploadFile | None = Depends(raw_pdf_upload),
     db: AsyncSession = Depends(get_db),
     session: AnonymousSession = Depends(get_anonymous_session),
 ):
+    if isinstance(raw_upload, UploadFile):
+        files = [raw_upload]
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
 
