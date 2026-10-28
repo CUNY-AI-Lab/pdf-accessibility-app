@@ -184,16 +184,17 @@ Design (2026-10-27), in [architecture.md](architecture.md#version-2):
   and routes, without the bypass reconciliation (the two no-script Worker
   Routes stay, so v1 keeps serving); (4) cutover: delete the two no-script
   routes. Rollback is recreating them.
-- **Status (2026-10-27):** source done in this repo (#14) and Doorway
-  (cail-tools-admission#362); per-job credential (Phase 2 step 3) done. The
-  R2 bucket and its 2-day expiry rule exist. Verified: the full source gate,
-  26 Worker tests in workerd, and `worker/dev/e2e.mjs` with
-  `E2E_BROWSER=1` (the real Worker and runner, the app in Chromium, model
-  calls relayed to the real Gateway, docling-serve on actual-dell) on a CUNY
-  OER PDF: complete and veraPDF-compliant, with keep, an edit re-run, and
-  delete. Not yet done: the Worker release and its secrets, the runner and
-  docling-serve 1.35.0 on actual-dell, the Doorway release, cutover, and
-  the acceptance check of a real sign-in and upload on the deployed path.
+- **Status (2026-10-28): live.** v2 serves `/pdf-accessibility` behind
+  Doorway (cail-tools-admission#362); the two no-script NML routes were
+  deleted at about 13:50 UTC. Worker `cail-pdf-accessibility` released by
+  `worker-release.yml` with both secrets read back; the runner runs on
+  actual-dell beside docling-serve 1.35.0 and claims through Doorway.
+  Verified on the deployed path: a browser is sent to CUNY sign-in, the API
+  and a forged identity are refused with the launch path, a runner claim
+  without the token is refused by the Worker, and the runner's claims
+  succeed. Still open: a real sign-in and upload on the deployed path,
+  retiring the NML deployment (kept a few days for rollback, which is
+  recreating the two routes), and the Gateway `tool` claim.
 
 ### 4. Reliability
 
