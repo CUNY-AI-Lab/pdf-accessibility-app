@@ -57,9 +57,17 @@ def _task(kind="process", **overrides) -> Task:
 class FakeWorker:
     """The Worker's runner API, recorded."""
 
-    def __init__(self, *, state: bytes | None = None, progress_status: int = 200):
+    def __init__(
+        self,
+        *,
+        state: bytes | None = None,
+        progress_status: int = 200,
+        refuse_once: asyncio.Event | None = None,
+    ):
         self.state = state
         self.progress_status = progress_status
+        # When given, progress answers 200 until the event is set.
+        self.refuse_once = refuse_once
         self.uploads: dict[str, tuple[str, bytes]] = {}
         self.progress: list[dict] = []
         self.completed: dict | None = None
@@ -78,6 +86,8 @@ class FakeWorker:
             return httpx.Response(200, content=self.state)
         if action == "/progress":
             self.progress.append(json.loads(request.content))
+            if self.refuse_once is not None and not self.refuse_once.is_set():
+                return httpx.Response(200, json={"ok": True})
             return httpx.Response(self.progress_status, json={"ok": True})
         if action.startswith("/files/"):
             self.uploads[action.removeprefix("/files/")] = (
@@ -315,11 +325,14 @@ async def test_refused_review_action_keeps_the_previous_result(tmp_path, monkeyp
 @pytest.mark.asyncio
 async def test_lost_lease_stops_the_pipeline(tmp_path, monkeypatch, quiet_previews):
     settings = _settings(tmp_path)
-    worker = FakeWorker(progress_status=409)
+    started = asyncio.Event()
+    # The lease is lost only once the pipeline is running, as it would be.
+    worker = FakeWorker(progress_status=409, refuse_once=started)
     client = worker.client()
     cancelled = asyncio.Event()
 
     async def slow_pipeline(job_id, session_maker, settings_arg, sink):
+        started.set()
         try:
             await asyncio.sleep(30)
         except asyncio.CancelledError:
