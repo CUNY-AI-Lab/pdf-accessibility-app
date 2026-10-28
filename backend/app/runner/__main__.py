@@ -9,6 +9,7 @@ import asyncio
 import logging
 import signal
 import socket
+from pathlib import Path
 
 import httpx
 
@@ -36,6 +37,8 @@ async def main() -> None:
         loop.add_signal_handler(signum, stopping.set)
 
     logger.info("Runner %s taking work from %s", runner_id, client.base_url)
+    alive = Path(settings.runner_alive_file) if settings.runner_alive_file.strip() else None
+    heartbeat = asyncio.create_task(_stay_alive(alive, stopping)) if alive is not None else None
     try:
         while not stopping.is_set():
             await slots.acquire()
@@ -56,11 +59,20 @@ async def main() -> None:
             job.add_done_callback(running.discard)
             job.add_done_callback(lambda _done: slots.release())
     finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
         # Unfinished tasks go back to the queue when their leases lapse.
         for job in running:
             job.cancel()
         await asyncio.gather(*running, return_exceptions=True)
         await client.close()
+
+
+async def _stay_alive(path: Path, stopping: asyncio.Event) -> None:
+    """Touch the health check's file while the runner is running."""
+    while not stopping.is_set():
+        path.touch()
+        await _sleep_unless(stopping, 30.0)
 
 
 async def _sleep_unless(stopping: asyncio.Event, seconds: float) -> None:

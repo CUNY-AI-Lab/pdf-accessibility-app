@@ -149,6 +149,8 @@ class Settings(BaseSettings):
     runner_slots: int = 2
     runner_poll_seconds: float = 2.0
     runner_heartbeat_seconds: float = 30.0
+    # Touched on every claim loop, for the container's health check.
+    runner_alive_file: str = ""
 
     # Dev
     debug: bool = False

@@ -1,0 +1,162 @@
+name: Worker release
+
+# Releases the v2 Worker (worker/, cail-pdf-accessibility) from the exact
+# current main commit: upload, read back, promote, confirm, and roll back on
+# any failure after promotion. The source gate in ci.yml is the check; this
+# workflow repeats the Worker's part so a release never ships unchecked code.
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Release the Worker to the CUNY AI Lab account"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: inputs.deploy && github.ref == 'refs/heads/main'
+    name: Release the Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: cail-pdf-accessibility-production
+      cancel-in-progress: false
+    defaults: { run: { working-directory: worker } }
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - name: Check out the exact main commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.23.4"
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          (cd ../frontend && bun install --frozen-lockfile)
+          bun install --frozen-lockfile
+
+      - name: Confirm this is still the current main commit
+        run: |
+          set -euo pipefail
+          current_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
+          test "$current_sha" = "$GITHUB_SHA" || {
+            printf 'Refusing stale main release: workflow %s, current main %s\n' "$GITHUB_SHA" "$current_sha" >&2
+            exit 1
+          }
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Check the Worker
+        run: bun run check
+
+      - name: Read back the files bucket lifecycle rule
+        run: |
+          set -euo pipefail
+          # Bucket state, not Worker config: refuse to ship while the bucket
+          # would keep people's PDFs past the backstop.
+          rules="$(bunx wrangler r2 bucket lifecycle list cail-pdf-accessibility-files --config wrangler.jsonc)"
+          printf '%s\n' "$rules"
+          awk '
+            /^name: +/    { sub(/^name: +/, "");    name = $0; enabled = ""; next }
+            /^enabled: +/ { sub(/^enabled: +/, ""); enabled = $0; next }
+            /^action: +/  {
+              sub(/^action: +/, "")
+              if (enabled == "Yes" && $0 ~ /^Expire objects after [12] days?$/) expire = 1
+              next
+            }
+            END { exit expire ? 0 : 1 }
+          ' <<<"$rules" || { printf 'cail-pdf-accessibility-files has no enabled rule expiring objects within 2 days\n' >&2; exit 1; }
+
+      - name: Record the version serving now
+        run: |
+          set -euo pipefail
+          deployments_json="$(bunx wrangler deployments list --config wrangler.jsonc --json)"
+          if jq -e 'type == "array" and length == 0' <<<"$deployments_json" >/dev/null; then
+            printf 'first_release=true\n' >> "$GITHUB_ENV"
+            printf 'The Worker has never been deployed; this release creates it and its Durable Object.\n'
+            exit 0
+          fi
+          previous_version="$(bunx wrangler deployments status --config wrangler.jsonc --json | jq -er '
+            if (.versions | length) != 1 or .versions[0].percentage != 100 then error("not one version at 100 percent")
+            else .versions[0].version_id end')"
+          printf 'previous_version=%s\n' "$previous_version" >> "$GITHUB_ENV"
+
+      # A new Durable Object class is created only by `wrangler deploy`, never
+      # by `versions upload`. The first release uses it; the Worker has no
+      # route and Doorway does not bind it yet, so nothing is serving traffic.
+      - name: First release
+        if: env.first_release == 'true'
+        run: |
+          set -euo pipefail
+          bunx wrangler deploy --config wrangler.jsonc --strict --tag "$GITHUB_SHA" --message "commit $GITHUB_SHA"
+          version_id="$(bunx wrangler deployments status --config wrangler.jsonc --json | jq -er '.versions[0].version_id')"
+          printf 'version_id=%s\n' "$version_id" >> "$GITHUB_ENV"
+
+      - name: Upload the exact main commit as an unpromoted version
+        if: env.first_release != 'true'
+        run: |
+          set -euo pipefail
+          bunx wrangler versions upload --config wrangler.jsonc --strict --tag "$GITHUB_SHA" --message "commit $GITHUB_SHA"
+          version_id="$(bunx wrangler versions list --config wrangler.jsonc --json | jq -er --arg sha "$GITHUB_SHA" '
+            [.[] | select(.annotations["workers/tag"] == $sha and .annotations["workers/triggered_by"] == "version_upload")]
+            | if length == 0 then error("no uploaded version is tagged \($sha)") else max_by(.number).id end')"
+          printf 'version_id=%s\n' "$version_id" >> "$GITHUB_ENV"
+
+      - name: Read back the version's config and bindings
+        run: |
+          set -euo pipefail
+          bunx wrangler versions view "$version_id" --config wrangler.jsonc --json | jq -e --arg sha "$GITHUB_SHA" '
+            def count(f): [.resources.bindings[]? | select(f)] | length;
+            .annotations["workers/tag"] == $sha and
+            count(.type == "service" and .name == "GATEWAY" and .service == "cail-model-api") == 1 and
+            count(.type == "assets" and .name == "ASSETS") == 1 and
+            count(.type == "r2_bucket" and .name == "FILES" and .bucket_name == "cail-pdf-accessibility-files") == 1 and
+            count(.type == "durable_object_namespace" and .name == "JOB_BOARD" and .class_name == "JobBoard") == 1 and
+            count(.type == "secret_text" and .name == "CAIL_IDENTITY_JWKS") == 1 and
+            count(.type == "secret_text" and .name == "RUNNER_TOKEN") == 1 and
+            count(.type == "plain_text" and .name == "BASE_PATH" and .text == "/pdf-accessibility") == 1 and
+            count(.type == "plain_text" and .name == "CAIL_IDENTITY_ISSUER" and
+              .text == "https://tools.ailab.gc.cuny.edu/cail-sso") == 1 and
+            count(.name == "DEV_GATEWAY_KEY") == 0 and
+            count(.name == "TEST_PRIVATE_JWK") == 0
+          ' >/dev/null
+          printf 'Version %s carries the required bindings\n' "$version_id"
+
+      - name: Arm the rollback
+        if: env.first_release != 'true'
+        run: printf 'promoted=true\n' >> "$GITHUB_ENV"
+
+      - name: Promote the read-back version to all traffic
+        if: env.first_release != 'true'
+        run: bunx wrangler versions deploy "${version_id}@100" --yes --config wrangler.jsonc --message "commit $GITHUB_SHA"
+
+      - name: Confirm the read-back version is the one serving
+        run: |
+          set -euo pipefail
+          bunx wrangler deployments status --config wrangler.jsonc --json | jq -e --arg version "$version_id" '
+            (.versions | length) == 1 and .versions[0].version_id == $version and .versions[0].percentage == 100
+          ' >/dev/null
+          printf 'cail-pdf-accessibility serves %s (%s) at 100 percent\n' "$version_id" "$GITHUB_SHA"
+
+      - name: Roll back to the previously serving version
+        if: failure() && env.promoted == 'true' && env.previous_version != ''
+        run: |
+          set -euo pipefail
+          bunx wrangler versions deploy "${previous_version}@100" --yes --config wrangler.jsonc \
+            --message "rollback from $GITHUB_SHA to $previous_version"
+          bunx wrangler deployments status --config wrangler.jsonc --json | jq -e --arg version "$previous_version" '
+            (.versions | length) == 1 and .versions[0].version_id == $version and .versions[0].percentage == 100
+          ' >/dev/null

@@ -1,0 +1,25 @@
+# docling-serve for PDF Accessibility, as ~/services/docling/compose.yml on
+# actual-dell. GPU (RTX 5000 Ada) runs the layout and table models; OCR
+# (RapidOCR) runs on CPU threads. Pinned to the version the evaluation used
+# (docs/evaluation.md): older servers ignore the heading-hierarchy option.
+services:
+  docling:
+    image: ghcr.io/docling-project/docling-serve-cu128:v1.35.0
+    container_name: docling-serve
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5001:5001"
+    environment:
+      DOCLING_SERVE_ENABLE_UI: "0"
+      OMP_NUM_THREADS: "4"
+    volumes:
+      - docling-cache:/opt/app-root/src/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+volumes:
+  docling-cache:
