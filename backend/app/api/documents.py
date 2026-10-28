@@ -93,7 +93,11 @@ async def list_review_tasks(
         .where(ReviewTask.job_id == job_id)
         .order_by(ReviewTask.blocking.desc(), ReviewTask.created_at.asc())
     )
-    tasks = result.scalars().all()
+    return visible_review_tasks(result.scalars().all())
+
+
+def visible_review_tasks(tasks: list[ReviewTask]) -> list[ReviewTaskResponse]:
+    """The review tasks a person sees, in the order given."""
     return [
         ReviewTaskResponse(
             id=task.id,

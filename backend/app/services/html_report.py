@@ -462,6 +462,49 @@ def render_html_report(
 </html>"""
 
 
+def render_batch_row(job: Job, validation: dict[str, Any]) -> str:
+    remediation = validation.get("remediation", {})
+    return f"""
+        <tr>
+          <td>{_e(job.original_filename)}</td>
+          <td>{_status_badge(job.status)}</td>
+          <td>{job.page_count or "?"}</td>
+          <td>{remediation.get("post_error_rules", 0)}</td>
+          <td>{remediation.get("auto_remediated_errors", 0)}</td>
+        </tr>
+        """
+
+
+def render_batch_section(
+    job: Job,
+    validation: dict[str, Any],
+    alt_texts: list[AltTextEntry],
+    review_tasks: list[ReviewTask],
+) -> str:
+    section = _render_job_section(job, validation, alt_texts, review_tasks, heading_level=2)
+    return f'<div class="job-section">{section}</div>'
+
+
+def render_batch_parts(
+    job: Job,
+    validation: dict[str, Any],
+    alt_texts: list[AltTextEntry],
+    review_tasks: list[ReviewTask],
+) -> dict[str, str]:
+    """One job's share of a batch report, for a caller that assembles it.
+
+    The Worker joins these with the same page frame as
+    ``render_batch_html_report``.
+    """
+    return {
+        "styles": _render_styles(),
+        "header": _render_brand_header(),
+        "footer": _render_footer(),
+        "row": render_batch_row(job, validation),
+        "section": render_batch_section(job, validation, alt_texts, review_tasks),
+    }
+
+
 def render_batch_html_report(
     job_reports: list[dict[str, Any]],
 ) -> str:
@@ -472,21 +515,7 @@ def render_batch_html_report(
     """
     now = datetime.now(UTC).strftime("%B %d, %Y")
 
-    # Summary table
-    summary_rows: list[str] = []
-    for entry in job_reports:
-        job: Job = entry["job"]
-        validation: dict[str, Any] = entry["validation"]
-        remediation = validation.get("remediation", {})
-        summary_rows.append(f"""
-        <tr>
-          <td>{_e(job.original_filename)}</td>
-          <td>{_status_badge(job.status)}</td>
-          <td>{job.page_count or "?"}</td>
-          <td>{remediation.get("post_error_rules", 0)}</td>
-          <td>{remediation.get("auto_remediated_errors", 0)}</td>
-        </tr>
-        """)
+    summary_rows = [render_batch_row(entry["job"], entry["validation"]) for entry in job_reports]
 
     summary_table = f"""
     <table class="batch-summary">
@@ -501,17 +530,12 @@ def render_batch_html_report(
     </table>
     """
 
-    # Per-job sections
-    sections: list[str] = []
-    for entry in job_reports:
-        section = _render_job_section(
-            entry["job"],
-            entry["validation"],
-            entry["alt_texts"],
-            entry["review_tasks"],
-            heading_level=2,
+    sections = [
+        render_batch_section(
+            entry["job"], entry["validation"], entry["alt_texts"], entry["review_tasks"]
         )
-        sections.append(f'<div class="job-section">{section}</div>')
+        for entry in job_reports
+    ]
 
     return f"""<!DOCTYPE html>
 <html lang="en">

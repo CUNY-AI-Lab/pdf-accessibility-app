@@ -141,6 +141,15 @@ class Settings(BaseSettings):
     docling_serve_ocr_engine: str = "rapidocr"
 
 
+    # Runner (v2): pulls work from the Worker at runner_worker_url, which
+    # relays each job's model calls with that person's Gateway credential.
+    runner_worker_url: str = ""
+    runner_token: str = ""
+    runner_id: str = ""
+    runner_slots: int = 2
+    runner_poll_seconds: float = 2.0
+    runner_heartbeat_seconds: float = 30.0
+
     # Dev
     debug: bool = False
 
@@ -162,7 +171,9 @@ class Settings(BaseSettings):
         host = (parsed.hostname or "").lower()
         is_local = host in LOCAL_LLM_HOSTS
 
-        if self.llm_strict_validation and not is_local:
+        # A runner gets its endpoint and credential from each task.
+        is_runner = bool(self.runner_worker_url.strip())
+        if self.llm_strict_validation and not is_local and not is_runner:
             if api_key.lower() in PLACEHOLDER_LLM_KEYS:
                 raise ValueError(
                     "LLM_API_KEY is required for remote LLM endpoints (set a real API key in .env)"
