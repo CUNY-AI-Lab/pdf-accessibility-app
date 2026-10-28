@@ -26,6 +26,14 @@ curl -fsS http://127.0.0.1:5001/version
 Until the NML deployment is retired, v1 reaches the same server over
 Tailscale Serve on port 8444, so a version change reaches v1 too.
 
+Memory: on 2026-10-27, after six days up and about 40 conversions in the
+last three, docling-serve 1.12.0 held 44 GB in its server process and 10 GB
+in 25 idle torch compile workers, of the host's 62 GB. The compose file
+limits the compile pool to one thread, shares the models between the two
+worker threads, caps the container at 24 GB, and turns on `/v1/memory`.
+Check growth with `docker stats --no-stream docling-serve` a day after a
+restart and again after a week.
+
 ## The runner
 
 First install:

@@ -12,6 +12,18 @@ services:
     environment:
       DOCLING_SERVE_ENABLE_UI: "0"
       OMP_NUM_THREADS: "4"
+      # Memory (2026-10-27: 44 GB in the server process plus 10 GB in 25 idle
+      # torch compile workers after six days and modest traffic).
+      # One compile thread: no pool of CPU-count subprocesses at ~400 MB each.
+      TORCHINDUCTOR_COMPILE_THREADS: "1"
+      # The two worker threads share one copy of the models.
+      DOCLING_SERVE_ENG_LOC_SHARE_MODELS: "true"
+      # /v1/memory, to watch growth; the port is reachable only on the host
+      # and the tailnet.
+      DOCLING_SERVE_ENABLE_MANAGEMENT_ENDPOINTS: "true"
+    # A cap, so growth cannot starve the runner or the host; if the server
+    # passes it, Docker restarts it and the conversion in flight fails.
+    mem_limit: 24g
     volumes:
       - docling-cache:/opt/app-root/src/.cache
     deploy:
