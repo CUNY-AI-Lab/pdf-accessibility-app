@@ -75,12 +75,13 @@ Auto-detects document language during classification. Shared utilities in
 - Docker image includes 18 language packs (CUNY-relevant subset)
 
 ## docling-serve (Structure Extraction)
-Persistent Docling HTTP server. Production uses the CUDA docling-serve on
-actual-dell (Compose, published on port 8444 with Tailscale Serve); NML
-reaches it over the tailnet.
+Persistent Docling HTTP server. Production uses the CUDA docling-serve 1.35.0
+on actual-dell (`deploy/actual-dell/docling.compose.yml`); the v2 runner on the
+same host reaches it at `http://127.0.0.1:5001`. Tailscale Serve also publishes
+it on port 8444 to the tailnet, which `worker/dev/e2e.mjs` uses.
 
-- Production config: `DOCLING_SERVE_URL` in NML's `.env` names actual-dell's
-  Tailscale Serve URL
+- Production config: `deploy/actual-dell/compose.yml` sets the runner's
+  `DOCLING_SERVE_URL`
 - Local dev: `DOCLING_DEVICE=mps docling-serve run --host 0.0.0.0 --port 5001`,
   then `DOCLING_SERVE_URL=http://localhost:5001`
 - OCR engine: RapidOCR (set via `DOCLING_SERVE_OCR_ENGINE`)

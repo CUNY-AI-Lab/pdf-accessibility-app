@@ -112,46 +112,14 @@ Gateway budget. See [docs/architecture.md](docs/architecture.md#version-2),
 [deploy/actual-dell/README.md](deploy/actual-dell/README.md), and
 [worker/README.md](worker/README.md).
 
-## NML Deployment
+## Version 1 on NML (retired)
 
-The NML host is reached with the local `nml-ssh` wrapper. The deployed project
-lives at `/data/pdf-accessibility-app` and runs as the Docker Compose project
-`pdf-accessibility-app`.
-
-The NML override uses host networking because Docker bridge networking is not
-reliable on that VM. The app listens on `127.0.0.1:8001`/`0.0.0.0:8001`, and
-Nginx serves it publicly at
-`https://tools.ailab.gc.cuny.edu/pdf-accessibility/`.
-
-Required NML `.env` settings:
-
-```env
-ANONYMOUS_SESSION_COOKIE_SECURE=true
-CORS_ALLOW_ORIGINS=https://tools.ailab.gc.cuny.edu
-VITE_APP_BASE_PATH=/pdf-accessibility/
-LLM_BASE_URL=https://tools.ailab.gc.cuny.edu/v1
-LLM_MODEL=qwen3-vl-235b-a22b-instruct
-LLM_API_KEY=<the app's sk-cail Gateway key>
-DOCLING_SERVE_URL=<actual-dell's Tailscale Serve URL, port 8444>
-WITH_LOCAL_DOCLING=false
-```
-
-The app no longer reads `GEMINI_API_KEY` or `USE_DIRECT_GEMINI_PDF`; delete
-them from the server's `.env`. Without a real `LLM_API_KEY` the app refuses
-to start.
-
-Deploy from the NML host:
-
-```bash
-cd /data/pdf-accessibility-app
-git pull
-docker compose up -d --build
-curl -fsS http://127.0.0.1:8001/health
-curl -fsS http://127.0.0.1:8001/health/ready
-curl -fsS https://tools.ailab.gc.cuny.edu/pdf-accessibility/health/ready
-```
-
-Do not commit `.env` or the backup `.env.*` files on the server.
+Version 1 ran on the NML host (lw4av) from `/data/pdf-accessibility-app`
+until 2026-10-28, when v2 replaced it. Its container and volumes are removed
+and the secrets in its `.env` files are blanked. The host's nginx now answers
+`/pdf-accessibility` with a permanent redirect to v2 (`debian/alt-text.conf` in
+whisper-server-nml). The FastAPI app in `backend/` still runs for local
+development (Quick Start, Docker); the runner reuses its pipeline.
 
 ## Configuration
 
@@ -281,20 +249,14 @@ to the public endpoint do not reach docling-serve.
 - [Backend README](backend/README.md)
 - [Frontend README](frontend/README.md)
 
-## SSO Note (tools.ailab.gc.cuny.edu deployment)
+## Sign-in and models
 
-The CUNYLogin SSO gateway being rolled out on `tools.ailab.gc.cuny.edu`
-currently classifies `/pdf-accessibility/` as **public** — the
-anonymous-session, zero-retention workflow is intentionally preserved. If
-that policy changes, the proxy hands this app a short-lived signed
-`X-CAIL-Identity-JWT` assertion, which the backend verifies itself; see
-`backend/CAIL_IDENTITY.md` for the contract and activation inputs. Bare
-`X-CAIL-*` headers are never trusted as identity. The anonymous cookie
-remains separate (CSRF and anonymous-session isolation), while verified
-job ownership keys off the assertion's stable subject.
-
-**Models:** every AI step calls the CAIL Gateway at `LLM_BASE_URL` with
-rendered page images, never PDF files. The Gateway admits only open-weight
-models and meters spend per key. Per-person Gateway credentials come with
-the Doorway version of the app; see
+v2 at `tools.ailab.gc.cuny.edu/pdf-accessibility/` is for signed-in CUNY
+people: Doorway signs them in and checks Admission membership, and anonymous
+use ended at the cutover. Every AI step calls the CAIL Gateway with rendered
+page images, never PDF files. In v2 each call goes through the Worker's relay
+with the person's own Gateway credential, so it counts against their budget;
+the Gateway admits only open-weight models. Run locally, the FastAPI app uses
+`LLM_API_KEY` and anonymous browser sessions; `backend/CAIL_IDENTITY.md`
+describes its optional identity check behind a proxy. See
 [docs/cail-integration-plan.md](docs/cail-integration-plan.md).
