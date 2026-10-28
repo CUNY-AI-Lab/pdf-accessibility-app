@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.models import Base, Job, JobStep
 from app.pipeline import orchestrator
+from app.services.llm_client import ModelAccessRefused, job_model_access
 
 
 class _RecordingJobManager:
@@ -147,4 +148,68 @@ async def test_tagging_failure_marks_active_step_failed(tmp_path, monkeypatch):
         "message": "tagger exploded",
     }
 
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_refused_model_access_fails_the_job_before_tagging(tmp_path, monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    input_pdf = tmp_path / "input.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+    tagged: list[object] = []
+
+    async def _fake_validate_pdf(**_kwargs):
+        return SimpleNamespace(compliant=True, violations=[], raw_report={"report": {}})
+
+    async def _fake_tag_pdf(**kwargs):
+        tagged.append(kwargs)
+        raise AssertionError("tagging must not start after a refusal")
+
+    monkeypatch.setattr(orchestrator, "validate_pdf", _fake_validate_pdf)
+    monkeypatch.setattr(orchestrator, "tag_pdf", _fake_tag_pdf)
+    job_manager = _RecordingJobManager()
+    settings = SimpleNamespace(
+        verapdf_path="verapdf",
+        verapdf_flavour="ua1",
+        subprocess_timeout_validation=30,
+    )
+
+    async with session_maker() as db:
+        db.add(
+            Job(
+                id="job-1",
+                filename="stored.pdf",
+                original_filename="sample.pdf",
+                owner_session_hash="owner",
+                input_path=str(input_pdf),
+                status="processing",
+                structure_json="{}",
+            )
+        )
+        for step_name in ("tagging", "validation", "fidelity"):
+            db.add(JobStep(job_id="job-1", step_name=step_name))
+        await db.commit()
+
+        with job_model_access() as access:
+            access.refusal = ModelAccessRefused(429, "quota_exceeded", "budget")
+            await orchestrator.run_tagging_and_validation(
+                "job-1",
+                db,
+                settings,
+                job_manager,
+                working_pdf=input_pdf,
+                structure_json={},
+            )
+
+        failed_job = await db.get(Job, "job-1")
+
+    assert tagged == []
+    assert failed_job is not None
+    assert failed_job.status == "failed"
+    assert failed_job.error == access.refusal.user_message
+    assert job_manager.events[-1]["status"] == "failed"
     await engine.dispose()

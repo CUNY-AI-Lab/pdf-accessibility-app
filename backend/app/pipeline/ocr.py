@@ -1,6 +1,7 @@
 """Step 2: OCR scanned PDFs using OCRmyPDF."""
 
 import asyncio
+import json
 import logging
 import math
 import sys
@@ -15,6 +16,7 @@ from app.pipeline.subprocess_utils import (
     communicate_with_timeout,
     subprocess_process_group_kwargs,
 )
+from app.services.llm_client import current_model_endpoint
 from app.services.runtime_paths import enriched_subprocess_env
 
 logger = logging.getLogger(__name__)
@@ -136,8 +138,9 @@ async def run_ocr(
     env = enriched_subprocess_env()
     if engine == "gateway":
         settings = get_settings()
-        env["CAIL_OCR_BASE_URL"] = settings.llm_base_url
-        env["CAIL_OCR_API_KEY"] = settings.llm_api_key
+        endpoint = current_model_endpoint(settings)
+        env["CAIL_OCR_BASE_URL"] = endpoint.base_url
+        env["CAIL_OCR_HEADERS"] = json.dumps(endpoint.headers)
         env["CAIL_OCR_MODEL"] = settings.ocr_model
         env["CAIL_OCR_PAGE_SECONDS"] = str(settings.ocr_gateway_page_seconds)
         # Pages run in rounds of --jobs, each round within the page limit, so

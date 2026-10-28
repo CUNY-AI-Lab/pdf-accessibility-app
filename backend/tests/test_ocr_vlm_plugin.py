@@ -63,11 +63,12 @@ def _answer(monkeypatch, status=200, answers=None, body=None):
         return httpx.Response(status, json=answer, request=httpx.Request("POST", url))
 
     monkeypatch.setenv("CAIL_OCR_BASE_URL", "https://gateway.test/v1")
-    monkeypatch.setenv("CAIL_OCR_API_KEY", "sk-test")
+    monkeypatch.setenv("CAIL_OCR_HEADERS", json.dumps({"Authorization": "Bearer sk-test"}))
     monkeypatch.setenv("CAIL_OCR_MODEL", "vision-model")
     monkeypatch.setenv("CAIL_OCR_PAGE_SECONDS", "300")
     monkeypatch.setattr(ocr_vlm_plugin.httpx, "post", post)
     monkeypatch.setattr(ocr_vlm_plugin.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(ocr_vlm_plugin, "_credential_refused", False)
     return calls
 
 

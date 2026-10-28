@@ -2,7 +2,7 @@ import asyncio
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -50,6 +50,111 @@ def track_llm_usage():
         yield recorder
     finally:
         _ACTIVE_USAGE_RECORDER.reset(token)
+
+
+@dataclass(frozen=True)
+class ModelEndpoint:
+    """Where a job's model calls go and the headers that authorize them."""
+
+    base_url: str
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+def settings_model_endpoint(settings: Any) -> ModelEndpoint:
+    token = str(settings.llm_api_key or "").strip()
+    return ModelEndpoint(
+        base_url=settings.llm_base_url,
+        headers={"Authorization": f"Bearer {token}"} if token else {},
+    )
+
+
+class ModelAccessRefused(Exception):
+    """The Gateway refused the job's credential, so no later call can succeed.
+
+    401 means the credential was not accepted, 403 that the person's access no
+    longer covers model use, and a 429 marked ``x-should-retry: false`` that the
+    person's budget or the Lab's ceiling is used up.
+    """
+
+    def __init__(self, status_code: int, code: str, provider_message: str):
+        self.status_code = status_code
+        self.code = code
+        self.provider_message = provider_message
+        super().__init__(self.user_message)
+
+    @property
+    def user_message(self) -> str:
+        if self.status_code == 401:
+            return (
+                "The CAIL Gateway did not accept this job's sign-in. "
+                "Sign in again and upload the PDF again."
+            )
+        if self.status_code == 403:
+            return (
+                "Your CUNY AI Lab access no longer covers model use, so this PDF "
+                "could not be finished."
+            )
+        return (
+            "Your CUNY AI Lab model budget is used up for now, so this PDF could "
+            "not be finished. Upload it again after your budget resets."
+        )
+
+
+@dataclass
+class ModelAccess:
+    """One job's model access: its endpoint, and the refusal that ends it."""
+
+    endpoint: ModelEndpoint | None = None
+    refusal: ModelAccessRefused | None = None
+
+
+_MODEL_ACCESS: ContextVar[ModelAccess | None] = ContextVar("job_model_access", default=None)
+
+
+@contextmanager
+def job_model_access(endpoint: ModelEndpoint | None = None):
+    """Scope model calls to one job; nested scopes share the outer one.
+
+    Child tasks and threads copy the context, so a refusal seen in any of them
+    is seen by all.
+    """
+    current = _MODEL_ACCESS.get()
+    if current is not None and endpoint is None:
+        yield current
+        return
+    access = ModelAccess(endpoint=endpoint)
+    token = _MODEL_ACCESS.set(access)
+    try:
+        yield access
+    finally:
+        _MODEL_ACCESS.reset(token)
+
+
+def current_model_endpoint(settings: Any) -> ModelEndpoint:
+    access = _MODEL_ACCESS.get()
+    if access is not None and access.endpoint is not None:
+        return access.endpoint
+    return settings_model_endpoint(settings)
+
+
+def raise_if_model_access_refused() -> None:
+    access = _MODEL_ACCESS.get()
+    if access is not None and access.refusal is not None:
+        raise access.refusal
+
+
+def _refusal_from(response: httpx.Response) -> ModelAccessRefused | None:
+    status = response.status_code
+    if status == 429 and response.headers.get("x-should-retry", "").lower() != "false":
+        return None
+    if status not in {401, 403, 429}:
+        return None
+    try:
+        error = response.json().get("error")
+    except ValueError:
+        error = None
+    code = str(error.get("code") or error.get("type") or "") if isinstance(error, dict) else ""
+    return ModelAccessRefused(status, code or str(status), _error_message(response))
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -168,11 +273,11 @@ class LlmClient:
         retry_backoff_base: float = 2.0,
         max_backoff_seconds: float = DEFAULT_MAX_BACKOFF_SECONDS,
         max_concurrency: int = 2,
+        headers: dict[str, str] | None = None,
     ):
-        headers = {}
-        token = api_key.strip()
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        if headers is None:
+            token = api_key.strip()
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
 
         self.max_retries = max(0, int(max_retries))
         self.retry_backoff_base = max(1.0, float(retry_backoff_base))
@@ -220,7 +325,9 @@ class LlmClient:
         raise RuntimeError("LLM request failed without returning a response")
 
     async def _do_chat_completion(self, messages: list[dict], **kwargs) -> dict:
+        raise_if_model_access_refused()
         async with self._semaphore:
+            raise_if_model_access_refused()
             response = await self.client.post(
                 "/chat/completions",
                 json={"model": self.model, "messages": messages, **kwargs},
@@ -232,6 +339,12 @@ class LlmClient:
                     response.status_code,
                     _error_message(response),
                 )
+            refusal = _refusal_from(response)
+            if refusal is not None:
+                access = _MODEL_ACCESS.get()
+                if access is not None and access.refusal is None:
+                    access.refusal = refusal
+                raise refusal
             response.raise_for_status()
             payload = response.json()
             _record_response_usage(payload)
@@ -265,9 +378,11 @@ def make_llm_client_with_overrides(
     max_backoff_seconds: float | None = None,
     max_concurrency: int | None = None,
 ) -> LlmClient:
+    endpoint = current_model_endpoint(settings)
     return LlmClient(
-        base_url=settings.llm_base_url,
-        api_key=settings.llm_api_key,
+        base_url=endpoint.base_url,
+        api_key="",
+        headers=endpoint.headers,
         model=settings.llm_model,
         timeout=settings.llm_timeout if timeout is None else timeout,
         max_retries=settings.llm_max_retries if max_retries is None else max_retries,

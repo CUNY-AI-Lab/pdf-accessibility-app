@@ -99,7 +99,12 @@ from app.services.intelligence_widgets import (
 )
 from app.services.job_manager import JobManager
 from app.services.job_state import clear_terminal_artifacts
-from app.services.llm_client import make_llm_client, track_llm_usage
+from app.services.llm_client import (
+    job_model_access,
+    make_llm_client,
+    raise_if_model_access_refused,
+    track_llm_usage,
+)
 from app.services.page_intelligence import collect_grounded_text_candidates
 from app.services.review_surface import (
     filter_user_visible_review_tasks,
@@ -5094,6 +5099,16 @@ async def run_pipeline(
     job_manager: JobManager,
 ):
     """Execute the full PDF accessibility pipeline for a job."""
+    with job_model_access():
+        await _run_pipeline(job_id, db_session_maker, settings, job_manager)
+
+
+async def _run_pipeline(
+    job_id: str,
+    db_session_maker,
+    settings: Settings,
+    job_manager: JobManager,
+):
     async with db_session_maker() as db:
         job = await db.get(Job, job_id)
         if not job:
@@ -5215,6 +5230,8 @@ async def run_pipeline(
             else:
                 await _update_step(db, job_id, "ocr", "skipped")
                 job_manager.emit_progress(job_id, step="ocr", status="skipped")
+
+            raise_if_model_access_refused()
 
             # ── Step 3: Structure Extraction ──
             current_step = "structure"
@@ -5467,6 +5484,8 @@ async def run_pipeline(
                 },
             )
 
+            raise_if_model_access_refused()
+
             # ── Step 4: Alt Text Generation ──
             current_step = "alt_text"
             if structure.figures:
@@ -5633,6 +5652,7 @@ async def run_pipeline(
                 job_manager.emit_progress(job_id, step="alt_text", status="skipped", result=skip_result)
 
             # No figures = skip review, go straight to tagging
+            raise_if_model_access_refused()
             await run_tagging_and_validation(
                 job_id, db, settings, job_manager, working_pdf, structure.document_json
             )
@@ -5673,7 +5693,28 @@ async def run_tagging_and_validation(
     structure_json: dict | None = None,
     pre_applied_change_specs: list[dict[str, object]] | None = None,
 ):
-    """Run steps 5-6 (tagging + validation). Called after review approval."""
+    """Run steps 5-6 (tagging + validation), after alt text or a review action."""
+    with job_model_access():
+        await _run_tagging_and_validation(
+            job_id,
+            db,
+            settings,
+            job_manager,
+            working_pdf,
+            structure_json,
+            pre_applied_change_specs,
+        )
+
+
+async def _run_tagging_and_validation(
+    job_id: str,
+    db: AsyncSession,
+    settings: Settings,
+    job_manager: JobManager,
+    working_pdf: Path | None,
+    structure_json: dict | None,
+    pre_applied_change_specs: list[dict[str, object]] | None,
+):
     job = await db.get(Job, job_id)
     if not job:
         return
@@ -5699,6 +5740,8 @@ async def run_tagging_and_validation(
             flavour=settings.verapdf_flavour,
             timeout_seconds=settings.subprocess_timeout_validation,
         )
+
+        raise_if_model_access_refused()
 
         # ── Step 5: Tagging ──
         current_step = "tagging"
@@ -6506,6 +6549,8 @@ async def run_tagging_and_validation(
                 "advisory_tasks": len(review_tasks) - blocking_task_count,
             },
         )
+
+        raise_if_model_access_refused()
 
         # Done!
         final_status = (
