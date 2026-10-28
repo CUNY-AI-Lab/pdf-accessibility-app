@@ -24,8 +24,9 @@ services:
     # A cap, so growth cannot starve the runner or the host; if the server
     # passes it, Docker restarts it and the conversion in flight fails.
     mem_limit: 24g
-    volumes:
-      - docling-cache:/opt/app-root/src/.cache
+    # No cache volume: the image carries the models its own version expects
+    # under /opt/app-root/src/.cache/docling/models. A volume there hid them
+    # behind 1.12's models, and 1.35.0 failed to start (2026-10-28).
     deploy:
       resources:
         reservations:
@@ -33,5 +34,3 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-volumes:
-  docling-cache:

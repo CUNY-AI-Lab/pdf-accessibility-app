@@ -32,7 +32,14 @@ in 25 idle torch compile workers, of the host's 62 GB. The compose file
 limits the compile pool to one thread, shares the models between the two
 worker threads, caps the container at 24 GB, and turns on `/v1/memory`.
 Check growth with `docker stats --no-stream docling-serve` a day after a
-restart and again after a week.
+restart and again after a week. Right after the 1.35.0 restart on 2026-10-28
+it held 2.4 GB with no compile workers, and the host had 49 GB available.
+
+The container mounts no cache volume: the image carries the models its own
+version expects. On 2026-10-28 the old `docling-cache` volume, mounted over
+the model directory, hid 1.35.0's models behind 1.12's, and the server
+crash-looped for about nine minutes until it was rolled back. The volume and
+`compose.yml.bak-20261028` (1.12.0) are kept on the host for a rollback.
 
 ## The runner
 
