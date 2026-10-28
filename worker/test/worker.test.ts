@@ -344,6 +344,18 @@ describe("review", () => {
     expect(review?.action?.type).toBe("undo");
   });
 
+  it("refuses a change it could not apply when the job has no saved state", async () => {
+    const id = await reviewable();
+    await runInDurableObject(jobBoard(env), (_board, state) => {
+      state.storage.sql.exec("UPDATE jobs SET has_state = 0 WHERE id = ?", id);
+    });
+    const undo = await api(`/jobs/${id}/applied-changes/1/undo`, { method: "POST", headers: { origin: ORIGIN } });
+    expect(undo.status).toBe(409);
+    await api(`/jobs/${id}/applied-changes/1/keep`, { method: "POST", headers: { origin: ORIGIN } });
+    expect(await claim()).toBeNull();
+    expect((await job(id)).status).toBe("manual_remediation");
+  });
+
   it("refuses review before a result exists", async () => {
     const id = await createdJobId(await upload());
     const response = await api(`/jobs/${id}/applied-changes/1/undo`, { method: "POST", headers: { origin: ORIGIN } });

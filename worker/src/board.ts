@@ -405,7 +405,7 @@ export class JobBoard extends DurableObject<Env> {
       now,
       id,
     );
-    if (row.task_kind === null) this.queueTask(id, "sync", null, now);
+    if (row.task_kind === null && row.has_state === 1) this.queueTask(id, "sync", null, now);
     await this.keepSweeping(now);
     const updated = this.row(id);
     return updated === null ? null : toRecord(updated);
@@ -423,6 +423,9 @@ export class JobBoard extends DurableObject<Env> {
       };
     }
     if (gatewayExpiresAt - now < LIMITS.queueMinimumMs) return { ok: false, status: 401, detail: MESSAGES.signInEnding };
+    if (row.has_state !== 1) {
+      return { ok: false, status: 409, detail: "This PDF can no longer be changed in the app. Upload it again." };
+    }
 
     const steps = parseSteps(row.steps_json);
     const prior = JSON.stringify({ status: row.status, steps });
@@ -486,7 +489,11 @@ export class JobBoard extends DurableObject<Env> {
         id,
       );
       this.queueTask(id, "review", pending.action, now);
-    } else if (row.overrides_version > row.synced_version && OUTPUT_READY_STATUSES.includes(row.status)) {
+    } else if (
+      row.overrides_version > row.synced_version &&
+      row.has_state === 1 &&
+      OUTPUT_READY_STATUSES.includes(row.status)
+    ) {
       this.queueTask(id, "sync", null, now);
     }
   }
