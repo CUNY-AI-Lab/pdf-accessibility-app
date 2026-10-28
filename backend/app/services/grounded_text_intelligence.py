@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from app.services.intelligence_gemini_pages import generate_suspicious_text_intelligence
+from app.services.intelligence_pages import generate_suspicious_text_intelligence
 from app.services.llm_client import make_llm_client
 
 if TYPE_CHECKING:
@@ -126,8 +126,8 @@ def apply_grounded_text_adjudication(
     )
     task["title"] = "Verify readable text on flagged blocks"
     task["detail"] = (
-        "Grounded Gemini review confirmed text blocks where the extracted accessible text "
-        "likely does not match what appears on the page."
+        "A model compared these text blocks with the page images and found that the "
+        "accessible text likely does not match what appears on the page."
     )
     task["severity"] = "high"
     task["blocking"] = True

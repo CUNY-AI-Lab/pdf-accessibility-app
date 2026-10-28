@@ -4,13 +4,15 @@ import pikepdf
 import pytest
 
 from app.pipeline.tagger import (
-    ContentRegion,
+    StructTreeBuilder,
+    _allocate_fragment_mcid,
     _complete_table_grid_cells,
-    _emit_tagged_region,
     _table_summary_text,
     tag_pdf,
 )
+from app.services.structure_text import screen_reader_text
 from tests.fixtures import TEST_SAMPLE_PDF
+from tests.pdf_fixtures import helvetica
 
 _CONTENT_PAINT_OPERATORS = frozenset({
     "Tj",
@@ -1214,38 +1216,133 @@ async def test_tag_pdf_does_not_artifact_nonblank_ocr_noise_only_pages(monkeypat
         assert b"/Artifact BMC" not in stream
 
 
-def test_emit_tagged_region_includes_actualtext_for_resolved_heading():
-    class _Builder:
-        def add_heading(self, level, page_index, page_ref, text, lang=None, stream_owner=None):
-            assert level == 2
-            assert text == "ABSTRACT"
-            return 7
+def test_resolved_heading_text_is_the_heading_elements_actualtext():
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    builder = StructTreeBuilder(pdf)
+    builder.setup()
 
-    region = ContentRegion(
-        kind="text",
-        start_idx=0,
-        end_idx=1,
-        instructions=[pikepdf.ContentStreamInstruction([], pikepdf.Operator("BT"))],
+    tag, _mcid, bdc_text = _allocate_fragment_mcid(
+        builder,
+        {"type": "heading", "level": 2, "text": "A B S T R A C T", "actual_text": "ABSTRACT"},
+        0,
+        page.obj,
+        {},
+        set(),
     )
-    instructions: list = []
+    builder.finalize()
 
-    _emit_tagged_region(
-        instructions,
-        region,
-        {
-            "type": "heading",
-            "level": 2,
-            "text": "A B S T R A C T",
-            "actual_text": "ABSTRACT",
+    heading = builder.doc_elem["/K"][0]
+    assert tag == "H2"
+    assert bdc_text is None
+    assert str(heading["/ActualText"]) == "ABSTRACT"
+
+@pytest.mark.asyncio
+async def test_a_drawn_path_is_marked_whole_construction_and_paint(tmp_path):
+    """Marked content may not open between a path's construction and its
+    painting operator (ISO 32000-1, 14.6), so a rule drawn beside text is
+    one artifact from its first operator to its paint."""
+    input_pdf = tmp_path / "rule.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
+    page.Contents = pdf.make_stream(
+        b"BT /F1 12 Tf 72 720 Td (Body text) Tj ET\n72 700 200 1 re f\n0 0 m 10 10 l S\n"
+    )
+    pdf.save(input_pdf)
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {"type": "paragraph", "text": "Body text", "page": 0,
+                 "bbox": {"l": 70, "b": 715, "r": 140, "t": 732}},
+            ],
         },
-        _Builder(),
-        page_index=0,
-        page_ref=None,
-        alt_lookup={},
-        decorative_figures=set(),
+        alt_texts=[],
+        language="en",
     )
 
-    bdc = instructions[0]
-    attributes = bdc.operands[1]
-    assert attributes["/MCID"] == 7
-    assert str(attributes["/ActualText"]) == "ABSTRACT"
+    with pikepdf.open(output_pdf) as tagged:
+        depth, outside = 0, []
+        for instr in pikepdf.parse_content_stream(tagged.pages[0]):
+            op = str(instr.operator)
+            if op in {"BDC", "BMC"}:
+                depth += 1
+            elif op == "EMC":
+                depth -= 1
+            elif op in {"re", "m", "l", "f", "S"} and depth == 0:
+                outside.append(op)
+        assert outside == []
+        assert _unmarked_paint_operators(tagged.pages[0]) == []
+
+
+@pytest.mark.asyncio
+async def test_structure_follows_docling_reading_order_not_drawing_order(tmp_path):
+    """The page draws the second column first; the structure tree, and so a
+    screen reader, follows Docling's reading order."""
+    input_pdf = tmp_path / "columns.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
+    page.Contents = pdf.make_stream(
+        b"BT /F1 12 Tf 320 720 Td (Second column) Tj ET\n"
+        b"BT /F1 12 Tf 72 720 Td (First column) Tj ET\n"
+    )
+    pdf.save(input_pdf)
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={
+            "elements": [
+                {"type": "paragraph", "text": "First column", "page": 0,
+                 "bbox": {"l": 70, "b": 715, "r": 160, "t": 732}},
+                {"type": "paragraph", "text": "Second column", "page": 0,
+                 "bbox": {"l": 318, "b": 715, "r": 420, "t": 732}},
+            ],
+        },
+        alt_texts=[],
+        language="en",
+    )
+
+    assert screen_reader_text(output_pdf).split("\n") == ["First column", "Second column"]
+
+
+@pytest.mark.asyncio
+async def test_a_paragraph_continued_on_the_next_page_is_one_structure_element(tmp_path):
+    input_pdf = tmp_path / "two_pages.pdf"
+    output_pdf = tmp_path / "tagged.pdf"
+    pdf = pikepdf.new()
+    for words in (b"A paragraph that runs", b"onto the next page"):
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
+        page.Contents = pdf.make_stream(b"BT /F1 12 Tf 72 720 Td (" + words + b") Tj ET\n")
+    pdf.save(input_pdf)
+    paragraph = {"type": "paragraph", "text": "A paragraph that runs onto the next page",
+                 "page": 0, "bbox": {"l": 70, "b": 715, "r": 220, "t": 732},
+                 "continued_ref": "#/texts/0"}
+    continuation = {**paragraph, "page": 1, "continuation": True}
+
+    await tag_pdf(
+        input_path=input_pdf,
+        output_path=output_pdf,
+        structure_json={"elements": [paragraph, continuation]},
+        alt_texts=[],
+        language="en",
+    )
+
+    with pikepdf.open(output_pdf) as tagged:
+        root_kids = tagged.Root.StructTreeRoot.K
+        document = root_kids[0] if isinstance(root_kids, pikepdf.Array) else root_kids
+        kids = document.K
+        paragraphs = [kid for kid in (kids if isinstance(kids, pikepdf.Array) else [kids])
+                      if kid.get("/S") == pikepdf.Name("/P")]
+        assert len(paragraphs) == 1
+        assert len(paragraphs[0].K) == 2
+    assert " ".join(screen_reader_text(output_pdf).split()) == (
+        "A paragraph that runs onto the next page"
+    )

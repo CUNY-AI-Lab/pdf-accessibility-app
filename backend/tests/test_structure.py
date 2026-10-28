@@ -457,3 +457,141 @@ def test_extract_title_from_docling_uses_only_docling_title_labels():
     title = _extract_title_from_docling(doc_dict, elements=[])
 
     assert title == "CHAPTER 5"
+
+
+def test_table_cell_boxes_are_converted_to_bottom_left_like_element_boxes():
+    from app.pipeline.structure import _normalize_table_cells
+
+    table_data = {
+        "table_cells": [
+            {
+                "text": "Category",
+                "start_row_offset_idx": 0,
+                "start_col_offset_idx": 0,
+                "bbox": {"l": 74.0, "t": 102.0, "r": 110.0, "b": 111.5, "coord_origin": "TOPLEFT"},
+            },
+            {
+                "text": "Region",
+                "start_row_offset_idx": 0,
+                "start_col_offset_idx": 1,
+                "bbox": {"l": 167.0, "t": 691.7, "r": 195.0, "b": 682.2,
+                         "coord_origin": "BOTTOMLEFT"},
+            },
+        ]
+    }
+    cells = _normalize_table_cells(table_data, page_height=793.7)
+    assert cells[0]["bbox"] == pytest.approx({"l": 74.0, "b": 682.2, "r": 110.0, "t": 691.7})
+    assert cells[1]["bbox"] == pytest.approx({"l": 167.0, "b": 682.2, "r": 195.0, "t": 691.7})
+
+
+def test_figures_use_doclings_own_images_without_page_images(tmp_path):
+    import base64
+    import io
+
+    from PIL import Image
+
+    from app.pipeline.structure import _save_docling_figures
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (40, 30), "red").save(buffer, format="PNG")
+    uri = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    doc_dict = {
+        "pages": {"1": {"size": {"width": 612, "height": 792}}},
+        "pictures": [
+            {
+                "prov": [{"page_no": 1, "bbox": {"l": 72, "t": 700, "r": 272, "b": 550,
+                                                 "coord_origin": "BOTTOMLEFT"}}],
+                "image": {"uri": uri},
+                "captions": [],
+            },
+            {"prov": [{"page_no": 1, "bbox": {"l": 72, "t": 400, "r": 272, "b": 250}}]},
+        ],
+    }
+
+    figures = _save_docling_figures(doc_dict, tmp_path / "figures")
+
+    # The first figure has its own image; the second has neither that nor a
+    # page image to crop from, so only the first can get alt text.
+    assert [figure.index for figure in figures] == [0]
+    assert Image.open(figures[0].path).size == (40, 30)
+    assert figures[0].page == 0
+
+
+def _prov(b: float, t: float) -> list[dict]:
+    return [{"page_no": 1, "bbox": {"l": 72, "b": b, "r": 540, "t": t}}]
+
+
+def test_normalize_docling_elements_keeps_picture_and_table_captions_as_text():
+    """Docling attaches captions to their picture or table, outside the body's
+    children; they are printed text, so each becomes a caption element, in
+    the order printed and only once."""
+    doc_dict = {
+        "body": {
+            "children": [
+                {"$ref": "#/pictures/0"},
+                {"$ref": "#/tables/0"},
+                {"$ref": "#/texts/1"},
+                {"$ref": "#/texts/2"},
+            ],
+        },
+        "texts": [
+            {"label": "caption", "text": "Figure 1. Loans by year.", "prov": _prov(480, 495)},
+            {"label": "caption", "text": "Table 1. Loans by subject.", "prov": _prov(420, 435)},
+            {"label": "text", "text": "Body text.", "prov": _prov(100, 200)},
+        ],
+        "pictures": [
+            {
+                "label": "picture",
+                "prov": _prov(500, 700),
+                "captions": [{"$ref": "#/texts/0"}],
+                "children": [{"$ref": "#/texts/0"}],
+            }
+        ],
+        "tables": [
+            {
+                "label": "table",
+                "prov": _prov(250, 410),
+                "captions": [{"$ref": "#/texts/1"}],
+                "data": {"num_rows": 0, "num_cols": 0, "table_cells": []},
+            }
+        ],
+    }
+
+    elements = _normalize_docling_elements(doc_dict)
+
+    assert [(element["type"], element.get("text")) for element in elements] == [
+        ("figure", None),
+        ("caption", "Figure 1. Loans by year."),
+        ("caption", "Table 1. Loans by subject."),
+        ("table", None),
+        ("paragraph", "Body text."),
+    ]
+
+
+def test_normalize_docling_elements_keeps_the_boxes_of_text_continued_elsewhere():
+    doc_dict = {
+        "body": {"children": [{"$ref": "#/texts/0"}]},
+        "texts": [
+            {
+                "label": "text",
+                "text": "A paragraph that runs on into the next column.",
+                "prov": [
+                    {"page_no": 1, "bbox": {"l": 50, "b": 100, "r": 290, "t": 140}},
+                    {"page_no": 1, "bbox": {"l": 320, "b": 680, "r": 560, "t": 720}},
+                    {"page_no": 2, "bbox": {"l": 50, "b": 680, "r": 290, "t": 720}},
+                ],
+            }
+        ],
+    }
+
+    element, continuation = _normalize_docling_elements(doc_dict)
+
+    assert element["bbox"] == {"l": 50, "b": 100, "r": 290, "t": 140}
+    assert element["extra_bboxes"] == [{"l": 320, "b": 680, "r": 560, "t": 720}]
+    # The part on the next page is a continuation sharing the element's
+    # structure element.
+    assert continuation["page"] == 1
+    assert continuation["bbox"] == {"l": 50, "b": 680, "r": 290, "t": 720}
+    assert "extra_bboxes" not in continuation
+    assert continuation["continuation"] is True
+    assert continuation["continued_ref"] == element["continued_ref"]

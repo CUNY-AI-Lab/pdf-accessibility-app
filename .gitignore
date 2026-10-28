@@ -63,3 +63,6 @@ tmp/
 
 # PDF test files (keep test fixtures but ignore user uploads)
 # test_*.pdf — uncomment if you want to track test PDFs
+
+# Local credentials (Adobe PDF Services, etc.)
+.secrets/

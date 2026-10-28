@@ -42,11 +42,11 @@ Covered areas include:
 Primary implementation:
 - [backend/app/pipeline/orchestrator.py](backend/app/pipeline/orchestrator.py)
 - [backend/app/services/page_intelligence.py](backend/app/services/page_intelligence.py)
-- [backend/app/services/intelligence_gemini_pages.py](backend/app/services/intelligence_gemini_pages.py)
+- [backend/app/services/intelligence_pages.py](backend/app/services/intelligence_pages.py)
 
 ### Semantic adjudication for hard regions
 
-Hard semantic decisions are now grounded against multiple evidence sources and routed through Gemini structured outputs.
+Hard semantic decisions are now grounded against multiple evidence sources and routed through structured outputs from an open-weight vision model on the CAIL Gateway.
 
 Current semantic-unit families:
 - suspicious text blocks
@@ -60,7 +60,7 @@ This is the main product differentiator: the app no longer treats all semantic a
 
 Primary implementation:
 - [backend/app/services/semantic_units.py](backend/app/services/semantic_units.py)
-- [backend/app/services/intelligence_gemini_semantics.py](backend/app/services/intelligence_gemini_semantics.py)
+- [backend/app/services/intelligence_semantics.py](backend/app/services/intelligence_semantics.py)
 
 ### Forms
 
@@ -70,7 +70,7 @@ Covered today:
 - widget tagging
 - `/TU` writing for risky fields
 - grouped field detection and label generation
-- high-confidence Gemini-assisted label generation
+- high-confidence model-assisted label generation
 
 Evidence:
 - official form acceptance set: [backend/data/benchmarks/corpus_20260309_123540/corpus_report.md](backend/data/benchmarks/corpus_20260309_123540/corpus_report.md)
@@ -97,7 +97,7 @@ What is strong:
 - table extraction and tagging
 - header rows and row-header columns
 - table risk detection
-- Gemini-first table interpretation for risky tables
+- model-first table interpretation for risky tables
 
 What is still partial:
 - grouped headers beyond simple header band modeling
@@ -108,7 +108,7 @@ What is still partial:
 
 What is strong:
 - page/block-level semantic adjudication
-- Gemini reading-order decisions on hard pages
+- model reading-order decisions on hard pages
 - deterministic structure apply paths before tagging
 
 What is still partial:

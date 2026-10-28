@@ -8,12 +8,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pikepdf
+import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_c
+from pdfminer.high_level import extract_pages
+from pdfminer.layout import LTChar, LTContainer, LTImage
 
 from app.pipeline.language import detect_language
+from app.pipeline.pdf_repair import pdfminer_readable
 from app.services.pdf_preflight import (
     PdfUploadPreflightError,
     PdfUploadPreflightReport,
     inspect_pdf_upload,
+    page_image_pixels_of,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,6 +44,14 @@ _TEXT_DETECT_SAMPLE_TIERS = (
 # is bounded internally at 30s but OCRmyPDF itself can exceed that in rare cases.
 _TEXT_DETECT_TIMEOUT_SECONDS = 20.0
 _PROBE_OCR_TIMEOUT_SECONDS = 90.0
+# A page whose images cover this share of it while it carries fewer native
+# characters than this has its text in the images (a pictured table, a scanned
+# insert), so a born-digital document with such a page is OCR'd there, unless
+# the page already carries an invisible OCR layer.
+_IMAGE_TEXT_PAGE_COVERAGE = 0.25
+_IMAGE_TEXT_PAGE_MAX_CHARS = 1500
+# Pages with less image data than this are not inspected for image text.
+_IMAGE_TEXT_PAGE_MIN_PIXELS = 250_000
 _OCR_SCAN_IMAGE_HEAVY_RATIO = 0.75
 _OCR_SCAN_TEXT_RATIO = 0.9
 _OCR_SCAN_PREFLIGHT_SETTINGS = SimpleNamespace(
@@ -56,6 +70,10 @@ class ClassificationResult:
     image_heavy_pages: int = 0
     total_image_pixels: int = 0
     ocr_scan_like: bool = False
+    # When some pages have their text in images, the 0-based pages to OCR
+    # with --redo-ocr: those and the pages without text. Empty: OCR every page
+    # without text.
+    ocr_pages: list[int] = field(default_factory=list)
 
 
 def _page_has_text(page: pikepdf.Page) -> bool:
@@ -116,6 +134,51 @@ def _detect_language_from_text(pdf_path: Path) -> str | None:
             return detected
 
     return None
+
+
+def _image_text_pages(pdf_path: Path, candidates: list[int]) -> list[int]:
+    """Of ``candidates`` (0-based), the pages whose images cover at least a
+    quarter of the page while the page carries little native text and no
+    invisible text. Invisible text is an earlier OCR layer, which OCRmyPDF's
+    --redo-ocr would replace."""
+    if not candidates:
+        return []
+    found = []
+    document = pdfium.PdfDocument(pdf_path)
+    with document, pdfminer_readable(pdf_path) as readable:
+        for page_index, layout in zip(
+            candidates, extract_pages(readable, page_numbers=candidates), strict=False
+        ):
+            page_area = max(layout.width * layout.height, 1.0)
+            image_area = 0.0
+            chars = 0
+            stack = list(layout)
+            while stack:
+                item = stack.pop()
+                if isinstance(item, LTChar):
+                    chars += 1
+                elif isinstance(item, LTImage):
+                    width = min(item.x1, layout.x1) - max(item.x0, layout.x0)
+                    height = min(item.y1, layout.y1) - max(item.y0, layout.y0)
+                    image_area += max(width, 0.0) * max(height, 0.0)
+                elif isinstance(item, LTContainer):
+                    stack.extend(item)
+            if (
+                image_area / page_area >= _IMAGE_TEXT_PAGE_COVERAGE
+                and chars < _IMAGE_TEXT_PAGE_MAX_CHARS
+                and not _has_invisible_text(document[page_index])
+            ):
+                found.append(page_index)
+    return found
+
+
+def _has_invisible_text(page: pdfium.PdfPage) -> bool:
+    return any(
+        page_object.type == pdfium_c.FPDF_PAGEOBJ_TEXT
+        and pdfium_c.FPDFTextObj_GetTextRenderMode(page_object.raw)
+        == pdfium_c.FPDF_TEXTRENDERMODE_INVISIBLE
+        for page_object in page.get_objects(max_depth=15)
+    )
 
 
 def _inspect_workload(pdf_path: Path) -> PdfUploadPreflightReport | None:
@@ -201,9 +264,27 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
                     type="digital", confidence=1.0, pages_with_text=0, total_pages=0
                 )
 
-            pages_with_text = sum(1 for page in pdf.pages if _page_has_text(page))
+            text_pages = [index for index, page in enumerate(pdf.pages) if _page_has_text(page)]
+            pages_with_text = len(text_pages)
             ratio = pages_with_text / total
             workload = _inspect_workload(pdf_path)
+            no_text_pages = sorted(set(range(total)) - set(text_pages))
+            # Pages that are pictures with no text at all (a scanned insert in
+            # a born-digital document); the OCR step is the only one that
+            # recognizes text, so the document is OCR'd there.
+            image_only_pages = [
+                index
+                for index in no_text_pages
+                if page_image_pixels_of(pdf.pages[index]) >= _IMAGE_TEXT_PAGE_MIN_PIXELS
+            ]
+            image_text_pages = _image_text_pages(
+                pdf_path,
+                [
+                    index
+                    for index in text_pages
+                    if page_image_pixels_of(pdf.pages[index]) >= _IMAGE_TEXT_PAGE_MIN_PIXELS
+                ],
+            )
 
             if ratio < 0.1:
                 classification = "scanned"
@@ -215,12 +296,10 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
             ):
                 classification = "ocr_scan"
                 image_heavy_ratio = (
-                    workload.image_heavy_pages / max(workload.page_count, 1)
-                    if workload
-                    else 0.0
+                    workload.image_heavy_pages / max(workload.page_count, 1) if workload else 0.0
                 )
                 confidence = min(1.0, max(0.75, (ratio + image_heavy_ratio) / 2))
-            elif ratio > 0.9:
+            elif ratio > 0.9 and not image_text_pages and not image_only_pages:
                 classification = "digital"
                 confidence = ratio
             else:
@@ -235,6 +314,11 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
                 image_heavy_pages=workload.image_heavy_pages if workload else 0,
                 total_image_pixels=workload.total_image_pixels if workload else 0,
                 ocr_scan_like=bool(workload and workload.is_ocr_scan_like),
+                ocr_pages=(
+                    sorted(set(no_text_pages) | set(image_text_pages))
+                    if classification == "mixed" and image_text_pages
+                    else []
+                ),
             )
 
     result = await asyncio.to_thread(_classify_structure)

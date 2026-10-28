@@ -1,6 +1,7 @@
 import asyncio
 
 import httpx
+import pytest
 
 from app.services.llm_client import LlmClient, track_llm_usage
 
@@ -11,9 +12,9 @@ def _ok_response(request: httpx.Request, payload: dict | None = None) -> httpx.R
 
 def test_llm_client_honors_retry_after_header(monkeypatch):
     client = LlmClient(
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        base_url="https://tools.ailab.gc.cuny.edu/v1",
         api_key="test",
-        model="google/gemini-3-flash-preview",
+        model="qwen3-vl-235b-a22b-instruct",
         max_retries=1,
         max_concurrency=1,
     )
@@ -48,9 +49,9 @@ def test_llm_client_honors_retry_after_header(monkeypatch):
 
 def test_llm_client_retries_transport_error_then_succeeds(monkeypatch):
     client = LlmClient(
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        base_url="https://tools.ailab.gc.cuny.edu/v1",
         api_key="test",
-        model="google/gemini-3-flash-preview",
+        model="qwen3-vl-235b-a22b-instruct",
         max_retries=2,
         retry_backoff_base=2.0,
         max_concurrency=1,
@@ -81,9 +82,9 @@ def test_llm_client_retries_transport_error_then_succeeds(monkeypatch):
 
 def test_llm_client_limits_concurrency(monkeypatch):
     client = LlmClient(
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        base_url="https://tools.ailab.gc.cuny.edu/v1",
         api_key="test",
-        model="google/gemini-3-flash-preview",
+        model="qwen3-vl-235b-a22b-instruct",
         max_retries=0,
         max_concurrency=2,
     )
@@ -117,9 +118,9 @@ def test_llm_client_limits_concurrency(monkeypatch):
 
 def test_llm_client_tracks_usage_cost(monkeypatch):
     client = LlmClient(
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        base_url="https://tools.ailab.gc.cuny.edu/v1",
         api_key="test",
-        model="google/gemini-3-flash-preview",
+        model="qwen3-vl-235b-a22b-instruct",
         max_retries=0,
         max_concurrency=1,
     )
@@ -155,3 +156,28 @@ def test_llm_client_tracks_usage_cost(monkeypatch):
     assert usage.completion_tokens == 45
     assert usage.total_tokens == 168
     assert usage.cost_usd == 0.01234
+
+
+def test_a_read_timeout_is_not_repeated(monkeypatch):
+    client = LlmClient(
+        base_url="https://tools.example.test/v1",
+        api_key="test",
+        model="vision-model",
+        max_retries=3,
+        max_concurrency=1,
+    )
+    attempts = {"count": 0}
+
+    async def fake_post(path, json):
+        attempts["count"] += 1
+        request = client.client.build_request("POST", path, json=json)
+        raise httpx.ReadTimeout("no answer in time", request=request)
+
+    monkeypatch.setattr(client.client, "post", fake_post)
+
+    with pytest.raises(httpx.ReadTimeout):
+        asyncio.run(client.chat_completion([{"role": "user", "content": "hi"}]))
+    asyncio.run(client.close())
+
+    # The model may have run and been charged; the request is not sent again.
+    assert attempts["count"] == 1

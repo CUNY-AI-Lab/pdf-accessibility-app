@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 from pydantic import model_validator
@@ -10,7 +11,6 @@ PLACEHOLDER_LLM_KEYS = {
     "ollama",
     "changeme",
     "your-api-key",
-    "your_gemini_api_key",
     "replace_me",
 }
 LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -27,28 +27,15 @@ class Settings(BaseSettings):
     processing_dir: Path = BASE_DIR / "data" / "processing"
     output_dir: Path = BASE_DIR / "data" / "output"
 
-    # Gemini
-    llm_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    # Model lane: an open-weight vision model through the CAIL Gateway, given
+    # rendered page images.
+    llm_base_url: str = "https://tools.ailab.gc.cuny.edu/v1"
     llm_api_key: str = ""
-    llm_model: str = "google/gemini-3-flash-preview"
-    gemini_api_key: str = ""
-    gemini_model: str = "gemini-3-flash-preview"
-    use_direct_gemini_pdf: bool = True
-    gemini_direct_timeout: int = 120
-    gemini_direct_max_output_tokens: int = 8192
-    gemini_direct_thinking_level: str = "low"
-    gemini_direct_thinking_budget: int = 0
-    gemini_direct_alt_text_thinking_level: str = "medium"
-    gemini_direct_alt_text_thinking_budget: int = 0
-    semantic_media_backend: str = "gemini"
-    local_semantic_base_url: str = "http://127.0.0.1:8000/v1"
-    local_semantic_api_key: str = ""
-    local_semantic_model: str = ""
-    local_semantic_timeout: int = 120
-    local_semantic_max_retries: int = 1
-    local_semantic_max_concurrency: int = 2
-    local_semantic_page_candidate_batch_size: int = 1
-    local_semantic_bookmark_preview_pages: int = 4
+    llm_model: str = "qwen3-vl-235b-a22b-instruct"
+    # Requests ask about a page's form fields in batches and show bookmarks a
+    # sample of page images.
+    llm_page_candidate_batch_size: int = 12
+    llm_bookmark_preview_pages: int = 4
     llm_timeout: int = 120
     llm_pretag_timeout: int = 45
     llm_pretag_fallback_timeout: int = 15
@@ -76,6 +63,14 @@ class Settings(BaseSettings):
     binary_search_dirs: str = ""
 
     # OCR
+    # "gateway" recognizes text with ocr_model through the LLM connection
+    # (llm_base_url, llm_api_key); "tesseract" runs locally.
+    ocr_engine: Literal["tesseract", "gateway"] = "tesseract"
+    ocr_model: str = "qwen3-vl-235b-a22b-instruct"
+    # Gateway OCR waits on the network, so pages run in parallel, each within
+    # a time limit (retries included) after which it falls back to Tesseract.
+    ocr_gateway_jobs: int = 8
+    ocr_gateway_page_seconds: int = 300
     ocr_language: str = "eng"
     ocr_rotate_pages: bool = True
     ocr_deskew: bool = True
@@ -153,7 +148,7 @@ class Settings(BaseSettings):
     def validate_llm_settings(self):
         base_url = self.llm_base_url.strip()
         model = self.llm_model.strip()
-        api_key = self.llm_api_key.strip() or self.gemini_api_key.strip()
+        api_key = self.llm_api_key.strip()
 
         if not base_url:
             raise ValueError("LLM_BASE_URL must be set")
@@ -170,13 +165,7 @@ class Settings(BaseSettings):
         if self.llm_strict_validation and not is_local:
             if api_key.lower() in PLACEHOLDER_LLM_KEYS:
                 raise ValueError(
-                    "LLM_API_KEY is required for remote LLM endpoints "
-                    "(set a real API key in .env)"
-                )
-            if "gemini" not in model.lower():
-                raise ValueError(
-                    "Remote LLM endpoint must use a Gemini model "
-                    "(expected LLM_MODEL to contain 'gemini')"
+                    "LLM_API_KEY is required for remote LLM endpoints (set a real API key in .env)"
                 )
         return self
 

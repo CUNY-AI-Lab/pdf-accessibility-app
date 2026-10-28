@@ -5,7 +5,6 @@ from collections.abc import Awaitable
 from typing import Any
 
 from app.config import Settings
-from app.services.gemini_direct import direct_gemini_pdf_enabled, direct_gemini_timeout_override
 from app.services.llm_client import LlmClient, make_llm_client_with_overrides
 
 
@@ -88,25 +87,9 @@ async def await_llm_operation[T](
     timeout_seconds: float | None = None,
 ) -> T:
     timeout = timeout_seconds if timeout_seconds is not None else llm_operation_timeout_seconds(settings)
-    timeout_guard = direct_gemini_timeout_override(None)
-    if direct_gemini_pdf_enabled(settings):
-        # Direct Gemini requests run through the sync SDK in a worker thread.
-        # Bound them with the SDK timeout instead of clipping them with pretag's
-        # shorter wrapper timeout; otherwise a page-batch timeout can cascade
-        # into many lower-quality individual fallback calls.
-        configured_direct_timeout = max(
-            1.0,
-            float(getattr(settings, "gemini_direct_timeout", 45) or 45),
-        )
-        timeout = max(
-            timeout,
-            configured_direct_timeout + min(5.0, max(1.0, configured_direct_timeout * 0.1)),
-        )
-        timeout_guard = direct_gemini_timeout_override(configured_direct_timeout)
     try:
-        with timeout_guard:
-            operation = asyncio.ensure_future(awaitable)
-            return await asyncio.wait_for(operation, timeout=timeout)
+        operation = asyncio.ensure_future(awaitable)
+        return await asyncio.wait_for(operation, timeout=timeout)
     except TimeoutError as exc:
         raise RuntimeError(f"{label} timed out after {timeout:.1f}s") from exc
 

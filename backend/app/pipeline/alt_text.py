@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.pipeline.structure import FigureInfo
-from app.services.intelligence_gemini import confidence_label
-from app.services.intelligence_gemini_figures import generate_figures_intelligence
+from app.services.intelligence_figures import generate_figures_intelligence
+from app.services.intelligence_normalize import confidence_label
 from app.services.llm_client import LlmClient
 
 logger = logging.getLogger(__name__)
@@ -211,7 +211,14 @@ async def generate_alt_text(
                 used_placeholder_fallback=used_placeholder_fallback,
                 is_decorative=is_decorative,
             )
-            logger.info(f"Generated alt text for figure {fig.index}: {text[:80]}...")
+            logger.info(
+                "Figure %s: %s (%s confidence): %s; %s",
+                fig.index,
+                suggested_action or "no action",
+                confidence,
+                text[:80],
+                str(adjudication.get("reason") or "")[:160],
+            )
             existing[fig.index] = AltTextResult(
                 figure_index=fig.index,
                 generated_text=text,

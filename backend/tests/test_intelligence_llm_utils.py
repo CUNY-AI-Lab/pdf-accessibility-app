@@ -1,6 +1,4 @@
 import asyncio
-import base64
-from io import BytesIO
 from pathlib import Path
 
 import httpx
@@ -8,22 +6,21 @@ import pikepdf
 import pytest
 
 from app.services.intelligence_llm_utils import (
+    JSON_SCHEMA_REFUSED_MODELS,
     apply_cache_breakpoint,
     extract_json_object,
-    pdf_file_parts,
     preferred_cache_breakpoint_index,
     request_llm_json,
     request_llm_json_with_response,
-    semantic_page_parts,
+    request_pdf_pages_json,
 )
 
 
 @pytest.fixture(autouse=True)
-def _disable_direct_gemini_by_default(monkeypatch):
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.direct_gemini_pdf_enabled",
-        lambda: False,
-    )
+def _forget_json_schema_refusals():
+    JSON_SCHEMA_REFUSED_MODELS.clear()
+    yield
+    JSON_SCHEMA_REFUSED_MODELS.clear()
 
 
 def test_extract_json_object_accepts_trailing_text_after_first_json_object():
@@ -33,6 +30,8 @@ def test_extract_json_object_accepts_trailing_text_after_first_json_object():
 
 
 class _SchemaFallbackLlm:
+    model = "test-model"
+
     def __init__(self):
         self.calls = []
 
@@ -66,6 +65,8 @@ def test_request_llm_json_tries_json_schema_then_falls_back_to_json_object():
 
 
 class _RetryableFailureLlm:
+    model = "test-model"
+
     def __init__(self):
         self.calls = []
 
@@ -113,6 +114,8 @@ def test_apply_cache_breakpoint_marks_only_requested_content_item():
 
 
 class _CacheBreakpointLlm:
+    model = "test-model"
+
     def __init__(self):
         self.messages = []
 
@@ -143,183 +146,6 @@ def test_request_llm_json_applies_cache_breakpoint_to_message_content():
     assert "cache_control" not in sent_content[2]
 
 
-def test_request_llm_json_with_response_uses_direct_gemini_for_media(monkeypatch):
-    captured = {}
-
-    async def _fake_direct_request(**kwargs):
-        captured.update(kwargs)
-        return (
-            {"summary": "ok"},
-            {
-                "choices": [{"message": {"content": '{"summary":"ok"}', "annotations": []}}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.0},
-            },
-        )
-
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.direct_gemini_pdf_enabled",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.request_direct_gemini_content_json_with_response",
-        _fake_direct_request,
-    )
-
-    parsed, response = asyncio.run(
-        request_llm_json_with_response(
-            llm_client=object(),
-            content=[
-                {"type": "text", "text": "prompt"},
-                {"type": "file", "file": {"filename": "doc.pdf", "file_data": "data:application/pdf;base64,AA=="}},
-            ],
-            schema_name="demo",
-            response_schema={
-                "type": "object",
-                "properties": {"summary": {"type": "string"}},
-                "required": ["summary"],
-            },
-        )
-    )
-
-    assert parsed == {"summary": "ok"}
-    assert response["usage"]["total_tokens"] == 12
-    assert captured["content"][1]["type"] == "file"
-
-
-def test_request_llm_json_with_response_uses_direct_gemini_for_text_only(monkeypatch):
-    captured = {}
-
-    async def _fake_direct_request(**kwargs):
-        captured.update(kwargs)
-        return (
-            {"summary": "ok"},
-            {
-                "choices": [{"message": {"content": '{"summary":"ok"}', "annotations": []}}],
-                "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10, "cost": 0.0},
-            },
-        )
-
-    class _UnexpectedLlm:
-        async def chat_completion(self, messages, **kwargs):
-            raise AssertionError("text-only structured calls should route directly to Gemini")
-
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.direct_gemini_pdf_enabled",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.request_direct_gemini_content_json_with_response",
-        _fake_direct_request,
-    )
-
-    parsed, response = asyncio.run(
-        request_llm_json_with_response(
-            llm_client=_UnexpectedLlm(),
-            content=[{"type": "text", "text": "prompt"}],
-            schema_name="demo",
-            response_schema={
-                "type": "object",
-                "properties": {"summary": {"type": "string"}},
-                "required": ["summary"],
-            },
-        )
-    )
-
-    assert parsed == {"summary": "ok"}
-    assert response["usage"]["total_tokens"] == 10
-    assert captured["content"] == [{"type": "text", "text": "prompt"}]
-
-
-def test_request_llm_json_with_response_uses_local_semantic_for_image_only(monkeypatch):
-    captured = {}
-
-    async def _fake_local_request(**kwargs):
-        captured.update(kwargs)
-        return (
-            {"summary": "ok"},
-            {
-                "choices": [{"message": {"content": '{"summary":"ok"}'}}],
-                "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9},
-            },
-        )
-
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.local_semantic_enabled",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.request_local_semantic_content_json_with_response",
-        _fake_local_request,
-    )
-
-    parsed, response = asyncio.run(
-        request_llm_json_with_response(
-            llm_client=object(),
-            content=[
-                {"type": "text", "text": "prompt"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
-            ],
-            schema_name="demo",
-            response_schema={
-                "type": "object",
-                "properties": {"summary": {"type": "string"}},
-                "required": ["summary"],
-            },
-        )
-    )
-
-    assert parsed == {"summary": "ok"}
-    assert response["usage"]["total_tokens"] == 9
-    assert captured["content"][1]["type"] == "image_url"
-
-
-def test_request_llm_json_with_response_prefers_gemini_for_file_content_even_when_local_enabled(monkeypatch):
-    captured = {}
-
-    async def _fake_gemini_request(**kwargs):
-        captured.update(kwargs)
-        return (
-            {"summary": "ok"},
-            {
-                "choices": [{"message": {"content": '{"summary":"ok"}'}}],
-                "usage": {"prompt_tokens": 9, "completion_tokens": 2, "total_tokens": 11},
-            },
-        )
-
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.local_semantic_enabled",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.direct_gemini_pdf_enabled",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.request_direct_gemini_content_json_with_response",
-        _fake_gemini_request,
-    )
-
-    parsed, response = asyncio.run(
-        request_llm_json_with_response(
-            llm_client=object(),
-            content=[
-                {"type": "text", "text": "prompt"},
-                {"type": "file", "file": {"filename": "doc.pdf", "file_data": "data:application/pdf;base64,AA=="}},
-            ],
-            schema_name="demo",
-            response_schema={
-                "type": "object",
-                "properties": {"summary": {"type": "string"}},
-                "required": ["summary"],
-            },
-        )
-    )
-
-    assert parsed == {"summary": "ok"}
-    assert response["usage"]["total_tokens"] == 11
-    assert captured["content"][1]["type"] == "file"
-
-
 def test_preferred_cache_breakpoint_index_prefers_last_image_block():
     content = [
         {"type": "text", "text": "prompt"},
@@ -329,46 +155,6 @@ def test_preferred_cache_breakpoint_index_prefers_last_image_block():
     ]
 
     assert preferred_cache_breakpoint_index(content) == 2
-
-
-def test_preferred_cache_breakpoint_index_prefers_last_file_block():
-    content = [
-        {"type": "text", "text": "prompt"},
-        {"type": "file", "file": {"filename": "document.pdf", "file_data": "data:application/pdf;base64,abc"}},
-        {"type": "text", "text": "dynamic"},
-    ]
-
-    assert preferred_cache_breakpoint_index(content) == 1
-
-
-def test_semantic_page_parts_use_page_preview_when_local_backend_enabled(monkeypatch):
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.local_semantic_enabled",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.page_preview_parts",
-        lambda job, page_numbers: [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}],
-    )
-
-    parts = semantic_page_parts(object(), [1], filename="demo.pdf")
-
-    assert parts[0]["type"] == "image_url"
-
-
-def test_semantic_page_parts_use_pdf_input_when_local_backend_disabled(monkeypatch):
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.local_semantic_enabled",
-        lambda: False,
-    )
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.pdf_file_parts",
-        lambda job, page_numbers, filename=None: [{"type": "file", "file": {"filename": filename or "demo.pdf", "file_data": "data:application/pdf;base64,AA=="}}],
-    )
-
-    parts = semantic_page_parts(object(), [1], filename="demo.pdf")
-
-    assert parts[0]["type"] == "file"
 
 
 def test_preferred_cache_breakpoint_index_uses_last_block_when_no_images():
@@ -381,6 +167,8 @@ def test_preferred_cache_breakpoint_index_uses_last_block_when_no_images():
 
 
 class _MalformedThenValidLlm:
+    model = "test-model"
+
     def __init__(self):
         self.messages = []
 
@@ -415,6 +203,8 @@ def test_request_llm_json_retries_after_malformed_json_response():
 
 
 class _ConversationPrefixLlm:
+    model = "test-model"
+
     def __init__(self):
         self.messages = []
         self.kwargs = []
@@ -455,39 +245,6 @@ def test_request_llm_json_with_response_includes_conversation_prefix():
     assert llm.messages[0][1]["role"] == "user"
 
 
-def test_request_llm_json_with_response_keeps_conversation_prefix_on_chat_path_when_direct_enabled(monkeypatch):
-    llm = _ConversationPrefixLlm()
-
-    async def _unexpected_direct_request(**kwargs):
-        raise AssertionError("conversation-prefix requests should stay on the chat-completions path")
-
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.direct_gemini_pdf_enabled",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        "app.services.intelligence_llm_utils.request_direct_gemini_content_json_with_response",
-        _unexpected_direct_request,
-    )
-
-    parsed, _response = asyncio.run(
-        request_llm_json_with_response(
-            llm_client=llm,
-            content=[{"type": "text", "text": "hello"}],
-            conversation_prefix=[
-                {
-                    "role": "assistant",
-                    "content": "Previous context is available.",
-                }
-            ],
-        )
-    )
-
-    assert parsed == {"summary": "ok"}
-    assert llm.messages[0][0]["role"] == "assistant"
-    assert llm.messages[0][1]["role"] == "user"
-
-
 def test_request_llm_json_with_response_omits_plugins_when_not_provided():
     llm = _ConversationPrefixLlm()
 
@@ -509,27 +266,88 @@ def _make_pdf(pdf_path: Path, page_count: int) -> None:
     pdf.save(str(pdf_path))
 
 
-def test_pdf_file_parts_emits_pdf_subset_as_file_content(tmp_path):
-    pdf_path = tmp_path / "sample.pdf"
-    _make_pdf(pdf_path, 3)
+class _RecordingLlm:
+    model = "test-model"
 
-    job = type(
-        "JobLike",
-        (),
-        {
-            "input_path": str(pdf_path),
-            "output_path": str(pdf_path),
-            "original_filename": "sample.pdf",
-        },
-    )()
+    def __init__(self, message):
+        self.message = message
+        self.messages = []
+        self.closed = False
 
-    parts = pdf_file_parts(job, [1, 3])
+    async def chat_completion(self, messages, **kwargs):
+        self.messages.append(messages)
+        return {"choices": [{"message": self.message}]}
 
-    assert len(parts) == 1
-    assert parts[0]["type"] == "file"
-    assert parts[0]["file"]["filename"] == "sample.pdf"
-    data_url = parts[0]["file"]["file_data"]
-    assert data_url.startswith("data:application/pdf;base64,")
-    decoded = base64.b64decode(data_url.split(",", 1)[1])
-    with pikepdf.Pdf.open(BytesIO(decoded)) as pdf:
-        assert len(pdf.pages) == 2
+    async def close(self):
+        self.closed = True
+
+
+def test_image_content_goes_to_the_chat_completions_lane():
+    llm = _RecordingLlm({"content": '{"summary":"ok"}'})
+    image = {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA=="}}
+
+    parsed = asyncio.run(
+        request_llm_json(llm_client=llm, content=[{"type": "text", "text": "prompt"}, image])
+    )
+
+    assert parsed == {"summary": "ok"}
+    assert llm.messages[0][-1]["content"][1] == image
+
+
+def test_a_reasoning_models_json_is_read_from_reasoning_content():
+    llm = _RecordingLlm({"content": "", "reasoning_content": '{"summary":"ok"}'})
+
+    parsed = asyncio.run(request_llm_json(llm_client=llm, content=[{"type": "text", "text": "hi"}]))
+
+    assert parsed == {"summary": "ok"}
+
+
+def test_pdf_pages_request_sends_page_images_and_the_system_instruction(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "doc.pdf"
+    document = pikepdf.new()
+    document.add_blank_page()
+    document.add_blank_page()
+    document.save(pdf_path)
+    llm = _RecordingLlm({"content": '{"title":"Annual Report"}'})
+    monkeypatch.setattr("app.services.intelligence_llm_utils.make_llm_client", lambda settings: llm)
+
+    parsed = asyncio.run(
+        request_pdf_pages_json(
+            pdf_path=pdf_path,
+            page_numbers=[1, 2],
+            prompt="Find the title.",
+            context_payload={"candidates": ["Annual Report"]},
+            system_instruction="You read documents.",
+        )
+    )
+
+    assert parsed == {"title": "Annual Report"}
+    system, user = llm.messages[0]
+    assert system == {"role": "system", "content": "You read documents."}
+    assert [part["type"] for part in user["content"]] == ["text", "image_url", "image_url", "text"]
+    assert llm.closed
+
+
+def test_a_model_that_refused_json_schema_is_asked_for_json_object_next_time():
+    schema = {
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+    }
+    first, second = _SchemaFallbackLlm(), _SchemaFallbackLlm()
+
+    for llm in (first, second):
+        asyncio.run(
+            request_llm_json(
+                llm_client=llm,
+                content=[{"type": "text", "text": "hello"}],
+                schema_name="demo",
+                response_schema=schema,
+            )
+        )
+
+    assert [call["response_format"]["type"] for call in first.calls] == [
+        "json_schema",
+        "json_object",
+    ]
+    assert [call["response_format"]["type"] for call in second.calls] == ["json_object"]

@@ -16,7 +16,7 @@ def test_title_intelligence_applies_visible_title_when_missing(monkeypatch, tmp_
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path)
 
-    async def _fake_direct_request(**kwargs):
+    async def _fake_pages_request(**kwargs):
         assert kwargs["page_numbers"] == [1, 2]
         assert kwargs["context_payload"]["job_filename"] == "chapter.pdf"
         assert kwargs["context_payload"]["current_title"] == ""
@@ -30,8 +30,8 @@ def test_title_intelligence_applies_visible_title_when_missing(monkeypatch, tmp_
         }
 
     monkeypatch.setattr(
-        "app.services.title_intelligence.request_direct_gemini_pdf_json",
-        _fake_direct_request,
+        "app.services.title_intelligence.request_pdf_pages_json",
+        _fake_pages_request,
     )
 
     structure_json = {
@@ -66,7 +66,7 @@ def test_title_intelligence_keeps_existing_title_when_model_declines(monkeypatch
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path)
 
-    async def _fake_direct_request(**kwargs):
+    async def _fake_pages_request(**kwargs):
         assert kwargs["page_numbers"] == [1, 2]
         assert kwargs["context_payload"]["current_title"] == "Existing Title"
         return {
@@ -78,8 +78,8 @@ def test_title_intelligence_keeps_existing_title_when_model_declines(monkeypatch
         }
 
     monkeypatch.setattr(
-        "app.services.title_intelligence.request_direct_gemini_pdf_json",
-        _fake_direct_request,
+        "app.services.title_intelligence.request_pdf_pages_json",
+        _fake_pages_request,
     )
 
     structure_json = {

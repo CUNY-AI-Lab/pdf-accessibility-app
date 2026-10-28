@@ -2,9 +2,12 @@
 
 import asyncio
 import logging
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+import pikepdf
 
 from app.config import get_settings
 from app.pipeline.subprocess_utils import (
@@ -16,6 +19,10 @@ from app.services.runtime_paths import enriched_subprocess_env
 
 logger = logging.getLogger(__name__)
 
+GATEWAY_OCR_PLUGIN = "app.pipeline.ocr_vlm_plugin"
+# Time for Tesseract to read a page after the Gateway gave up on it.
+GATEWAY_PAGE_FALLBACK_SECONDS = 60
+
 
 @dataclass
 class OcrResult:
@@ -25,7 +32,7 @@ class OcrResult:
     message: str = ""
 
 
-def _build_ocrmypdf_args(
+def build_ocrmypdf_args(
     *,
     input_path: Path,
     output_path: Path,
@@ -35,10 +42,13 @@ def _build_ocrmypdf_args(
     deskew: bool,
     jobs: int | None = None,
     max_image_mpixels: int | None = None,
+    engine: str = "tesseract",
+    pages: list[int] | None = None,
 ) -> list[str]:
     settings = get_settings()
+    default_jobs = settings.ocr_gateway_jobs if engine == "gateway" else settings.ocrmypdf_jobs
     try:
-        resolved_jobs = int(jobs if jobs is not None else settings.ocrmypdf_jobs)
+        resolved_jobs = int(jobs if jobs is not None else default_jobs)
     except (TypeError, ValueError):
         resolved_jobs = 1
     try:
@@ -65,6 +75,8 @@ def _build_ocrmypdf_args(
         "--max-image-mpixels",
         str(max(1, resolved_max_image_mpixels)),
     ]
+    if engine == "gateway":
+        args.extend(["--plugin", GATEWAY_OCR_PLUGIN])
     if mode == "redo":
         if rotate_pages:
             args.append("--rotate-pages")
@@ -82,6 +94,9 @@ def _build_ocrmypdf_args(
         if deskew:
             args.append("--deskew")
         args.append("--skip-text")
+    if pages:
+        # OCRmyPDF numbers pages from 1.
+        args.extend(["--pages", ",".join(str(page + 1) for page in pages)])
     args.extend([str(input_path), str(output_path)])
     return args
 
@@ -97,14 +112,16 @@ async def run_ocr(
     timeout_seconds: int | None = None,
     jobs: int | None = None,
     max_image_mpixels: int | None = None,
+    engine: str = "tesseract",
+    pages: list[int] | None = None,
 ) -> OcrResult:
     """Run OCRmyPDF as a subprocess to add text layer to scanned PDFs.
 
     OCRmyPDF is not thread-safe, so we run it as a separate process.
     """
-    logger.info(f"Running OCR on {input_path.name} (language={language})")
+    logger.info(f"Running OCR on {input_path.name} (language={language}, engine={engine})")
 
-    args = _build_ocrmypdf_args(
+    args = build_ocrmypdf_args(
         input_path=input_path,
         output_path=output_path,
         language=language,
@@ -113,13 +130,28 @@ async def run_ocr(
         deskew=deskew,
         jobs=jobs,
         max_image_mpixels=max_image_mpixels,
+        engine=engine,
+        pages=pages,
     )
+    env = enriched_subprocess_env()
+    if engine == "gateway":
+        settings = get_settings()
+        env["CAIL_OCR_BASE_URL"] = settings.llm_base_url
+        env["CAIL_OCR_API_KEY"] = settings.llm_api_key
+        env["CAIL_OCR_MODEL"] = settings.ocr_model
+        env["CAIL_OCR_PAGE_SECONDS"] = str(settings.ocr_gateway_page_seconds)
+        # Pages run in rounds of --jobs, each round within the page limit, so
+        # the whole run can take longer than the configured OCR timeout.
+        with pikepdf.open(input_path) as pdf:
+            rounds = math.ceil(len(pdf.pages) / max(1, jobs or settings.ocr_gateway_jobs))
+        needed = rounds * (settings.ocr_gateway_page_seconds + GATEWAY_PAGE_FALLBACK_SECONDS)
+        timeout_seconds = max(timeout_seconds or 0, needed)
 
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=enriched_subprocess_env(),
+        env=env,
         **subprocess_process_group_kwargs(),
     )
     try:

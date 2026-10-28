@@ -18,7 +18,7 @@ def test_early_pages_intelligence_combines_title_and_front_matter(monkeypatch, t
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path, page_count=4)
 
-    async def _fake_direct_request(**kwargs):
+    async def _fake_pages_request(**kwargs):
         assert kwargs["page_numbers"] == [1, 2, 3]
         assert kwargs["context_payload"]["job_filename"] == "report.pdf"
         assert kwargs["context_payload"]["title_candidates"]
@@ -43,8 +43,8 @@ def test_early_pages_intelligence_combines_title_and_front_matter(monkeypatch, t
         }
 
     monkeypatch.setattr(
-        "app.services.early_pages_intelligence.request_direct_gemini_pdf_json",
-        _fake_direct_request,
+        "app.services.early_pages_intelligence.request_pdf_pages_json",
+        _fake_pages_request,
     )
 
     structure_json = {
@@ -77,17 +77,17 @@ def test_early_pages_intelligence_combines_title_and_front_matter(monkeypatch, t
         "Series Information",
     ]
 
-def test_early_pages_intelligence_uses_direct_gemini(monkeypatch, tmp_path):
+def test_early_pages_intelligence_asks_the_model_about_the_early_pages(monkeypatch, tmp_path):
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path, page_count=4)
 
-    async def _fake_direct_request(**kwargs):
+    async def _fake_pages_request(**kwargs):
         assert kwargs["page_numbers"] == [1, 2]
         assert "title_candidates" in kwargs["context_payload"]
         assert "front_matter_pages" in kwargs["context_payload"]
         return {
             "task_type": "document_early_pages_intelligence",
-            "summary": "Recovered the title and front matter from direct Gemini.",
+            "summary": "Recovered the title and front matter from the early pages.",
             "title": {
                 "confidence": "high",
                 "reason": "Clear cover title.",
@@ -101,8 +101,8 @@ def test_early_pages_intelligence_uses_direct_gemini(monkeypatch, tmp_path):
         }
 
     monkeypatch.setattr(
-        "app.services.early_pages_intelligence.request_direct_gemini_pdf_json",
-        _fake_direct_request,
+        "app.services.early_pages_intelligence.request_pdf_pages_json",
+        _fake_pages_request,
     )
 
     structure_json = {
