@@ -83,7 +83,16 @@ jobs:
       - name: Record the version serving now
         run: |
           set -euo pipefail
-          deployments_json="$(bunx wrangler deployments list --config wrangler.jsonc --json)"
+          # A Worker that does not exist yet answers code 10007, not an empty list.
+          if ! deployments_json="$(bunx wrangler deployments list --config wrangler.jsonc --json 2>"$RUNNER_TEMP/deployments.err")"; then
+            if grep -q 'code: 10007' "$RUNNER_TEMP/deployments.err"; then
+              printf 'first_release=true\n' >> "$GITHUB_ENV"
+              printf 'The Worker does not exist yet; this release creates it and its Durable Object.\n'
+              exit 0
+            fi
+            cat "$RUNNER_TEMP/deployments.err" >&2
+            exit 1
+          fi
           if jq -e 'type == "array" and length == 0' <<<"$deployments_json" >/dev/null; then
             printf 'first_release=true\n' >> "$GITHUB_ENV"
             printf 'The Worker has never been deployed; this release creates it and its Durable Object.\n'
