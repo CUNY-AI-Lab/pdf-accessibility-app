@@ -7,33 +7,37 @@ import pytest
 
 from app.config import Settings
 from app.pipeline import orchestrator
-from app.pipeline.orchestrator import (
-    FONT_LANE_EMBED,
-    FONT_LANE_OCR_REDO,
-    FONT_LANE_REPAIR_DICTS,
-    FONT_LANE_REPAIR_TOUNICODE,
-    _apply_pretag_form_intelligence,
-    _apply_pretag_grounded_text_resolutions,
-    _apply_pretag_table_intelligence,
-    _apply_pretag_widget_rationalization,
-    _attempt_auto_llm_font_map,
-    _cid_cff_width_key,
-    _embed_lane_should_skip_local,
-    _font_remediation_lanes,
-    _ghostscript_embed_command,
+from app.pipeline.fonts import embedding, encoding, lanes, programs, repair
+from app.pipeline.fonts.diagnostics import (
     _inspect_font_diagnostics,
     _inspect_pdf_features,
-    _local_embed_support_kind,
-    _local_font_program,
+    _unicode_repair_gate_from_diagnostics,
+)
+from app.pipeline.fonts.embedding import _ghostscript_embed_command
+from app.pipeline.fonts.encoding import (
     _merge_tounicode_maps,
-    _normalize_font_name,
     _parse_tounicode_map_details,
     _sanitize_text_showing_zero_bytes,
     _simple_font_auto_unicode_policy,
     _simple_font_unicode_map,
     _simple_font_zero_byte_repair_candidate,
-    _sync_pdf_cid_cff_widths_sync,
-    _unicode_repair_gate_from_diagnostics,
+)
+from app.pipeline.fonts.lanes import _embed_lane_should_skip_local, _font_remediation_lanes
+from app.pipeline.fonts.names import _normalize_font_name
+from app.pipeline.fonts.programs import _local_embed_support_kind, _local_font_program
+from app.pipeline.fonts.repair import _cid_cff_width_key, _sync_pdf_cid_cff_widths_sync
+from app.pipeline.fonts.rules import (
+    FONT_LANE_EMBED,
+    FONT_LANE_OCR_REDO,
+    FONT_LANE_REPAIR_DICTS,
+    FONT_LANE_REPAIR_TOUNICODE,
+)
+from app.pipeline.orchestrator import (
+    _apply_pretag_form_intelligence,
+    _apply_pretag_grounded_text_resolutions,
+    _apply_pretag_table_intelligence,
+    _apply_pretag_widget_rationalization,
+    _attempt_auto_llm_font_map,
 )
 from app.services import font_intelligence_auto, semantic_pretag_policy
 from app.services.form_fields import (
@@ -102,7 +106,9 @@ def _xobject_font_only_pdf(output_path: Path) -> None:
                     pikepdf.ContentStreamInstruction([], pikepdf.Operator("BT")),
                     pikepdf.ContentStreamInstruction([font_name, 12], pikepdf.Operator("Tf")),
                     pikepdf.ContentStreamInstruction([10, 20], pikepdf.Operator("Td")),
-                    pikepdf.ContentStreamInstruction([pikepdf.String("Nested only")], pikepdf.Operator("Tj")),
+                    pikepdf.ContentStreamInstruction(
+                        [pikepdf.String("Nested only")], pikepdf.Operator("Tj")
+                    ),
                     pikepdf.ContentStreamInstruction([], pikepdf.Operator("ET")),
                 ]
             )
@@ -110,18 +116,24 @@ def _xobject_font_only_pdf(output_path: Path) -> None:
         form["/Type"] = pikepdf.Name("/XObject")
         form["/Subtype"] = pikepdf.Name("/Form")
         form["/BBox"] = pikepdf.Array([0, 0, 200, 50])
-        form["/Resources"] = pikepdf.Dictionary({
-            "/Font": pikepdf.Dictionary({font_name: imported_font}),
-        })
+        form["/Resources"] = pikepdf.Dictionary(
+            {
+                "/Font": pikepdf.Dictionary({font_name: imported_font}),
+            }
+        )
 
-        page.obj["/Resources"] = pikepdf.Dictionary({
-            "/XObject": pikepdf.Dictionary({"/Fx0": form}),
-        })
+        page.obj["/Resources"] = pikepdf.Dictionary(
+            {
+                "/XObject": pikepdf.Dictionary({"/Fx0": form}),
+            }
+        )
         page["/Contents"] = pdf.make_stream(
             pikepdf.unparse_content_stream(
                 [
                     pikepdf.ContentStreamInstruction([], pikepdf.Operator("q")),
-                    pikepdf.ContentStreamInstruction([pikepdf.Name("/Fx0")], pikepdf.Operator("Do")),
+                    pikepdf.ContentStreamInstruction(
+                        [pikepdf.Name("/Fx0")], pikepdf.Operator("Do")
+                    ),
                     pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q")),
                 ]
             )
@@ -132,66 +144,90 @@ def _xobject_font_only_pdf(output_path: Path) -> None:
 def _pdf_with_stale_acroform(output_path: Path) -> None:
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(200, 200))
-    link = pdf.make_indirect(pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Annot"),
-        "/Subtype": pikepdf.Name("/Link"),
-        "/Rect": pikepdf.Array([10, 10, 40, 20]),
-        "/A": pikepdf.Dictionary({
-            "/S": pikepdf.Name("/URI"),
-            "/URI": pikepdf.String("https://example.com"),
-        }),
-    }))
+    link = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Link"),
+                "/Rect": pikepdf.Array([10, 10, 40, 20]),
+                "/A": pikepdf.Dictionary(
+                    {
+                        "/S": pikepdf.Name("/URI"),
+                        "/URI": pikepdf.String("https://example.com"),
+                    }
+                ),
+            }
+        )
+    )
     page["/Annots"] = pikepdf.Array([link])
-    pdf.Root["/AcroForm"] = pikepdf.Dictionary({
-        "/Fields": pikepdf.Array([]),
-        "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
-        "/DR": pikepdf.Dictionary(),
-    })
+    pdf.Root["/AcroForm"] = pikepdf.Dictionary(
+        {
+            "/Fields": pikepdf.Array([]),
+            "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
+            "/DR": pikepdf.Dictionary(),
+        }
+    )
     pdf.save(str(output_path))
 
 
 def _pdf_with_real_widget(output_path: Path) -> None:
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(200, 200))
-    widget = pdf.make_indirect(pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Annot"),
-        "/Subtype": pikepdf.Name("/Widget"),
-        "/Rect": pikepdf.Array([10, 10, 40, 20]),
-        "/FT": pikepdf.Name("/Tx"),
-        "/T": pikepdf.String("field1"),
-    }))
+    widget = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Widget"),
+                "/Rect": pikepdf.Array([10, 10, 40, 20]),
+                "/FT": pikepdf.Name("/Tx"),
+                "/T": pikepdf.String("field1"),
+            }
+        )
+    )
     page["/Annots"] = pikepdf.Array([widget])
-    pdf.Root["/AcroForm"] = pikepdf.Dictionary({
-        "/Fields": pikepdf.Array([widget]),
-        "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
-        "/DR": pikepdf.Dictionary(),
-    })
+    pdf.Root["/AcroForm"] = pikepdf.Dictionary(
+        {
+            "/Fields": pikepdf.Array([widget]),
+            "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
+            "/DR": pikepdf.Dictionary(),
+        }
+    )
     pdf.save(str(output_path))
 
 
 def _pdf_with_two_real_widgets(output_path: Path) -> None:
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(200, 200))
-    widget_one = pdf.make_indirect(pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Annot"),
-        "/Subtype": pikepdf.Name("/Widget"),
-        "/Rect": pikepdf.Array([10, 40, 80, 55]),
-        "/FT": pikepdf.Name("/Tx"),
-        "/T": pikepdf.String("field1"),
-    }))
-    widget_two = pdf.make_indirect(pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Annot"),
-        "/Subtype": pikepdf.Name("/Widget"),
-        "/Rect": pikepdf.Array([10, 10, 80, 25]),
-        "/FT": pikepdf.Name("/Tx"),
-        "/T": pikepdf.String("field2"),
-    }))
+    widget_one = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Widget"),
+                "/Rect": pikepdf.Array([10, 40, 80, 55]),
+                "/FT": pikepdf.Name("/Tx"),
+                "/T": pikepdf.String("field1"),
+            }
+        )
+    )
+    widget_two = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Widget"),
+                "/Rect": pikepdf.Array([10, 10, 80, 25]),
+                "/FT": pikepdf.Name("/Tx"),
+                "/T": pikepdf.String("field2"),
+            }
+        )
+    )
     page["/Annots"] = pikepdf.Array([widget_one, widget_two])
-    pdf.Root["/AcroForm"] = pikepdf.Dictionary({
-        "/Fields": pikepdf.Array([widget_one, widget_two]),
-        "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
-        "/DR": pikepdf.Dictionary(),
-    })
+    pdf.Root["/AcroForm"] = pikepdf.Dictionary(
+        {
+            "/Fields": pikepdf.Array([widget_one, widget_two]),
+            "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
+            "/DR": pikepdf.Dictionary(),
+        }
+    )
     pdf.save(str(output_path))
 
 
@@ -200,50 +236,68 @@ def _pdf_with_static_text_widgets(output_path: Path) -> None:
     page_one = pdf.add_blank_page(page_size=(200, 200))
     page_two = pdf.add_blank_page(page_size=(200, 200))
 
-    widget_one = pdf.make_indirect(pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Annot"),
-        "/Subtype": pikepdf.Name("/Widget"),
-        "/Rect": pikepdf.Array([20, 160, 180, 180]),
-        "/FT": pikepdf.Name("/Tx"),
-        "/T": pikepdf.String("NAVIGATING THE FDS ONLINE FILING SYSTEM"),
-        "/TU": pikepdf.String("NAVIGATING THE FDS ONLINE FILING SYSTEM"),
-        "/F": 4,
-    }))
-    widget_two = pdf.make_indirect(pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Annot"),
-        "/Subtype": pikepdf.Name("/Widget"),
-        "/Rect": pikepdf.Array([20, 12, 120, 24]),
-        "/FT": pikepdf.Name("/Tx"),
-        "/T": pikepdf.String("1 | Page"),
-        "/TU": pikepdf.String("1 | Page"),
-        "/F": 4,
-    }))
-    widget_three = pdf.make_indirect(pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Annot"),
-        "/Subtype": pikepdf.Name("/Widget"),
-        "/Rect": pikepdf.Array([20, 160, 180, 180]),
-        "/FT": pikepdf.Name("/Tx"),
-        "/T": pikepdf.String("NAVIGATING THE FDS ONLINE FILING SYSTEM"),
-        "/TU": pikepdf.String("NAVIGATING THE FDS ONLINE FILING SYSTEM"),
-        "/F": 4,
-    }))
-    widget_four = pdf.make_indirect(pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Annot"),
-        "/Subtype": pikepdf.Name("/Widget"),
-        "/Rect": pikepdf.Array([20, 12, 120, 24]),
-        "/FT": pikepdf.Name("/Tx"),
-        "/T": pikepdf.String("2 | Page"),
-        "/TU": pikepdf.String("2 | Page"),
-        "/F": 4,
-    }))
+    widget_one = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Widget"),
+                "/Rect": pikepdf.Array([20, 160, 180, 180]),
+                "/FT": pikepdf.Name("/Tx"),
+                "/T": pikepdf.String("NAVIGATING THE FDS ONLINE FILING SYSTEM"),
+                "/TU": pikepdf.String("NAVIGATING THE FDS ONLINE FILING SYSTEM"),
+                "/F": 4,
+            }
+        )
+    )
+    widget_two = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Widget"),
+                "/Rect": pikepdf.Array([20, 12, 120, 24]),
+                "/FT": pikepdf.Name("/Tx"),
+                "/T": pikepdf.String("1 | Page"),
+                "/TU": pikepdf.String("1 | Page"),
+                "/F": 4,
+            }
+        )
+    )
+    widget_three = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Widget"),
+                "/Rect": pikepdf.Array([20, 160, 180, 180]),
+                "/FT": pikepdf.Name("/Tx"),
+                "/T": pikepdf.String("NAVIGATING THE FDS ONLINE FILING SYSTEM"),
+                "/TU": pikepdf.String("NAVIGATING THE FDS ONLINE FILING SYSTEM"),
+                "/F": 4,
+            }
+        )
+    )
+    widget_four = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Widget"),
+                "/Rect": pikepdf.Array([20, 12, 120, 24]),
+                "/FT": pikepdf.Name("/Tx"),
+                "/T": pikepdf.String("2 | Page"),
+                "/TU": pikepdf.String("2 | Page"),
+                "/F": 4,
+            }
+        )
+    )
 
     page_one["/Annots"] = pikepdf.Array([widget_one, widget_two])
     page_two["/Annots"] = pikepdf.Array([widget_three, widget_four])
-    pdf.Root["/AcroForm"] = pikepdf.Dictionary({
-        "/Fields": pikepdf.Array([widget_one, widget_two, widget_three, widget_four]),
-        "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
-        "/DR": pikepdf.Dictionary(),
-    })
+    pdf.Root["/AcroForm"] = pikepdf.Dictionary(
+        {
+            "/Fields": pikepdf.Array([widget_one, widget_two, widget_three, widget_four]),
+            "/DA": pikepdf.String("/Helv 10 Tf 0 g"),
+            "/DR": pikepdf.Dictionary(),
+        }
+    )
     pdf.save(str(output_path))
 
 
@@ -254,34 +308,50 @@ def _pdf_with_cid_type0_widths(output_path: Path) -> None:
     font_file3 = pdf.make_stream(b"dummy")
     font_file3["/Subtype"] = pikepdf.Name("/CIDFontType0C")
 
-    descriptor = pdf.make_indirect(pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/FontDescriptor"),
-        "/FontName": pikepdf.Name("/ABCDEE+TestCID"),
-        "/FontFile3": font_file3,
-    }))
-    cid_font = pdf.make_indirect(pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Font"),
-        "/Subtype": pikepdf.Name("/CIDFontType0"),
-        "/BaseFont": pikepdf.Name("/ABCDEE+TestCID"),
-        "/CIDSystemInfo": pikepdf.Dictionary({
-            "/Registry": pikepdf.String("Adobe"),
-            "/Ordering": pikepdf.String("Identity"),
-            "/Supplement": 0,
-        }),
-        "/FontDescriptor": descriptor,
-        "/W": pikepdf.Array([170, pikepdf.Array([10, 0, 20])]),
-    }))
-    type0_font = pdf.make_indirect(pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Font"),
-        "/Subtype": pikepdf.Name("/Type0"),
-        "/BaseFont": pikepdf.Name("/ABCDEE+TestCID-Identity-H"),
-        "/Encoding": pikepdf.Name("/Identity-H"),
-        "/DescendantFonts": pikepdf.Array([cid_font]),
-    }))
+    descriptor = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/FontDescriptor"),
+                "/FontName": pikepdf.Name("/ABCDEE+TestCID"),
+                "/FontFile3": font_file3,
+            }
+        )
+    )
+    cid_font = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Font"),
+                "/Subtype": pikepdf.Name("/CIDFontType0"),
+                "/BaseFont": pikepdf.Name("/ABCDEE+TestCID"),
+                "/CIDSystemInfo": pikepdf.Dictionary(
+                    {
+                        "/Registry": pikepdf.String("Adobe"),
+                        "/Ordering": pikepdf.String("Identity"),
+                        "/Supplement": 0,
+                    }
+                ),
+                "/FontDescriptor": descriptor,
+                "/W": pikepdf.Array([170, pikepdf.Array([10, 0, 20])]),
+            }
+        )
+    )
+    type0_font = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Font"),
+                "/Subtype": pikepdf.Name("/Type0"),
+                "/BaseFont": pikepdf.Name("/ABCDEE+TestCID-Identity-H"),
+                "/Encoding": pikepdf.Name("/Identity-H"),
+                "/DescendantFonts": pikepdf.Array([cid_font]),
+            }
+        )
+    )
 
-    page["/Resources"] = pikepdf.Dictionary({
-        "/Font": pikepdf.Dictionary({"/F0": type0_font}),
-    })
+    page["/Resources"] = pikepdf.Dictionary(
+        {
+            "/Font": pikepdf.Dictionary({"/F0": type0_font}),
+        }
+    )
     pdf.save(str(output_path))
 
 
@@ -389,7 +459,7 @@ def test_sync_pdf_cid_cff_widths_syncs_cff_widths(monkeypatch, tmp_path):
     _pdf_with_cid_type0_widths(input_pdf)
 
     monkeypatch.setattr(
-        orchestrator,
+        repair,
         "_collect_cid_cff_widths",
         lambda _font_bytes: {170: 10, 171: -4, 172: 20},
     )
@@ -459,28 +529,30 @@ async def test_pretag_grounded_text_resolutions_apply_safe_spacing_fix(monkeypat
             "target_count": 1,
             "encoding_problem_count": 0,
             "targets": [
-                    {
-                        "page": 1,
-                        "review_id": "review-0",
-                        "role": "heading",
-                        "original_text_candidate": "A B S T R A C T",
-                        "native_text_candidate": "A B S T R A C T",
+                {
+                    "page": 1,
+                    "review_id": "review-0",
+                    "role": "heading",
+                    "original_text_candidate": "A B S T R A C T",
+                    "native_text_candidate": "A B S T R A C T",
                     "ocr_text_candidate": "ABSTRACT",
                     "bbox": {"l": 10, "t": 20, "r": 100, "b": 40},
                 }
             ],
         },
     )
-    monkeypatch.setattr(font_intelligence_auto, "make_llm_client", lambda settings: _FakeLlmClient())
+    monkeypatch.setattr(
+        font_intelligence_auto, "make_llm_client", lambda settings: _FakeLlmClient()
+    )
 
     async def _fake_generate(**kwargs):
         return {
             "blocks": [
-                    {
-                        "page": 1,
-                        "review_id": "review-0",
-                        "role": "heading",
-                        "readable_text_hint": "ABSTRACT",
+                {
+                    "page": 1,
+                    "review_id": "review-0",
+                    "role": "heading",
+                    "readable_text_hint": "ABSTRACT",
                     "chosen_source": "ocr",
                     "issue_type": "spacing_only",
                     "confidence": "high",
@@ -523,7 +595,9 @@ async def test_pretag_grounded_text_resolutions_apply_safe_spacing_fix(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_pretag_grounded_text_resolutions_artifact_duplicate_noise_block(monkeypatch, tmp_path):
+async def test_pretag_grounded_text_resolutions_artifact_duplicate_noise_block(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(
         orchestrator,
         "collect_grounded_text_candidates",
@@ -616,7 +690,9 @@ async def test_pretag_grounded_text_resolutions_artifact_duplicate_noise_block(m
 
 
 @pytest.mark.asyncio
-async def test_pretag_grounded_text_resolutions_artifact_mark_decorative_block(monkeypatch, tmp_path):
+async def test_pretag_grounded_text_resolutions_artifact_mark_decorative_block(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(
         orchestrator,
         "collect_grounded_text_candidates",
@@ -712,9 +788,7 @@ def test_should_auto_apply_grounded_code_block_accepts_grounded_multiline_code()
     block = {
         "role": "code",
         "readable_text_hint": (
-            "1 def fetch_url(entry):\n"
-            "2     uri = entry['download_url']\n"
-            "3     return uri"
+            "1 def fetch_url(entry):\n2     uri = entry['download_url']\n3     return uri"
         ),
         "chosen_source": "llm_inferred",
         "issue_type": "encoding_problem",
@@ -1230,10 +1304,7 @@ def test_remove_widget_fields_clears_annotations_and_empty_acroform(tmp_path):
     pdf_path = tmp_path / "static_widgets.pdf"
     cleaned_pdf = tmp_path / "cleaned.pdf"
     _pdf_with_static_text_widgets(pdf_path)
-    review_ids = {
-        str(field["field_review_id"])
-        for field in _extract_widget_fields(pdf_path)
-    }
+    review_ids = {str(field["field_review_id"]) for field in _extract_widget_fields(pdf_path)}
 
     removed = _remove_widget_fields(
         input_pdf=pdf_path,
@@ -1249,7 +1320,9 @@ def test_remove_widget_fields_clears_annotations_and_empty_acroform(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pretag_widget_rationalization_noops_without_nonheuristic_targets(monkeypatch, tmp_path):
+async def test_pretag_widget_rationalization_noops_without_nonheuristic_targets(
+    monkeypatch, tmp_path
+):
     pdf_path = tmp_path / "static_widgets.pdf"
     _pdf_with_static_text_widgets(pdf_path)
 
@@ -1395,7 +1468,13 @@ async def test_pretag_table_intelligence_retries_manual_only_aggressively(monkey
                     "num_rows": 8,
                     "num_cols": 6,
                     "cells": [
-                        {"row": 0, "col": 0, "text": "Group", "column_header": True, "row_header": True},
+                        {
+                            "row": 0,
+                            "col": 0,
+                            "text": "Group",
+                            "column_header": True,
+                            "row_header": True,
+                        },
                         {"row": 0, "col": 1, "text": "A", "column_header": True},
                         {"row": 1, "col": 0, "text": "Row", "row_header": True},
                         {"row": 1, "col": 1, "text": "Value"},
@@ -1500,7 +1579,13 @@ async def test_pretag_table_intelligence_retries_to_confirm_existing_headers(mon
                     "num_rows": 8,
                     "num_cols": 6,
                     "cells": [
-                        {"row": 0, "col": 0, "text": "Group", "column_header": True, "row_header": True},
+                        {
+                            "row": 0,
+                            "col": 0,
+                            "text": "Group",
+                            "column_header": True,
+                            "row_header": True,
+                        },
                         {"row": 0, "col": 1, "text": "A", "column_header": True},
                         {"row": 1, "col": 0, "text": "Row", "row_header": True},
                         {"row": 1, "col": 1, "text": "Value"},
@@ -1613,7 +1698,9 @@ async def test_pretag_table_intelligence_times_out_cleanly(monkeypatch, tmp_path
 
     assert updated == original_structure
     assert audit["applied"] is False
-    assert audit["reason"].startswith("llm_failed: table_intelligence[review-timeout] timed out after ")
+    assert audit["reason"].startswith(
+        "llm_failed: table_intelligence[review-timeout] timed out after "
+    )
 
 
 @pytest.mark.asyncio
@@ -1685,7 +1772,9 @@ async def test_pretag_table_intelligence_uses_pretag_timeout_override(monkeypatc
 
     assert updated == original_structure
     assert audit["applied"] is False
-    assert audit["reason"].startswith("llm_failed: table_intelligence[review-timeout] timed out after ")
+    assert audit["reason"].startswith(
+        "llm_failed: table_intelligence[review-timeout] timed out after "
+    )
 
 
 def test_font_name_normalization_strips_subset_prefix_and_punctuation():
@@ -1694,10 +1783,12 @@ def test_font_name_normalization_strips_subset_prefix_and_punctuation():
 
 
 def test_simple_type1_fonts_fall_back_to_standard_encoding():
-    font_dict = pikepdf.Dictionary({
-        "/Subtype": pikepdf.Name("/Type1"),
-        "/BaseFont": pikepdf.Name("/Times-Roman"),
-    })
+    font_dict = pikepdf.Dictionary(
+        {
+            "/Subtype": pikepdf.Name("/Type1"),
+            "/BaseFont": pikepdf.Name("/Times-Roman"),
+        }
+    )
 
     mapping = _simple_font_unicode_map(font_dict, None)
 
@@ -1705,22 +1796,26 @@ def test_simple_type1_fonts_fall_back_to_standard_encoding():
 
 
 def test_simple_font_policy_blocks_implicit_nonstandard_fonts():
-    font_dict = pikepdf.Dictionary({
-        "/Subtype": pikepdf.Name("/Type1"),
-        "/BaseFont": pikepdf.Name("/ABCDEE+TeX_CM_Maths_Symbols"),
-    })
+    font_dict = pikepdf.Dictionary(
+        {
+            "/Subtype": pikepdf.Name("/Type1"),
+            "/BaseFont": pikepdf.Name("/ABCDEE+TeX_CM_Maths_Symbols"),
+        }
+    )
 
     assert _simple_font_auto_unicode_policy(font_dict) == "blocked"
 
 
 def test_simple_font_policy_allows_embedded_cff_when_builtin_encoding_decodes(monkeypatch):
-    font_dict = pikepdf.Dictionary({
-        "/Subtype": pikepdf.Name("/Type1"),
-        "/BaseFont": pikepdf.Name("/ABCDEE+TeX_CM_Maths_Symbols"),
-    })
+    font_dict = pikepdf.Dictionary(
+        {
+            "/Subtype": pikepdf.Name("/Type1"),
+            "/BaseFont": pikepdf.Name("/ABCDEE+TeX_CM_Maths_Symbols"),
+        }
+    )
 
     monkeypatch.setattr(
-        orchestrator,
+        encoding,
         "_cff_builtin_encoding_map",
         lambda font_bytes: {14: "◦"} if font_bytes == b"cff" else {},
     )
@@ -1729,13 +1824,15 @@ def test_simple_font_policy_allows_embedded_cff_when_builtin_encoding_decodes(mo
 
 
 def test_simple_type1_fonts_use_embedded_cff_encoding_when_available(monkeypatch):
-    font_dict = pikepdf.Dictionary({
-        "/Subtype": pikepdf.Name("/Type1"),
-        "/BaseFont": pikepdf.Name("/ABCDEE+TeX_CM_Maths_Symbols"),
-    })
+    font_dict = pikepdf.Dictionary(
+        {
+            "/Subtype": pikepdf.Name("/Type1"),
+            "/BaseFont": pikepdf.Name("/ABCDEE+TeX_CM_Maths_Symbols"),
+        }
+    )
 
     monkeypatch.setattr(
-        orchestrator,
+        encoding,
         "_cff_builtin_encoding_map",
         lambda font_bytes: {14: "◦", 20: "≤"} if font_bytes == b"cff" else {},
     )
@@ -1746,24 +1843,32 @@ def test_simple_type1_fonts_use_embedded_cff_encoding_when_available(monkeypatch
 
 
 def test_local_embed_support_includes_standard_type1_fonts():
-    font_dict = pikepdf.Dictionary({
-        "/Subtype": pikepdf.Name("/Type1"),
-        "/BaseFont": pikepdf.Name("/Times-Roman"),
-    })
+    font_dict = pikepdf.Dictionary(
+        {
+            "/Subtype": pikepdf.Name("/Type1"),
+            "/BaseFont": pikepdf.Name("/Times-Roman"),
+        }
+    )
 
     assert _local_embed_support_kind(font_dict) == "type1_standard14"
 
 
 def test_local_font_program_uses_type1_fontfile_for_standard14(monkeypatch):
-    font_dict = pikepdf.Dictionary({
-        "/Subtype": pikepdf.Name("/Type1"),
-        "/BaseFont": pikepdf.Name("/Times-Roman"),
-    })
+    font_dict = pikepdf.Dictionary(
+        {
+            "/Subtype": pikepdf.Name("/Type1"),
+            "/BaseFont": pikepdf.Name("/Times-Roman"),
+        }
+    )
 
     monkeypatch.setattr(
-        orchestrator,
+        programs,
         "_ghostscript_type1_font_program",
-        lambda font_name: (b"%!PS-AdobeFont-1.0", "NimbusRoman-Regular", {"Length1": 10, "Length2": 20, "Length3": 0}),
+        lambda font_name: (
+            b"%!PS-AdobeFont-1.0",
+            "NimbusRoman-Regular",
+            {"Length1": 10, "Length2": 20, "Length3": 0},
+        ),
     )
 
     font_bytes, matched_name, fontfile_key, lengths = _local_font_program(font_dict, "Times-Roman")
@@ -1795,16 +1900,16 @@ def test_ghostscript_type1_descriptor_accepts_float_like_afm_metrics(tmp_path, m
     metrics_dir = tmp_path / "afm"
     metrics_dir.mkdir()
     (metrics_dir / "Times-Roman.afm").write_text("")
-    monkeypatch.setattr(orchestrator, "_ghostscript_font_metrics_dir", lambda: metrics_dir)
+    monkeypatch.setattr(programs, "_ghostscript_font_metrics_dir", lambda: metrics_dir)
     monkeypatch.setitem(
-        orchestrator.GHOSTSCRIPT_TYPE1_DESCRIPTOR_SPECS,
+        programs.GHOSTSCRIPT_TYPE1_DESCRIPTOR_SPECS,
         "timesroman",
         {"afm": "Times-Roman.afm", "flags": 34},
     )
     monkeypatch.setattr(afmLib, "AFM", _FakeAFM)
-    orchestrator._ghostscript_type1_descriptor.cache_clear()
+    programs._ghostscript_type1_descriptor.cache_clear()
 
-    descriptor = orchestrator._ghostscript_type1_descriptor("Times-Roman")
+    descriptor = programs._ghostscript_type1_descriptor("Times-Roman")
 
     assert descriptor is not None
     assert descriptor["ItalicAngle"] == 0
@@ -1821,15 +1926,21 @@ def test_font_diagnostics_can_skip_used_code_analysis(tmp_path, monkeypatch):
 
     pdf = pikepdf.new()
     page = pdf.add_blank_page()
-    page.obj["/Resources"] = pikepdf.Dictionary({
-        "/Font": pikepdf.Dictionary({
-            "/F1": pikepdf.Dictionary({
-                "/Type": pikepdf.Name("/Font"),
-                "/Subtype": pikepdf.Name("/Type1"),
-                "/BaseFont": pikepdf.Name("/Times-Roman"),
-            }),
-        }),
-    })
+    page.obj["/Resources"] = pikepdf.Dictionary(
+        {
+            "/Font": pikepdf.Dictionary(
+                {
+                    "/F1": pikepdf.Dictionary(
+                        {
+                            "/Type": pikepdf.Name("/Font"),
+                            "/Subtype": pikepdf.Name("/Type1"),
+                            "/BaseFont": pikepdf.Name("/Times-Roman"),
+                        }
+                    ),
+                }
+            ),
+        }
+    )
     pdf.save(str(input_pdf))
 
     parse_calls = {"count": 0}
@@ -1930,21 +2041,27 @@ def test_embed_system_fonts_creates_descriptor_for_standard_type1(tmp_path, monk
     pdf = pikepdf.new()
     page = pdf.add_blank_page()
     page_obj = page.obj
-    font_dict = pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Font"),
-        "/Subtype": pikepdf.Name("/Type1"),
-        "/BaseFont": pikepdf.Name("/Times-Roman"),
-        "/Encoding": pikepdf.Name("/WinAnsiEncoding"),
-    })
-    page_obj["/Resources"] = pikepdf.Dictionary({
-        "/Font": pikepdf.Dictionary({
-            "/F1": font_dict,
-        })
-    })
+    font_dict = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/Font"),
+            "/Subtype": pikepdf.Name("/Type1"),
+            "/BaseFont": pikepdf.Name("/Times-Roman"),
+            "/Encoding": pikepdf.Name("/WinAnsiEncoding"),
+        }
+    )
+    page_obj["/Resources"] = pikepdf.Dictionary(
+        {
+            "/Font": pikepdf.Dictionary(
+                {
+                    "/F1": font_dict,
+                }
+            )
+        }
+    )
     pdf.save(str(input_pdf))
 
     monkeypatch.setattr(
-        orchestrator,
+        embedding,
         "_ghostscript_type1_descriptor",
         lambda font_name: {
             "Flags": 34,
@@ -1961,7 +2078,7 @@ def test_embed_system_fonts_creates_descriptor_for_standard_type1(tmp_path, monk
         },
     )
     monkeypatch.setattr(
-        orchestrator,
+        embedding,
         "_local_font_program",
         lambda font_dict, font_name, descendant_subtype=None: (
             b"%!PS-AdobeFont-1.0",
@@ -1971,7 +2088,7 @@ def test_embed_system_fonts_creates_descriptor_for_standard_type1(tmp_path, monk
         ),
     )
 
-    ok, message, stats = orchestrator._embed_system_fonts_sync(input_pdf, output_pdf)
+    ok, message, stats = embedding._embed_system_fonts_sync(input_pdf, output_pdf)
 
     assert ok is True
     assert "Local font embedding completed" in message
@@ -2001,40 +2118,52 @@ def test_embed_system_fonts_preserves_existing_type1_widths(tmp_path, monkeypatc
     pdf = pikepdf.new()
     page = pdf.add_blank_page()
     page_obj = page.obj
-    descriptor = pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/FontDescriptor"),
-        "/FontName": pikepdf.Name("/Helvetica"),
-        "/Flags": 32,
-        "/ItalicAngle": 0,
-        "/Ascent": 718,
-        "/Descent": -207,
-        "/CapHeight": 718,
-        "/StemV": 80,
-        "/FontBBox": pikepdf.Array([-166, -225, 1000, 931]),
-    })
-    font_dict = pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Font"),
-        "/Subtype": pikepdf.Name("/Type1"),
-        "/BaseFont": pikepdf.Name("/Helvetica"),
-        "/Encoding": pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/Encoding"),
-            "/BaseEncoding": pikepdf.Name("/WinAnsiEncoding"),
-            "/Differences": pikepdf.Array([1, pikepdf.Name("/A"), pikepdf.Name("/B"), pikepdf.Name("/C")]),
-        }),
-        "/FirstChar": 0,
-        "/LastChar": 3,
-        "/Widths": pikepdf.Array([278, 667, 722, 611]),
-        "/FontDescriptor": descriptor,
-    })
-    page_obj["/Resources"] = pikepdf.Dictionary({
-        "/Font": pikepdf.Dictionary({
-            "/F1": font_dict,
-        })
-    })
+    descriptor = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/FontDescriptor"),
+            "/FontName": pikepdf.Name("/Helvetica"),
+            "/Flags": 32,
+            "/ItalicAngle": 0,
+            "/Ascent": 718,
+            "/Descent": -207,
+            "/CapHeight": 718,
+            "/StemV": 80,
+            "/FontBBox": pikepdf.Array([-166, -225, 1000, 931]),
+        }
+    )
+    font_dict = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/Font"),
+            "/Subtype": pikepdf.Name("/Type1"),
+            "/BaseFont": pikepdf.Name("/Helvetica"),
+            "/Encoding": pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/Encoding"),
+                    "/BaseEncoding": pikepdf.Name("/WinAnsiEncoding"),
+                    "/Differences": pikepdf.Array(
+                        [1, pikepdf.Name("/A"), pikepdf.Name("/B"), pikepdf.Name("/C")]
+                    ),
+                }
+            ),
+            "/FirstChar": 0,
+            "/LastChar": 3,
+            "/Widths": pikepdf.Array([278, 667, 722, 611]),
+            "/FontDescriptor": descriptor,
+        }
+    )
+    page_obj["/Resources"] = pikepdf.Dictionary(
+        {
+            "/Font": pikepdf.Dictionary(
+                {
+                    "/F1": font_dict,
+                }
+            )
+        }
+    )
     pdf.save(str(input_pdf))
 
     monkeypatch.setattr(
-        orchestrator,
+        embedding,
         "_ghostscript_type1_descriptor",
         lambda font_name: {
             "Flags": 32,
@@ -2051,7 +2180,7 @@ def test_embed_system_fonts_preserves_existing_type1_widths(tmp_path, monkeypatc
         },
     )
     monkeypatch.setattr(
-        orchestrator,
+        embedding,
         "_local_font_program",
         lambda font_dict, font_name, descendant_subtype=None: (
             b"%!PS-AdobeFont-1.0",
@@ -2061,7 +2190,7 @@ def test_embed_system_fonts_preserves_existing_type1_widths(tmp_path, monkeypatc
         ),
     )
 
-    ok, _, _ = orchestrator._embed_system_fonts_sync(input_pdf, output_pdf)
+    ok, _, _ = embedding._embed_system_fonts_sync(input_pdf, output_pdf)
 
     assert ok is True
 
@@ -2074,48 +2203,61 @@ def test_embed_system_fonts_preserves_existing_type1_widths(tmp_path, monkeypatc
 
 
 def test_simple_font_zero_byte_repair_candidate_only_allows_code_zero_residue():
-    font_dict = pikepdf.Dictionary({
-        "/Subtype": pikepdf.Name("/Type1"),
-        "/BaseFont": pikepdf.Name("/Times-Roman"),
-        "/Encoding": pikepdf.Name("/WinAnsiEncoding"),
-    })
+    font_dict = pikepdf.Dictionary(
+        {
+            "/Subtype": pikepdf.Name("/Type1"),
+            "/BaseFont": pikepdf.Name("/Times-Roman"),
+            "/Encoding": pikepdf.Name("/WinAnsiEncoding"),
+        }
+    )
 
     generated_map = _simple_font_unicode_map(font_dict, None)
 
-    assert _simple_font_zero_byte_repair_candidate(
-        font_dict,
-        used_codes={0, 65},
-        existing_map={},
-        generated_map=generated_map,
-    ) is True
-    assert _simple_font_zero_byte_repair_candidate(
-        font_dict,
-        used_codes={0, 129, 65},
-        existing_map={},
-        generated_map=generated_map,
-    ) is False
+    assert (
+        _simple_font_zero_byte_repair_candidate(
+            font_dict,
+            used_codes={0, 65},
+            existing_map={},
+            generated_map=generated_map,
+        )
+        is True
+    )
+    assert (
+        _simple_font_zero_byte_repair_candidate(
+            font_dict,
+            used_codes={0, 129, 65},
+            existing_map={},
+            generated_map=generated_map,
+        )
+        is False
+    )
 
 
 def test_simple_font_zero_byte_candidate_uses_embedded_cff_map(monkeypatch):
-    font_dict = pikepdf.Dictionary({
-        "/Subtype": pikepdf.Name("/Type1"),
-        "/BaseFont": pikepdf.Name("/ABCDEE+TeX_CM_Maths_Symbols"),
-    })
+    font_dict = pikepdf.Dictionary(
+        {
+            "/Subtype": pikepdf.Name("/Type1"),
+            "/BaseFont": pikepdf.Name("/ABCDEE+TeX_CM_Maths_Symbols"),
+        }
+    )
 
     monkeypatch.setattr(
-        orchestrator,
+        encoding,
         "_cff_builtin_encoding_map",
         lambda font_bytes: {14: "◦", 20: "≤", 135: "+", 136: "="} if font_bytes == b"cff" else {},
     )
 
     generated_map = _simple_font_unicode_map(font_dict, b"cff")
 
-    assert _simple_font_zero_byte_repair_candidate(
-        font_dict,
-        used_codes={0, 14, 20, 135, 136},
-        existing_map={},
-        generated_map=generated_map,
-    ) is True
+    assert (
+        _simple_font_zero_byte_repair_candidate(
+            font_dict,
+            used_codes={0, 14, 20, 135, 136},
+            existing_map={},
+            generated_map=generated_map,
+        )
+        is True
+    )
 
 
 def test_zero_byte_text_operand_sanitizer_strips_only_string_bytes():
@@ -2202,7 +2344,9 @@ def test_grounded_text_candidates_do_not_block_until_llm_confirms():
 
     assert updated_tasks == []
     assert updated_report["passed"] is True
-    grounded = next(check for check in updated_report["checks"] if check["check"] == "grounded_text_fidelity")
+    grounded = next(
+        check for check in updated_report["checks"] if check["check"] == "grounded_text_fidelity"
+    )
     assert grounded["status"] == "pass"
     assert grounded["metrics"]["candidate_blocks"] == 1
     assert grounded["metrics"]["confirmed_blocks"] == 0
@@ -2266,7 +2410,9 @@ def test_grounded_text_candidates_block_when_llm_confirms():
     assert updated_tasks[0]["metadata"]["grounded_text_llm_adjudicated"] is True
     assert updated_tasks[0]["metadata"]["grounded_target_count"] == 1
     assert updated_report["passed"] is False
-    grounded = next(check for check in updated_report["checks"] if check["check"] == "grounded_text_fidelity")
+    grounded = next(
+        check for check in updated_report["checks"] if check["check"] == "grounded_text_fidelity"
+    )
     assert grounded["status"] == "fail"
     assert grounded["metrics"]["confirmed_blocks"] == 1
 
@@ -2289,48 +2435,60 @@ def test_has_grounded_text_candidate_task_detects_only_grounded_candidate():
 
 
 def test_auto_apply_form_intelligence_rejects_technical_or_unchanged_labels():
-    assert _should_auto_apply_form_intelligence(
-        {
-            "confidence": "high",
-            "suggested_action": "set_field_label",
-            "accessible_label": "f1_01[0]",
-            "current_field_name": "f1_01[0]",
-            "current_accessible_name": "",
-        }
-    ) is False
+    assert (
+        _should_auto_apply_form_intelligence(
+            {
+                "confidence": "high",
+                "suggested_action": "set_field_label",
+                "accessible_label": "f1_01[0]",
+                "current_field_name": "f1_01[0]",
+                "current_accessible_name": "",
+            }
+        )
+        is False
+    )
 
-    assert _should_auto_apply_form_intelligence(
-        {
-            "confidence": "high",
-            "suggested_action": "set_field_label",
-            "accessible_label": "First name",
-            "current_field_name": "f1_01[0]",
-            "current_accessible_name": "First name",
-        }
-    ) is False
+    assert (
+        _should_auto_apply_form_intelligence(
+            {
+                "confidence": "high",
+                "suggested_action": "set_field_label",
+                "accessible_label": "First name",
+                "current_field_name": "f1_01[0]",
+                "current_accessible_name": "First name",
+            }
+        )
+        is False
+    )
 
-    assert _should_auto_apply_form_intelligence(
-        {
-            "confidence": "high",
-            "suggested_action": "set_field_label",
-            "accessible_label": "First name and middle initial",
-            "current_field_name": "f1_01[0]",
-            "current_accessible_name": "f1_01[0]",
-        }
-    ) is True
+    assert (
+        _should_auto_apply_form_intelligence(
+            {
+                "confidence": "high",
+                "suggested_action": "set_field_label",
+                "accessible_label": "First name and middle initial",
+                "current_field_name": "f1_01[0]",
+                "current_accessible_name": "f1_01[0]",
+            }
+        )
+        is True
+    )
 
-    assert _should_auto_apply_form_intelligence(
-        {
-            "confidence": "high",
-            "suggested_action": "set_field_label",
-            "accessible_label": (
-                "If treating a nonresident alien or dual-status alien spouse as a U.S. "
-                "resident for the entire tax year, check the box and enter their name"
-            ),
-            "current_field_name": "c1_9[0]",
-            "current_accessible_name": "",
-        }
-    ) is True
+    assert (
+        _should_auto_apply_form_intelligence(
+            {
+                "confidence": "high",
+                "suggested_action": "set_field_label",
+                "accessible_label": (
+                    "If treating a nonresident alien or dual-status alien spouse as a U.S. "
+                    "resident for the entire tax year, check the box and enter their name"
+                ),
+                "current_field_name": "c1_9[0]",
+                "current_accessible_name": "",
+            }
+        )
+        is True
+    )
 
 
 def test_form_targets_for_intelligence_prefers_local_nearby_fields(monkeypatch, tmp_path):
@@ -2392,7 +2550,9 @@ def test_form_targets_for_intelligence_prefers_local_nearby_fields(monkeypatch, 
     monkeypatch.setattr(
         semantic_pretag_policy,
         "collect_nearby_blocks",
-        lambda *args, **kwargs: [{"review_id": "review-1", "type": "paragraph", "text": "Nearby label"}],
+        lambda *args, **kwargs: [
+            {"review_id": "review-1", "type": "paragraph", "text": "Nearby label"}
+        ],
     )
 
     targets = semantic_pretag_policy.form_targets_for_intelligence(
@@ -2475,7 +2635,9 @@ def test_form_targets_for_intelligence_includes_enclosing_context(monkeypatch, t
 
 
 @pytest.mark.asyncio
-async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(tmp_path, monkeypatch):
+async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(
+    tmp_path, monkeypatch
+):
     source_pdf = tmp_path / "source.pdf"
     source_pdf.write_bytes(b"%PDF-1.4\n% test\n")
 
@@ -2488,7 +2650,11 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
             "model": "qwen3-vl-235b-a22b-instruct",
         }
 
-    monkeypatch.setattr(font_intelligence_auto, "generate_remediation_intelligence", _generate_remediation_intelligence)
+    monkeypatch.setattr(
+        font_intelligence_auto,
+        "generate_remediation_intelligence",
+        _generate_remediation_intelligence,
+    )
     monkeypatch.setattr(
         font_intelligence_auto,
         "select_auto_font_resolution",
@@ -2511,7 +2677,9 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
 
     current_validation = SimpleNamespace(
         compliant=False,
-        violations=[SimpleNamespace(rule_id="ISO 14289-1:2014-7.21.7-1", severity="error", count=3)],
+        violations=[
+            SimpleNamespace(rule_id="ISO 14289-1:2014-7.21.7-1", severity="error", count=3)
+        ],
         raw_report={},
     )
     improved_validation = SimpleNamespace(
@@ -2548,7 +2716,12 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
         }
     ]
 
-    audit, candidate_validation, candidate_output, metadata_overrides = await _attempt_auto_llm_font_map(
+    (
+        audit,
+        candidate_validation,
+        candidate_output,
+        metadata_overrides,
+    ) = await _attempt_auto_llm_font_map(
         job=job,
         settings=_settings(auto_apply_llm_font_map=True),
         output_pdf=source_pdf,
@@ -2560,11 +2733,16 @@ async def test_attempt_auto_llm_font_map_applies_only_when_validation_improves(t
     assert audit["unicode_text"] == "►"
     assert candidate_validation is improved_validation
     assert candidate_output is not None and candidate_output.exists()
-    assert metadata_overrides[("font_text_fidelity", "validation")]["llm_auto_font_map"]["applied"] is True
+    assert (
+        metadata_overrides[("font_text_fidelity", "validation")]["llm_auto_font_map"]["applied"]
+        is True
+    )
 
 
 @pytest.mark.asyncio
-async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_validation_improves(tmp_path, monkeypatch):
+async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_validation_improves(
+    tmp_path, monkeypatch
+):
     source_pdf = tmp_path / "source.pdf"
     source_pdf.write_bytes(b"%PDF-1.4\n% test\n")
 
@@ -2575,7 +2753,9 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
         async def close(self):
             return None
 
-    monkeypatch.setattr(font_intelligence_auto, "make_llm_client", lambda settings: _FakeLlmClient())
+    monkeypatch.setattr(
+        font_intelligence_auto, "make_llm_client", lambda settings: _FakeLlmClient()
+    )
 
     async def _generate_remediation_intelligence(**kwargs):
         return {
@@ -2586,7 +2766,11 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
             "model": "qwen3-vl-235b-a22b-instruct",
         }
 
-    monkeypatch.setattr(font_intelligence_auto, "generate_remediation_intelligence", _generate_remediation_intelligence)
+    monkeypatch.setattr(
+        font_intelligence_auto,
+        "generate_remediation_intelligence",
+        _generate_remediation_intelligence,
+    )
     monkeypatch.setattr(
         font_intelligence_auto,
         "select_auto_font_resolution",
@@ -2612,7 +2796,9 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
 
     current_validation = SimpleNamespace(
         compliant=False,
-        violations=[SimpleNamespace(rule_id="ISO 14289-1:2014-7.21.7-1", severity="error", count=3)],
+        violations=[
+            SimpleNamespace(rule_id="ISO 14289-1:2014-7.21.7-1", severity="error", count=3)
+        ],
         raw_report={},
     )
     improved_validation = SimpleNamespace(
@@ -2650,7 +2836,12 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
         }
     ]
 
-    audit, candidate_validation, candidate_output, metadata_overrides = await _attempt_auto_llm_font_map(
+    (
+        audit,
+        candidate_validation,
+        candidate_output,
+        metadata_overrides,
+    ) = await _attempt_auto_llm_font_map(
         job=job,
         settings=_settings(auto_apply_llm_font_map=True),
         output_pdf=source_pdf,
@@ -2662,11 +2853,18 @@ async def test_attempt_auto_llm_font_map_applies_decorative_artifact_when_valida
     assert audit["resolution_type"] == "artifact"
     assert candidate_validation is improved_validation
     assert candidate_output is not None and candidate_output.exists()
-    assert metadata_overrides[("font_text_fidelity", "validation")]["llm_auto_font_map"]["resolution_type"] == "artifact"
+    assert (
+        metadata_overrides[("font_text_fidelity", "validation")]["llm_auto_font_map"][
+            "resolution_type"
+        ]
+        == "artifact"
+    )
 
 
 @pytest.mark.asyncio
-async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_does_not_improve(tmp_path, monkeypatch):
+async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_does_not_improve(
+    tmp_path, monkeypatch
+):
     source_pdf = tmp_path / "source.pdf"
     source_pdf.write_bytes(b"%PDF-1.4\n% test\n")
 
@@ -2677,7 +2875,9 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
         async def close(self):
             return None
 
-    monkeypatch.setattr(font_intelligence_auto, "make_llm_client", lambda settings: _FakeLlmClient())
+    monkeypatch.setattr(
+        font_intelligence_auto, "make_llm_client", lambda settings: _FakeLlmClient()
+    )
 
     async def _generate_remediation_intelligence(**kwargs):
         return {
@@ -2688,7 +2888,11 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
             "model": "qwen3-vl-235b-a22b-instruct",
         }
 
-    monkeypatch.setattr(font_intelligence_auto, "generate_remediation_intelligence", _generate_remediation_intelligence)
+    monkeypatch.setattr(
+        font_intelligence_auto,
+        "generate_remediation_intelligence",
+        _generate_remediation_intelligence,
+    )
     monkeypatch.setattr(
         font_intelligence_auto,
         "select_auto_font_resolution",
@@ -2719,12 +2923,16 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
 
     current_validation = SimpleNamespace(
         compliant=False,
-        violations=[SimpleNamespace(rule_id="ISO 14289-1:2014-7.21.7-1", severity="error", count=3)],
+        violations=[
+            SimpleNamespace(rule_id="ISO 14289-1:2014-7.21.7-1", severity="error", count=3)
+        ],
         raw_report={},
     )
     unchanged_validation = SimpleNamespace(
         compliant=False,
-        violations=[SimpleNamespace(rule_id="ISO 14289-1:2014-7.21.7-1", severity="error", count=3)],
+        violations=[
+            SimpleNamespace(rule_id="ISO 14289-1:2014-7.21.7-1", severity="error", count=3)
+        ],
         raw_report={},
     )
     improved_validation = SimpleNamespace(
@@ -2764,7 +2972,12 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
         }
     ]
 
-    audit, candidate_validation, candidate_output, metadata_overrides = await _attempt_auto_llm_font_map(
+    (
+        audit,
+        candidate_validation,
+        candidate_output,
+        metadata_overrides,
+    ) = await _attempt_auto_llm_font_map(
         job=job,
         settings=_settings(auto_apply_llm_font_map=True),
         output_pdf=source_pdf,
@@ -2776,28 +2989,48 @@ async def test_attempt_auto_llm_font_map_falls_back_to_font_map_when_artifact_do
     assert audit["resolution_type"] == "font_map_fallback"
     assert candidate_validation is improved_validation
     assert candidate_output is not None and candidate_output.exists()
-    assert metadata_overrides[("font_text_fidelity", "validation")]["llm_auto_font_map"]["resolution_type"] == "font_map_fallback"
+    assert (
+        metadata_overrides[("font_text_fidelity", "validation")]["llm_auto_font_map"][
+            "resolution_type"
+        ]
+        == "font_map_fallback"
+    )
 
 
 def test_embed_lane_skips_local_when_no_supported_candidates():
-    assert _embed_lane_should_skip_local({
-        "summary": {
-            "unembedded_fonts": 1,
-            "local_embed_candidate_count": 0,
-        }
-    }) is True
-    assert _embed_lane_should_skip_local({
-        "summary": {
-            "unembedded_fonts": 1,
-            "local_embed_candidate_count": 1,
-        }
-    }) is False
-    assert _embed_lane_should_skip_local({
-        "summary": {
-            "unembedded_fonts": 0,
-            "local_embed_candidate_count": 0,
-        }
-    }) is False
+    assert (
+        _embed_lane_should_skip_local(
+            {
+                "summary": {
+                    "unembedded_fonts": 1,
+                    "local_embed_candidate_count": 0,
+                }
+            }
+        )
+        is True
+    )
+    assert (
+        _embed_lane_should_skip_local(
+            {
+                "summary": {
+                    "unembedded_fonts": 1,
+                    "local_embed_candidate_count": 1,
+                }
+            }
+        )
+        is False
+    )
+    assert (
+        _embed_lane_should_skip_local(
+            {
+                "summary": {
+                    "unembedded_fonts": 0,
+                    "local_embed_candidate_count": 0,
+                }
+            }
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -2821,12 +3054,12 @@ async def test_font_dict_lane_reuses_existing_tags(tmp_path, monkeypatch):
     async def fail_tag_pdf(*args, **kwargs):
         raise AssertionError("tag_pdf should not run for non-structural font repairs")
 
-    monkeypatch.setattr(orchestrator, "create_job_dir", lambda job_id: tmp_path)
-    monkeypatch.setattr(orchestrator, "_repair_pdf_font_dicts", fake_repair)
-    monkeypatch.setattr(orchestrator, "validate_pdf", fake_validate)
-    monkeypatch.setattr(orchestrator, "tag_pdf", fail_tag_pdf)
+    monkeypatch.setattr(lanes, "create_job_dir", lambda job_id: tmp_path)
+    monkeypatch.setattr(lanes, "_repair_pdf_font_dicts", fake_repair)
+    monkeypatch.setattr(lanes, "validate_pdf", fake_validate)
+    monkeypatch.setattr(lanes, "tag_pdf", fail_tag_pdf)
 
-    result = await orchestrator._attempt_font_lane(
+    result = await lanes._attempt_font_lane(
         job_id="job-1",
         job=SimpleNamespace(original_filename="sample.pdf", ocr_language=None),
         settings=_settings(),
@@ -2850,7 +3083,9 @@ async def test_embed_lane_skips_local_attempt_when_diagnostics_rule_it_out(tmp_p
     tagged_pdf.write_bytes(b"%PDF-1.7\n")
 
     async def fail_local_embed(*args, **kwargs):
-        raise AssertionError("_embed_system_fonts should not run when diagnostics skip local embedding")
+        raise AssertionError(
+            "_embed_system_fonts should not run when diagnostics skip local embedding"
+        )
 
     async def fake_gs_embed(input_path, output_path, **kwargs):
         output_path.write_bytes(b"%PDF-1.7\n")
@@ -2882,19 +3117,23 @@ async def test_embed_lane_skips_local_attempt_when_diagnostics_rule_it_out(tmp_p
             validated_path=Path(pdf_path),
         )
 
-    monkeypatch.setattr(orchestrator, "create_job_dir", lambda job_id: tmp_path)
-    monkeypatch.setattr(orchestrator, "_inspect_font_diagnostics", lambda *args, **kwargs: {
-        "summary": {
-            "unembedded_fonts": 1,
-            "local_embed_candidate_count": 0,
-        }
-    })
-    monkeypatch.setattr(orchestrator, "_embed_system_fonts", fail_local_embed)
-    monkeypatch.setattr(orchestrator, "_rewrite_pdf_with_ghostscript_embed", fake_gs_embed)
-    monkeypatch.setattr(orchestrator, "tag_pdf", fake_tag_pdf)
-    monkeypatch.setattr(orchestrator, "validate_pdf", fake_validate)
+    monkeypatch.setattr(lanes, "create_job_dir", lambda job_id: tmp_path)
+    monkeypatch.setattr(
+        lanes,
+        "_inspect_font_diagnostics",
+        lambda *args, **kwargs: {
+            "summary": {
+                "unembedded_fonts": 1,
+                "local_embed_candidate_count": 0,
+            }
+        },
+    )
+    monkeypatch.setattr(lanes, "_embed_system_fonts", fail_local_embed)
+    monkeypatch.setattr(lanes, "_rewrite_pdf_with_ghostscript_embed", fake_gs_embed)
+    monkeypatch.setattr(lanes, "tag_pdf", fake_tag_pdf)
+    monkeypatch.setattr(lanes, "validate_pdf", fake_validate)
 
-    result = await orchestrator._attempt_font_lane(
+    result = await lanes._attempt_font_lane(
         job_id="job-embed",
         job=SimpleNamespace(original_filename="sample.pdf", ocr_language=None),
         settings=_settings(),
@@ -2925,7 +3164,9 @@ async def test_ocr_lane_refreshes_structure_before_retag(tmp_path, monkeypatch):
         return SimpleNamespace(success=True, output_path=ocr_pdf, skipped=False, message="")
 
     async def fake_extract_structure(input_path, job_dir):
-        return SimpleNamespace(document_json={"elements": [{"type": "paragraph", "text": "fresh", "page": 0}]})
+        return SimpleNamespace(
+            document_json={"elements": [{"type": "paragraph", "text": "fresh", "page": 0}]}
+        )
 
     async def fake_tag_pdf(*args, **kwargs):
         captured["structure_json"] = kwargs["structure_json"]
@@ -2954,13 +3195,13 @@ async def test_ocr_lane_refreshes_structure_before_retag(tmp_path, monkeypatch):
             validated_path=Path(pdf_path),
         )
 
-    monkeypatch.setattr(orchestrator, "create_job_dir", lambda job_id: tmp_path)
-    monkeypatch.setattr(orchestrator, "run_ocr", fake_run_ocr)
-    monkeypatch.setattr(orchestrator, "extract_structure", fake_extract_structure)
-    monkeypatch.setattr(orchestrator, "tag_pdf", fake_tag_pdf)
-    monkeypatch.setattr(orchestrator, "validate_pdf", fake_validate)
+    monkeypatch.setattr(lanes, "create_job_dir", lambda job_id: tmp_path)
+    monkeypatch.setattr(lanes, "run_ocr", fake_run_ocr)
+    monkeypatch.setattr(lanes, "extract_structure", fake_extract_structure)
+    monkeypatch.setattr(lanes, "tag_pdf", fake_tag_pdf)
+    monkeypatch.setattr(lanes, "validate_pdf", fake_validate)
 
-    result = await orchestrator._attempt_font_lane(
+    result = await lanes._attempt_font_lane(
         job_id="job-ocr",
         job=SimpleNamespace(original_filename="sample.pdf", ocr_language=None),
         settings=_settings(),
