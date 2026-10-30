@@ -2041,6 +2041,11 @@ def _is_pdf_mapping(obj) -> bool:
     return obj is not None and hasattr(obj, "get") and hasattr(obj, "keys")
 
 
+def _is_form_xobject(obj) -> bool:
+    """A Form XObject is a stream, not a bare dictionary (ISO 32000-1, 8.10)."""
+    return isinstance(obj, pikepdf.Stream) and obj.get("/Subtype") == pikepdf.Name("/Form")
+
+
 def _local_embed_support_kind(font_dict, descendant_subtype=None) -> str:
     import pikepdf
 
@@ -3514,12 +3519,12 @@ def _inspect_font_diagnostics(
 
                 if op == "Do" and operands and isinstance(xobjects, pikepdf.Dictionary):
                     xobject = _resolve_dictionary(xobjects.get(operands[0]))
-                    if not isinstance(xobject, pikepdf.Dictionary):
-                        continue
-                    if xobject.get("/Subtype") != pikepdf.Name("/Form"):
+                    if not _is_form_xobject(xobject):
                         continue
                     child_resources = _resolve_dictionary(xobject.get("/Resources")) or resources
-                    _collect_used_simple_font_codes(xobject, child_resources)
+                    _collect_used_simple_font_codes(
+                        xobject, child_resources, target_font_keys=target_font_keys
+                    )
 
         def _touch_profile(font_dict, *, descendant_subtype=None, descriptor=None) -> None:
             font_key = _obj_key(font_dict)
@@ -4099,9 +4104,7 @@ def _repair_pdf_tounicode_sync(
 
             if op == "Do" and operands and isinstance(xobjects, pikepdf.Dictionary):
                 xobject = _resolve_dictionary(xobjects.get(operands[0]))
-                if not isinstance(xobject, pikepdf.Dictionary):
-                    continue
-                if xobject.get("/Subtype") != pikepdf.Name("/Form"):
+                if not _is_form_xobject(xobject):
                     continue
                 child_resources = _resolve_dictionary(xobject.get("/Resources")) or resources
                 _collect_used_simple_font_codes(xobject, child_resources)
@@ -4270,9 +4273,7 @@ def _repair_pdf_tounicode_sync(
                         changed = True
             elif op == "Do" and operands and isinstance(xobjects, pikepdf.Dictionary):
                 xobject = _resolve_dictionary(xobjects.get(operands[0]))
-                if isinstance(xobject, pikepdf.Dictionary) and xobject.get(
-                    "/Subtype"
-                ) == pikepdf.Name("/Form"):
+                if _is_form_xobject(xobject):
                     child_resources = _resolve_dictionary(xobject.get("/Resources")) or resources
                     _sanitize_simple_font_zero_bytes(pdf, xobject, child_resources)
 
