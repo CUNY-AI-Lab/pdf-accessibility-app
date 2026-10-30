@@ -48,6 +48,9 @@ class PageLedger:
 
 
 ledger = PageLedger()
+# docling-serve request options a bench run adds to the app's own
+# (``install_docling_options``); part of the docling cache key when set.
+extra_docling_options: dict[str, str] = {}
 
 
 def new_page() -> PageLedger:
@@ -111,6 +114,8 @@ def install_docling_cache(directory: Path) -> None:
             "include_figure_images": include_figure_images,
             "code": code,
         }
+        if extra_docling_options:
+            options["extra"] = dict(sorted(extra_docling_options.items()))
         key = docling_cache_key(pdf_path.read_bytes(), options, versions[base_url])
         path = directory / f"{key}.json.gz"
         started = time.monotonic()
@@ -135,6 +140,23 @@ def install_docling_cache(directory: Path) -> None:
         return doc_dict, figures
 
     structure._convert_via_docling_serve = cached_convert
+
+
+def install_docling_options(options: dict[str, str]) -> None:
+    """Add ``options`` to every conversion request the app sends docling-serve
+    (such as ``table_cell_matching=false``), overriding the app's value for
+    the same field."""
+    if not options:
+        return
+    extra_docling_options.update(options)
+    request = structure._docling_serve_request
+
+    async def request_with_options(client, method, url, **kwargs):
+        if method.upper() == "POST" and "/v1/convert/" in url and "data" in kwargs:
+            kwargs["data"] = {**kwargs["data"], **extra_docling_options}
+        return await request(client, method, url, **kwargs)
+
+    structure._docling_serve_request = request_with_options
 
 
 class CassetteMiss(RuntimeError):

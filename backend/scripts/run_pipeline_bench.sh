@@ -19,6 +19,15 @@
 #                calls go through a cassette in data/eval/cache/llm-cassette,
 #                replayed where it has them (--cassette-mode record|replay|strict).
 # --docling-device  the device docling-serve runs on, for capture.json.
+# --docling-url  the docling-serve the containers reach (default
+#                http://host.docker.internal:5001).
+# --docling-option key=value  adds a docling-serve request option to the
+#                app's own (e.g. table_cell_matching=false); repeatable.
+# --local-ocr <base url> <model>  recognizes text with a model on a local
+#                OpenAI-compatible server (OCR_ENGINE=gateway, no key); the AI
+#                steps get a model name the server refuses.
+# --ocr-plugin <file>  replaces app/pipeline/ocr_vlm_plugin.py with <file>.
+# --env KEY=VALUE  passes an environment variable to the containers.
 # Without --llm no model is reachable and the AI steps fail at once, so runs
 # compare the deterministic pipeline. Conversions are cached by PDF bytes,
 # request options and Docling version in data/eval/cache/docling-serve.
@@ -38,9 +47,13 @@ gateway_ocr=
 cassette_mode=replay
 docling_device=unknown
 docling_cache=1
+docling_url=http://host.docker.internal:5001
+docling_options=()
+local_ocr=
+local_ocr_model=
 # A long document takes docling-serve on a Mac GPU longer than production's
 # five minutes.
-env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001 -e DOCLING_SERVE_TIMEOUT=1800)
+env=(-e DOCLING_SERVE_TIMEOUT=1800)
 mounts=(-v "$bench:/bench" -v "$cache:/cache" -v "$backend/scripts:/app/backend/scripts:ro")
 while [ $# -gt 0 ]; do
   case $1 in
@@ -56,10 +69,22 @@ while [ $# -gt 0 ]; do
     --shards) shards=$2; shift ;;
     --docling-device) docling_device=$2; shift ;;
     --no-docling-cache) docling_cache= ;;
+    --docling-url) docling_url=$2; shift ;;
+    --docling-option) docling_options+=("$2"); shift ;;
+    --local-ocr) local_ocr=$2 local_ocr_model=$3; shift 2 ;;
+    --ocr-plugin)
+      mounts+=(-v "$(cd "$(dirname "$2")" && pwd)/$(basename "$2"):/app/backend/app/pipeline/ocr_vlm_plugin.py:ro")
+      env+=(-e "BENCH_OCR_PLUGIN=$(basename "$2")"); shift ;;
+    --env) env+=(-e "$2"); shift ;;
     *) echo "unknown flag $1" >&2; exit 2 ;;
   esac
   shift
 done
+env+=(-e "DOCLING_SERVE_URL=$docling_url")
+if [ ${#docling_options[@]} -gt 0 ]; then
+  json=$(python3 -c 'import json,sys; print(json.dumps(dict(a.split("=",1) for a in sys.argv[1:])))' "${docling_options[@]}")
+  env+=(-e "BENCH_DOCLING_OPTIONS=$json")
+fi
 # The Gateway key goes to the containers only when they call the Gateway.
 if [ -n "$gateway_ocr" ] || [ -n "$llm" ]; then
   LLM_API_KEY=$(security find-generic-password -s cail-gateway -w)
@@ -69,7 +94,12 @@ fi
 [ -n "$gateway_ocr" ] && env+=(-e OCR_ENGINE=gateway)
 bench_args=(--bench-dir /bench --candidate "$candidate" --subsets "$subset")
 [ -n "$docling_cache" ] && bench_args+=(--docling-cache /cache/docling-serve)
-if [ -n "$llm" ]; then
+if [ -n "$local_ocr" ]; then
+  # The AI steps reach the local server with a model name it refuses, so
+  # they fail at once, as without --llm.
+  env+=(-e OCR_ENGINE=gateway -e "OCR_MODEL=$local_ocr_model" -e "LLM_BASE_URL=$local_ocr"
+    -e LLM_API_KEY=local -e LLM_MODEL=ai-steps-off -e LLM_MAX_RETRIES=0 -e BENCH_AI_STEPS=off)
+elif [ -n "$llm" ]; then
   env+=(-e "LLM_BASE_URL=$gateway" -e "LLM_MODEL=$llm" -e BENCH_AI_STEPS="$llm")
   bench_args+=(--cassette /cache/llm-cassette --cassette-mode "$cassette_mode")
 else

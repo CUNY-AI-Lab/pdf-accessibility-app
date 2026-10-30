@@ -190,10 +190,19 @@ async def main() -> None:
 
     settings = get_settings()
     job_manager = JobManager()
+    # Extra docling-serve request options, as JSON (run_pipeline_bench.sh
+    # --docling-option); installed before the cache so they are in its key.
+    docling_options = json.loads(os.environ.get("BENCH_DOCLING_OPTIONS") or "{}")
+    bench_caches.install_docling_options(docling_options)
     if options.docling_cache:
         bench_caches.install_docling_cache(options.docling_cache)
     bench_caches.install_llm_cassette(options.cassette, options.cassette_mode)
     metadata = capture_metadata(settings)
+    if docling_options:
+        metadata["docling_serve"]["extra_options"] = docling_options
+    if os.environ.get("BENCH_OCR_PLUGIN"):
+        metadata["ocr"]["plugin"] = os.environ["BENCH_OCR_PLUGIN"]
+        metadata["ocr"]["model"] = settings.ocr_model
     with tempfile.TemporaryDirectory() as tmp:
         engine = create_async_engine(f"sqlite+aiosqlite:///{tmp}/bench.sqlite3")
         async with engine.begin() as conn:
@@ -210,6 +219,9 @@ async def main() -> None:
                 if tagged.exists() or failed.exists():
                     continue
                 tag_calls.clear()
+                # Names the page for an OCR plugin's side records (the OCR
+                # subprocess inherits the environment).
+                os.environ["BENCH_PAGE"] = f"{subset}/{pdf.stem}"
                 ledger = bench_caches.new_page()
                 started = time.monotonic()
                 output, status, error, job_id = await remediate(
