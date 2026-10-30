@@ -1,0 +1,63 @@
+{"report":{"buildInformation":{"releaseDetails":[{
+  "id" : "core",
+  "version" : "1.28.2",
+  "buildDate" : 1752610020000
+},{
+  "id" : "validation-model",
+  "version" : "1.28.2",
+  "buildDate" : 1752610260000
+},{
+  "id" : "gui",
+  "version" : "1.28.0",
+  "buildDate" : 1758002160000
+}]},"jobs":[{"itemDetails":{
+  "name" : "broken.pdf",
+  "size" : 27
+},"taskException":{
+  "exception" : "Couldn't parse stream",
+  "type" : "PARSE",
+  "duration" : {
+    "start" : 1793377095735,
+    "finish" : 1793377095752,
+    "difference" : 17,
+    "duration" : "00:00:00.017"
+  },
+  "executed" : true,
+  "success" : false,
+  "exceptionMessage" : "Exception: Couldn't parse stream caused by exception: Document doesn't contain startxref keyword"
+},"processingTime":{
+  "start" : 1793377095735,
+  "finish" : 1793377095752,
+  "difference" : 17,
+  "duration" : "00:00:00.017"
+}}],"batchSummary":{
+  "duration" : {
+    "start" : 1793377095717,
+    "finish" : 1793377095760,
+    "difference" : 43,
+    "duration" : "00:00:00.043"
+  },
+  "totalJobs" : 1,
+  "outOfMemory" : 0,
+  "veraExceptions" : 0,
+  "featuresSummary" : {
+    "failedJobCount" : 0,
+    "totalJobCount" : 0,
+    "successfulJobCount" : 0
+  },
+  "repairSummary" : {
+    "failedJobCount" : 0,
+    "totalJobCount" : 0,
+    "successfulJobCount" : 0
+  },
+  "multiJob" : false,
+  "failedEncryptedJobs" : 0,
+  "failedParsingJobs" : 1,
+  "validationSummary" : {
+    "failedJobCount" : 1,
+    "totalJobCount" : 1,
+    "nonCompliantPdfaCount" : 0,
+    "compliantPdfaCount" : 0,
+    "successfulJobCount" : 0
+  }
+}}}
