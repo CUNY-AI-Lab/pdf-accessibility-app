@@ -10,7 +10,8 @@ from pathlib import Path
 import pikepdf
 from pdfminer.high_level import extract_text
 
-from app.pipeline.orchestrator import _inspect_font_diagnostics, _repair_pdf_tounicode_sync
+from app.pipeline.fonts.diagnostics import _inspect_font_diagnostics
+from app.pipeline.fonts.tounicode import _repair_pdf_tounicode_sync
 from tests.pdf_fixtures import helvetica
 
 # Drawn through the form: "Hi", a stray zero byte, "there".

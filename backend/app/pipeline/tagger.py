@@ -30,6 +30,11 @@ from docling_parse.pdf_parser import DoclingPdfParser
 from PIL import Image
 
 from app.pipeline.element_text import accounts_for, readable
+from app.pipeline.fonts.resources import (
+    TAGGER_RESOURCES,
+    _has_embedded_font,
+    _iter_pdf_fonts,
+)
 from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.page_glyphs import MeasuredGlyph, MeasuredTextOp, PdfGlyphReader, union_bbox
@@ -4393,101 +4398,29 @@ def _normalize_type1_font_charsets(pdf: pikepdf.Pdf) -> int:
     pipelines. Removing an invalid CharSet is safer than keeping incorrect
     glyph metadata.
     """
-    seen_resources: set[tuple[int, int]] = set()
     seen_fonts: set[tuple[int, int]] = set()
-    seen_appearances: set[tuple[int, int]] = set()
     changes = 0
 
-    def _is_mapping_like(obj) -> bool:
-        return isinstance(obj, pikepdf.Dictionary) or (hasattr(obj, "keys") and hasattr(obj, "get"))
-
-    def _has_embedded_font(descriptor) -> bool:
-        if not isinstance(descriptor, pikepdf.Dictionary):
-            return False
-        return any(
-            key in descriptor
-            for key in (
-                pikepdf.Name("/FontFile"),
-                pikepdf.Name("/FontFile2"),
-                pikepdf.Name("/FontFile3"),
-            )
-        )
-
-    def _walk_resources(resources) -> None:
+    def _process_font(font_dict) -> None:
         nonlocal changes
-        resources = _resolve_dictionary(resources)
-        if not _is_mapping_like(resources):
+        font_key = _obj_key(font_dict)
+        if font_key and font_key in seen_fonts:
             return
-        resources_key = _obj_key(resources)
-        if resources_key and resources_key in seen_resources:
+        if font_key:
+            seen_fonts.add(font_key)
+
+        subtype = font_dict.get("/Subtype")
+        if subtype not in (pikepdf.Name("/Type1"), pikepdf.Name("/MMType1")):
             return
-        if resources_key:
-            seen_resources.add(resources_key)
-
-        fonts = _resolve_dictionary(resources.get("/Font"))
-        if _is_mapping_like(fonts):
-            for _, font_obj in fonts.items():
-                font_dict = _resolve_dictionary(font_obj)
-                if not _is_mapping_like(font_dict):
-                    continue
-                font_key = _obj_key(font_dict)
-                if font_key and font_key in seen_fonts:
-                    continue
-                if font_key:
-                    seen_fonts.add(font_key)
-
-                subtype = font_dict.get("/Subtype")
-                if subtype not in (pikepdf.Name("/Type1"), pikepdf.Name("/MMType1")):
-                    continue
-                descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
-                if not _has_embedded_font(descriptor):
-                    continue
-                if isinstance(descriptor, pikepdf.Dictionary) and pikepdf.Name("/CharSet") in descriptor:
-                    del descriptor[pikepdf.Name("/CharSet")]
-                    changes += 1
-
-        xobjects = _resolve_dictionary(resources.get("/XObject"))
-        if not _is_mapping_like(xobjects):
+        descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
+        if not _has_embedded_font(descriptor):
             return
-        for _, xobject in xobjects.items():
-            xobject_dict = _resolve_dictionary(xobject)
-            if not _is_mapping_like(xobject_dict):
-                continue
-            if xobject_dict.get("/Subtype") != pikepdf.Name("/Form"):
-                continue
-            _walk_resources(xobject_dict.get("/Resources"))
+        if isinstance(descriptor, pikepdf.Dictionary) and pikepdf.Name("/CharSet") in descriptor:
+            del descriptor[pikepdf.Name("/CharSet")]
+            changes += 1
 
-    def _walk_appearance_object(obj) -> None:
-        appearance_obj = _resolve_dictionary(obj)
-        if not _is_mapping_like(appearance_obj):
-            return
-        appearance_key = _obj_key(appearance_obj)
-        if appearance_key and appearance_key in seen_appearances:
-            return
-        if appearance_key:
-            seen_appearances.add(appearance_key)
-
-        _walk_resources(appearance_obj.get("/Resources"))
-        for key in ("/N", "/R", "/D"):
-            child = appearance_obj.get(key)
-            if child is not None:
-                _walk_appearance_object(child)
-
-    for page in pdf.pages:
-        _walk_resources(page.get("/Resources"))
-        annots = page.get("/Annots")
-        if isinstance(annots, pikepdf.Array):
-            for annot in annots:
-                ap = _resolve_dictionary(annot.get("/AP")) if hasattr(annot, "get") else None
-                if isinstance(ap, pikepdf.Dictionary):
-                    for key in ("/N", "/R", "/D"):
-                        child = ap.get(key)
-                        if child is not None:
-                            _walk_appearance_object(child)
-
-    acroform = _resolve_dictionary(pdf.Root.get("/AcroForm"))
-    if _is_mapping_like(acroform):
-        _walk_resources(acroform.get("/DR"))
+    for font_dict in _iter_pdf_fonts(pdf, policy=TAGGER_RESOURCES, object_key=_obj_key):
+        _process_font(font_dict)
 
     return changes
 
