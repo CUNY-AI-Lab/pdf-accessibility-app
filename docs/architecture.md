@@ -44,21 +44,21 @@ flowchart TD
 ## Session boundary
 
 The deployed app is for signed-in CUNY people. Doorway signs them in, checks
-Admission membership, and forwards signed identity legs; the Worker verifies
+Admission membership, and forwards signed identity tokens; the Worker verifies
 them and scopes every job, file, and review route to the signed-in subject.
 The runner on actual-dell runs each job's pipeline, and its model calls go
-through the Worker with that person's Gateway credential (see
+through the Worker with the signed-in person's Gateway credential (see
 [Version 2](#version-2)). There are no anonymous sessions in the deployed app.
 
-Run locally (Quick Start or Docker), the FastAPI app has no sign-in. It scopes
-jobs to anonymous browser sessions instead:
+Run locally (Quick Start or Docker), the FastAPI app has no sign-in, and jobs
+belong to anonymous browser sessions:
 
 - middleware assigns an HTTP-only cookie to each browser
 - every job row is owned by a hash of that session token
 - list, detail, download, preview, SSE progress, and review routes are all scoped to the current browser session
 - jobs and their files expire after `JOB_TTL_HOURS`, which defaults to `12`
 
-A local run's model calls use `LLM_API_KEY`, not a person's Gateway credential.
+Model calls in a local run use the `LLM_API_KEY` from `.env`.
 
 ## Version 2
 
