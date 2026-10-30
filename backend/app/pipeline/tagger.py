@@ -35,6 +35,7 @@ from app.pipeline.fonts.resources import (
     _has_embedded_font,
     _iter_pdf_fonts,
 )
+from app.pipeline.form_xobjects import unique_form_instances
 from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.page_glyphs import MeasuredGlyph, MeasuredTextOp, PdfGlyphReader, union_bbox
@@ -515,7 +516,22 @@ def _owner_of(
         else:
             share = 1.0 if target_box["l"] <= box["l"] <= target_box["r"] else 0.0
         area = _bbox_area(target_box)
-        if share >= 0.5 and area < best_area:
+        if share < 0.5:
+            continue
+        if (
+            best is not None and target.cell is not None and best.cell is not None
+            and target.elem_idx == best.elem_idx
+        ):
+            # Cell boxes fitted to adjacent lines can overlap. The smaller
+            # box may be the next row's short number; choose the line whose
+            # middle is closest before using area to break a tie.
+            best_box = _upright(best.box, turn)
+            distance = abs((target_box["b"] + target_box["t"]) / 2 - middle)
+            best_distance = abs((best_box["b"] + best_box["t"]) / 2 - middle)
+            better = (distance, area) < (best_distance, best_area)
+        else:
+            better = area < best_area
+        if better:
             best, best_area = target, area
     return best
 
@@ -1525,8 +1541,8 @@ class TextShowRun:
 
 
 @dataclass
-class OcrFormInvocation:
-    """An OCR form XObject invocation preserved at page level and tagged inside the form."""
+class FormInvocation:
+    """A Form XObject invocation preserved in its caller and tagged inside the form."""
 
     xobject_name: str
     stream: pikepdf.Object
@@ -1882,7 +1898,7 @@ def _split_text_ops_across_targets(
         operator = str(instr.operator)
         owners = (
             [word_owners.get(_glyph_key(glyph)) for glyph in op.glyphs]
-            if op is not None and operator in ("Tj", "TJ") and instr.operands
+            if op is not None and operator in TEXT_SHOW_OPERATORS and instr.operands
             else []
         )
         if len(set(owners)) < 2:
@@ -1890,7 +1906,17 @@ def _split_text_ops_across_targets(
                 new_measured[len(new_instructions)] = op
             new_instructions.append(instr)
             continue
-        array = list(instr.operands[0]) if operator == "TJ" else [instr.operands[0]]
+        # The quote operators also show text, after moving to the next
+        # line (and, for double quote, setting word and character spacing).
+        # Expand their state changes once before splitting the string.
+        if operator == '"':
+            for operand, name in zip(list(instr.operands)[:2], ("Tw", "Tc"), strict=True):
+                new_instructions.append(pikepdf.ContentStreamInstruction(
+                    [operand], pikepdf.Operator(name)
+                ))
+        if operator in {"'", '"'}:
+            new_instructions.append(pikepdf.ContentStreamInstruction([], pikepdf.Operator("T*")))
+        array = list(instr.operands[0]) if operator == "TJ" else [instr.operands[-1]]
         drawn: dict[int, list[tuple[MeasuredGlyph, ContentTarget | None]]] = {}
         for glyph, owner in zip(op.glyphs, owners, strict=True):
             drawn.setdefault(glyph.element, []).append((glyph, owner))
@@ -2017,9 +2043,9 @@ def _table_cell_bbox(table: dict, cell: dict) -> dict[str, float] | None:
 
 def _matrix_tuple(value: Any) -> tuple[float, float, float, float, float, float]:
     if isinstance(value, pikepdf.Array) and len(value) >= 6:
-        return tuple(_safe_float(item) for item in value[:6])
+        return tuple(_safe_float(item) for item in list(value)[:6])
     if isinstance(value, (list, tuple)) and len(value) >= 6:
-        return tuple(_safe_float(item) for item in value[:6])
+        return tuple(_safe_float(item) for item in list(value)[:6])
     return IDENTITY
 
 
@@ -2036,138 +2062,45 @@ def _lookup_xobject(resources, name: str) -> pikepdf.Object | None:
 
 
 def _is_ocr_form_xobject(name: str, xobject: Any) -> bool:
-    if not name.startswith("/OCR"):
-        return False
-    try:
-        return xobject is not None and xobject.get("/Subtype") == pikepdf.Name("/Form")
-    except Exception:
-        return False
-
-
-def _try_extract_ocr_form_invocation(
-    instructions: list,
-    start_idx: int,
-    resources,
-    current_ctm: tuple[float, float, float, float, float, float],
-) -> OcrFormInvocation | None:
-    if start_idx < 0 or start_idx >= len(instructions):
-        return None
-
-    instr = instructions[start_idx]
-    op = str(instr.operator)
-
-    if op == "Do":
-        operands = list(instr.operands) if hasattr(instr, "operands") else []
-        if not operands:
-            return None
-        name = str(operands[0])
-        xobject = _lookup_xobject(resources, name)
-        if not _is_ocr_form_xobject(name, xobject):
-            return None
-        form_matrix = _matrix_tuple(xobject.get("/Matrix")) if hasattr(xobject, "get") else IDENTITY
-        return OcrFormInvocation(
-            xobject_name=name,
-            stream=xobject,
-            start_idx=start_idx,
-            end_idx=start_idx + 1,
-            instructions=[instr],
-            initial_ctm=_mat_multiply(form_matrix, current_ctm),
-        )
-
-    if op != "q":
-        return None
-
-    depth = 0
-    j = start_idx
-    temp_ctm = current_ctm
-    form_name = ""
-    form_stream = None
-    do_count = 0
-    do_ctm = current_ctm
-    allowed_ops = {"q", "Q", "cm", "Do"}
-
-    while j < len(instructions):
-        inner = instructions[j]
-        inner_op = str(inner.operator)
-        if inner_op not in allowed_ops:
-            return None
-
-        if inner_op == "q":
-            depth += 1
-        elif inner_op == "Q":
-            depth -= 1
-            if depth == 0:
-                break
-            if depth < 0:
-                return None
-        elif inner_op == "cm":
-            inner_ops = list(inner.operands) if hasattr(inner, "operands") else []
-            if len(inner_ops) >= 6:
-                temp_ctm = _mat_multiply(tuple(_safe_float(x) for x in inner_ops[:6]), temp_ctm)
-        elif inner_op == "Do":
-            operands = list(inner.operands) if hasattr(inner, "operands") else []
-            if not operands:
-                return None
-            name = str(operands[0])
-            xobject = _lookup_xobject(resources, name)
-            if not _is_ocr_form_xobject(name, xobject):
-                return None
-            do_count += 1
-            if do_count > 1:
-                return None
-            form_name = name
-            form_stream = xobject
-            do_ctm = temp_ctm
-
-        j += 1
-
-    if depth != 0 or do_count != 1 or form_stream is None:
-        return None
-
-    form_matrix = _matrix_tuple(form_stream.get("/Matrix")) if hasattr(form_stream, "get") else IDENTITY
-    return OcrFormInvocation(
-        xobject_name=form_name,
-        stream=form_stream,
-        start_idx=start_idx,
-        end_idx=j + 1,
-        instructions=instructions[start_idx : j + 1],
-        initial_ctm=_mat_multiply(form_matrix, do_ctm),
+    return (
+        name.startswith("/OCR")
+        and isinstance(xobject, pikepdf.Stream)
+        and xobject.get("/Subtype") == "/Form"
     )
 
 
-def _extract_ocr_form_invocations(page: pikepdf.Page, instructions: list) -> list[OcrFormInvocation]:
-    resources = page.get("/Resources", {}) if hasattr(page, "get") else {}
-    invocations: list[OcrFormInvocation] = []
-    seen_streams: set[tuple[int, int] | tuple[str, int]] = set()
+def _extract_form_invocations(content_owner, instructions: list) -> list[FormInvocation]:
+    """Form calls and their transforms, regardless of the producer's names.
+
+    Only the Do passes through: q/Q and other graphics state still belong
+    to the caller. Nested forms are visited by the tagging traversal.
+    """
+    resources = content_owner.get("/Resources", {})
+    invocations: list[FormInvocation] = []
     ctm = IDENTITY
-    ctm_stack: list[tuple[float, float, float, float, float, float]] = []
-
-    i = 0
-    while i < len(instructions):
-        invocation = _try_extract_ocr_form_invocation(instructions, i, resources, ctm)
-        if invocation is not None:
-            key = _obj_key(invocation.stream)
-            normalized_key: tuple[int, int] | tuple[str, int]
-            normalized_key = key if key is not None else ("direct", id(invocation.stream))
-            if normalized_key not in seen_streams:
-                invocations.append(invocation)
-                seen_streams.add(normalized_key)
-            i = invocation.end_idx
-            continue
-
-        instr = instructions[i]
+    stack: list[tuple] = []
+    for index, instr in enumerate(instructions):
         op = str(instr.operator)
+        operands = list(instr.operands) if op in {"cm", "Do"} else []
         if op == "q":
-            ctm_stack.append(ctm)
+            stack.append(ctm)
         elif op == "Q":
-            if ctm_stack:
-                ctm = ctm_stack.pop()
-        elif op == "cm":
-            operands = list(instr.operands) if hasattr(instr, "operands") else []
-            if len(operands) >= 6:
-                ctm = _mat_multiply(tuple(_safe_float(x) for x in operands[:6]), ctm)
-        i += 1
-
+            if stack:
+                ctm = stack.pop()
+        elif op == "cm" and len(operands) >= 6:
+            ctm = _mat_multiply(tuple(_safe_float(x) for x in operands[:6]), ctm)
+        elif op == "Do" and operands:
+            name = str(operands[0])
+            form = _lookup_xobject(resources, name)
+            if isinstance(form, pikepdf.Stream) and form.get("/Subtype") == "/Form":
+                invocations.append(FormInvocation(
+                    xobject_name=name,
+                    stream=form,
+                    start_idx=index,
+                    end_idx=index + 1,
+                    instructions=[instr],
+                    initial_ctm=_mat_multiply(_matrix_tuple(form.get("/Matrix")), ctm),
+                ))
     return invocations
 
 
@@ -2425,7 +2358,7 @@ class StructTreeBuilder:
 
     def _append_child(self, parent: pikepdf.Object, child: pikepdf.Object):
         """Append a child element to a parent's /K array."""
-        if parent == self.doc_elem and self.reading_order is not None:
+        if self.reading_order is not None:
             self._reading_order_of[child.objgen] = self.reading_order
         parent_k = parent.get("/K")
         if isinstance(parent_k, pikepdf.Array):
@@ -2442,12 +2375,24 @@ class StructTreeBuilder:
         element without a position keeps its place after the one before it.
         """
         kids = self.doc_elem.get("/K")
-        if not isinstance(kids, pikepdf.Array) or len(kids) - start < 2:
+        if not isinstance(kids, pikepdf.Array):
             return
+        def position(kid):
+            order = self._reading_order_of.get(kid.objgen)
+            if kid.get("/S") == "/L":
+                items = list(kid.get("/K") or [])
+                items.sort(key=lambda item: self._reading_order_of.get(item.objgen, -1))
+                kid["/K"] = pikepdf.Array(items)
+                positions = [position(item) for item in items]
+                positions = [value for value in positions if value is not None]
+                if positions:
+                    order = min(positions)
+            return order
+
         page_kids = [kids[i] for i in range(start, len(kids))]
         keys: list[float] = []
         for kid in page_kids:
-            order = self._reading_order_of.get(kid.objgen)
+            order = position(kid)
             keys.append(order if order is not None else (keys[-1] if keys else -1))
         ordered = [kid for _key, _i, kid in sorted(zip(keys, range(len(keys)), page_kids))]
         self.doc_elem["/K"] = pikepdf.Array([kids[i] for i in range(start)] + ordered)
@@ -2924,7 +2869,7 @@ class StructTreeBuilder:
             "/P": list_elem,
             "/K": pikepdf.Array([]),
         }))
-        list_elem["/K"].append(li_elem)
+        self._append_child(list_elem, li_elem)
         self._struct_elems_created += 1
 
         # Track the most recent LI so nested lists can attach to it.
@@ -3084,17 +3029,32 @@ class StructTreeBuilder:
 # Content stream rewriting — position-based
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _strip_existing_markers(instructions: list) -> list:
-    """Remove existing BDC/BMC/EMC markers from content stream instructions."""
+def _strip_existing_markers(instructions: list, resources=None) -> list:
+    """Discard old tagging IDs, retaining the source's text replacements.
+
+    /ActualText is part of how a PDF encodes text (ISO 32000-1, 14.9.4),
+    including fonts whose glyph codes have no Unicode mapping. Removing it
+    along with the old MCIDs changes what the page says.
+    """
     stripped = []
-    depth = 0
+    retained: list[bool] = []
+    properties = resources.get("/Properties", {}) if resources is not None else {}
     for instr in instructions:
-        op = str(instr.operator) if hasattr(instr, 'operator') else ""
-        if op in ("BDC", "BMC"):
-            depth += 1
+        op = str(instr.operator)
+        if op in {"BDC", "BMC"}:
+            props = instr.operands[1] if op == "BDC" and len(instr.operands) > 1 else None
+            if isinstance(props, pikepdf.Name):
+                props = properties.get(props)
+            keep = isinstance(props, pikepdf.Dictionary) and "/ActualText" in props
+            retained.append(keep)
+            if keep:
+                stripped.append(pikepdf.ContentStreamInstruction(
+                    [pikepdf.Name("/Span"), pikepdf.Dictionary(ActualText=props.ActualText)],
+                    pikepdf.Operator("BDC"),
+                ))
         elif op == "EMC":
-            if depth > 0:
-                depth -= 1
+            if retained and retained.pop():
+                stripped.append(instr)
         else:
             stripped.append(instr)
     return stripped
@@ -3824,7 +3784,7 @@ def _rewrite_content_stream(
         logger.warning(f"Could not parse content stream for page {page_index}: {e}")
         return set()
 
-    instructions = _strip_existing_markers(instructions)
+    instructions = _strip_existing_markers(instructions, content_owner.get("/Resources"))
     if not instructions:
         return set()
 
@@ -3867,6 +3827,25 @@ def _rewrite_content_stream(
     for region in passthrough_regions:
         for idx in range(region.start_idx, region.end_idx):
             mark_by_idx[idx] = _PASSTHROUGH_MARK
+
+    # Keep each source replacement inside one new MCID, with its closing
+    # EMC inside that same sequence. Otherwise a new fragment boundary can
+    # close the source Span early or leave its replacement outside the tree.
+    replacements: list[int] = []
+    for index, instr in enumerate(instructions):
+        op = str(instr.operator)
+        if op == "BDC":
+            replacements.append(index)
+        elif op == "EMC" and replacements:
+            start = replacements.pop()
+            marks = Counter(
+                mark_by_idx[j] for j in range(start + 1, index)
+                if str(instructions[j].operator) in TEXT_SHOW_OPERATORS and j in mark_by_idx
+            )
+            if marks:
+                mark = marks.most_common(1)[0][0]
+                for j in range(start, index + 1):
+                    mark_by_idx[j] = mark
 
     overlay_targets: list[tuple[ContentRegion, int]] = []
     decorative_covered: set[int] = set()
@@ -4965,7 +4944,7 @@ async def tag_pdf(
 ) -> TaggingResult:
     """Write PDF/UA structure tags into the PDF."""
 
-    def _tag():
+    def _tag(input_path: Path):
         tags_added = 0
         parser_doc = None
         docling_parse_word_cache: dict[int, list[dict]] = {}
@@ -5080,70 +5059,49 @@ async def tag_pdf(
                 page_tagged_elements: list[dict] = []
                 first_page_kid = len(builder.doc_elem.get("/K") or [])
                 if page_elems:
-                    try:
-                        raw_page_instructions = list(pikepdf.parse_content_stream(page))
-                    except Exception:
-                        raw_page_instructions = []
-                    ocr_form_invocations = _extract_ocr_form_invocations(
-                        page,
-                        _strip_existing_markers(raw_page_instructions),
-                    )
-                    ocr_passthrough_regions = [
-                        ContentRegion(
-                            kind="passthrough",
-                            start_idx=invocation.start_idx,
-                            end_idx=invocation.end_idx,
-                            instructions=invocation.instructions,
-                            xobject_name=invocation.xobject_name,
-                        )
-                        for invocation in ocr_form_invocations
-                    ]
-                    matched_page_indices = _rewrite_content_stream(
-                        pdf, page, page_index, page_elems,
-                        builder, page.obj, alt_lookup,
-                        decorative_figures=decorative_figures,
-                        passthrough_regions=ocr_passthrough_regions,
-                        measured_ops=page_glyphs.ops.get(()),
-                    )
-                    page_tagged_elements.extend(
-                        page_elems[idx]
-                        for idx in sorted(matched_page_indices)
-                        if 0 <= idx < len(page_elems)
-                    )
-
-                    remaining_elems = [
-                        elem
-                        for idx, elem in enumerate(page_elems)
-                        if idx not in matched_page_indices
-                    ]
-                    for invocation in ocr_form_invocations:
-                        if not remaining_elems:
-                            break
-                        matched_form_indices = _rewrite_content_stream(
-                            pdf,
-                            invocation.stream,
-                            page_index,
-                            remaining_elems,
-                            builder,
-                            page.obj,
-                            alt_lookup,
-                            decorative_figures=decorative_figures,
-                            initial_ctm=invocation.initial_ctm,
-                            stream_owner=invocation.stream,
-                            measured_ops=page_glyphs.ops.get(
-                                (invocation.xobject_name.lstrip("/"),)
-                            ),
-                        )
-                        page_tagged_elements.extend(
-                            remaining_elems[idx]
-                            for idx in sorted(matched_form_indices)
-                            if 0 <= idx < len(remaining_elems)
-                        )
-                        remaining_elems = [
-                            elem
-                            for idx, elem in enumerate(remaining_elems)
-                            if idx not in matched_form_indices
+                    def rewrite(owner, path=(), initial_ctm=IDENTITY, ancestors=frozenset()):
+                        try:
+                            instructions = _strip_existing_markers(
+                                list(pikepdf.parse_content_stream(owner)), owner.get("/Resources")
+                            )
+                        except pikepdf.PdfError as exc:
+                            logger.warning("Could not parse content on page %s: %s", page_index, exc)
+                            return set()
+                        forms = _extract_form_invocations(owner, instructions)
+                        passthrough = [
+                            ContentRegion(
+                                kind="passthrough",
+                                start_idx=form.start_idx,
+                                end_idx=form.end_idx,
+                                instructions=form.instructions,
+                                xobject_name=form.xobject_name,
+                            )
+                            for form in forms
                         ]
+                        matched = _rewrite_content_stream(
+                            pdf, owner, page_index, page_elems,
+                            builder, page.obj, alt_lookup,
+                            decorative_figures=decorative_figures,
+                            initial_ctm=initial_ctm,
+                            stream_owner=None if not path else owner,
+                            passthrough_regions=passthrough,
+                            measured_ops=page_glyphs.ops.get(path),
+                        )
+                        for form in forms:
+                            if form.stream.objgen in ancestors:
+                                continue
+                            matched.update(rewrite(
+                                form.stream,
+                                (*path, form.xobject_name.lstrip("/")),
+                                _mat_multiply(form.initial_ctm, initial_ctm),
+                                ancestors | {form.stream.objgen},
+                            ))
+                        return matched
+
+                    matched_page_indices = rewrite(page)
+                    page_tagged_elements.extend(
+                        page_elems[idx] for idx in sorted(matched_page_indices)
+                    )
 
                     seen_page_element_ids: set[int] = set()
                     for elem in page_tagged_elements:
@@ -5227,4 +5185,8 @@ async def tag_pdf(
             title_set=title_set,
         )
 
-    return await asyncio.to_thread(_tag)
+    def _tag_with_forms():
+        with unique_form_instances(input_path) as tagging_input:
+            return _tag(tagging_input)
+
+    return await asyncio.to_thread(_tag_with_forms)
