@@ -257,6 +257,5 @@ use ended at the cutover. Every AI step calls the CAIL Gateway with rendered
 page images, never PDF files. In v2 each call goes through the Worker's relay
 with the person's own Gateway credential, so it counts against their budget;
 the Gateway admits only open-weight models. Run locally, the FastAPI app uses
-`LLM_API_KEY` and anonymous browser sessions; `backend/CAIL_IDENTITY.md`
-describes its optional identity check behind a proxy. See
+`LLM_API_KEY` and anonymous browser sessions. See
 [docs/cail-integration-plan.md](docs/cail-integration-plan.md).
