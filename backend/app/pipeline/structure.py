@@ -52,6 +52,7 @@ class FigureInfo:
     caption: str | None = None
     page: int | None = None
     bbox: dict | None = None
+    classification: str | None = None
 
 
 @dataclass
@@ -1248,6 +1249,20 @@ def _repair_pdf_with_ghostscript(
     return output_path.exists() and output_path.stat().st_size > 0
 
 
+def _picture_classification(picture: dict) -> str | None:
+    """Retain Docling's existing prediction, without requesting another model."""
+    predictions = ((picture.get("meta") or {}).get("classification") or {}).get("predictions") or []
+    if not predictions:
+        for annotation in picture.get("annotations") or []:
+            if annotation.get("kind") == "classification":
+                predictions = annotation.get("predicted_classes") or []
+                break
+    if predictions:
+        prediction = max(predictions, key=lambda item: float(item.get("confidence") or 0))
+        return str(prediction.get("class_name") or "").strip().lower() or None
+    return "chart" if picture.get("label") == "chart" else None
+
+
 def _save_docling_figures(doc_dict: dict, figures_dir: Path) -> list[FigureInfo]:
     """Save an image of each figure Docling found, for alt text: the figure's
     own image when Docling returns one, else a crop of its page image."""
@@ -1280,7 +1295,8 @@ def _save_docling_figures(doc_dict: dict, figures_dir: Path) -> list[FigureInfo]
         if picture_uri.startswith("data:image/"):
             fig_path.write_bytes(base64.b64decode(picture_uri.split(",", 1)[1]))
             figures.append(
-                FigureInfo(index=i, path=fig_path, caption=caption, page=page_no - 1, bbox=bbox)
+                FigureInfo(index=i, path=fig_path, caption=caption, page=page_no - 1, bbox=bbox,
+                           classification=_picture_classification(pic))
             )
             continue
 
@@ -1334,6 +1350,7 @@ def _save_docling_figures(doc_dict: dict, figures_dir: Path) -> list[FigureInfo]
                 caption=caption,
                 page=page_no - 1,  # Convert to 0-based
                 bbox=bbox,
+                classification=_picture_classification(pic),
             ))
         else:
             logger.warning(
@@ -1558,6 +1575,7 @@ async def extract_structure(
                                 caption=caption,
                                 page=(element.prov[0].page_no - 1) if element.prov else None,
                                 bbox=_extract_bbox(element.prov) if getattr(element, "prov", None) else None,
+                                classification=_picture_classification(dict_pictures[i]) if i < len(dict_pictures) else None,
                             ))
                     except Exception as e:
                         logger.warning(f"Failed to extract figure {i}: {e}")

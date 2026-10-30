@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     skip_alt_text_generation: bool = False
     alt_text_max_concurrency: int = 8
     alt_text_global_max_concurrency: int = 12
+    alt_text_cache_enabled: bool = True
     auto_apply_llm_font_map: bool = True
     auto_apply_grounded_text: bool = True
     auto_apply_table_intelligence: bool = True

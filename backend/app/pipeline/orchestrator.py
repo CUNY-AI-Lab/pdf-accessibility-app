@@ -2275,6 +2275,9 @@ async def _run_pipeline(
                             llm_client,
                             job=job,
                             original_filename=job.original_filename,
+                            settings=settings,
+                            structure=structure.document_json,
+                            pdf_path=working_pdf,
                         )
                     alt_text_llm_usage = _llm_usage_snapshot(usage)
                 finally:

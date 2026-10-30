@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import json
 import logging
 import re
 from collections import defaultdict
@@ -16,6 +18,7 @@ from PIL import Image
 from app.config import get_settings
 from app.models import Job
 from app.pipeline.structure import FigureInfo
+from app.services.alt_text_cache import AltTextCache, request_input_hash, usable_description
 from app.services.intelligence_llm_utils import (
     context_json_part,
     page_preview_parts,
@@ -36,6 +39,31 @@ _ALT_TEXT_GLOBAL_GATE_DEPTH: ContextVar[int] = ContextVar(
 _ALT_TEXT_GLOBAL_SEMAPHORE: asyncio.Semaphore | None = None
 _ALT_TEXT_GLOBAL_SEMAPHORE_LIMIT = 0
 _ALT_TEXT_GLOBAL_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
+
+FIGURE_DESCRIPTION_RULES = """Descriptions must be grounded only in visible crop content.
+Use page context and captions to decide semantics, but never copy document-only
+context, captions, filenames or inferred identities into alt_text. Follow each
+candidate's description_guidance. Describe only legible values; never invent them.
+A captioned or explicitly referenced image must not be marked decorative.
+"""
+
+
+def figure_description_guidance(classification: str | None) -> str:
+    kind = str(classification or "").lower().replace("_", " ").replace("-", " ")
+    if "flow" in kind or "diagram" in kind or "drawing" in kind or "structure" in kind:
+        return "Diagram: identify the components and their relationships, flow or sequence."
+    if any(word in kind.split() for word in ("chart", "graph", "plot", "heatmap")):
+        return "Chart: give the chart type, axes and units, main trend, and legible key values."
+    if "screenshot" in kind:
+        return "Screenshot: describe the relevant interface, visible state and legible controls or message."
+    if "photo" in kind or "natural image" in kind:
+        return "Photo: describe visible subjects, actions and setting; do not infer identities."
+    if "logo" in kind:
+        return "Logo: give the visible name and distinguishing design; do not infer an organization."
+    if "equation" in kind or "formula" in kind:
+        return "Equation image: transcribe the legible expression in speakable mathematical order."
+    return "Describe the visible information concisely and factually."
+
 
 FIGURE_BATCH_PROMPT = """You are reviewing multiple figure candidates from the same PDF page for accessibility.
 
@@ -61,6 +89,8 @@ Rules:
 - Use `manual_only` when the image purpose is unclear.
 - Do not start alt text with "Image of" or "Picture of".
 """
+
+FIGURE_BATCH_PROMPT += "\n" + FIGURE_DESCRIPTION_RULES
 
 
 FIGURE_BATCH_SCHEMA: dict[str, Any] = {
@@ -162,6 +192,59 @@ def _manual_only_figure_result(*, figure_index: int, reason: str) -> dict[str, o
         "resolved_kind": None,
         "is_decorative": False,
     }
+
+
+class _CachedFigureRequest:
+    """Match cache entries against the request the JSON transport actually sends.
+
+    Only one-candidate batches use this adapter. Multi-candidate prompts and
+    semantic follow-ups have shared context and are never cached. Repaired
+    or format-fallback responses are not stored either.
+    """
+
+    def __init__(
+        self, client: LlmClient, cache: AltTextCache, figure: FigureInfo, prompt_version: str,
+    ):
+        self.client = client
+        self.model = client.model
+        self.cache = cache
+        self.figure_index = figure.index
+        with figure.path.open("rb") as image:
+            self.image_hash = hashlib.file_digest(image, "sha256").hexdigest()
+        self.prompt_version = prompt_version
+        self.input_hash: str | None = None
+        self.request_count = 0
+        self.cached = False
+
+    async def chat_completion(self, messages: list[dict], **kwargs) -> dict:
+        self.request_count += 1
+        self.input_hash = request_input_hash({"messages": messages, **kwargs})
+        description = self.cache.get(
+            self.image_hash, self.model, self.prompt_version, self.input_hash,
+        ) if self.input_hash else None
+        if description:
+            self.cached = True
+            decision = {
+                "figure_index": self.figure_index,
+                "suggested_action": "set_alt_text", "alt_text": description,
+                "confidence": "medium",
+                "summary": "Reused a description with identical model inputs.",
+                "reason": "Image, request payload, model and prompt version match the cache.",
+            }
+            return {"choices": [{"message": {
+                "content": json.dumps({"decisions": [decision]}),
+            }}]}
+        return await self.client.chat_completion(messages=messages, **kwargs)
+
+    def store(self, decision: dict[str, object]) -> None:
+        text = str(decision.get("alt_text") or "").strip()
+        if (
+            self.request_count == 1 and not self.cached and self.input_hash
+            and decision.get("suggested_action") == "set_alt_text"
+            and decision.get("confidence") == "high" and not decision.get("is_decorative")
+            and usable_description(text)
+        ):
+            self.cache.put(self.image_hash, self.model, self.prompt_version, self.input_hash, text)
 
 
 def _bbox_area(bbox: dict[str, Any] | None) -> float:
@@ -334,7 +417,8 @@ async def generate_figure_intelligence(
         page=int(figure.page) + 1 if isinstance(figure.page, int) and figure.page >= 0 else 1,
         accessibility_goal=(
             "Decide whether this candidate region is a meaningful standalone figure, decorative content, "
-            "or not really a figure at all for assistive technology."
+            "or not really a figure at all for assistive technology. "
+            + FIGURE_DESCRIPTION_RULES
         ),
         bbox=figure.bbox,
         nearby_context=[
@@ -346,6 +430,8 @@ async def generate_figure_intelligence(
         metadata={
             "extra_image_data_urls": [_image_data_url(figure.path)] if figure.path.exists() else [],
             "figure_index": figure.index,
+            "classification": figure.classification,
+            "description_guidance": figure_description_guidance(figure.classification),
             "reviewer_feedback": reviewer_feedback or "",
             "previous_intelligence": previous_intelligence or {},
         },
@@ -384,6 +470,8 @@ async def generate_figures_intelligence(
     llm_client: LlmClient,
     job: Job | Any | None = None,
     original_filename: str = "",
+    description_cache: AltTextCache | None = None,
+    prompt_version: str = "",
 ) -> list[dict[str, object]]:
     if not figures:
         return []
@@ -412,6 +500,8 @@ async def generate_figures_intelligence(
                             "caption": str(figure.caption or "").strip(),
                             "page": page,
                             "bbox": figure.bbox,
+                            "classification": figure.classification,
+                            "description_guidance": figure_description_guidance(figure.classification),
                             **page_context.get(figure.index, {}),
                         }
                         for figure in chunk
@@ -431,10 +521,20 @@ async def generate_figures_intelligence(
                                 {"type": "image_url", "image_url": {"url": _image_data_url(figure.path)}},
                             ]
                         )
+                # A multi-candidate batch exposes every candidate to all the
+                # others, so its context cannot be separated per figure.
+                cached_request = None
+                if description_cache is not None and len(chunk) == 1:
+                    try:
+                        cached_request = _CachedFigureRequest(
+                            llm_client, description_cache, chunk[0], prompt_version,
+                        )
+                    except OSError:
+                        pass
                 parsed: dict[str, Any] | None
                 try:
                     parsed = await request_llm_json(
-                        llm_client=llm_client,
+                        llm_client=cached_request or llm_client,
                         content=content,
                         schema_name="figure_batch_intelligence",
                         response_schema=FIGURE_BATCH_SCHEMA,
@@ -459,9 +559,15 @@ async def generate_figures_intelligence(
                     )
                     if _requires_single_figure_followup(finalized):
                         continue
+                    if cached_request is not None and cached_request.cached:
+                        finalized.update({
+                            "source": "cache", "cached": True, "prompt_version": prompt_version,
+                        })
                     page_results[figure_index] = finalized
                     seen.add(figure_index)
 
+                if cached_request is not None and chunk[0].index in seen:
+                    cached_request.store(page_results[chunk[0].index])
                 for figure in chunk:
                     if figure.index in seen:
                         continue
