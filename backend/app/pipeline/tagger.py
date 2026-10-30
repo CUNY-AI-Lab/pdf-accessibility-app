@@ -3214,17 +3214,18 @@ def _allocate_fragment_mcid(
         fig_idx = elem.get("figure_index")
         if fig_idx in decorative_figures:
             return None
-        alt = (
-            alt_lookup.get(fig_idx)
-            or elem.get("caption")
-            or elem.get("text")
+        alt = next(
+            (
+                candidate.strip()
+                for candidate in (alt_lookup.get(fig_idx), elem.get("caption"), elem.get("text"))
+                if isinstance(candidate, str) and not is_placeholder_alt_text(candidate)
+            ),
+            None,
         )
-        if isinstance(alt, str):
-            alt = alt.strip()
         mcid = builder.add_figure(
             page_index,
             page_ref,
-            alt_text=alt or None,
+            alt_text=alt,
             stream_owner=stream_owner,
         )
         actual_text = None
@@ -3990,12 +3991,18 @@ def _make_bmc_artifact(
     )
 
 
-def _is_weak_figure_alt_text(text: Any) -> bool:
+def is_placeholder_alt_text(text: Any) -> bool:
+    """True for alt text that describes nothing: empty, or a bracketed
+    placeholder such as "[Could not determine figure semantics]". It is never
+    written as /Alt; a figure without a description goes to a person."""
     normalized = " ".join(str(text or "").split()).strip()
-    if not normalized:
+    return not normalized or (normalized.startswith("[") and normalized.endswith("]"))
+
+
+def _is_weak_figure_alt_text(text: Any) -> bool:
+    if is_placeholder_alt_text(text):
         return True
-    if normalized.startswith("[") and normalized.endswith("]"):
-        return True
+    normalized = " ".join(str(text or "").split()).strip()
     return bool(WEAK_FIGURE_ALT_RE.fullmatch(normalized))
 
 
@@ -5052,7 +5059,7 @@ async def tag_pdf(
                     decorative_figures.add(fig_idx)
                     continue
                 text = alt.get("text")
-                if isinstance(text, str) and text.strip():
+                if isinstance(text, str) and not is_placeholder_alt_text(text):
                     alt_lookup[fig_idx] = text.strip()
 
             for fig_idx, source_alt in source_figure_alt_lookup.items():

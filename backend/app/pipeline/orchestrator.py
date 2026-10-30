@@ -46,7 +46,7 @@ from app.pipeline.subprocess_utils import (
     communicate_with_timeout,
     subprocess_process_group_kwargs,
 )
-from app.pipeline.tagger import tag_pdf
+from app.pipeline.tagger import is_placeholder_alt_text, tag_pdf
 from app.pipeline.validator import validate_pdf
 from app.services.applied_changes import add_applied_change
 from app.services.auto_structure_apply import auto_apply_structure_tasks
@@ -730,6 +730,35 @@ def _merge_review_task_metadata(
             task["metadata"] = {**current, **metadata}
             break
     return review_tasks
+
+
+def _alt_text_entry_state(
+    alt,
+    *,
+    caption: str | None,
+    auto_approve: bool,
+) -> tuple[str, str]:
+    """Return the (status, text) to store for one figure's generated alt text.
+
+    An empty or placeholder description is never approved: the figure keeps
+    no alt text and stays "pending_review" until a person describes it, unless
+    its visible caption can stand in.
+    """
+    generated_text = (alt.generated_text or "").strip()
+    status = alt.status
+    caption_fallback = (caption or "").strip()
+
+    if auto_approve and generated_text.lower() == "decorative":
+        return "rejected", ""
+    if status == "rejected":
+        return status, generated_text
+    if is_placeholder_alt_text(generated_text):
+        if caption_fallback and not is_placeholder_alt_text(caption_fallback):
+            return "approved", caption_fallback
+        return "pending_review", ""
+    if auto_approve:
+        return "approved", generated_text
+    return status, generated_text
 
 
 def _apply_figure_reclassification(
@@ -5556,24 +5585,11 @@ async def _run_pipeline(
                         reclassified_count += 1
                         continue
                     fig = structure.figures[alt.figure_index]
-                    generated_text = (alt.generated_text or "").strip()
-                    status = alt.status
-                    caption_fallback = (fig.caption or "").strip()
-
-                    if settings.auto_approve_generated_alt_text:
-                        normalized = generated_text.lower()
-                        if normalized == "decorative":
-                            status = "rejected"
-                            generated_text = ""
-                        elif not generated_text and caption_fallback:
-                            status = "approved"
-                            generated_text = caption_fallback
-                        elif not generated_text or (
-                            generated_text.startswith("[") and generated_text.endswith("]")
-                        ):
-                            status = "approved"
-                        else:
-                            status = "approved"
+                    status, generated_text = _alt_text_entry_state(
+                        alt,
+                        caption=fig.caption,
+                        auto_approve=settings.auto_approve_generated_alt_text,
+                    )
 
                     if status == "approved":
                         approved_count += 1
@@ -5750,14 +5766,13 @@ async def _run_tagging_and_validation(
 
         output_path = get_output_path(job_id, f"accessible_{job.original_filename}")
 
-        # Gather approved alt texts
-        result = await db.execute(
-            select(AltTextEntry).where(
-                AltTextEntry.job_id == job_id,
-                AltTextEntry.status.in_(("approved", "rejected")),
-            )
-        )
-        reviewed_alt_entries = result.scalars().all()
+        # Approved and rejected figure decisions go to the tagger; fidelity also
+        # sees the figures still waiting for a description.
+        result = await db.execute(select(AltTextEntry).where(AltTextEntry.job_id == job_id))
+        alt_entries = result.scalars().all()
+        reviewed_alt_entries = [
+            entry for entry in alt_entries if entry.status in ("approved", "rejected")
+        ]
         reviewed_alts = [
             {
                 "figure_index": a.figure_index,
@@ -6141,7 +6156,7 @@ async def _run_tagging_and_validation(
                     "edited_text": entry.edited_text,
                     "status": entry.status,
                 }
-                for entry in reviewed_alt_entries
+                for entry in alt_entries
             ],
             validation_report=validation_payload,
             raw_validation_report=selected_validation.raw_report,
@@ -6204,7 +6219,7 @@ async def _run_tagging_and_validation(
                             "edited_text": entry.edited_text,
                             "status": entry.status,
                         }
-                        for entry in reviewed_alt_entries
+                        for entry in alt_entries
                     ],
                     validation_report=retry_validation_payload,
                     raw_validation_report=retry_validation.raw_report,
@@ -6324,7 +6339,7 @@ async def _run_tagging_and_validation(
                             "edited_text": entry.edited_text,
                             "status": entry.status,
                         }
-                        for entry in reviewed_alt_entries
+                        for entry in alt_entries
                     ],
                     validation_report=auto_validation_payload,
                     raw_validation_report=auto_validation.raw_report,
@@ -6376,7 +6391,7 @@ async def _run_tagging_and_validation(
                         "edited_text": entry.edited_text,
                         "status": entry.status,
                     }
-                    for entry in reviewed_alt_entries
+                    for entry in alt_entries
                 ],
                 validation_report=candidate_validation_payload,
                 raw_validation_report=candidate_validation.raw_report,
@@ -6414,7 +6429,7 @@ async def _run_tagging_and_validation(
                     "edited_text": entry.edited_text,
                     "status": entry.status,
                 }
-                for entry in reviewed_alt_entries
+                for entry in alt_entries
             ],
             validation_report=validation_payload,
             raw_validation_report=selected_validation.raw_report,
@@ -6457,7 +6472,7 @@ async def _run_tagging_and_validation(
                 AppliedChange.review_status == "pending_review",
             )
         )
-        reviewed_alt_by_index = {entry.figure_index: entry for entry in reviewed_alt_entries}
+        alt_entry_by_index = {entry.figure_index: entry for entry in alt_entries}
         for change_spec in auto_applied_change_specs:
             task_type = str(change_spec.get("task_type") or "review_change")
             metadata = (
@@ -6478,7 +6493,7 @@ async def _run_tagging_and_validation(
                     figure_index = int(figure_index_raw)
                 except (TypeError, ValueError):
                     figure_index = -1
-                entry = reviewed_alt_by_index.get(figure_index)
+                entry = alt_entry_by_index.get(figure_index)
                 if entry is not None:
                     before = {
                         "generated_text": undo_payload.get("generated_text"),

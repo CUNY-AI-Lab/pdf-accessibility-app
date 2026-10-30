@@ -18,6 +18,7 @@ from PIL import Image
 from rapidfuzz.distance import Levenshtein
 from rapidfuzz.fuzz import partial_ratio
 
+from app.pipeline.tagger import is_placeholder_alt_text
 from app.services.form_fields import extract_widget_fields
 from app.services.page_intelligence import (
     collect_grounded_text_candidates,
@@ -262,6 +263,54 @@ def _output_struct_type_counts(pdf_path: Path) -> dict[str, int] | None:
     except Exception:
         logger.debug("Could not inspect output structure tree for %s", pdf_path, exc_info=True)
         return None
+
+
+def _output_figures_without_alt(pdf_path: Path) -> list[dict[str, Any]]:
+    """Figures a screen reader cannot describe: a Figure structure element with
+    no /Alt or /ActualText, or only a placeholder. Raises if the PDF cannot be read."""
+    missing: list[dict[str, Any]] = []
+    with pikepdf.Pdf.open(pdf_path) as pdf:
+        struct_root = pdf.Root.get("/StructTreeRoot")
+        if not isinstance(struct_root, pikepdf.Dictionary):
+            return missing
+        page_numbers = {page.obj.objgen: number for number, page in enumerate(pdf.pages, start=1)}
+        seen: set[tuple[int, int]] = set()
+
+        def page_of(node: pikepdf.Dictionary) -> int | None:
+            pages = [node.get("/Pg")]
+            kids = node.get("/K")
+            for kid in kids if isinstance(kids, pikepdf.Array) else [kids]:
+                if isinstance(kid, pikepdf.Dictionary):
+                    pages.append(kid.get("/Pg"))
+            for page in pages:
+                if isinstance(page, pikepdf.Dictionary) and page.is_indirect:
+                    number = page_numbers.get(page.objgen)
+                    if number is not None:
+                        return number
+            return None
+
+        def walk(node: Any) -> None:
+            if isinstance(node, pikepdf.Array):
+                for child in node:
+                    walk(child)
+                return
+            if not isinstance(node, pikepdf.Dictionary):
+                return
+            if node.is_indirect:
+                if node.objgen in seen:
+                    return
+                seen.add(node.objgen)
+            if node.get("/S") == pikepdf.Name("/Figure"):
+                described = any(
+                    not is_placeholder_alt_text(str(node.get(key) or ""))
+                    for key in ("/Alt", "/ActualText")
+                )
+                if not described:
+                    missing.append({"page": page_of(node)})
+            walk(node.get("/K"))
+
+        walk(struct_root.get("/K"))
+    return missing
 
 
 def _strip_subset_prefix(value: str | None) -> str:
@@ -2125,6 +2174,66 @@ def assess_fidelity(
             },
         }
     )
+
+    # A figure the app could not describe ships with no alt text, never a
+    # placeholder, and holds the document until a person describes it.
+    try:
+        undescribed_figures = _output_figures_without_alt(output_pdf)
+    except Exception as exc:
+        logger.warning("Figure description check failed", exc_info=True)
+        undescribed_figures = None
+        add_check_error(
+            "figure_descriptions", "Check figure descriptions by hand", _check_error_text(exc)
+        )
+    if undescribed_figures is not None:
+        waiting_figures = [
+            {
+                "figure_index": entry["figure_index"],
+                "page": figure_pages.get(entry["figure_index"]),
+            }
+            for entry in alt_entries
+            if isinstance(entry, dict)
+            and isinstance(entry.get("figure_index"), int)
+            and entry.get("status") != "rejected"
+            and (
+                entry.get("status") != "approved"
+                or is_placeholder_alt_text(entry.get("edited_text") or entry.get("generated_text"))
+            )
+        ]
+        if undescribed_figures:
+            add_task(
+                "review:alt_text:undescribed",
+                task_type="alt_text",
+                title="Describe figures that have no description",
+                detail=(
+                    f"{len(undescribed_figures)} figure(s) have no description a screen reader "
+                    "can announce. Add a description for each before distribution."
+                ),
+                severity="high",
+                blocking=True,
+                metadata={
+                    "undescribed_figures": len(undescribed_figures),
+                    "pages_to_check": sorted(
+                        {
+                            int(item["page"])
+                            for item in undescribed_figures
+                            if isinstance(item.get("page"), int)
+                        }
+                    ),
+                    "figures_awaiting_description": waiting_figures[:20],
+                },
+            )
+        checks.append(
+            {
+                "check": "figure_descriptions",
+                "status": "fail" if undescribed_figures else "pass",
+                "message": "Checked that every Figure in the output has a description.",
+                "metrics": {
+                    "undescribed_figures": len(undescribed_figures),
+                    "figures_awaiting_description": len(waiting_figures),
+                },
+            }
+        )
 
     # ── 1A: Link text quality ─────────────────────────────────────────────
     try:
