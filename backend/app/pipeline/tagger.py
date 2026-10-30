@@ -3514,7 +3514,8 @@ def _attach_glyph_text(pages_elements: dict[int, list[dict]], pdfium_text: Pdfiu
     text pdfium extracts inside its boxes accounts for the structure step's
     text: the PDF's own characters and word breaks, which
     _element_accessible_text (and a table cell's /ActualText) prefer to
-    Docling's text (see element_text)."""
+    Docling's text (see element_text). A formula keeps Docling's text; one
+    left without any gets its glyphs' text."""
     for page_index, elements in pages_elements.items():
         for elem in elements:
             boxes = [elem.get("bbox"), *elem.get("extra_bboxes", [])]
@@ -3528,6 +3529,16 @@ def _attach_glyph_text(pages_elements: dict[int, list[dict]], pdfium_text: Pdfiu
                         # own glyph after the letter): the readable text is
                         # a correction.
                         elem["resolved_text"] = elem.get("resolved_text") or text
+            elif (
+                elem.get("type") == "formula"
+                and isinstance(boxes[0], dict)
+                and not str(elem.get("text") or "").strip()
+            ):
+                # A formula with no structure text reads its own glyphs, so it
+                # still gets /ActualText and /Alt (see _allocate_fragment_mcid).
+                text = readable(pdfium_text.in_boxes(page_index, boxes))
+                if text:
+                    elem["glyph_text"] = text
             if elem.get("type") == "table":
                 for cell in elem.get("cells") or []:
                     if isinstance(cell, dict) and (box := _table_cell_bbox(elem, cell)):

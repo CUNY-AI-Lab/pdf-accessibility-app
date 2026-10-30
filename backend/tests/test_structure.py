@@ -595,3 +595,21 @@ def test_normalize_docling_elements_keeps_the_boxes_of_text_continued_elsewhere(
     assert "extra_bboxes" not in continuation
     assert continuation["continuation"] is True
     assert continuation["continued_ref"] == element["continued_ref"]
+
+
+def test_formula_keeps_the_text_docling_puts_in_orig():
+    # docling-serve 1.35.0 (Docling 2.130.0), converted with the app's options
+    # (no formula enrichment): a formula's text is "" and orig holds its text.
+    import json
+    from pathlib import Path
+
+    doc_dict = json.loads(
+        (Path(__file__).parent / "docling_documents" / "formula.json").read_text()
+    )
+    [docling_formula] = [item for item in doc_dict["texts"] if item["label"] == "formula"]
+    assert docling_formula["text"] == ""
+
+    elements = _normalize_docling_elements(doc_dict)
+
+    [formula] = [element for element in elements if element["type"] == "formula"]
+    assert formula["text"] == "E = mc2 + ab"
