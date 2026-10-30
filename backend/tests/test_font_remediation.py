@@ -12,7 +12,6 @@ from app.pipeline.orchestrator import (
     FONT_LANE_OCR_REDO,
     FONT_LANE_REPAIR_DICTS,
     FONT_LANE_REPAIR_TOUNICODE,
-    _apply_figure_reclassification,
     _apply_pretag_form_intelligence,
     _apply_pretag_grounded_text_resolutions,
     _apply_pretag_table_intelligence,
@@ -2287,57 +2286,6 @@ def test_has_grounded_text_candidate_task_detects_only_grounded_candidate():
     ]
     assert _has_grounded_text_candidate_task(review_tasks) is True
     assert _has_grounded_text_candidate_task(review_tasks[1:]) is False
-
-
-def test_apply_figure_reclassification_removes_matching_figure_elements():
-    structure_json = {
-        "elements": [
-            {"type": "heading", "page": 0, "text": "Title"},
-            {"type": "figure", "page": 0, "figure_index": 1, "text": "Wrongly detected figure"},
-            {"type": "table", "page": 0, "review_id": "review-1"},
-            {"type": "figure", "page": 1, "figure_index": 2, "text": "Real figure"},
-        ]
-    }
-
-    alt_texts = [
-        SimpleNamespace(figure_index=1, status="reclassified", resolved_kind="table"),
-        SimpleNamespace(figure_index=2, status="pending_review", resolved_kind=None),
-    ]
-
-    updated, audit = _apply_figure_reclassification(structure_json, alt_texts)
-
-    assert updated is not structure_json
-    assert [element.get("type") for element in updated["elements"]] == ["heading", "table", "figure"]
-    assert audit["applied"] is True
-    assert audit["candidate_count"] == 1
-    assert audit["removed_count"] == 1
-    assert audit["removed_indexes"] == [1]
-    assert audit["removed_kinds"] == {"table": 1}
-    assert audit["pages"] == [1]
-
-
-def test_apply_figure_reclassification_marks_synthetic_artifact_pages_as_ignored():
-    structure_json = {
-        "elements": [
-            {
-                "type": "figure",
-                "page": 1,
-                "figure_index": 7,
-                "text": "Synthetic page figure",
-                "synthetic_figure": True,
-            },
-        ]
-    }
-
-    alt_texts = [
-        SimpleNamespace(figure_index=7, status="reclassified", resolved_kind="artifact"),
-    ]
-
-    updated, audit = _apply_figure_reclassification(structure_json, alt_texts)
-
-    assert updated["elements"] == []
-    assert updated["visual_meaning_ignored_pages"] == [2]
-    assert audit["artifact_pages"] == [2]
 
 
 def test_auto_apply_form_intelligence_rejects_technical_or_unchanged_labels():

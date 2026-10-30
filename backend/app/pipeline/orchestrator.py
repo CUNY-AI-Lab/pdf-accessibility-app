@@ -40,6 +40,8 @@ from app.pipeline.llm_operations import (
     pretag_llm_operation_timeout_seconds as _pretag_llm_operation_timeout_seconds,
 )
 from app.pipeline.ocr import run_ocr
+from app.pipeline.page_frame import PageFrame
+from app.pipeline.pdfium_text import PdfiumText
 from app.pipeline.structure import extract_structure
 from app.pipeline.subprocess_utils import (
     SubprocessTimeout,
@@ -65,7 +67,11 @@ from app.services.font_intelligence_auto import (
 from app.services.font_intelligence_auto import (
     fidelity_not_worse as _fidelity_not_worse,
 )
-from app.services.form_fields import apply_field_accessible_names, remove_widget_fields
+from app.services.form_fields import (
+    apply_field_accessible_names,
+    extract_widget_fields,
+    remove_widget_fields,
+)
 from app.services.grounded_text_apply import (
     PRETAG_GROUNDED_TEXT_TARGET_LIMIT,
 )
@@ -742,7 +748,9 @@ def _alt_text_entry_state(
 
     An empty or placeholder description is never approved: the figure keeps
     no alt text and stays "pending_review" until a person describes it, unless
-    its visible caption can stand in.
+    its visible caption can stand in. A figure the model judged a table or
+    form region but that was kept (see _apply_figure_reclassification) always
+    waits for a person: a caption names a table, it does not read it.
     """
     generated_text = (alt.generated_text or "").strip()
     status = alt.status
@@ -752,6 +760,11 @@ def _alt_text_entry_state(
         return "rejected", ""
     if status == "rejected":
         return status, generated_text
+    if status == "pending_review" and getattr(alt, "resolved_kind", None) in (
+        "table",
+        "form_region",
+    ):
+        return "pending_review", ""
     if is_placeholder_alt_text(generated_text):
         if caption_fallback and not is_placeholder_alt_text(caption_fallback):
             return "approved", caption_fallback
@@ -761,10 +774,107 @@ def _alt_text_entry_state(
     return status, generated_text
 
 
+# A reclassified figure's region is covered by a Docling table only when the
+# table holds this share of the figure's box ...
+RECLASSIFIED_FIGURE_TABLE_CONTAINMENT = 0.8
+# ... and this share of the table's words is real text inside the box: the
+# tagger tags a table from the text drawn on the page, never from pixels.
+RECLASSIFIED_FIGURE_TABLE_TEXT_SHARE = 0.5
+_WORD_RE = re.compile(r"\w+")
+
+
+def _box_containment(inner: dict, outer: dict) -> float:
+    """The share of ``inner``'s area inside ``outer`` (boxes l, b, r, t)."""
+    try:
+        il, ir = sorted((float(inner["l"]), float(inner["r"])))
+        ib, it = sorted((float(inner["b"]), float(inner["t"])))
+        ol, orr = sorted((float(outer["l"]), float(outer["r"])))
+        ob, ot = sorted((float(outer["b"]), float(outer["t"])))
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    area = (ir - il) * (it - ib)
+    if area <= 0:
+        return 0.0
+    width = max(0.0, min(ir, orr) - max(il, ol))
+    height = max(0.0, min(it, ot) - max(ib, ob))
+    return width * height / area
+
+
+def _reclassified_figure_cover(
+    figure: dict,
+    kind: str,
+    elements: list[object],
+    working_pdf: Path | None,
+) -> str | None:
+    """What carries a reclassified figure's content once the figure is gone.
+
+    Deleting the figure turns its pixels into an artifact, so its content
+    survives only in what the tagger tags in the same region: the text drawn
+    there, as the cells of a Docling table that holds the region, or the form
+    fields there (widgets are tagged as Form). Returns "table" or "form_field",
+    or None when nothing tagged covers the region (or it cannot be checked).
+    """
+    page = figure.get("page")
+    bbox = figure.get("bbox")
+    if working_pdf is None or not isinstance(page, int) or not isinstance(bbox, dict):
+        return None
+    tables = [
+        element
+        for element in elements
+        if isinstance(element, dict)
+        and element.get("type") == "table"
+        and element.get("page") == page
+        and isinstance(element.get("bbox"), dict)
+        and _box_containment(bbox, element["bbox"]) >= RECLASSIFIED_FIGURE_TABLE_CONTAINMENT
+    ]
+    try:
+        with PdfiumText(working_pdf) as pdfium_text:
+            if page >= len(pdfium_text.document):
+                return None
+            user_box = PageFrame.of(pdfium_text.document[page]).to_user_space(bbox)
+            region_words = set(_WORD_RE.findall(pdfium_text.in_boxes(page, [user_box]).lower()))
+        if kind == "form_region":
+            for field in extract_widget_fields(working_pdf):
+                field_box = field.get("bbox")
+                if (
+                    field.get("page") == page + 1
+                    and isinstance(field_box, dict)
+                    and _box_containment(field_box, user_box) >= 0.5
+                ):
+                    return "form_field"
+    except Exception:
+        logger.warning("Could not check what covers a reclassified figure", exc_info=True)
+        return None
+    for table in tables:
+        cell_words = [
+            word
+            for cell in table.get("cells") or []
+            if isinstance(cell, dict)
+            for word in _WORD_RE.findall(str(cell.get("text") or "").lower())
+        ]
+        if cell_words and (
+            sum(1 for word in cell_words if word in region_words) / len(cell_words)
+            >= RECLASSIFIED_FIGURE_TABLE_TEXT_SHARE
+        ):
+            return "table"
+    return None
+
+
 def _apply_figure_reclassification(
     structure_json: dict[str, object],
     alt_texts: list[object],
+    *,
+    working_pdf: Path | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
+    """Act on the figures the model reclassified.
+
+    A figure judged a table or part of a form is removed only when a tagged
+    table or form field covers its region (see _reclassified_figure_cover).
+    Otherwise it stays a figure with no description, which holds the document
+    for a person. A figure judged an artifact is kept and marked decorative,
+    as the model's mark_decorative decision is, so a person can review it.
+    The kept figures' results in ``alt_texts`` are updated in place.
+    """
     audit: dict[str, object] = {
         "attempted": False,
         "applied": False,
@@ -773,6 +883,9 @@ def _apply_figure_reclassification(
         "removed_count": 0,
         "removed_indexes": [],
         "removed_kinds": {},
+        "covered_by": {},
+        "kept_for_review_indexes": [],
+        "decorative_indexes": [],
         "pages": [],
         "artifact_pages": [],
     }
@@ -780,7 +893,7 @@ def _apply_figure_reclassification(
         audit["reason"] = "missing_structure"
         return structure_json, audit
 
-    reclassified: dict[int, str] = {}
+    reclassified: dict[int, object] = {}
     for item in alt_texts:
         figure_index = getattr(item, "figure_index", None)
         status = str(getattr(item, "status", "") or "").strip()
@@ -790,7 +903,7 @@ def _apply_figure_reclassification(
             and status == "reclassified"
             and resolved_kind in FIGURE_RECLASSIFY_KINDS
         ):
-            reclassified[figure_index] = resolved_kind
+            reclassified[figure_index] = item
 
     if not reclassified:
         audit["reason"] = "no_candidates"
@@ -808,6 +921,9 @@ def _apply_figure_reclassification(
     removed_indexes: list[int] = []
     removed_pages: set[int] = set()
     removed_kinds: dict[str, int] = {}
+    covered_by: dict[str, str] = {}
+    kept_for_review: list[int] = []
+    decorative: list[int] = []
     artifact_pages: set[int] = set()
     for element in elements:
         if not isinstance(element, dict):
@@ -815,23 +931,50 @@ def _apply_figure_reclassification(
             continue
         if element.get("type") == "figure" and isinstance(element.get("figure_index"), int):
             figure_index = int(element["figure_index"])
-            resolved_kind = reclassified.get(figure_index)
-            if resolved_kind:
-                removed_indexes.append(figure_index)
+            result = reclassified.get(figure_index)
+            if result is not None:
+                resolved_kind = str(result.resolved_kind)
                 page = element.get("page")
+                if resolved_kind == "artifact":
+                    if isinstance(page, int) and page >= 0 and bool(element.get("synthetic_figure")):
+                        artifact_pages.add(page + 1)
+                    result.status = "rejected"
+                    result.generated_text = ""
+                    result.suggested_action = "mark_decorative"
+                    result.reviewable = True
+                    decorative.append(figure_index)
+                    updated_elements.append(element)
+                    continue
+                cover = _reclassified_figure_cover(element, resolved_kind, elements, working_pdf)
+                if cover is None:
+                    result.status = "pending_review"
+                    result.generated_text = ""
+                    result.suggested_action = "manual_only"
+                    result.reviewable = True
+                    result.importance = "high"
+                    kept_for_review.append(figure_index)
+                    updated_elements.append(element)
+                    continue
+                removed_indexes.append(figure_index)
+                covered_by[str(figure_index)] = cover
                 if isinstance(page, int) and page >= 0:
                     removed_pages.add(page + 1)
-                    if (
-                        resolved_kind == "artifact"
-                        and bool(element.get("synthetic_figure"))
-                    ):
-                        artifact_pages.add(page + 1)
                 removed_kinds[resolved_kind] = removed_kinds.get(resolved_kind, 0) + 1
                 continue
         updated_elements.append(element)
 
-    if not removed_indexes:
-        audit["reason"] = "no_matching_structure_elements"
+    audit["removed_count"] = len(removed_indexes)
+    audit["removed_indexes"] = sorted(removed_indexes)
+    audit["removed_kinds"] = removed_kinds
+    audit["covered_by"] = covered_by
+    audit["kept_for_review_indexes"] = sorted(kept_for_review)
+    audit["decorative_indexes"] = sorted(decorative)
+    audit["pages"] = sorted(removed_pages)
+    audit["artifact_pages"] = sorted(artifact_pages)
+    if not removed_indexes and not artifact_pages:
+        audit["reason"] = (
+            "kept_figures" if kept_for_review or decorative else "no_matching_structure_elements"
+        )
         return structure_json, audit
 
     updated["elements"] = updated_elements
@@ -848,11 +991,6 @@ def _apply_figure_reclassification(
         updated["visual_meaning_ignored_pages"] = sorted(ignored_pages)
     audit["applied"] = True
     audit["reason"] = "applied"
-    audit["removed_count"] = len(removed_indexes)
-    audit["removed_indexes"] = sorted(removed_indexes)
-    audit["removed_kinds"] = removed_kinds
-    audit["pages"] = sorted(removed_pages)
-    audit["artifact_pages"] = sorted(artifact_pages)
     return updated, audit
 
 
@@ -5569,6 +5707,7 @@ async def _run_pipeline(
                 structure.document_json, figure_reclassification = _apply_figure_reclassification(
                     structure.document_json,
                     alt_texts,
+                    working_pdf=working_pdf,
                 )
                 if figure_reclassification.get("applied"):
                     job.structure_json = json.dumps(structure.document_json)

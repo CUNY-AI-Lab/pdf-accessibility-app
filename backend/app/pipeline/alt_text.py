@@ -81,10 +81,18 @@ def figure_applied_change_specs(
             detail = result.summary or "The model hid this figure from assistive technology."
         elif result.status == NEEDS_DESCRIPTION:
             title = f"Figure {result.figure_index + 1} needs a description"
-            detail = (
-                "The app could not describe this figure, so it has no alt text. "
-                "Add a description before distribution."
-            )
+            if result.resolved_kind in ("table", "form_region"):
+                kind = "a table" if result.resolved_kind == "table" else "part of a form"
+                detail = (
+                    f"The model judged this figure to be {kind}, but nothing tagged in the "
+                    "PDF carries its content, so it stays a figure with no alt text. "
+                    "Add a description before distribution."
+                )
+            else:
+                detail = (
+                    "The app could not describe this figure, so it has no alt text. "
+                    "Add a description before distribution."
+                )
         else:
             title = f"Updated figure {result.figure_index + 1}"
             detail = result.summary or "The model updated this figure description."
