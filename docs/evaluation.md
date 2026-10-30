@@ -55,9 +55,25 @@ reads pdfium's text in its own order, so there only the text layer counts.
   `run_pipeline` (classify, OCR, Docling structure through docling-serve as in
   production, tagging, validation) on each page and reads the tagged result.
   The app's AI steps are off unless a run names a Gateway model (`--llm`).
+  It runs in `pdf-a11y-eval:branch`, the production image built from the
+  checkout (`--image` names another, such as a published runner image).
   Pipeline results here used docling-serve 1.35.0 (Docling 2.130), on CPU
-  through October 5 and on the GPU since; production's actual-dell runs
-  1.12.0 (Docling 2.72) until it is upgraded, which loses heading levels.
+  through October 5 and on the GPU since. Production on actual-dell has run
+  the same 1.35.0 since 2026-10-28; before that it ran 1.12.0 (Docling 2.72),
+  which loses heading levels.
+- **Run records:** each page's run leaves `<stem>.run.json` (every step's
+  status and seconds, docling-serve cache use, model requests, tokens and
+  cost), and each capture a `capture.json` (commit, image, docling-serve and
+  Docling versions and device, OCR engine, Tesseract and OCRmyPDF versions,
+  date). Bench runs keep docling-serve's answers in
+  `data/eval/cache/docling-serve`, keyed by the PDF's bytes, the request's
+  options and the Docling version, so a page converted before is not
+  converted again (a scan's OCR output differs from run to run, so only
+  born-digital pages repeat). With `--llm`, model calls go through a
+  cassette (`scripts/bench_caches.py`): `replay` answers the requests it
+  has recorded and records the rest, `record` calls the model every time,
+  `strict` calls nothing and fails what it lacks. The caches live in the
+  bench process only; the app and the runner never load them.
 - **Re-tagging:** a pipeline run keeps what the tagger was given for each
   page (`scripts/pipeline_bench.py`), and `scripts/retag_bench.py` tags every
   page again with other tagger code in about a minute, without OCR and
@@ -67,7 +83,23 @@ reads pdfium's text in its own order, so there only the text layer counts.
   not replay the font repairs the pipeline makes to many born-digital tagged
   PDFs afterwards (24 of the multi-column sample's 60 pages, 10 of the
   tables sample's), so on born-digital pages it can differ from a pipeline
-  run by a few tests (two on each of those samples).
+  run by a few tests (two on each of those samples). Captures are not
+  committed; each set is kept as a release asset of the Lab's
+  [eval-data repository](https://github.com/CUNY-AI-Lab/pdf-accessibility-eval-data/releases),
+  with its `capture.json` files and per-test results.
+- **Per-test results:** `scripts/score_olmocr.py` keeps every test's result
+  in `results/<subset>/<candidate>.jsonl`, and `--against <candidate>` lists
+  the tests fixed and broken between two candidates with the paired counts.
+- **Where a test is lost:** `scripts/attribute_failures.py` repeats each
+  failed test's check on what each stage handed the next: the text layer of
+  the PDF the tagger was given, Docling's text in the structure's order, and
+  the tagged output. A failure is the tagger's when Docling's text passes or
+  has the test's words in order; OCR's when a word the test needs is not in
+  the text layer at all (on a born-digital page, the font repair's when the
+  source PDF has the word and the PDF the pipeline rewrote does not, else
+  the source PDF's own); otherwise Docling's. Failures where the tagged output has every word
+  in order and only punctuation, accents, case or spacing differ are counted
+  apart.
 - **OCR stage:** `backend/scripts/ocr_bench.py` runs the app's own OCRmyPDF
   command inside the production image and reads the raw text layer.
 - **AI steps:** `backend/scripts/score_semantics.py` compares the title,

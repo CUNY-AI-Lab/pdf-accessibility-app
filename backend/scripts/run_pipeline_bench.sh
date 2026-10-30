@@ -2,40 +2,60 @@
 # Run pipeline_bench.py over one benchmark subset in parallel containers, with
 # structure from a docling-serve on the host (DOCLING_SERVE_URL, as in
 # production).
-#   run_pipeline_bench.sh <candidate> <subset> [--worktree] [--gateway-ocr]
-#     [--llm <model>] [--shards N]
-# By default the pipeline is production's, from pdf-a11y-eval:prod.
+#   run_pipeline_bench.sh <candidate> <subset> [--image <name>] [--worktree]
+#     [--gateway-ocr] [--llm <model>] [--cassette-mode <mode>] [--shards N]
+#     [--docling-device <device>] [--no-docling-cache]
+# The pipeline runs in pdf-a11y-eval:branch, the production image's recipe
+# built from this checkout:
+#   docker build --label org.opencontainers.image.revision=$(git rev-parse HEAD) \
+#     -t pdf-a11y-eval:branch .
+# --image        runs another image instead, such as a published runner image
+#                (ghcr.io/cuny-ai-lab/pdf-accessibility-app:<commit>).
 # --worktree     runs this worktree's app/ (a snapshot, so later edits do not
-#                leak into a running bench) in pdf-a11y-eval:branch, built
-#                from this worktree: docker build -t pdf-a11y-eval:branch .
+#                leak into a running bench) in that image.
 # --gateway-ocr  recognizes text through the CAIL Gateway (OCR_ENGINE=gateway),
 #                with the key from the Keychain item "cail-gateway".
-# --llm          turns the app's AI steps on with that Gateway model.
+# --llm          turns the app's AI steps on with that Gateway model; model
+#                calls go through a cassette in data/eval/cache/llm-cassette,
+#                replayed where it has them (--cassette-mode record|replay|strict).
+# --docling-device  the device docling-serve runs on, for capture.json.
 # Without --llm no model is reachable and the AI steps fail at once, so runs
-# compare the deterministic pipeline.
+# compare the deterministic pipeline. Conversions are cached by PDF bytes,
+# request options and Docling version in data/eval/cache/docling-serve.
 set -euo pipefail
 candidate=$1 subset=$2
 shift 2
 backend=$(cd "$(dirname "$0")/.." && pwd)
 bench=$backend/data/eval/olmocr-bench/bench_data
+cache=$backend/data/eval/cache
 shards=4
-image=pdf-a11y-eval:prod
+image=pdf-a11y-eval:branch
+app_source=image
 snapshot=
 gateway=https://tools.ailab.gc.cuny.edu/v1
 llm=
 gateway_ocr=
-env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001)
-mounts=(-v "$bench:/bench" -v "$backend/scripts/pipeline_bench.py:/app/backend/pipeline_bench.py:ro")
+cassette_mode=replay
+docling_device=unknown
+docling_cache=1
+# A long document takes docling-serve on a Mac GPU longer than production's
+# five minutes.
+env=(-e DOCLING_SERVE_URL=http://host.docker.internal:5001 -e DOCLING_SERVE_TIMEOUT=1800)
+mounts=(-v "$bench:/bench" -v "$cache:/cache" -v "$backend/scripts:/app/backend/scripts:ro")
 while [ $# -gt 0 ]; do
   case $1 in
+    --image) image=$2; shift ;;
     --worktree)
-      image=pdf-a11y-eval:branch
+      app_source=worktree
       snapshot=$(mktemp -d "$bench/.app-snapshot-XXXXXX")
       cp -R "$backend/app/." "$snapshot"
       mounts+=(-v "$snapshot:/app/backend/app:ro") ;;
     --gateway-ocr) gateway_ocr=1 ;;
     --llm) llm=$2; shift ;;
+    --cassette-mode) cassette_mode=$2; shift ;;
     --shards) shards=$2; shift ;;
+    --docling-device) docling_device=$2; shift ;;
+    --no-docling-cache) docling_cache= ;;
     *) echo "unknown flag $1" >&2; exit 2 ;;
   esac
   shift
@@ -47,25 +67,36 @@ if [ -n "$gateway_ocr" ] || [ -n "$llm" ]; then
   env+=(-e LLM_API_KEY)
 fi
 [ -n "$gateway_ocr" ] && env+=(-e OCR_ENGINE=gateway)
+bench_args=(--bench-dir /bench --candidate "$candidate" --subsets "$subset")
+[ -n "$docling_cache" ] && bench_args+=(--docling-cache /cache/docling-serve)
 if [ -n "$llm" ]; then
-  env+=(-e "LLM_BASE_URL=$gateway" -e "LLM_MODEL=$llm")
+  env+=(-e "LLM_BASE_URL=$gateway" -e "LLM_MODEL=$llm" -e BENCH_AI_STEPS="$llm")
+  bench_args+=(--cassette /cache/llm-cassette --cassette-mode "$cassette_mode")
 else
-  # Gateway OCR reads LLM_BASE_URL; the AI steps then name a model the
-  # Gateway refuses, so they fail at once as with no model at all. The
-  # production image predates the Gateway lane: it wants "gemini" in the
-  # model name, and USE_DIRECT_GEMINI_PDF=false keeps it off Google.
+  # With Gateway OCR the AI steps reach the Gateway but name no model it
+  # serves, so they fail at once; otherwise nothing listens at the address.
   base_url=http://127.0.0.1:9/v1
   [ -n "$gateway_ocr" ] && base_url=$gateway
-  env+=(-e "LLM_BASE_URL=$base_url" -e LLM_MODEL=gemini-unused
-    -e LLM_MAX_RETRIES=0 -e USE_DIRECT_GEMINI_PDF=false)
+  env+=(-e "LLM_BASE_URL=$base_url" -e LLM_MODEL=ai-steps-off -e LLM_MAX_RETRIES=0
+    -e BENCH_AI_STEPS=off)
 fi
-mkdir -p "$bench/logs"
+# The commit of the app code that runs: the image's, or this checkout's.
+revision='{{index .Config.Labels "org.opencontainers.image.revision"}}'
+commit=$(docker image inspect -f "$revision" "$image")
+if [ "$app_source" = worktree ]; then
+  commit=$(git -C "$backend" rev-parse HEAD)
+  if [ -n "$(git -C "$backend" status --porcelain -- app)" ]; then commit=$commit-dirty; fi
+fi
+env+=(-e "BENCH_GIT_COMMIT=${commit:-unknown}" -e "BENCH_APP_SOURCE=$app_source"
+  -e "BENCH_IMAGE=$image" -e "BENCH_IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$image")"
+  -e "BENCH_DOCLING_DEVICE=$docling_device")
+mkdir -p "$bench/logs" "$cache"
 [ -n "$snapshot" ] && trap 'rm -rf "$snapshot"' EXIT
 
 for i in $(seq 0 $((shards - 1))); do
   docker run --rm --name "pipe-$candidate-$subset-$i" --user 0 "${env[@]}" "${mounts[@]}" \
-    "$image" sh -c "cd /app/backend && python pipeline_bench.py --bench-dir /bench \
-      --candidate $candidate --subsets $subset --shard $i/$shards" \
+    -e PYTHONPATH=/app/backend "$image" \
+    python /app/backend/scripts/pipeline_bench.py "${bench_args[@]}" --shard "$i/$shards" \
     >> "$bench/logs/$candidate.$subset.$i.log" 2>&1 &
 done
 wait
