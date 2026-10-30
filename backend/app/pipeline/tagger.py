@@ -3214,17 +3214,18 @@ def _allocate_fragment_mcid(
         fig_idx = elem.get("figure_index")
         if fig_idx in decorative_figures:
             return None
-        alt = (
-            alt_lookup.get(fig_idx)
-            or elem.get("caption")
-            or elem.get("text")
+        alt = next(
+            (
+                candidate.strip()
+                for candidate in (alt_lookup.get(fig_idx), elem.get("caption"), elem.get("text"))
+                if isinstance(candidate, str) and not is_placeholder_alt_text(candidate)
+            ),
+            None,
         )
-        if isinstance(alt, str):
-            alt = alt.strip()
         mcid = builder.add_figure(
             page_index,
             page_ref,
-            alt_text=alt or None,
+            alt_text=alt,
             stream_owner=stream_owner,
         )
         actual_text = None
@@ -3513,7 +3514,8 @@ def _attach_glyph_text(pages_elements: dict[int, list[dict]], pdfium_text: Pdfiu
     text pdfium extracts inside its boxes accounts for the structure step's
     text: the PDF's own characters and word breaks, which
     _element_accessible_text (and a table cell's /ActualText) prefer to
-    Docling's text (see element_text)."""
+    Docling's text (see element_text). A formula keeps Docling's text; one
+    left without any gets its glyphs' text."""
     for page_index, elements in pages_elements.items():
         for elem in elements:
             boxes = [elem.get("bbox"), *elem.get("extra_bboxes", [])]
@@ -3527,6 +3529,16 @@ def _attach_glyph_text(pages_elements: dict[int, list[dict]], pdfium_text: Pdfiu
                         # own glyph after the letter): the readable text is
                         # a correction.
                         elem["resolved_text"] = elem.get("resolved_text") or text
+            elif (
+                elem.get("type") == "formula"
+                and isinstance(boxes[0], dict)
+                and not str(elem.get("text") or "").strip()
+            ):
+                # A formula with no structure text reads its own glyphs, so it
+                # still gets /ActualText and /Alt (see _allocate_fragment_mcid).
+                text = readable(pdfium_text.in_boxes(page_index, boxes))
+                if text:
+                    elem["glyph_text"] = text
             if elem.get("type") == "table":
                 for cell in elem.get("cells") or []:
                     if isinstance(cell, dict) and (box := _table_cell_bbox(elem, cell)):
@@ -3990,12 +4002,18 @@ def _make_bmc_artifact(
     )
 
 
-def _is_weak_figure_alt_text(text: Any) -> bool:
+def is_placeholder_alt_text(text: Any) -> bool:
+    """True for alt text that describes nothing: empty, or a bracketed
+    placeholder such as "[Could not determine figure semantics]". It is never
+    written as /Alt; a figure without a description goes to a person."""
     normalized = " ".join(str(text or "").split()).strip()
-    if not normalized:
+    return not normalized or (normalized.startswith("[") and normalized.endswith("]"))
+
+
+def _is_weak_figure_alt_text(text: Any) -> bool:
+    if is_placeholder_alt_text(text):
         return True
-    if normalized.startswith("[") and normalized.endswith("]"):
-        return True
+    normalized = " ".join(str(text or "").split()).strip()
     return bool(WEAK_FIGURE_ALT_RE.fullmatch(normalized))
 
 
@@ -4183,14 +4201,44 @@ def _reset_xmp_metadata(pdf: pikepdf.Pdf):
         logger.warning(f"Could not reset existing metadata stream: {e}")
 
 
+# Titles authoring tools write that say nothing about the document: an Office
+# "Microsoft Word - file.docx" prefix, a file name, or a stock placeholder.
+OFFICE_TITLE_PREFIX_RE = re.compile(r"^microsoft\s+(?:office\s+)?(?:word|powerpoint|excel)\s*-", re.I)
+FILE_NAME_TITLE_RE = re.compile(r"\.(?:pdf|docx?|pptx?|xlsx?|odt|odp|rtf|txt|indd|pages|key|tex)$", re.I)
+PLACEHOLDER_TITLE_RE = re.compile(
+    r"^(?:untitled(?:[\s_-]*\d+)?|untitled document|document\s*\d*|presentation\s*\d*|title)$",
+    re.I,
+)
+
+
+def _is_placeholder_document_title(title: str, original_filename: str) -> bool:
+    """Whether a document-info title only names the file or the tool that made it."""
+    text = " ".join(title.split())
+    if (
+        not text
+        or OFFICE_TITLE_PREFIX_RE.match(text)
+        or FILE_NAME_TITLE_RE.search(text)
+        or PLACEHOLDER_TITLE_RE.fullmatch(text)
+    ):
+        return True
+    name = Path(original_filename).name.casefold() if original_filename else ""
+    return bool(name) and text.casefold() in {name, Path(name).stem}
+
+
 def _set_document_title(pdf: pikepdf.Pdf, structure_json: dict, original_filename: str):
-    """Set the document title in XMP metadata and enable title display."""
+    """Set the document title in XMP metadata and enable title display.
+
+    The PDF's own title wins unless it is a placeholder (see
+    _is_placeholder_document_title); then the title the structure step
+    detected is used, and failing that the uploaded file's name."""
     existing_title = None
     try:
         if "/Title" in pdf.docinfo:
             existing_title = str(pdf.docinfo["/Title"]).strip()
     except Exception:
         pass
+    if existing_title and _is_placeholder_document_title(existing_title, original_filename):
+        existing_title = None
 
     title = existing_title or structure_json.get("title")
     if not title and original_filename:
@@ -5052,7 +5100,7 @@ async def tag_pdf(
                     decorative_figures.add(fig_idx)
                     continue
                 text = alt.get("text")
-                if isinstance(text, str) and text.strip():
+                if isinstance(text, str) and not is_placeholder_alt_text(text):
                     alt_lookup[fig_idx] = text.strip()
 
             for fig_idx, source_alt in source_figure_alt_lookup.items():

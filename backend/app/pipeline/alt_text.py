@@ -11,6 +11,10 @@ from app.services.llm_client import LlmClient
 
 logger = logging.getLogger(__name__)
 
+# A figure the app could not describe: it has no alt text and waits for a
+# person. Nothing is approved or written in its place.
+NEEDS_DESCRIPTION = "pending_review"
+
 
 def _caption_fallback(caption: str | None) -> str:
     if not isinstance(caption, str):
@@ -75,6 +79,20 @@ def figure_applied_change_specs(
         if result.status == "rejected":
             title = f"Hid figure {result.figure_index + 1}"
             detail = result.summary or "The model hid this figure from assistive technology."
+        elif result.status == NEEDS_DESCRIPTION:
+            title = f"Figure {result.figure_index + 1} needs a description"
+            if result.resolved_kind in ("table", "form_region"):
+                kind = "a table" if result.resolved_kind == "table" else "part of a form"
+                detail = (
+                    f"The model judged this figure to be {kind}, but nothing tagged in the "
+                    "PDF carries its content, so it stays a figure with no alt text. "
+                    "Add a description before distribution."
+                )
+            else:
+                detail = (
+                    "The app could not describe this figure, so it has no alt text. "
+                    "Add a description before distribution."
+                )
         else:
             title = f"Updated figure {result.figure_index + 1}"
             detail = result.summary or "The model updated this figure description."
@@ -141,11 +159,10 @@ async def generate_alt_text(
         if not fig.path.exists():
             logger.warning(f"Figure {fig.index} image not found: {fig.path}")
             fallback = _caption_fallback(fig.caption)
-            generated_text = fallback or "[Image file not found]"
             existing[fig.index] = AltTextResult(
                 figure_index=fig.index,
-                generated_text=generated_text,
-                status="approved",
+                generated_text=fallback,
+                status="approved" if fallback else NEEDS_DESCRIPTION,
                 suggested_action="manual_only",
                 confidence="low",
                 summary="The image file was missing, so the app used the best available fallback.",
@@ -202,7 +219,6 @@ async def generate_alt_text(
                     text = fallback
                     used_caption_fallback = True
                 else:
-                    text = "[Could not determine figure semantics]"
                     used_placeholder_fallback = True
             reviewable, importance = _figure_reviewability(
                 suggested_action=suggested_action or "manual_only",
@@ -222,7 +238,13 @@ async def generate_alt_text(
             existing[fig.index] = AltTextResult(
                 figure_index=fig.index,
                 generated_text=text,
-                status="rejected" if is_decorative else "approved",
+                status=(
+                    "rejected"
+                    if is_decorative
+                    else NEEDS_DESCRIPTION
+                    if used_placeholder_fallback
+                    else "approved"
+                ),
                 resolved_kind=resolved_kind,
                 suggested_action=suggested_action or ("mark_decorative" if is_decorative else "set_alt_text"),
                 confidence=confidence,
@@ -237,11 +259,10 @@ async def generate_alt_text(
         except Exception as e:
             logger.error(f"Alt text generation failed for figure {fig.index}: {e}")
             fallback = _caption_fallback(fig.caption)
-            generated_text = fallback or f"[Generation failed: {e}]"
             existing[fig.index] = AltTextResult(
                 figure_index=fig.index,
-                generated_text=generated_text,
-                status="approved",
+                generated_text=fallback,
+                status="approved" if fallback else NEEDS_DESCRIPTION,
                 resolved_kind=None,
                 suggested_action="manual_only",
                 confidence="low",
@@ -263,11 +284,10 @@ async def generate_alt_text(
         result = existing.get(fig.index)
         if result is None:
             fallback = _caption_fallback(fig.caption)
-            generated_text = fallback or "[Could not determine figure semantics]"
             result = AltTextResult(
                 figure_index=fig.index,
-                generated_text=generated_text,
-                status="approved",
+                generated_text=fallback,
+                status="approved" if fallback else NEEDS_DESCRIPTION,
                 resolved_kind=None,
                 suggested_action="manual_only",
                 confidence="low",

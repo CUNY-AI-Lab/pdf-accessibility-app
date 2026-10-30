@@ -181,87 +181,125 @@ async def _validate_with_verapdf(
             error=f"Failed to parse veraPDF output: {e}",
         )
 
-    # Parse violations from veraPDF JSON report
-    violations = []
-    compliant = True
+    return parse_verapdf_report(report)
 
-    # veraPDF JSON structure varies by version; handle common formats
-    report_root = report.get("report", {}) if isinstance(report, dict) else {}
-    jobs = report_root.get("jobs", []) if isinstance(report_root, dict) else []
-    if jobs:
-        job = jobs[0]
-        validation_raw = job.get("validationResult", {})
-        validation_entries = (
-            validation_raw
-            if isinstance(validation_raw, list)
-            else [validation_raw]
+
+def _job_verdict(job: object) -> tuple[bool, list[dict], str | None]:
+    """Return (compliant, validation entries, error) for one veraPDF job."""
+    if not isinstance(job, dict):
+        return False, [], "veraPDF job entry is not an object"
+    task_exception = job.get("taskException")
+    if task_exception:
+        message = (
+            task_exception.get("exceptionMessage") or task_exception.get("exception")
+            if isinstance(task_exception, dict)
+            else None
         )
-        validation_entries = [entry for entry in validation_entries if isinstance(entry, dict)]
+        return False, [], f"veraPDF could not validate the file: {message or task_exception}"
+    validation_raw = job.get("validationResult")
+    entries = validation_raw if isinstance(validation_raw, list) else [validation_raw]
+    entries = [entry for entry in entries if isinstance(entry, dict)]
+    if not entries:
+        return False, [], "veraPDF job has no validation result"
+    unfinished = [
+        str(entry["jobEndStatus"])
+        for entry in entries
+        if entry.get("jobEndStatus") not in (None, "normal")
+    ]
+    if unfinished:
+        return False, entries, f"veraPDF validation ended early: {', '.join(unfinished)}"
+    if any(not isinstance(entry.get("compliant"), bool) for entry in entries):
+        return False, entries, "veraPDF validation result has no compliant verdict"
+    return all(entry["compliant"] for entry in entries), entries, None
 
-        if validation_entries:
-            compliant = all(bool(entry.get("compliant", False)) for entry in validation_entries)
-        else:
-            compliant = False
 
-        for validation in validation_entries:
-            details = validation.get("details", {})
-            if not isinstance(details, dict):
-                continue
+def parse_verapdf_report(report: object) -> ValidationResult:
+    """Read a veraPDF JSON report.
 
-            # Older veraPDF JSON schema.
-            legacy_rules = details.get("rule", [])
-            if isinstance(legacy_rules, list):
-                for detail in legacy_rules:
-                    if not isinstance(detail, dict):
-                        continue
-                    clause = str(detail.get("clause", ""))
-                    test_number = str(detail.get("testNumber", ""))
-                    category, fix_hint = _guidance_for(clause, test_number)
-                    rule_id = (
-                        f"{detail.get('specification', '')}-"
-                        f"{clause}-"
-                        f"{test_number}"
-                    )
-                    violations.append(Violation(
-                        rule_id=rule_id,
-                        description=detail.get("description", "Unknown violation"),
-                        severity="error",
-                        count=detail.get("failedChecks", 1),
-                        category=category,
-                        fix_hint=fix_hint,
-                    ))
+    The file is compliant only when the report holds at least one job, every job
+    has a validation result, and every result says compliant. An empty report, a
+    task exception, or a validation that ended early is non-compliant.
+    """
+    report_root = report.get("report") if isinstance(report, dict) else None
+    jobs = report_root.get("jobs") if isinstance(report_root, dict) else None
+    if not isinstance(jobs, list) or not jobs:
+        return ValidationResult(
+            compliant=False,
+            raw_report=report if isinstance(report, dict) else {},
+            error="veraPDF report has no validation jobs",
+        )
 
-            # Newer veraPDF JSON schema.
-            rule_summaries = details.get("ruleSummaries", [])
-            if not isinstance(rule_summaries, list):
-                continue
-            for summary in rule_summaries:
-                if not isinstance(summary, dict):
+    compliant = True
+    errors: list[str] = []
+    validation_entries: list[dict] = []
+    for job in jobs:
+        job_compliant, entries, error = _job_verdict(job)
+        compliant = compliant and job_compliant
+        validation_entries.extend(entries)
+        if error:
+            errors.append(error)
+
+    violations: list[Violation] = []
+    for validation in validation_entries:
+        details = validation.get("details", {})
+        if not isinstance(details, dict):
+            continue
+
+        # Older veraPDF JSON schema.
+        legacy_rules = details.get("rule", [])
+        if isinstance(legacy_rules, list):
+            for detail in legacy_rules:
+                if not isinstance(detail, dict):
                     continue
-                status = str(summary.get("status", "")).lower()
-                if status == "passed":
-                    continue
-                failed_checks = summary.get("failedChecks", 1)
-                clause = str(summary.get("clause", ""))
-                test_number = str(summary.get("testNumber", ""))
+                clause = str(detail.get("clause", ""))
+                test_number = str(detail.get("testNumber", ""))
                 category, fix_hint = _guidance_for(clause, test_number)
                 rule_id = (
-                    f"{summary.get('specification', '')}-"
+                    f"{detail.get('specification', '')}-"
                     f"{clause}-"
                     f"{test_number}"
                 )
                 violations.append(Violation(
                     rule_id=rule_id,
-                    description=summary.get("description", "Unknown violation"),
-                    severity="error" if status in ("failed", "error") else "warning",
-                    location=summary.get("object"),
-                    count=failed_checks if isinstance(failed_checks, int) else 1,
+                    description=detail.get("description", "Unknown violation"),
+                    severity="error",
+                    count=detail.get("failedChecks", 1),
                     category=category,
                     fix_hint=fix_hint,
                 ))
+
+        # Newer veraPDF JSON schema.
+        rule_summaries = details.get("ruleSummaries", [])
+        if not isinstance(rule_summaries, list):
+            continue
+        for summary in rule_summaries:
+            if not isinstance(summary, dict):
+                continue
+            status = str(summary.get("status", "")).lower()
+            if status == "passed":
+                continue
+            failed_checks = summary.get("failedChecks", 1)
+            clause = str(summary.get("clause", ""))
+            test_number = str(summary.get("testNumber", ""))
+            category, fix_hint = _guidance_for(clause, test_number)
+            rule_id = (
+                f"{summary.get('specification', '')}-"
+                f"{clause}-"
+                f"{test_number}"
+            )
+            violations.append(Violation(
+                rule_id=rule_id,
+                description=summary.get("description", "Unknown violation"),
+                severity="error" if status in ("failed", "error") else "warning",
+                location=summary.get("object"),
+                count=failed_checks if isinstance(failed_checks, int) else 1,
+                category=category,
+                fix_hint=fix_hint,
+            ))
 
     return ValidationResult(
         compliant=compliant,
         violations=violations,
         raw_report=report,
+        error="; ".join(errors) or None,
     )

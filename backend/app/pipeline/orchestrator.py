@@ -40,13 +40,15 @@ from app.pipeline.llm_operations import (
     pretag_llm_operation_timeout_seconds as _pretag_llm_operation_timeout_seconds,
 )
 from app.pipeline.ocr import run_ocr
+from app.pipeline.page_frame import PageFrame
+from app.pipeline.pdfium_text import PdfiumText
 from app.pipeline.structure import extract_structure
 from app.pipeline.subprocess_utils import (
     SubprocessTimeout,
     communicate_with_timeout,
     subprocess_process_group_kwargs,
 )
-from app.pipeline.tagger import tag_pdf
+from app.pipeline.tagger import is_placeholder_alt_text, tag_pdf
 from app.pipeline.validator import validate_pdf
 from app.services.applied_changes import add_applied_change
 from app.services.auto_structure_apply import auto_apply_structure_tasks
@@ -65,7 +67,11 @@ from app.services.font_intelligence_auto import (
 from app.services.font_intelligence_auto import (
     fidelity_not_worse as _fidelity_not_worse,
 )
-from app.services.form_fields import apply_field_accessible_names, remove_widget_fields
+from app.services.form_fields import (
+    apply_field_accessible_names,
+    extract_widget_fields,
+    remove_widget_fields,
+)
 from app.services.grounded_text_apply import (
     PRETAG_GROUNDED_TEXT_TARGET_LIMIT,
 )
@@ -732,10 +738,143 @@ def _merge_review_task_metadata(
     return review_tasks
 
 
+def _alt_text_entry_state(
+    alt,
+    *,
+    caption: str | None,
+    auto_approve: bool,
+) -> tuple[str, str]:
+    """Return the (status, text) to store for one figure's generated alt text.
+
+    An empty or placeholder description is never approved: the figure keeps
+    no alt text and stays "pending_review" until a person describes it, unless
+    its visible caption can stand in. A figure the model judged a table or
+    form region but that was kept (see _apply_figure_reclassification) always
+    waits for a person: a caption names a table, it does not read it.
+    """
+    generated_text = (alt.generated_text or "").strip()
+    status = alt.status
+    caption_fallback = (caption or "").strip()
+
+    if auto_approve and generated_text.lower() == "decorative":
+        return "rejected", ""
+    if status == "rejected":
+        return status, generated_text
+    if status == "pending_review" and getattr(alt, "resolved_kind", None) in (
+        "table",
+        "form_region",
+    ):
+        return "pending_review", ""
+    if is_placeholder_alt_text(generated_text):
+        if caption_fallback and not is_placeholder_alt_text(caption_fallback):
+            return "approved", caption_fallback
+        return "pending_review", ""
+    if auto_approve:
+        return "approved", generated_text
+    return status, generated_text
+
+
+# A reclassified figure's region is covered by a Docling table only when the
+# table holds this share of the figure's box ...
+RECLASSIFIED_FIGURE_TABLE_CONTAINMENT = 0.8
+# ... and this share of the table's words is real text inside the box: the
+# tagger tags a table from the text drawn on the page, never from pixels.
+RECLASSIFIED_FIGURE_TABLE_TEXT_SHARE = 0.5
+_WORD_RE = re.compile(r"\w+")
+
+
+def _box_containment(inner: dict, outer: dict) -> float:
+    """The share of ``inner``'s area inside ``outer`` (boxes l, b, r, t)."""
+    try:
+        il, ir = sorted((float(inner["l"]), float(inner["r"])))
+        ib, it = sorted((float(inner["b"]), float(inner["t"])))
+        ol, orr = sorted((float(outer["l"]), float(outer["r"])))
+        ob, ot = sorted((float(outer["b"]), float(outer["t"])))
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    area = (ir - il) * (it - ib)
+    if area <= 0:
+        return 0.0
+    width = max(0.0, min(ir, orr) - max(il, ol))
+    height = max(0.0, min(it, ot) - max(ib, ob))
+    return width * height / area
+
+
+def _reclassified_figure_cover(
+    figure: dict,
+    kind: str,
+    elements: list[object],
+    working_pdf: Path | None,
+) -> str | None:
+    """What carries a reclassified figure's content once the figure is gone.
+
+    Deleting the figure turns its pixels into an artifact, so its content
+    survives only in what the tagger tags in the same region: the text drawn
+    there, as the cells of a Docling table that holds the region, or the form
+    fields there (widgets are tagged as Form). Returns "table" or "form_field",
+    or None when nothing tagged covers the region (or it cannot be checked).
+    """
+    page = figure.get("page")
+    bbox = figure.get("bbox")
+    if working_pdf is None or not isinstance(page, int) or not isinstance(bbox, dict):
+        return None
+    tables = [
+        element
+        for element in elements
+        if isinstance(element, dict)
+        and element.get("type") == "table"
+        and element.get("page") == page
+        and isinstance(element.get("bbox"), dict)
+        and _box_containment(bbox, element["bbox"]) >= RECLASSIFIED_FIGURE_TABLE_CONTAINMENT
+    ]
+    try:
+        with PdfiumText(working_pdf) as pdfium_text:
+            if page >= len(pdfium_text.document):
+                return None
+            user_box = PageFrame.of(pdfium_text.document[page]).to_user_space(bbox)
+            region_words = set(_WORD_RE.findall(pdfium_text.in_boxes(page, [user_box]).lower()))
+        if kind == "form_region":
+            for field in extract_widget_fields(working_pdf):
+                field_box = field.get("bbox")
+                if (
+                    field.get("page") == page + 1
+                    and isinstance(field_box, dict)
+                    and _box_containment(field_box, user_box) >= 0.5
+                ):
+                    return "form_field"
+    except Exception:
+        logger.warning("Could not check what covers a reclassified figure", exc_info=True)
+        return None
+    for table in tables:
+        cell_words = [
+            word
+            for cell in table.get("cells") or []
+            if isinstance(cell, dict)
+            for word in _WORD_RE.findall(str(cell.get("text") or "").lower())
+        ]
+        if cell_words and (
+            sum(1 for word in cell_words if word in region_words) / len(cell_words)
+            >= RECLASSIFIED_FIGURE_TABLE_TEXT_SHARE
+        ):
+            return "table"
+    return None
+
+
 def _apply_figure_reclassification(
     structure_json: dict[str, object],
     alt_texts: list[object],
+    *,
+    working_pdf: Path | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
+    """Act on the figures the model reclassified.
+
+    A figure judged a table or part of a form is removed only when a tagged
+    table or form field covers its region (see _reclassified_figure_cover).
+    Otherwise it stays a figure with no description, which holds the document
+    for a person. A figure judged an artifact is kept and marked decorative,
+    as the model's mark_decorative decision is, so a person can review it.
+    The kept figures' results in ``alt_texts`` are updated in place.
+    """
     audit: dict[str, object] = {
         "attempted": False,
         "applied": False,
@@ -744,6 +883,9 @@ def _apply_figure_reclassification(
         "removed_count": 0,
         "removed_indexes": [],
         "removed_kinds": {},
+        "covered_by": {},
+        "kept_for_review_indexes": [],
+        "decorative_indexes": [],
         "pages": [],
         "artifact_pages": [],
     }
@@ -751,7 +893,7 @@ def _apply_figure_reclassification(
         audit["reason"] = "missing_structure"
         return structure_json, audit
 
-    reclassified: dict[int, str] = {}
+    reclassified: dict[int, object] = {}
     for item in alt_texts:
         figure_index = getattr(item, "figure_index", None)
         status = str(getattr(item, "status", "") or "").strip()
@@ -761,7 +903,7 @@ def _apply_figure_reclassification(
             and status == "reclassified"
             and resolved_kind in FIGURE_RECLASSIFY_KINDS
         ):
-            reclassified[figure_index] = resolved_kind
+            reclassified[figure_index] = item
 
     if not reclassified:
         audit["reason"] = "no_candidates"
@@ -779,6 +921,9 @@ def _apply_figure_reclassification(
     removed_indexes: list[int] = []
     removed_pages: set[int] = set()
     removed_kinds: dict[str, int] = {}
+    covered_by: dict[str, str] = {}
+    kept_for_review: list[int] = []
+    decorative: list[int] = []
     artifact_pages: set[int] = set()
     for element in elements:
         if not isinstance(element, dict):
@@ -786,23 +931,50 @@ def _apply_figure_reclassification(
             continue
         if element.get("type") == "figure" and isinstance(element.get("figure_index"), int):
             figure_index = int(element["figure_index"])
-            resolved_kind = reclassified.get(figure_index)
-            if resolved_kind:
-                removed_indexes.append(figure_index)
+            result = reclassified.get(figure_index)
+            if result is not None:
+                resolved_kind = str(result.resolved_kind)
                 page = element.get("page")
+                if resolved_kind == "artifact":
+                    if isinstance(page, int) and page >= 0 and bool(element.get("synthetic_figure")):
+                        artifact_pages.add(page + 1)
+                    result.status = "rejected"
+                    result.generated_text = ""
+                    result.suggested_action = "mark_decorative"
+                    result.reviewable = True
+                    decorative.append(figure_index)
+                    updated_elements.append(element)
+                    continue
+                cover = _reclassified_figure_cover(element, resolved_kind, elements, working_pdf)
+                if cover is None:
+                    result.status = "pending_review"
+                    result.generated_text = ""
+                    result.suggested_action = "manual_only"
+                    result.reviewable = True
+                    result.importance = "high"
+                    kept_for_review.append(figure_index)
+                    updated_elements.append(element)
+                    continue
+                removed_indexes.append(figure_index)
+                covered_by[str(figure_index)] = cover
                 if isinstance(page, int) and page >= 0:
                     removed_pages.add(page + 1)
-                    if (
-                        resolved_kind == "artifact"
-                        and bool(element.get("synthetic_figure"))
-                    ):
-                        artifact_pages.add(page + 1)
                 removed_kinds[resolved_kind] = removed_kinds.get(resolved_kind, 0) + 1
                 continue
         updated_elements.append(element)
 
-    if not removed_indexes:
-        audit["reason"] = "no_matching_structure_elements"
+    audit["removed_count"] = len(removed_indexes)
+    audit["removed_indexes"] = sorted(removed_indexes)
+    audit["removed_kinds"] = removed_kinds
+    audit["covered_by"] = covered_by
+    audit["kept_for_review_indexes"] = sorted(kept_for_review)
+    audit["decorative_indexes"] = sorted(decorative)
+    audit["pages"] = sorted(removed_pages)
+    audit["artifact_pages"] = sorted(artifact_pages)
+    if not removed_indexes and not artifact_pages:
+        audit["reason"] = (
+            "kept_figures" if kept_for_review or decorative else "no_matching_structure_elements"
+        )
         return structure_json, audit
 
     updated["elements"] = updated_elements
@@ -819,11 +991,6 @@ def _apply_figure_reclassification(
         updated["visual_meaning_ignored_pages"] = sorted(ignored_pages)
     audit["applied"] = True
     audit["reason"] = "applied"
-    audit["removed_count"] = len(removed_indexes)
-    audit["removed_indexes"] = sorted(removed_indexes)
-    audit["removed_kinds"] = removed_kinds
-    audit["pages"] = sorted(removed_pages)
-    audit["artifact_pages"] = sorted(artifact_pages)
     return updated, audit
 
 
@@ -1872,6 +2039,11 @@ def _walk_pdf_resource_graph(
 
 def _is_pdf_mapping(obj) -> bool:
     return obj is not None and hasattr(obj, "get") and hasattr(obj, "keys")
+
+
+def _is_form_xobject(obj) -> bool:
+    """A Form XObject is a stream, not a bare dictionary (ISO 32000-1, 8.10)."""
+    return isinstance(obj, pikepdf.Stream) and obj.get("/Subtype") == pikepdf.Name("/Form")
 
 
 def _local_embed_support_kind(font_dict, descendant_subtype=None) -> str:
@@ -3347,12 +3519,12 @@ def _inspect_font_diagnostics(
 
                 if op == "Do" and operands and isinstance(xobjects, pikepdf.Dictionary):
                     xobject = _resolve_dictionary(xobjects.get(operands[0]))
-                    if not isinstance(xobject, pikepdf.Dictionary):
-                        continue
-                    if xobject.get("/Subtype") != pikepdf.Name("/Form"):
+                    if not _is_form_xobject(xobject):
                         continue
                     child_resources = _resolve_dictionary(xobject.get("/Resources")) or resources
-                    _collect_used_simple_font_codes(xobject, child_resources)
+                    _collect_used_simple_font_codes(
+                        xobject, child_resources, target_font_keys=target_font_keys
+                    )
 
         def _touch_profile(font_dict, *, descendant_subtype=None, descriptor=None) -> None:
             font_key = _obj_key(font_dict)
@@ -3932,9 +4104,7 @@ def _repair_pdf_tounicode_sync(
 
             if op == "Do" and operands and isinstance(xobjects, pikepdf.Dictionary):
                 xobject = _resolve_dictionary(xobjects.get(operands[0]))
-                if not isinstance(xobject, pikepdf.Dictionary):
-                    continue
-                if xobject.get("/Subtype") != pikepdf.Name("/Form"):
+                if not _is_form_xobject(xobject):
                     continue
                 child_resources = _resolve_dictionary(xobject.get("/Resources")) or resources
                 _collect_used_simple_font_codes(xobject, child_resources)
@@ -4103,9 +4273,7 @@ def _repair_pdf_tounicode_sync(
                         changed = True
             elif op == "Do" and operands and isinstance(xobjects, pikepdf.Dictionary):
                 xobject = _resolve_dictionary(xobjects.get(operands[0]))
-                if isinstance(xobject, pikepdf.Dictionary) and xobject.get(
-                    "/Subtype"
-                ) == pikepdf.Name("/Form"):
+                if _is_form_xobject(xobject):
                     child_resources = _resolve_dictionary(xobject.get("/Resources")) or resources
                     _sanitize_simple_font_zero_bytes(pdf, xobject, child_resources)
 
@@ -5540,6 +5708,7 @@ async def _run_pipeline(
                 structure.document_json, figure_reclassification = _apply_figure_reclassification(
                     structure.document_json,
                     alt_texts,
+                    working_pdf=working_pdf,
                 )
                 if figure_reclassification.get("applied"):
                     job.structure_json = json.dumps(structure.document_json)
@@ -5556,24 +5725,11 @@ async def _run_pipeline(
                         reclassified_count += 1
                         continue
                     fig = structure.figures[alt.figure_index]
-                    generated_text = (alt.generated_text or "").strip()
-                    status = alt.status
-                    caption_fallback = (fig.caption or "").strip()
-
-                    if settings.auto_approve_generated_alt_text:
-                        normalized = generated_text.lower()
-                        if normalized == "decorative":
-                            status = "rejected"
-                            generated_text = ""
-                        elif not generated_text and caption_fallback:
-                            status = "approved"
-                            generated_text = caption_fallback
-                        elif not generated_text or (
-                            generated_text.startswith("[") and generated_text.endswith("]")
-                        ):
-                            status = "approved"
-                        else:
-                            status = "approved"
+                    status, generated_text = _alt_text_entry_state(
+                        alt,
+                        caption=fig.caption,
+                        auto_approve=settings.auto_approve_generated_alt_text,
+                    )
 
                     if status == "approved":
                         approved_count += 1
@@ -5750,14 +5906,13 @@ async def _run_tagging_and_validation(
 
         output_path = get_output_path(job_id, f"accessible_{job.original_filename}")
 
-        # Gather approved alt texts
-        result = await db.execute(
-            select(AltTextEntry).where(
-                AltTextEntry.job_id == job_id,
-                AltTextEntry.status.in_(("approved", "rejected")),
-            )
-        )
-        reviewed_alt_entries = result.scalars().all()
+        # Approved and rejected figure decisions go to the tagger; fidelity also
+        # sees the figures still waiting for a description.
+        result = await db.execute(select(AltTextEntry).where(AltTextEntry.job_id == job_id))
+        alt_entries = result.scalars().all()
+        reviewed_alt_entries = [
+            entry for entry in alt_entries if entry.status in ("approved", "rejected")
+        ]
         reviewed_alts = [
             {
                 "figure_index": a.figure_index,
@@ -6141,7 +6296,7 @@ async def _run_tagging_and_validation(
                     "edited_text": entry.edited_text,
                     "status": entry.status,
                 }
-                for entry in reviewed_alt_entries
+                for entry in alt_entries
             ],
             validation_report=validation_payload,
             raw_validation_report=selected_validation.raw_report,
@@ -6204,7 +6359,7 @@ async def _run_tagging_and_validation(
                             "edited_text": entry.edited_text,
                             "status": entry.status,
                         }
-                        for entry in reviewed_alt_entries
+                        for entry in alt_entries
                     ],
                     validation_report=retry_validation_payload,
                     raw_validation_report=retry_validation.raw_report,
@@ -6324,7 +6479,7 @@ async def _run_tagging_and_validation(
                             "edited_text": entry.edited_text,
                             "status": entry.status,
                         }
-                        for entry in reviewed_alt_entries
+                        for entry in alt_entries
                     ],
                     validation_report=auto_validation_payload,
                     raw_validation_report=auto_validation.raw_report,
@@ -6376,7 +6531,7 @@ async def _run_tagging_and_validation(
                         "edited_text": entry.edited_text,
                         "status": entry.status,
                     }
-                    for entry in reviewed_alt_entries
+                    for entry in alt_entries
                 ],
                 validation_report=candidate_validation_payload,
                 raw_validation_report=candidate_validation.raw_report,
@@ -6414,7 +6569,7 @@ async def _run_tagging_and_validation(
                     "edited_text": entry.edited_text,
                     "status": entry.status,
                 }
-                for entry in reviewed_alt_entries
+                for entry in alt_entries
             ],
             validation_report=validation_payload,
             raw_validation_report=selected_validation.raw_report,
@@ -6457,7 +6612,7 @@ async def _run_tagging_and_validation(
                 AppliedChange.review_status == "pending_review",
             )
         )
-        reviewed_alt_by_index = {entry.figure_index: entry for entry in reviewed_alt_entries}
+        alt_entry_by_index = {entry.figure_index: entry for entry in alt_entries}
         for change_spec in auto_applied_change_specs:
             task_type = str(change_spec.get("task_type") or "review_change")
             metadata = (
@@ -6478,7 +6633,7 @@ async def _run_tagging_and_validation(
                     figure_index = int(figure_index_raw)
                 except (TypeError, ValueError):
                     figure_index = -1
-                entry = reviewed_alt_by_index.get(figure_index)
+                entry = alt_entry_by_index.get(figure_index)
                 if entry is not None:
                     before = {
                         "generated_text": undo_payload.get("generated_text"),

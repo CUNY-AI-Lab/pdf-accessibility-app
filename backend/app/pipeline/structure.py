@@ -320,7 +320,9 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
         elements_before = len(elements)
         # Docling uses 1-based page numbers; convert to 0-based for pikepdf
         page = (prov[0]["page_no"] - 1) if prov else 0
-        text = item.get("text", item.get("orig", ""))
+        # Without formula enrichment Docling gives a formula text "" and keeps
+        # what the page shows in orig; an empty text falls back to orig.
+        text = item.get("text") or item.get("orig") or ""
         bbox = _extract_bbox(prov)
 
         # Docling may provide per-element language via Watson NLP metadata
