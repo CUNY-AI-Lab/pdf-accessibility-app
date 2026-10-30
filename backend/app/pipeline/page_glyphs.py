@@ -35,12 +35,12 @@ from pdfminer.cmapdb import IdentityCMap, IdentityCMapByte
 from pdfminer.converter import PDFLayoutAnalyzer
 from pdfminer.layout import LTChar
 from pdfminer.pdfdocument import PDFDocument, PDFNoPageLabels
-from pdfminer.pdffont import PDFSimpleFont
+from pdfminer.pdffont import PDFSimpleFont, PDFType3Font
 from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
 from pdfminer.pdfpage import PDFPage
 from pdfminer.pdfparser import PDFParser
 from pdfminer.psparser import literal_name
-from pdfminer.utils import decode_text
+from pdfminer.utils import apply_matrix_pt, decode_text
 
 from app.pipeline.pdf_repair import pdfminer_readable
 
@@ -231,10 +231,33 @@ class _Recorder(PDFLayoutAnalyzer):
         char = self.cur_item._objs[-1]
         if not isinstance(char, LTChar) or self.op is None:
             return advance
+        bbox = {"l": char.x0, "b": char.y0, "r": char.x1, "t": char.y1}
+        if isinstance(font, PDFType3Font):
+            # Type 3 glyphs use the font's own coordinate system, which
+            # need not be the usual 1000 units per em. LTChar assumes an
+            # em-high box; with bitmap TeX fonts that can be 0.24 points
+            # tall, entirely below the ink. Use the transformed FontBBox
+            # height while keeping the measured advance for word spacing.
+            corners = [
+                apply_matrix_pt(font.matrix, (x, y))
+                for x in (font.bbox[0], font.bbox[2])
+                for y in (font.bbox[1], font.bbox[3])
+            ]
+            bottom = min(y for _, y in corners) * fontsize + rise
+            top = max(y for _, y in corners) * fontsize + rise
+            points = [
+                apply_matrix_pt(matrix, (x, y))
+                for x in (0, char.adv)
+                for y in (bottom, top)
+            ]
+            bbox = {
+                "l": min(x for x, _ in points), "r": max(x for x, _ in points),
+                "b": min(y for _, y in points), "t": max(y for _, y in points),
+            }
         element, code = self.op_elements[len(self.op.glyphs)]
         glyph = MeasuredGlyph(
             text=char.get_text(),
-            bbox={"l": char.x0, "b": char.y0, "r": char.x1, "t": char.y1},
+            bbox=bbox,
             element=element,
             code=code,
             turn=round(math.atan2(char.matrix[1], char.matrix[0]) / (math.pi / 2)) % 4,
