@@ -5,7 +5,10 @@ import copy
 import json
 import logging
 import re
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -148,8 +151,8 @@ from app.pipeline.ocr import run_ocr
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.pdfium_text import PdfiumText
 from app.pipeline.structure import extract_structure
-from app.pipeline.tagger import is_placeholder_alt_text, tag_pdf
-from app.pipeline.validator import validate_pdf
+from app.pipeline.tagger import TaggingResult, is_placeholder_alt_text, tag_pdf
+from app.pipeline.validator import ValidationResult, validate_pdf
 from app.services.applied_changes import add_applied_change
 from app.services.auto_structure_apply import auto_apply_structure_tasks
 from app.services.bookmark_intelligence import enhance_bookmark_structure_with_intelligence
@@ -2436,6 +2439,784 @@ async def run_tagging_and_validation(
         )
 
 
+@dataclass
+class Candidate:
+    """A PDF and the evaluations and changes belonging to those exact bytes."""
+
+    output_path: Path
+    validation: ValidationResult
+    validation_report: dict[str, object]
+    fidelity_report: dict[str, object]
+    tagging_result: TaggingResult
+    structure_json: dict
+    working_pdf: Path
+    fidelity_source_pdf: Path
+    produced_by: str
+    alt_entries: list[dict[str, object]]
+    review_tasks: list[dict[str, object]] = dataclass_field(default_factory=list)
+    applied_change_specs: list[dict[str, object]] = dataclass_field(default_factory=list)
+    grounded_text_adjudication: dict[str, object] = dataclass_field(default_factory=dict)
+
+
+def _candidate_job(job: Job, candidate: Candidate) -> Job:
+    preview_job = copy.copy(job)
+    preview_job.output_path = str(candidate.output_path)
+    preview_job.structure_json = json.dumps(candidate.structure_json)
+    return preview_job
+
+
+async def _assess_candidate_fidelity(
+    candidate: Candidate,
+    *,
+    job: Job,
+    settings: Settings,
+    adjudicate: bool = True,
+) -> None:
+    candidate.fidelity_report, candidate.review_tasks = await asyncio.to_thread(
+        assess_fidelity,
+        input_pdf=Path(job.input_path),
+        output_pdf=candidate.output_path,
+        comparison_source_pdf=candidate.fidelity_source_pdf,
+        structure_json=candidate.structure_json,
+        alt_entries=candidate.alt_entries,
+        validation_report=candidate.validation_report,
+        raw_validation_report=candidate.validation.raw_report,
+        tagging_metrics=candidate.validation_report["tagging"],
+        classification=job.classification,
+    )
+    if adjudicate:
+        (
+            candidate.review_tasks,
+            candidate.fidelity_report,
+            candidate.grounded_text_adjudication,
+        ) = await _adjudicate_grounded_text_candidates(
+            job=_candidate_job(job, candidate),
+            settings=settings,
+            review_tasks=candidate.review_tasks,
+            fidelity_report=candidate.fidelity_report,
+        )
+
+
+async def evaluate_candidate(
+    *,
+    job: Job,
+    settings: Settings,
+    input_path: Path,
+    output_path: Path,
+    structure_json: dict,
+    reviewed_alts: list[dict],
+    alt_entries,
+    baseline_validation: ValidationResult,
+    font_remediation: FontRemediation,
+    llm_font_map_auto: dict[str, object],
+    produced_by: str,
+    fidelity_source_pdf: Path,
+    applied_change_specs: list[dict[str, object]],
+    tagging_result: TaggingResult | None = None,
+    validation: ValidationResult | None = None,
+    remediate_fonts: bool = False,
+    on_tagged=None,
+    on_validated=None,
+    adjudicate: bool = True,
+) -> Candidate:
+    """Tag, validate, build the report, assess fidelity, then adjudicate if needed.
+
+    Font-map and font-lane helpers already tag/patch and validate their outputs;
+    accept those results without re-tagging away the repairs.
+    """
+    if tagging_result is None:
+        tagging_result = await tag_pdf(
+            input_path=input_path,
+            output_path=output_path,
+            structure_json=structure_json,
+            alt_texts=reviewed_alts,
+            original_filename=job.original_filename or "",
+        )
+        output_path = Path(tagging_result.output_path)
+    if on_tagged is not None:
+        await on_tagged(tagging_result)
+    if validation is None:
+        validation = await validate_pdf(
+            pdf_path=output_path,
+            verapdf_path=settings.verapdf_path,
+            flavour=settings.verapdf_flavour,
+            timeout_seconds=settings.subprocess_timeout_validation,
+        )
+    if remediate_fonts:
+        (
+            tagging_result,
+            validation,
+            output_path,
+            input_path,
+            structure_json,
+            fidelity_source_pdf,
+        ) = await _select_font_lanes(
+            job=job,
+            settings=settings,
+            working_pdf=input_path,
+            structure_json=structure_json,
+            reviewed_alts=reviewed_alts,
+            tagging_result=tagging_result,
+            validation=validation,
+            font_remediation=font_remediation,
+        )
+        llm_font_map_auto["enabled"] = bool(settings.auto_apply_llm_font_map)
+    # A patch may preserve all tag counts while producing a different PDF.
+    tagging_result = copy.copy(tagging_result)
+    tagging_result.output_path = Path(output_path)
+    candidate = Candidate(
+        output_path=Path(output_path),
+        validation=validation,
+        validation_report=_build_validation_payload(
+            baseline_validation=baseline_validation,
+            selected_validation=validation,
+            settings=settings,
+            font_remediation=font_remediation,
+            tagging_result=tagging_result,
+            llm_font_map_auto=llm_font_map_auto,
+        ),
+        fidelity_report={},
+        tagging_result=tagging_result,
+        structure_json=structure_json or {},
+        working_pdf=Path(input_path),
+        fidelity_source_pdf=fidelity_source_pdf,
+        produced_by=produced_by,
+        alt_entries=[
+            {
+                "figure_index": entry.figure_index,
+                "generated_text": entry.generated_text,
+                "edited_text": entry.edited_text,
+                "status": entry.status,
+            }
+            for entry in alt_entries
+        ],
+        applied_change_specs=list(applied_change_specs),
+    )
+    if on_validated is not None:
+        await on_validated(candidate)
+    await _assess_candidate_fidelity(candidate, job=job, settings=settings, adjudicate=adjudicate)
+    return candidate
+
+
+def _candidate_is_acceptable(
+    candidate: Candidate,
+    current: Candidate,
+    *,
+    require_improvement: bool = False,
+    grounded_text: bool = False,
+) -> bool:
+    """Adopt only compliant, non-regressing candidates under the existing policy."""
+    if not candidate.validation.compliant:
+        return False
+    if not _fidelity_not_worse(candidate.fidelity_report, current.fidelity_report):
+        return False
+    if grounded_text:
+        return _grounded_text_retry_improved(current.review_tasks, candidate.review_tasks)
+    if require_improvement:
+        return _blocking_task_count(candidate.review_tasks) < _blocking_task_count(
+            current.review_tasks
+        )
+    return True
+
+
+async def _retry_grounded_candidate(
+    candidate: Candidate, *, job: Job, settings: Settings, evaluate,
+) -> Candidate:
+    safe_resolutions = _collect_safe_grounded_text_resolutions(candidate.grounded_text_adjudication)
+    if not safe_resolutions or not _blocking_task_count(candidate.review_tasks):
+        return candidate
+    retry_structure, retry_audit = _apply_grounded_text_resolutions_to_structure(
+        candidate.structure_json,
+        safe_resolutions,
+    )
+    if not bool(retry_audit.get("applied")):
+        return candidate
+    retry = await evaluate(
+        input_path=candidate.output_path,
+        output_path=get_output_path(job.id, f"accessible_grounded_retry_{job.original_filename}"),
+        structure_json=retry_structure,
+        fidelity_source_pdf=candidate.fidelity_source_pdf,
+        applied_change_specs=candidate.applied_change_specs,
+        produced_by="grounded_text",
+        adjudicate=False,
+    )
+    if (
+        _candidate_is_acceptable(retry, candidate, require_improvement=True)
+        and not _has_grounded_text_candidate_task(retry.review_tasks)
+    ):
+        return retry
+    (
+        retry.review_tasks,
+        retry.fidelity_report,
+        retry.grounded_text_adjudication,
+    ) = await _adjudicate_grounded_text_candidates(
+        job=_candidate_job(job, retry),
+        settings=settings,
+        review_tasks=retry.review_tasks,
+        fidelity_report=retry.fidelity_report,
+    )
+    return retry if _candidate_is_acceptable(retry, candidate, grounded_text=True) else candidate
+
+
+async def _retry_structure_candidate(
+    candidate: Candidate, *, job: Job, settings: Settings, evaluate,
+) -> Candidate:
+    if not candidate.structure_json or not _blocking_task_count(candidate.review_tasks):
+        return candidate
+    suggested_tasks, structure, applied_specs = await auto_apply_structure_tasks(
+        job=_candidate_job(job, candidate),
+        settings=settings,
+        review_tasks=candidate.review_tasks,
+        structure_json=candidate.structure_json,
+    )
+    candidate.review_tasks = suggested_tasks
+    if not applied_specs or structure == candidate.structure_json:
+        return candidate
+    retry = await evaluate(
+        input_path=candidate.output_path,
+        output_path=get_output_path(job.id, f"accessible_auto_review_{job.original_filename}"),
+        structure_json=structure,
+        fidelity_source_pdf=candidate.fidelity_source_pdf,
+        applied_change_specs=[*candidate.applied_change_specs, *applied_specs],
+        produced_by="auto_structure",
+    )
+    return retry if _candidate_is_acceptable(retry, candidate, require_improvement=True) else candidate
+
+
+async def _retry_font_map_candidate(
+    candidate: Candidate,
+    *,
+    job: Job,
+    settings: Settings,
+    evaluate,
+    baseline_validation: ValidationResult,
+    font_remediation: FontRemediation,
+    llm_font_map_auto: dict[str, object],
+):
+    audit, validation, output_pdf, metadata_overrides = await _attempt_auto_llm_font_map(
+        job=_candidate_job(job, candidate),
+        settings=settings,
+        output_pdf=candidate.output_path,
+        current_validation=candidate.validation,
+        review_tasks=candidate.review_tasks,
+    )
+    llm_font_map_auto.clear()
+    llm_font_map_auto.update(audit)
+    if validation is not None and output_pdf is not None:
+        retry = await evaluate(
+            input_path=candidate.output_path,
+            output_path=output_pdf,
+            structure_json=candidate.structure_json,
+            fidelity_source_pdf=candidate.fidelity_source_pdf,
+            applied_change_specs=candidate.applied_change_specs,
+            produced_by="font_map",
+            tagging_result=candidate.tagging_result,
+            validation=validation,
+            adjudicate=False,
+        )
+        if _candidate_is_acceptable(retry, candidate):
+            return retry, metadata_overrides
+        rejection_reason = (
+            "fidelity_regression" if retry.validation.compliant else "noncompliant_candidate"
+        )
+        llm_font_map_auto["applied"] = False
+        llm_font_map_auto["reason"] = rejection_reason
+        for metadata in metadata_overrides.values():
+            font_map_metadata = metadata.get("llm_auto_font_map")
+            if isinstance(font_map_metadata, dict):
+                font_map_metadata["applied"] = False
+                font_map_metadata["reason"] = rejection_reason
+    candidate.validation_report = _build_validation_payload(
+        baseline_validation=baseline_validation,
+        selected_validation=candidate.validation,
+        settings=settings,
+        font_remediation=font_remediation,
+        tagging_result=candidate.tagging_result,
+        llm_font_map_auto=llm_font_map_auto,
+    )
+    return candidate, metadata_overrides
+
+
+async def _prepare_tagging_inputs(
+    job: Job, db: AsyncSession, settings: Settings, working_pdf: Path, structure_json: dict,
+):
+    """Apply the existing pretag policies and collect figure decisions once."""
+    # Approved and rejected figure decisions go to the tagger; fidelity also
+    # sees the figures still waiting for a description.
+    result = await db.execute(select(AltTextEntry).where(AltTextEntry.job_id == job.id))
+    alt_entries = result.scalars().all()
+    reviewed_alt_entries = [
+        entry for entry in alt_entries if entry.status in ("approved", "rejected")
+    ]
+    reviewed_alts = [
+        {
+            "figure_index": a.figure_index,
+            "text": a.edited_text or a.generated_text,
+            "status": a.status,
+            "decorative": a.status == "rejected",
+        }
+        for a in reviewed_alt_entries
+    ]
+
+    structure_json, pretag_grounded_text = await _apply_pretag_grounded_text_resolutions(
+        job=job,
+        settings=settings,
+        working_pdf=working_pdf,
+        structure_json=structure_json,
+    )
+    docling_pretag_router = docling_pretag_ambiguity_router(
+        working_pdf=working_pdf,
+        structure_json=structure_json,
+    )
+    structure_json, pretag_table_intelligence = await _apply_pretag_table_intelligence(
+        job=job,
+        settings=settings,
+        structure_json=structure_json,
+        targets=list(docling_pretag_router.get("table_targets") or []),
+    )
+    working_pdf, pretag_widget_rationalization = await _apply_pretag_widget_rationalization(
+        job=job,
+        settings=settings,
+        working_pdf=working_pdf,
+        structure_json=structure_json,
+        targets=list(docling_pretag_router.get("widget_targets") or []),
+    )
+    docling_form_router = docling_pretag_ambiguity_router(
+        working_pdf=working_pdf,
+        structure_json=structure_json,
+    )
+    docling_pretag_plan = dict(docling_pretag_router.get("plan") or {})
+    docling_pretag_plan["forms"] = dict(
+        (docling_form_router.get("plan") or {}).get("forms") or {}
+    )
+    working_pdf, pretag_form_intelligence = await _apply_pretag_form_intelligence(
+        job=job,
+        settings=settings,
+        working_pdf=working_pdf,
+        structure_json=structure_json,
+        targets=list(docling_form_router.get("form_targets") or []),
+    )
+
+    pretag_llm_usage = _empty_llm_usage()
+    for audit in (
+        pretag_grounded_text,
+        pretag_table_intelligence,
+        pretag_widget_rationalization,
+        pretag_form_intelligence,
+    ):
+        _accumulate_llm_usage(pretag_llm_usage, audit.get("llm_usage"))
+
+    pretag_details = {
+        "pretag_llm_usage": pretag_llm_usage,
+        "docling_pretag_plan": docling_pretag_plan,
+        "pretag_grounded_text": pretag_grounded_text,
+        "pretag_table_intelligence": pretag_table_intelligence,
+        "pretag_widget_rationalization": pretag_widget_rationalization,
+        "pretag_form_intelligence": pretag_form_intelligence,
+    }
+    return working_pdf, structure_json, alt_entries, reviewed_alts, pretag_details
+
+
+def _tagging_step_result(tagging_result, pretag_details):
+    pretag_grounded_text = pretag_details["pretag_grounded_text"]
+    pretag_table_intelligence = pretag_details["pretag_table_intelligence"]
+    pretag_widget_rationalization = pretag_details["pretag_widget_rationalization"]
+    pretag_form_intelligence = pretag_details["pretag_form_intelligence"]
+    pretag_llm_usage = pretag_details["pretag_llm_usage"]
+    docling_pretag_plan = pretag_details["docling_pretag_plan"]
+    return {
+        "tags_added": tagging_result.tags_added,
+        "lang_set": tagging_result.lang_set,
+        "struct_elems": tagging_result.struct_elems_created,
+        "headings_tagged": tagging_result.headings_tagged,
+        "figures_tagged": tagging_result.figures_tagged,
+        "decorative_figures_artifacted": tagging_result.decorative_figures_artifacted,
+        "tables_tagged": tagging_result.tables_tagged,
+        "lists_tagged": tagging_result.lists_tagged,
+        "links_tagged": tagging_result.links_tagged,
+        "bookmarks_added": tagging_result.bookmarks_added,
+        "title_set": tagging_result.title_set,
+        "grounded_text_auto_applied": bool(pretag_grounded_text.get("applied")),
+        "grounded_text_auto_applied_count": int(
+            pretag_grounded_text.get("applied_count", 0) or 0
+        ),
+        "grounded_text_code_auto_applied_count": int(
+            pretag_grounded_text.get("applied_code_text_count", 0) or 0
+        ),
+        "table_intelligence_auto_applied": bool(pretag_table_intelligence.get("applied")),
+        "table_intelligence_auto_applied_count": int(
+            pretag_table_intelligence.get("applied_count", 0) or 0
+        ),
+        "table_intelligence_confirmed_count": int(
+            pretag_table_intelligence.get("confirmed_count", 0) or 0
+        ),
+        "table_intelligence_set_headers_count": int(
+            pretag_table_intelligence.get("set_headers_count", 0) or 0
+        ),
+        "widget_rationalization_auto_applied": bool(
+            pretag_widget_rationalization.get("applied")
+        ),
+        "widget_rationalization_auto_applied_count": int(
+            pretag_widget_rationalization.get("applied_count", 0) or 0
+        ),
+        "form_intelligence_auto_applied": bool(pretag_form_intelligence.get("applied")),
+        "form_intelligence_auto_applied_count": int(
+            pretag_form_intelligence.get("applied_count", 0) or 0
+        ),
+        "pretag_llm_usage": pretag_llm_usage,
+        "docling_pretag_ambiguity_plan": docling_pretag_plan,
+        "grounded_text_audit": pretag_grounded_text,
+        "table_intelligence_audit": pretag_table_intelligence,
+        "widget_rationalization_audit": pretag_widget_rationalization,
+        "form_intelligence_audit": pretag_form_intelligence,
+    }
+
+
+async def _select_font_lanes(
+    *,
+    job: Job,
+    settings: Settings,
+    working_pdf: Path,
+    structure_json: dict,
+    reviewed_alts: list[dict],
+    tagging_result: TaggingResult,
+    validation: ValidationResult,
+    font_remediation: FontRemediation,
+):
+    """Preserve the validation/tag-regression policy for preparatory font lanes."""
+    job_id = job.id
+    selected_tagging_result = tagging_result
+    selected_validation = validation
+    selected_output_path = Path(tagging_result.output_path)
+    remediation_pdf_features = _inspect_pdf_features(working_pdf)
+    font_remediation.document_features = remediation_pdf_features
+    font_remediation.first_pass_errors = _error_count(validation)
+    font_remediation.first_pass_warnings = _warning_count(validation)
+    fidelity_source_pdf = Path(job.input_path)
+
+    if not validation.compliant and _has_font_errors(validation.violations):
+        initial_font_diagnostics = _inspect_font_diagnostics(
+            selected_output_path,
+            validation.violations,
+        )
+        font_remediation.preflight_diagnostics = initial_font_diagnostics
+        unicode_gate = None
+        if any(
+            v.severity == "error"
+            and any(marker in str(v.rule_id) for marker in FONT_UNICODE_RULE_MARKERS)
+            for v in validation.violations
+        ):
+            gate_font_diagnostics = initial_font_diagnostics
+            summary = (
+                initial_font_diagnostics.get("summary")
+                if isinstance(initial_font_diagnostics, dict)
+                else None
+            )
+            profiles = (
+                initial_font_diagnostics.get("profiles")
+                if isinstance(initial_font_diagnostics, dict)
+                else None
+            )
+            if (
+                isinstance(summary, dict)
+                and isinstance(profiles, list)
+                and int(summary.get("fonts_total", 0) or 0) > len(profiles)
+            ):
+                gate_font_diagnostics = _inspect_font_diagnostics(
+                    selected_output_path,
+                    validation.violations,
+                    profile_limit=512,
+                )
+            unicode_gate = _unicode_repair_gate_from_diagnostics(
+                gate_font_diagnostics,
+                violations=validation.violations,
+            )
+        font_remediation.unicode_gate = unicode_gate
+        planned_lanes, skipped_lanes = _font_remediation_lanes(
+            validation.violations,
+            classification=job.classification,
+            pdf_features=remediation_pdf_features,
+            settings=settings,
+            unicode_gate=unicode_gate,
+        )
+        font_remediation.lanes_planned = planned_lanes
+        font_remediation.lanes_skipped = skipped_lanes
+        font_remediation.eligible = bool(planned_lanes)
+        font_remediation.attempted = bool(planned_lanes)
+
+        if not planned_lanes:
+            font_remediation.error = "No safe font remediation lane eligible"
+        else:
+            try:
+                best_validation = selected_validation
+                best_tagging_result = selected_tagging_result
+                best_working_pdf = working_pdf
+                best_structure_json = structure_json
+                best_tagged_pdf = selected_output_path
+                best_output_path = str(best_tagged_pdf)
+                selected_lanes: list[str] = []
+                ocr_messages: list[str] = []
+                ocr_skipped = False
+
+                for lane in planned_lanes:
+                    attempt = await _attempt_font_lane(
+                        job_id=job_id,
+                        job=job,
+                        settings=settings,
+                        working_pdf=best_working_pdf,
+                        tagged_pdf=best_tagged_pdf,
+                        structure_json=best_structure_json,
+                        reviewed_alts=reviewed_alts,
+                        lane=lane,
+                        current_tagging_result=best_tagging_result,
+                    )
+
+                    lane_result: dict[str, object] = {
+                        "lane": lane,
+                        "success": bool(attempt.get("success")),
+                        "error": attempt.get("error"),
+                        "message": attempt.get("message"),
+                    }
+                    details = attempt.get("details")
+                    if isinstance(details, dict) and details:
+                        lane_result["details"] = details
+
+                    ocr_message = str(attempt.get("ocr_message", "")).strip()
+                    if ocr_message:
+                        ocr_messages.append(ocr_message)
+                    ocr_skipped = ocr_skipped or bool(attempt.get("ocr_skipped", False))
+
+                    if attempt.get("success"):
+                        candidate_validation = attempt["validation"]
+                        candidate_tagging_result = attempt["tagging_result"]
+                        candidate_errors = _error_count(candidate_validation)
+                        candidate_warnings = _warning_count(candidate_validation)
+                        improved = _is_better_validation(candidate_validation, best_validation)
+                        regressions = _tagging_regressions(
+                            candidate_tagging_result,
+                            best_tagging_result,
+                        )
+                        lane_result["errors"] = candidate_errors
+                        lane_result["warnings"] = candidate_warnings
+                        lane_result["improved"] = improved
+                        if regressions:
+                            lane_result["regressions"] = regressions
+
+                        if improved and not regressions:
+                            best_validation = candidate_validation
+                            best_tagging_result = candidate_tagging_result
+                            preprocessed_path = attempt.get("preprocessed_path")
+                            requires_retag = bool(attempt.get("requires_retag", True))
+                            if (
+                                requires_retag
+                                and isinstance(preprocessed_path, str)
+                                and preprocessed_path
+                            ):
+                                best_working_pdf = Path(preprocessed_path)
+                                fidelity_source_pdf = best_working_pdf
+                            if isinstance(attempt["output_path"], Path):
+                                best_tagged_pdf = attempt["output_path"]
+                            else:
+                                best_tagged_pdf = Path(str(attempt["output_path"]))
+                            candidate_structure_json = attempt.get("structure_json")
+                            if isinstance(candidate_structure_json, dict):
+                                best_structure_json = candidate_structure_json
+                            if not requires_retag:
+                                best_working_pdf = best_tagged_pdf
+                            best_output_path = str(best_tagged_pdf)
+                            selected_lanes.append(lane)
+
+                    font_remediation.lane_results.append(lane_result)
+
+                    if best_validation.compliant:
+                        # No need to keep exploring lanes after full compliance.
+                        break
+
+                if not any(bool(r.get("success")) for r in font_remediation.lane_results):
+                    font_remediation.error = "All font remediation lanes failed"
+
+                font_remediation.ocr_message = " | ".join(ocr_messages)
+                font_remediation.ocr_skipped = ocr_skipped
+                font_remediation.second_pass_errors = _error_count(best_validation)
+                font_remediation.second_pass_warnings = _warning_count(best_validation)
+
+                if selected_lanes:
+                    selected_validation = best_validation
+                    selected_tagging_result = best_tagging_result
+                    selected_output_path = Path(best_output_path)
+                    working_pdf = best_tagged_pdf
+                    if isinstance(best_structure_json, dict):
+                        structure_json = best_structure_json
+                    font_remediation.selected_lane = selected_lanes[-1]
+                    font_remediation.selected_lanes = selected_lanes
+                    if fidelity_source_pdf != Path(job.input_path):
+                        font_remediation.selected_preprocessed_path = str(fidelity_source_pdf)
+                    font_remediation.applied = True
+            except Exception as exc:
+                logger.exception(f"Font remediation lane evaluation failed for job {job_id}")
+                font_remediation.error = str(exc)
+
+        font_remediation.postflight_diagnostics = _inspect_font_diagnostics(
+            selected_output_path,
+            selected_validation.violations,
+        )
+
+    return (
+        selected_tagging_result,
+        selected_validation,
+        selected_output_path,
+        working_pdf,
+        structure_json,
+        fidelity_source_pdf,
+    )
+
+
+async def _store_candidate_result(
+    *,
+    db: AsyncSession,
+    job: Job,
+    job_manager: JobManager,
+    candidate: Candidate,
+    alt_entries,
+    review_task_metadata_overrides: dict[tuple[str, str], dict[str, object]],
+) -> None:
+    """Persist only the selected PDF and the changes carried by that candidate."""
+    job_id = job.id
+    job.output_path = str(candidate.output_path)
+    job.structure_json = json.dumps(candidate.structure_json)
+    validation_payload = candidate.validation_report
+    fidelity_report = candidate.fidelity_report
+    review_tasks = candidate.review_tasks
+    if review_task_metadata_overrides:
+        for key, metadata in review_task_metadata_overrides.items():
+            review_tasks = _merge_review_task_metadata(
+                review_tasks,
+                task_type=key[0],
+                source=key[1],
+                metadata=metadata,
+            )
+    user_visible_review_tasks, fidelity_report = _prepare_user_review_surface(
+        review_tasks,
+        fidelity_report,
+    )
+    validation_payload["fidelity"] = fidelity_report
+    job.validation_json = json.dumps(validation_payload)
+    job.fidelity_json = json.dumps(fidelity_report)
+
+    await db.execute(delete(ReviewTask).where(ReviewTask.job_id == job_id))
+    await db.execute(
+        delete(AppliedChange).where(
+            AppliedChange.job_id == job_id,
+            AppliedChange.review_status == "pending_review",
+        )
+    )
+    alt_entry_by_index = {entry.figure_index: entry for entry in alt_entries}
+    for change_spec in candidate.applied_change_specs:
+        task_type = str(change_spec.get("task_type") or "review_change")
+        metadata = (
+            change_spec.get("metadata") if isinstance(change_spec.get("metadata"), dict) else {}
+        )
+        before = (
+            change_spec.get("before") if isinstance(change_spec.get("before"), dict) else {}
+        )
+        after = change_spec.get("after") if isinstance(change_spec.get("after"), dict) else {}
+        undo_payload = (
+            change_spec.get("undo_payload")
+            if isinstance(change_spec.get("undo_payload"), dict)
+            else {}
+        )
+        if task_type == "figure_semantics":
+            figure_index_raw = metadata.get("figure_index", undo_payload.get("figure_index"))
+            try:
+                figure_index = int(figure_index_raw)
+            except (TypeError, ValueError):
+                figure_index = -1
+            entry = alt_entry_by_index.get(figure_index)
+            if entry is not None:
+                before = {
+                    "generated_text": undo_payload.get("generated_text"),
+                    "edited_text": undo_payload.get("edited_text"),
+                    "status": undo_payload.get("status"),
+                }
+                after = {
+                    "generated_text": entry.generated_text,
+                    "edited_text": entry.edited_text,
+                    "status": entry.status,
+                }
+                undo_payload = {
+                    **undo_payload,
+                    "entry_id": entry.id,
+                    "figure_index": figure_index,
+                }
+        await add_applied_change(
+            db=db,
+            job=job,
+            change_type=task_type,
+            title=str(change_spec.get("title") or "Applied change"),
+            detail=str(change_spec.get("detail") or "The app applied a semantic change."),
+            importance=str(change_spec.get("importance") or "high"),
+            reviewable=bool(change_spec.get("reviewable", True))
+            and is_user_visible_applied_change_type(task_type),
+            metadata=metadata,
+            before=before,
+            after=after,
+            undo_payload=undo_payload,
+        )
+    for task in user_visible_review_tasks:
+        metadata = task.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        db.add(
+            ReviewTask(
+                job_id=job_id,
+                task_type=str(task.get("task_type") or "review_task"),
+                title=str(task.get("title") or "Follow-up review required"),
+                detail=str(task.get("detail") or ""),
+                severity=str(task.get("severity") or "medium"),
+                blocking=bool(task.get("blocking", True)),
+                status=str(task.get("status") or "pending_review"),
+                source=str(task.get("source") or "fidelity"),
+                metadata_json=json.dumps(metadata),
+            )
+        )
+
+    blocking_task_count = _blocking_task_count(review_tasks)
+    await _update_step(
+        db,
+        job_id,
+        "fidelity",
+        "complete",
+        result={
+            "passed": bool(fidelity_report.get("passed", False)),
+            "blocking_tasks": blocking_task_count,
+            "advisory_tasks": len(review_tasks) - blocking_task_count,
+        },
+    )
+    job_manager.emit_progress(
+        job_id,
+        step="fidelity",
+        status="complete",
+        result={
+            "passed": bool(fidelity_report.get("passed", False)),
+            "blocking_tasks": blocking_task_count,
+            "advisory_tasks": len(review_tasks) - blocking_task_count,
+        },
+    )
+
+    raise_if_model_access_refused()
+
+    # Done!
+    final_status = (
+        "complete"
+        if candidate.validation.compliant and bool(fidelity_report.get("passed", False))
+        else "manual_remediation"
+    )
+    job.status = final_status
+    await db.commit()
+    job_manager.emit_progress(job_id, step="review", status=final_status)
+    logger.info(f"Pipeline complete for job {job_id} with status={final_status}")
+
+
 async def _run_tagging_and_validation(
     job_id: str,
     db: AsyncSession,
@@ -2480,800 +3261,72 @@ async def _run_tagging_and_validation(
         await _update_step(db, job_id, "tagging", "running")
         job_manager.emit_progress(job_id, step="tagging", status="running")
 
-        output_path = get_output_path(job_id, f"accessible_{job.original_filename}")
+        (
+            working_pdf, structure_json, alt_entries, reviewed_alts, pretag_details,
+        ) = await _prepare_tagging_inputs(job, db, settings, working_pdf, structure_json)
 
-        # Approved and rejected figure decisions go to the tagger; fidelity also
-        # sees the figures still waiting for a description.
-        result = await db.execute(select(AltTextEntry).where(AltTextEntry.job_id == job_id))
-        alt_entries = result.scalars().all()
-        reviewed_alt_entries = [
-            entry for entry in alt_entries if entry.status in ("approved", "rejected")
-        ]
-        reviewed_alts = [
-            {
-                "figure_index": a.figure_index,
-                "text": a.edited_text or a.generated_text,
-                "status": a.status,
-                "decorative": a.status == "rejected",
+        async def on_tagged(tagging_result):
+            nonlocal current_step
+            await _update_step(
+                db, job_id, "tagging", "complete",
+                result=_tagging_step_result(tagging_result, pretag_details),
+            )
+            job_manager.emit_progress(job_id, step="tagging", status="complete")
+            current_step = "validation"
+            await _update_step(db, job_id, "validation", "running")
+            job_manager.emit_progress(job_id, step="validation", status="running")
+
+        font_remediation = FontRemediation()
+
+        async def on_validated(candidate):
+            nonlocal current_step
+            result = {
+                "compliant": candidate.validation.compliant,
+                "font_remediation_attempted": bool(font_remediation.attempted),
+                "font_remediation_applied": bool(font_remediation.applied),
             }
-            for a in reviewed_alt_entries
-        ]
-
-        structure_json, pretag_grounded_text = await _apply_pretag_grounded_text_resolutions(
-            job=job,
-            settings=settings,
-            working_pdf=working_pdf,
-            structure_json=structure_json,
-        )
-        docling_pretag_router = docling_pretag_ambiguity_router(
-            working_pdf=working_pdf,
-            structure_json=structure_json,
-        )
-        structure_json, pretag_table_intelligence = await _apply_pretag_table_intelligence(
-            job=job,
-            settings=settings,
-            structure_json=structure_json,
-            targets=list(docling_pretag_router.get("table_targets") or []),
-        )
-        working_pdf, pretag_widget_rationalization = await _apply_pretag_widget_rationalization(
-            job=job,
-            settings=settings,
-            working_pdf=working_pdf,
-            structure_json=structure_json,
-            targets=list(docling_pretag_router.get("widget_targets") or []),
-        )
-        docling_form_router = docling_pretag_ambiguity_router(
-            working_pdf=working_pdf,
-            structure_json=structure_json,
-        )
-        docling_pretag_plan = dict(docling_pretag_router.get("plan") or {})
-        docling_pretag_plan["forms"] = dict(
-            (docling_form_router.get("plan") or {}).get("forms") or {}
-        )
-        working_pdf, pretag_form_intelligence = await _apply_pretag_form_intelligence(
-            job=job,
-            settings=settings,
-            working_pdf=working_pdf,
-            structure_json=structure_json,
-            targets=list(docling_form_router.get("form_targets") or []),
-        )
-        job.structure_json = json.dumps(structure_json)
-
-        pretag_llm_usage = _empty_llm_usage()
-        for audit in (
-            pretag_grounded_text,
-            pretag_table_intelligence,
-            pretag_widget_rationalization,
-            pretag_form_intelligence,
-        ):
-            _accumulate_llm_usage(pretag_llm_usage, audit.get("llm_usage"))
-
-        tagging_result = await tag_pdf(
-            input_path=working_pdf,
-            output_path=output_path,
-            structure_json=structure_json,
-            alt_texts=reviewed_alts,
-            original_filename=job.original_filename or "",
-        )
-
-        job.output_path = str(tagging_result.output_path)
-        await _update_step(
-            db,
-            job_id,
-            "tagging",
-            "complete",
-            result={
-                "tags_added": tagging_result.tags_added,
-                "lang_set": tagging_result.lang_set,
-                "struct_elems": tagging_result.struct_elems_created,
-                "headings_tagged": tagging_result.headings_tagged,
-                "figures_tagged": tagging_result.figures_tagged,
-                "decorative_figures_artifacted": tagging_result.decorative_figures_artifacted,
-                "tables_tagged": tagging_result.tables_tagged,
-                "lists_tagged": tagging_result.lists_tagged,
-                "links_tagged": tagging_result.links_tagged,
-                "bookmarks_added": tagging_result.bookmarks_added,
-                "title_set": tagging_result.title_set,
-                "grounded_text_auto_applied": bool(pretag_grounded_text.get("applied")),
-                "grounded_text_auto_applied_count": int(
-                    pretag_grounded_text.get("applied_count", 0) or 0
-                ),
-                "grounded_text_code_auto_applied_count": int(
-                    pretag_grounded_text.get("applied_code_text_count", 0) or 0
-                ),
-                "table_intelligence_auto_applied": bool(pretag_table_intelligence.get("applied")),
-                "table_intelligence_auto_applied_count": int(
-                    pretag_table_intelligence.get("applied_count", 0) or 0
-                ),
-                "table_intelligence_confirmed_count": int(
-                    pretag_table_intelligence.get("confirmed_count", 0) or 0
-                ),
-                "table_intelligence_set_headers_count": int(
-                    pretag_table_intelligence.get("set_headers_count", 0) or 0
-                ),
-                "widget_rationalization_auto_applied": bool(
-                    pretag_widget_rationalization.get("applied")
-                ),
-                "widget_rationalization_auto_applied_count": int(
-                    pretag_widget_rationalization.get("applied_count", 0) or 0
-                ),
-                "form_intelligence_auto_applied": bool(pretag_form_intelligence.get("applied")),
-                "form_intelligence_auto_applied_count": int(
-                    pretag_form_intelligence.get("applied_count", 0) or 0
-                ),
-                "pretag_llm_usage": pretag_llm_usage,
-                "docling_pretag_ambiguity_plan": docling_pretag_plan,
-                "grounded_text_audit": pretag_grounded_text,
-                "table_intelligence_audit": pretag_table_intelligence,
-                "widget_rationalization_audit": pretag_widget_rationalization,
-                "form_intelligence_audit": pretag_form_intelligence,
-            },
-        )
-        job_manager.emit_progress(job_id, step="tagging", status="complete")
-
-        # ── Step 6: Validation ──
-        current_step = "validation"
-        await _update_step(db, job_id, "validation", "running")
-        job_manager.emit_progress(job_id, step="validation", status="running")
-
-        validation = await validate_pdf(
-            pdf_path=tagging_result.output_path,
-            verapdf_path=settings.verapdf_path,
-            flavour=settings.verapdf_flavour,
-            timeout_seconds=settings.subprocess_timeout_validation,
-        )
-
-        selected_tagging_result = tagging_result
-        selected_validation = validation
-        remediation_pdf_features = _inspect_pdf_features(working_pdf)
-        font_remediation = FontRemediation(
-            document_features=remediation_pdf_features,
-            first_pass_errors=_error_count(validation),
-            first_pass_warnings=_warning_count(validation),
-        )
-        fidelity_source_pdf = Path(job.input_path)
-
-        if not validation.compliant and _has_font_errors(validation.violations):
-            initial_font_diagnostics = _inspect_font_diagnostics(
-                Path(job.output_path or tagging_result.output_path),
-                validation.violations,
+            await _update_step(
+                db, job_id, "validation", "complete",
+                result={**result, "violations_count": len(candidate.validation.violations)},
             )
-            font_remediation.preflight_diagnostics = initial_font_diagnostics
-            unicode_gate = None
-            if any(
-                v.severity == "error"
-                and any(marker in str(v.rule_id) for marker in FONT_UNICODE_RULE_MARKERS)
-                for v in validation.violations
-            ):
-                gate_font_diagnostics = initial_font_diagnostics
-                summary = (
-                    initial_font_diagnostics.get("summary")
-                    if isinstance(initial_font_diagnostics, dict)
-                    else None
-                )
-                profiles = (
-                    initial_font_diagnostics.get("profiles")
-                    if isinstance(initial_font_diagnostics, dict)
-                    else None
-                )
-                if (
-                    isinstance(summary, dict)
-                    and isinstance(profiles, list)
-                    and int(summary.get("fonts_total", 0) or 0) > len(profiles)
-                ):
-                    gate_font_diagnostics = _inspect_font_diagnostics(
-                        Path(job.output_path or tagging_result.output_path),
-                        validation.violations,
-                        profile_limit=512,
-                    )
-                unicode_gate = _unicode_repair_gate_from_diagnostics(
-                    gate_font_diagnostics,
-                    violations=validation.violations,
-                )
-            font_remediation.unicode_gate = unicode_gate
-            planned_lanes, skipped_lanes = _font_remediation_lanes(
-                validation.violations,
-                classification=job.classification,
-                pdf_features=remediation_pdf_features,
-                settings=settings,
-                unicode_gate=unicode_gate,
-            )
-            font_remediation.lanes_planned = planned_lanes
-            font_remediation.lanes_skipped = skipped_lanes
-            font_remediation.eligible = bool(planned_lanes)
-            font_remediation.attempted = bool(planned_lanes)
+            job_manager.emit_progress(job_id, step="validation", status="complete", result=result)
+            current_step = "fidelity"
+            await _update_step(db, job_id, "fidelity", "running")
+            job_manager.emit_progress(job_id, step="fidelity", status="running")
 
-            if not planned_lanes:
-                font_remediation.error = "No safe font remediation lane eligible"
-            else:
-                try:
-                    best_validation = selected_validation
-                    best_tagging_result = selected_tagging_result
-                    best_working_pdf = working_pdf
-                    best_structure_json = structure_json
-                    best_tagged_pdf = Path(job.output_path or tagging_result.output_path)
-                    best_output_path = str(best_tagged_pdf)
-                    selected_lanes: list[str] = []
-                    ocr_messages: list[str] = []
-                    ocr_skipped = False
-
-                    for lane in planned_lanes:
-                        attempt = await _attempt_font_lane(
-                            job_id=job_id,
-                            job=job,
-                            settings=settings,
-                            working_pdf=best_working_pdf,
-                            tagged_pdf=best_tagged_pdf,
-                            structure_json=best_structure_json,
-                            reviewed_alts=reviewed_alts,
-                            lane=lane,
-                            current_tagging_result=best_tagging_result,
-                        )
-
-                        lane_result: dict[str, object] = {
-                            "lane": lane,
-                            "success": bool(attempt.get("success")),
-                            "error": attempt.get("error"),
-                            "message": attempt.get("message"),
-                        }
-                        details = attempt.get("details")
-                        if isinstance(details, dict) and details:
-                            lane_result["details"] = details
-
-                        ocr_message = str(attempt.get("ocr_message", "")).strip()
-                        if ocr_message:
-                            ocr_messages.append(ocr_message)
-                        ocr_skipped = ocr_skipped or bool(attempt.get("ocr_skipped", False))
-
-                        if attempt.get("success"):
-                            candidate_validation = attempt["validation"]
-                            candidate_tagging_result = attempt["tagging_result"]
-                            candidate_errors = _error_count(candidate_validation)
-                            candidate_warnings = _warning_count(candidate_validation)
-                            improved = _is_better_validation(candidate_validation, best_validation)
-                            regressions = _tagging_regressions(
-                                candidate_tagging_result,
-                                best_tagging_result,
-                            )
-                            lane_result["errors"] = candidate_errors
-                            lane_result["warnings"] = candidate_warnings
-                            lane_result["improved"] = improved
-                            if regressions:
-                                lane_result["regressions"] = regressions
-
-                            if improved and not regressions:
-                                best_validation = candidate_validation
-                                best_tagging_result = candidate_tagging_result
-                                preprocessed_path = attempt.get("preprocessed_path")
-                                requires_retag = bool(attempt.get("requires_retag", True))
-                                if (
-                                    requires_retag
-                                    and isinstance(preprocessed_path, str)
-                                    and preprocessed_path
-                                ):
-                                    best_working_pdf = Path(preprocessed_path)
-                                    fidelity_source_pdf = best_working_pdf
-                                if isinstance(attempt["output_path"], Path):
-                                    best_tagged_pdf = attempt["output_path"]
-                                else:
-                                    best_tagged_pdf = Path(str(attempt["output_path"]))
-                                candidate_structure_json = attempt.get("structure_json")
-                                if isinstance(candidate_structure_json, dict):
-                                    best_structure_json = candidate_structure_json
-                                best_output_path = str(best_tagged_pdf)
-                                selected_lanes.append(lane)
-
-                        font_remediation.lane_results.append(lane_result)
-
-                        if best_validation.compliant:
-                            # No need to keep exploring lanes after full compliance.
-                            break
-
-                    if not any(bool(r.get("success")) for r in font_remediation.lane_results):
-                        font_remediation.error = "All font remediation lanes failed"
-
-                    font_remediation.ocr_message = " | ".join(ocr_messages)
-                    font_remediation.ocr_skipped = ocr_skipped
-                    font_remediation.second_pass_errors = _error_count(best_validation)
-                    font_remediation.second_pass_warnings = _warning_count(best_validation)
-
-                    if selected_lanes:
-                        selected_validation = best_validation
-                        selected_tagging_result = best_tagging_result
-                        job.output_path = best_output_path
-                        if isinstance(best_structure_json, dict):
-                            structure_json = best_structure_json
-                            job.structure_json = json.dumps(best_structure_json)
-                        font_remediation.selected_lane = selected_lanes[-1]
-                        font_remediation.selected_lanes = selected_lanes
-                        if fidelity_source_pdf != Path(job.input_path):
-                            font_remediation.selected_preprocessed_path = str(fidelity_source_pdf)
-                        font_remediation.applied = True
-                except Exception as exc:
-                    logger.exception(f"Font remediation lane evaluation failed for job {job_id}")
-                    font_remediation.error = str(exc)
-
-            font_remediation.postflight_diagnostics = _inspect_font_diagnostics(
-                Path(job.output_path or tagging_result.output_path),
-                selected_validation.violations,
-            )
-
-        llm_font_map_auto: dict[str, object] = {
-            "enabled": bool(settings.auto_apply_llm_font_map),
-            "attempted": False,
-            "applied": False,
-            "reason": "",
+        llm_font_map_auto = {
+            "enabled": False,
+            "attempted": False, "applied": False, "reason": "",
         }
-        validation_payload = _build_validation_payload(
-            baseline_validation=baseline_validation,
-            selected_validation=selected_validation,
-            settings=settings,
-            font_remediation=font_remediation,
-            tagging_result=selected_tagging_result,
+        evaluate = partial(
+            evaluate_candidate,
+            job=job, settings=settings, reviewed_alts=reviewed_alts,
+            alt_entries=alt_entries, baseline_validation=baseline_validation,
+            font_remediation=font_remediation, llm_font_map_auto=llm_font_map_auto,
+        )
+        candidate = await evaluate(
+            input_path=working_pdf,
+            output_path=get_output_path(job_id, f"accessible_{job.original_filename}"),
+            structure_json=structure_json,
+            fidelity_source_pdf=Path(job.input_path),
+            applied_change_specs=pre_applied_change_specs or [],
+            produced_by="initial", remediate_fonts=True,
+            on_tagged=on_tagged, on_validated=on_validated,
+        )
+        candidate = await _retry_grounded_candidate(candidate, job=job, settings=settings, evaluate=evaluate)
+        candidate = await _retry_structure_candidate(candidate, job=job, settings=settings, evaluate=evaluate)
+        # The font-map patch must inherit the selected structure retry's bytes.
+        candidate, metadata_overrides = await _retry_font_map_candidate(
+            candidate, job=job, settings=settings, evaluate=evaluate,
+            baseline_validation=baseline_validation, font_remediation=font_remediation,
             llm_font_map_auto=llm_font_map_auto,
         )
-
-        await _update_step(
-            db,
-            job_id,
-            "validation",
-            "complete",
-            result={
-                "compliant": selected_validation.compliant,
-                "violations_count": len(selected_validation.violations),
-                "font_remediation_attempted": bool(font_remediation.attempted),
-                "font_remediation_applied": bool(font_remediation.applied),
-            },
+        # Recheck the chosen output, as before, before publishing the review surface.
+        await _assess_candidate_fidelity(candidate, job=job, settings=settings)
+        await _store_candidate_result(
+            db=db, job=job, job_manager=job_manager, candidate=candidate,
+            alt_entries=alt_entries, review_task_metadata_overrides=metadata_overrides,
         )
-        job_manager.emit_progress(
-            job_id,
-            step="validation",
-            status="complete",
-            result={
-                "compliant": selected_validation.compliant,
-                "font_remediation_attempted": bool(font_remediation.attempted),
-                "font_remediation_applied": bool(font_remediation.applied),
-            },
-        )
-
-        current_step = "fidelity"
-        await _update_step(db, job_id, "fidelity", "running")
-        job_manager.emit_progress(job_id, step="fidelity", status="running")
-
-        fidelity_report, review_tasks = await asyncio.to_thread(
-            assess_fidelity,
-            input_pdf=Path(job.input_path),
-            output_pdf=Path(job.output_path or tagging_result.output_path),
-            comparison_source_pdf=fidelity_source_pdf,
-            structure_json=structure_json or {},
-            alt_entries=[
-                {
-                    "figure_index": entry.figure_index,
-                    "generated_text": entry.generated_text,
-                    "edited_text": entry.edited_text,
-                    "status": entry.status,
-                }
-                for entry in alt_entries
-            ],
-            validation_report=validation_payload,
-            raw_validation_report=selected_validation.raw_report,
-            tagging_metrics=validation_payload["tagging"],
-            classification=job.classification,
-        )
-        (
-            review_tasks,
-            fidelity_report,
-            grounded_text_adjudication,
-        ) = await _adjudicate_grounded_text_candidates(
-            job=job,
-            settings=settings,
-            review_tasks=review_tasks,
-            fidelity_report=fidelity_report,
-        )
-        safe_grounded_resolutions = _collect_safe_grounded_text_resolutions(
-            grounded_text_adjudication
-        )
-        if safe_grounded_resolutions and _blocking_task_count(review_tasks) > 0:
-            retry_structure_json, retry_audit = _apply_grounded_text_resolutions_to_structure(
-                structure_json or {},
-                safe_grounded_resolutions,
-            )
-            if bool(retry_audit.get("applied")):
-                retry_output_path = get_output_path(
-                    job_id, f"accessible_grounded_retry_{job.original_filename}"
-                )
-                retry_tagging_result = await tag_pdf(
-                    input_path=working_pdf,
-                    output_path=retry_output_path,
-                    structure_json=retry_structure_json,
-                    alt_texts=reviewed_alts,
-                    original_filename=job.original_filename or "",
-                )
-                retry_validation = await validate_pdf(
-                    pdf_path=retry_tagging_result.output_path,
-                    verapdf_path=settings.verapdf_path,
-                    flavour=settings.verapdf_flavour,
-                    timeout_seconds=settings.subprocess_timeout_validation,
-                )
-                retry_validation_payload = _build_validation_payload(
-                    baseline_validation=baseline_validation,
-                    selected_validation=retry_validation,
-                    settings=settings,
-                    font_remediation=font_remediation,
-                    tagging_result=retry_tagging_result,
-                    llm_font_map_auto=llm_font_map_auto,
-                )
-                retry_fidelity_report, retry_review_tasks = await asyncio.to_thread(
-                    assess_fidelity,
-                    input_pdf=Path(job.input_path),
-                    output_pdf=retry_tagging_result.output_path,
-                    comparison_source_pdf=fidelity_source_pdf,
-                    structure_json=retry_structure_json,
-                    alt_entries=[
-                        {
-                            "figure_index": entry.figure_index,
-                            "generated_text": entry.generated_text,
-                            "edited_text": entry.edited_text,
-                            "status": entry.status,
-                        }
-                        for entry in alt_entries
-                    ],
-                    validation_report=retry_validation_payload,
-                    raw_validation_report=retry_validation.raw_report,
-                    tagging_metrics=retry_validation_payload["tagging"],
-                    classification=job.classification,
-                )
-                retry_blocking_count = _blocking_task_count(retry_review_tasks)
-                if (
-                    retry_validation.compliant
-                    and retry_blocking_count < _blocking_task_count(review_tasks)
-                    and not _has_grounded_text_candidate_task(retry_review_tasks)
-                ):
-                    structure_json = retry_structure_json
-                    job.structure_json = json.dumps(retry_structure_json)
-                    job.output_path = str(retry_tagging_result.output_path)
-                    selected_tagging_result = retry_tagging_result
-                    selected_validation = retry_validation
-                    validation_payload = retry_validation_payload
-                    review_tasks = retry_review_tasks
-                    fidelity_report = retry_fidelity_report
-                else:
-                    (
-                        retry_review_tasks,
-                        retry_fidelity_report,
-                        _,
-                    ) = await _adjudicate_grounded_text_candidates(
-                        job=job,
-                        settings=settings,
-                        review_tasks=retry_review_tasks,
-                        fidelity_report=retry_fidelity_report,
-                    )
-                    if retry_validation.compliant and _grounded_text_retry_improved(
-                        review_tasks,
-                        retry_review_tasks,
-                    ):
-                        structure_json = retry_structure_json
-                        job.structure_json = json.dumps(retry_structure_json)
-                        job.output_path = str(retry_tagging_result.output_path)
-                        selected_tagging_result = retry_tagging_result
-                        selected_validation = retry_validation
-                        validation_payload = retry_validation_payload
-                        review_tasks = retry_review_tasks
-                        fidelity_report = retry_fidelity_report
-
-        review_task_metadata_overrides: dict[tuple[str, str], dict[str, object]] = {}
-        (
-            auto_audit,
-            candidate_validation,
-            candidate_output_pdf,
-            metadata_overrides,
-        ) = await _attempt_auto_llm_font_map(
-            job=job,
-            settings=settings,
-            output_pdf=Path(job.output_path or tagging_result.output_path),
-            current_validation=selected_validation,
-            review_tasks=review_tasks,
-        )
-        llm_font_map_auto = auto_audit
-        review_task_metadata_overrides.update(metadata_overrides)
-        auto_applied_change_specs: list[dict[str, object]] = list(pre_applied_change_specs or [])
-        validation_payload = _build_validation_payload(
-            baseline_validation=baseline_validation,
-            selected_validation=selected_validation,
-            settings=settings,
-            font_remediation=font_remediation,
-            tagging_result=selected_tagging_result,
-            llm_font_map_auto=llm_font_map_auto,
-        )
-
-        if structure_json and _blocking_task_count(review_tasks) > 0:
-            (
-                suggested_review_tasks,
-                auto_structure_json,
-                applied_specs,
-            ) = await auto_apply_structure_tasks(
-                job=job,
-                settings=settings,
-                review_tasks=review_tasks,
-                structure_json=structure_json,
-            )
-            review_tasks = suggested_review_tasks
-            if applied_specs and auto_structure_json != structure_json:
-                auto_output_path = get_output_path(
-                    job_id, f"accessible_auto_review_{job.original_filename}"
-                )
-                auto_tagging_result = await tag_pdf(
-                    input_path=working_pdf,
-                    output_path=auto_output_path,
-                    structure_json=auto_structure_json,
-                    alt_texts=reviewed_alts,
-                    original_filename=job.original_filename or "",
-                )
-                auto_validation = await validate_pdf(
-                    pdf_path=auto_tagging_result.output_path,
-                    verapdf_path=settings.verapdf_path,
-                    flavour=settings.verapdf_flavour,
-                    timeout_seconds=settings.subprocess_timeout_validation,
-                )
-                auto_validation_payload = _build_validation_payload(
-                    baseline_validation=baseline_validation,
-                    selected_validation=auto_validation,
-                    settings=settings,
-                    font_remediation=font_remediation,
-                    tagging_result=auto_tagging_result,
-                    llm_font_map_auto=llm_font_map_auto,
-                )
-                auto_fidelity_report, auto_review_tasks = await asyncio.to_thread(
-                    assess_fidelity,
-                    input_pdf=Path(job.input_path),
-                    output_pdf=auto_tagging_result.output_path,
-                    comparison_source_pdf=fidelity_source_pdf,
-                    structure_json=auto_structure_json,
-                    alt_entries=[
-                        {
-                            "figure_index": entry.figure_index,
-                            "generated_text": entry.generated_text,
-                            "edited_text": entry.edited_text,
-                            "status": entry.status,
-                        }
-                        for entry in alt_entries
-                    ],
-                    validation_report=auto_validation_payload,
-                    raw_validation_report=auto_validation.raw_report,
-                    tagging_metrics=auto_validation_payload["tagging"],
-                    classification=job.classification,
-                )
-                (
-                    auto_review_tasks,
-                    auto_fidelity_report,
-                    _,
-                ) = await _adjudicate_grounded_text_candidates(
-                    job=job,
-                    settings=settings,
-                    review_tasks=auto_review_tasks,
-                    fidelity_report=auto_fidelity_report,
-                )
-                if auto_validation.compliant and _blocking_task_count(
-                    auto_review_tasks
-                ) < _blocking_task_count(review_tasks):
-                    structure_json = auto_structure_json
-                    job.structure_json = json.dumps(auto_structure_json)
-                    job.output_path = str(auto_tagging_result.output_path)
-                    selected_tagging_result = auto_tagging_result
-                    selected_validation = auto_validation
-                    validation_payload = auto_validation_payload
-                    fidelity_report = auto_fidelity_report
-                    review_tasks = auto_review_tasks
-                    auto_applied_change_specs.extend(applied_specs)
-
-        if candidate_validation is not None and candidate_output_pdf is not None:
-            candidate_validation_payload = _build_validation_payload(
-                baseline_validation=baseline_validation,
-                selected_validation=candidate_validation,
-                settings=settings,
-                font_remediation=font_remediation,
-                tagging_result=selected_tagging_result,
-                llm_font_map_auto=llm_font_map_auto,
-            )
-            candidate_fidelity_report, candidate_review_tasks = await asyncio.to_thread(
-                assess_fidelity,
-                input_pdf=Path(job.input_path),
-                output_pdf=candidate_output_pdf,
-                comparison_source_pdf=fidelity_source_pdf,
-                structure_json=structure_json or {},
-                alt_entries=[
-                    {
-                        "figure_index": entry.figure_index,
-                        "generated_text": entry.generated_text,
-                        "edited_text": entry.edited_text,
-                        "status": entry.status,
-                    }
-                    for entry in alt_entries
-                ],
-                validation_report=candidate_validation_payload,
-                raw_validation_report=candidate_validation.raw_report,
-                tagging_metrics=candidate_validation_payload["tagging"],
-                classification=job.classification,
-            )
-            if _fidelity_not_worse(candidate_fidelity_report, fidelity_report):
-                selected_validation = candidate_validation
-                job.output_path = str(candidate_output_pdf)
-                validation_payload = candidate_validation_payload
-                fidelity_report = candidate_fidelity_report
-                review_tasks = candidate_review_tasks
-            else:
-                llm_font_map_auto["applied"] = False
-                llm_font_map_auto["reason"] = "fidelity_regression"
-                validation_payload = _build_validation_payload(
-                    baseline_validation=baseline_validation,
-                    selected_validation=selected_validation,
-                    settings=settings,
-                    font_remediation=font_remediation,
-                    tagging_result=selected_tagging_result,
-                    llm_font_map_auto=llm_font_map_auto,
-                )
-
-        final_fidelity_report, final_review_tasks = await asyncio.to_thread(
-            assess_fidelity,
-            input_pdf=Path(job.input_path),
-            output_pdf=Path(job.output_path or tagging_result.output_path),
-            comparison_source_pdf=fidelity_source_pdf,
-            structure_json=structure_json or {},
-            alt_entries=[
-                {
-                    "figure_index": entry.figure_index,
-                    "generated_text": entry.generated_text,
-                    "edited_text": entry.edited_text,
-                    "status": entry.status,
-                }
-                for entry in alt_entries
-            ],
-            validation_report=validation_payload,
-            raw_validation_report=selected_validation.raw_report,
-            tagging_metrics=validation_payload["tagging"],
-            classification=job.classification,
-        )
-        (
-            final_review_tasks,
-            final_fidelity_report,
-            _,
-        ) = await _adjudicate_grounded_text_candidates(
-            job=job,
-            settings=settings,
-            review_tasks=final_review_tasks,
-            fidelity_report=final_fidelity_report,
-        )
-        review_tasks = final_review_tasks
-        fidelity_report = final_fidelity_report
-
-        if review_task_metadata_overrides:
-            for key, metadata in review_task_metadata_overrides.items():
-                review_tasks = _merge_review_task_metadata(
-                    review_tasks,
-                    task_type=key[0],
-                    source=key[1],
-                    metadata=metadata,
-                )
-        user_visible_review_tasks, fidelity_report = _prepare_user_review_surface(
-            review_tasks,
-            fidelity_report,
-        )
-        validation_payload["fidelity"] = fidelity_report
-        job.validation_json = json.dumps(validation_payload)
-        job.fidelity_json = json.dumps(fidelity_report)
-
-        await db.execute(delete(ReviewTask).where(ReviewTask.job_id == job_id))
-        await db.execute(
-            delete(AppliedChange).where(
-                AppliedChange.job_id == job_id,
-                AppliedChange.review_status == "pending_review",
-            )
-        )
-        alt_entry_by_index = {entry.figure_index: entry for entry in alt_entries}
-        for change_spec in auto_applied_change_specs:
-            task_type = str(change_spec.get("task_type") or "review_change")
-            metadata = (
-                change_spec.get("metadata") if isinstance(change_spec.get("metadata"), dict) else {}
-            )
-            before = (
-                change_spec.get("before") if isinstance(change_spec.get("before"), dict) else {}
-            )
-            after = change_spec.get("after") if isinstance(change_spec.get("after"), dict) else {}
-            undo_payload = (
-                change_spec.get("undo_payload")
-                if isinstance(change_spec.get("undo_payload"), dict)
-                else {}
-            )
-            if task_type == "figure_semantics":
-                figure_index_raw = metadata.get("figure_index", undo_payload.get("figure_index"))
-                try:
-                    figure_index = int(figure_index_raw)
-                except (TypeError, ValueError):
-                    figure_index = -1
-                entry = alt_entry_by_index.get(figure_index)
-                if entry is not None:
-                    before = {
-                        "generated_text": undo_payload.get("generated_text"),
-                        "edited_text": undo_payload.get("edited_text"),
-                        "status": undo_payload.get("status"),
-                    }
-                    after = {
-                        "generated_text": entry.generated_text,
-                        "edited_text": entry.edited_text,
-                        "status": entry.status,
-                    }
-                    undo_payload = {
-                        **undo_payload,
-                        "entry_id": entry.id,
-                        "figure_index": figure_index,
-                    }
-            await add_applied_change(
-                db=db,
-                job=job,
-                change_type=task_type,
-                title=str(change_spec.get("title") or "Applied change"),
-                detail=str(change_spec.get("detail") or "The app applied a semantic change."),
-                importance=str(change_spec.get("importance") or "high"),
-                reviewable=bool(change_spec.get("reviewable", True))
-                and is_user_visible_applied_change_type(task_type),
-                metadata=metadata,
-                before=before,
-                after=after,
-                undo_payload=undo_payload,
-            )
-        for task in user_visible_review_tasks:
-            metadata = task.get("metadata", {})
-            if not isinstance(metadata, dict):
-                metadata = {}
-            db.add(
-                ReviewTask(
-                    job_id=job_id,
-                    task_type=str(task.get("task_type") or "review_task"),
-                    title=str(task.get("title") or "Follow-up review required"),
-                    detail=str(task.get("detail") or ""),
-                    severity=str(task.get("severity") or "medium"),
-                    blocking=bool(task.get("blocking", True)),
-                    status=str(task.get("status") or "pending_review"),
-                    source=str(task.get("source") or "fidelity"),
-                    metadata_json=json.dumps(metadata),
-                )
-            )
-
-        blocking_task_count = _blocking_task_count(review_tasks)
-        await _update_step(
-            db,
-            job_id,
-            "fidelity",
-            "complete",
-            result={
-                "passed": bool(fidelity_report.get("passed", False)),
-                "blocking_tasks": blocking_task_count,
-                "advisory_tasks": len(review_tasks) - blocking_task_count,
-            },
-        )
-        job_manager.emit_progress(
-            job_id,
-            step="fidelity",
-            status="complete",
-            result={
-                "passed": bool(fidelity_report.get("passed", False)),
-                "blocking_tasks": blocking_task_count,
-                "advisory_tasks": len(review_tasks) - blocking_task_count,
-            },
-        )
-
-        raise_if_model_access_refused()
-
-        # Done!
-        final_status = (
-            "complete"
-            if selected_validation.compliant and bool(fidelity_report.get("passed", False))
-            else "manual_remediation"
-        )
-        job.status = final_status
-        await db.commit()
-        job_manager.emit_progress(job_id, step="review", status=final_status)
-        logger.info(f"Pipeline complete for job {job_id} with status={final_status}")
 
     except Exception as e:
         logger.exception(f"Tagging/validation failed for job {job_id}")
