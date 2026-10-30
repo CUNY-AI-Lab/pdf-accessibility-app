@@ -23,8 +23,8 @@ docker compose pull && docker compose up -d
 curl -fsS http://127.0.0.1:5001/version
 ```
 
-Until the NML deployment is retired, v1 reaches the same server over
-Tailscale Serve on port 8444, so a version change reaches v1 too.
+Tailscale Serve also publishes it to the tailnet on port 8444, which
+`worker/dev/e2e.mjs` uses.
 
 Memory: on 2026-10-27, after six days up and about 40 conversions in the
 last three, docling-serve 1.12.0 held 44 GB in its server process and 10 GB

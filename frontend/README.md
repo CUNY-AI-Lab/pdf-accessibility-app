@@ -42,6 +42,12 @@ The frontend intentionally does not surface PDF-structural mechanics. Reading or
 
 The frontend does not implement login, account management, or browser-side PDF persistence.
 
+In v2, Doorway signs the person in before the app loads, and the Worker's API
+returns only that person's jobs. Jobs and files are deleted 12 hours after
+their last change.
+
+Against the local FastAPI backend:
+
 - the backend assigns an anonymous HTTP-only browser session cookie
 - the dashboard and job pages only show jobs created by that browser session
 - clearing cookies or switching browser profiles means the user loses access to in-flight and completed jobs from the old session
