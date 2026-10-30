@@ -1,6 +1,8 @@
 import logging
 from pathlib import Path
 
+import pytest
+
 from app.pipeline import fidelity
 from app.pipeline.fidelity import (
     _canonical_named_destination,
@@ -30,6 +32,17 @@ def _validation_report(*, compliant: bool, violations: list[dict], unicode_gate=
         },
         "tagging": {"tables_tagged": 0},
     }
+
+
+def _blank_output_pdf(tmp_path: Path, name: str = "out.pdf") -> Path:
+    """A readable output PDF with no forms or links, for checks that open it."""
+    import pikepdf
+
+    path = tmp_path / name
+    pdf = pikepdf.new()
+    pdf.add_blank_page()
+    pdf.save(path)
+    return path
 
 
 def test_fidelity_creates_blocking_font_task_when_unicode_gate_blocks():
@@ -566,7 +579,7 @@ def test_scanned_fidelity_fails_when_visible_scan_has_no_ocr_text_or_structure(m
     )
 
 
-def test_scanned_fidelity_skips_ocr_coverage_for_visually_blank_pages(monkeypatch):
+def test_scanned_fidelity_skips_ocr_coverage_for_visually_blank_pages(monkeypatch, tmp_path):
     monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "")
     monkeypatch.setattr(
         fidelity,
@@ -582,7 +595,7 @@ def test_scanned_fidelity_skips_ocr_coverage_for_visually_blank_pages(monkeypatc
 
     report, tasks = assess_fidelity(
         input_pdf=Path("scan.pdf"),
-        output_pdf=Path("out.pdf"),
+        output_pdf=_blank_output_pdf(tmp_path),
         structure_json={"elements": []},
         alt_entries=[],
         validation_report=_validation_report(compliant=True, violations=[]),
@@ -598,7 +611,7 @@ def test_scanned_fidelity_skips_ocr_coverage_for_visually_blank_pages(monkeypatc
     assert not tasks
 
 
-def test_fidelity_uses_comparison_source_for_ocr_rescue(monkeypatch):
+def test_fidelity_uses_comparison_source_for_ocr_rescue(monkeypatch, tmp_path):
     broken = "legacy broken text layer " * 20
     clean = "clean recovered text for assistive access " * 20
     samples = {
@@ -614,7 +627,7 @@ def test_fidelity_uses_comparison_source_for_ocr_rescue(monkeypatch):
 
     report, tasks = assess_fidelity(
         input_pdf=Path("input.pdf"),
-        output_pdf=Path("out.pdf"),
+        output_pdf=_blank_output_pdf(tmp_path),
         comparison_source_pdf=Path("ocr.pdf"),
         structure_json={"elements": []},
         alt_entries=[],
@@ -761,12 +774,12 @@ def test_extract_font_review_targets_enriches_local_text_context(tmp_path):
     assert targets[0]["after_text"] == "After text"
 
 
-def test_fidelity_allows_advisory_machine_alt_without_blocking(monkeypatch):
+def test_fidelity_allows_advisory_machine_alt_without_blocking(monkeypatch, tmp_path):
     monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
 
     report, tasks = assess_fidelity(
         input_pdf=Path("in.pdf"),
-        output_pdf=Path("out.pdf"),
+        output_pdf=_blank_output_pdf(tmp_path),
         structure_json={
             "elements": [
                 {"type": "figure", "figure_index": 0, "caption": "caption"},
@@ -1051,7 +1064,7 @@ def test_reading_order_metrics_fall_back_to_dense_matching_for_ocr_spacing():
     assert metrics["match_mode"] == "dense"
 
 
-def test_fidelity_does_not_block_on_single_reading_order_outlier(monkeypatch):
+def test_fidelity_does_not_block_on_single_reading_order_outlier(monkeypatch, tmp_path):
     fragments = [
         "alpha section heading long enough",
         "bravo section heading long enough",
@@ -1076,7 +1089,7 @@ def test_fidelity_does_not_block_on_single_reading_order_outlier(monkeypatch):
 
     report, tasks = assess_fidelity(
         input_pdf=Path("in.pdf"),
-        output_pdf=Path("out.pdf"),
+        output_pdf=_blank_output_pdf(tmp_path),
         structure_json={"elements": [{"type": "heading", "text": text} for text in fragments]},
         alt_entries=[],
         validation_report=_validation_report(compliant=True, violations=[]),
@@ -1440,3 +1453,142 @@ def test_fidelity_font_task_includes_review_targets():
     assert font_task["metadata"]["font_review_targets"][0]["font"] == "MathematicalPi-Six"
     assert font_task["metadata"]["font_review_targets"][0]["operator_index"] == 132
     assert "context_path" in font_task["metadata"]["font_review_targets"][0]
+
+
+_BODY_LINES = [
+    "Accessible documents keep their text layer intact after remediation.",
+    "Screen readers announce the same words that sighted readers see on the page.",
+    "This paragraph exists so the text sample is long enough to compare.",
+    "Fidelity checks compare the source text with the remediated text.",
+    "A remediated file that lost its text must not be released as complete.",
+    "The final line closes the sample with a few more ordinary words.",
+]
+
+
+def _text_pdf(path: Path, lines: list[str] = _BODY_LINES) -> Path:
+    import pikepdf
+
+    from tests.pdf_fixtures import helvetica
+
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
+    commands = ["BT", "/F1 11 Tf", "14 TL", "54 720 Td"]
+    for line in lines:
+        commands.append(f"({line}) Tj T*")
+    commands.append("ET")
+    page.Contents = pdf.make_stream("\n".join(commands).encode("latin-1"))
+    pdf.save(path)
+    return path
+
+
+def _assess_real(input_pdf: Path, output_pdf: Path, classification: str = "digital"):
+    return assess_fidelity(
+        input_pdf=input_pdf,
+        output_pdf=output_pdf,
+        structure_json={"elements": []},
+        alt_entries=[],
+        validation_report=_validation_report(compliant=True, violations=[]),
+        tagging_metrics={"tables_tagged": 0},
+        classification=classification,
+    )
+
+
+def _check(report: dict, name: str) -> dict:
+    return next(check for check in report["checks"] if check["check"] == name)
+
+
+def test_output_that_keeps_its_text_passes(tmp_path):
+    source = _text_pdf(tmp_path / "in.pdf")
+    output = _text_pdf(tmp_path / "out.pdf")
+
+    report, tasks = _assess_real(source, output)
+
+    assert report["passed"] is True
+    assert _check(report, "text_drift")["status"] == "pass"
+    assert not [task for task in tasks if task["blocking"]]
+
+
+@pytest.mark.parametrize("classification", ["digital", "mixed", "ocr_scan"])
+def test_output_that_lost_its_text_is_held(tmp_path, classification):
+    source = _text_pdf(tmp_path / "in.pdf")
+    output = _blank_output_pdf(tmp_path)
+
+    report, tasks = _assess_real(source, output, classification)
+
+    assert report["passed"] is False
+    assert _check(report, "text_drift")["status"] == "fail"
+    lost = [
+        task
+        for task in tasks
+        if task["task_type"] == "content_fidelity" and task["blocking"]
+    ]
+    assert len(lost) == 1
+    assert lost[0]["metadata"]["output_chars"] == 0
+    assert lost[0]["metadata"]["source_chars"] >= fidelity.TEXT_SAMPLE_MIN_CHARS
+
+
+def test_unreadable_output_is_held_and_every_check_reports_the_error(tmp_path, monkeypatch):
+    source = _text_pdf(tmp_path / "in.pdf")
+    output = tmp_path / "out.pdf"
+    output.write_bytes(b"%PDF-1.7\nthis file was truncated")
+    # The visual-gap check raises on an unreadable file, which fails the job;
+    # this test is about the checks that turned the same error into a pass.
+    monkeypatch.setattr(fidelity, "_collect_missing_visual_figure_targets", lambda **_: [])
+
+    report, tasks = _assess_real(source, output)
+
+    assert report["passed"] is False
+    for name in ("text_drift", "form_semantics", "link_text_quality", "internal_link_destinations"):
+        assert _check(report, name)["status"] == "error", name
+    assert _check(report, "reading_order")["status"] == "error"
+    blocking_checks = {
+        task["metadata"].get("check")
+        for task in tasks
+        if task["blocking"] and task["task_type"] == "content_fidelity"
+    }
+    assert {
+        "text_drift",
+        "form_semantics",
+        "link_text_quality",
+        "internal_link_destinations",
+    } <= blocking_checks
+    # The error is reported without the server's file paths.
+    for task in tasks:
+        assert str(tmp_path) not in str(task["metadata"].get("error", ""))
+
+
+def test_unreadable_source_text_is_not_read_as_a_short_source(tmp_path, monkeypatch):
+    source = _text_pdf(tmp_path / "in.pdf")
+    output = _text_pdf(tmp_path / "out.pdf")
+    real_extract = fidelity.extract_text
+
+    def failing_for_source(path, **kwargs):
+        if Path(path).name == "in.pdf":
+            raise ValueError("pdfminer could not decode a stream")
+        return real_extract(path, **kwargs)
+
+    monkeypatch.setattr(fidelity, "extract_text", failing_for_source)
+
+    report, _ = _assess_real(source, output)
+
+    assert report["passed"] is False
+    assert _check(report, "text_drift")["status"] == "error"
+
+
+def test_form_field_check_error_is_not_a_pass(tmp_path, monkeypatch):
+    source = _text_pdf(tmp_path / "in.pdf")
+    output = _text_pdf(tmp_path / "out.pdf")
+
+    def broken_fields(_path):
+        raise KeyError("/Kids")
+
+    monkeypatch.setattr(fidelity, "extract_widget_fields", broken_fields)
+
+    report, tasks = _assess_real(source, output)
+
+    assert report["passed"] is False
+    assert _check(report, "form_semantics")["status"] == "error"
+    assert any(
+        task["blocking"] and task["metadata"].get("check") == "form_semantics" for task in tasks
+    )

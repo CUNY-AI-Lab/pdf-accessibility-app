@@ -292,15 +292,31 @@ def _compute_preservation(source: str, output: str) -> float:
 
 
 def _extract_pdf_text_sample(path: Path) -> str:
-    try:
-        with _suppress_pdfminer_fontbbox_warning():
-            text = extract_text(
-                str(path),
-                page_numbers=list(range(TEXT_SAMPLE_MAX_PAGES)),
-            )
-    except Exception:
-        return ""
+    """Return the normalized text of a PDF's first pages; raises if it cannot be read."""
+    with _suppress_pdfminer_fontbbox_warning():
+        text = extract_text(
+            str(path),
+            page_numbers=list(range(TEXT_SAMPLE_MAX_PAGES)),
+        )
     return _normalize_text(text)[:TEXT_SAMPLE_MAX_CHARS]
+
+
+def _pdf_text_sample(path: Path) -> tuple[str, str | None]:
+    """Return a PDF's text sample and, when it could not be read, the error.
+
+    An unreadable PDF is reported as an error, never as a PDF with no text.
+    """
+    try:
+        return _extract_pdf_text_sample(path), None
+    except Exception as exc:
+        logger.warning("Could not extract text from %s", Path(path).name, exc_info=True)
+        return "", _check_error_text(exc)
+
+
+def _check_error_text(exc: BaseException) -> str:
+    """Describe a check's internal error without the server's file paths."""
+    message = re.sub(r"/\S*", "", str(exc)).strip(" :'\"")
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
 def _meaningful_structure_element_count(structure_json: dict[str, Any]) -> int:
@@ -557,15 +573,8 @@ def _table_semantics_risk(structure_json: dict[str, Any]) -> dict[str, Any]:
 
 
 def _form_semantics_risk(output_pdf: Path) -> dict[str, Any]:
-    try:
-        fields = extract_widget_fields(output_pdf)
-    except Exception:
-        return {
-            "field_count": 0,
-            "missing_labels": 0,
-            "weak_labels": 0,
-            "targets": [],
-        }
+    """Label quality of the output's form fields; raises if they cannot be read."""
+    fields = extract_widget_fields(output_pdf)
 
     targets: list[dict[str, Any]] = []
     missing_labels = 0
@@ -763,133 +772,131 @@ def _is_generated_link_contents(text: str, *, uri: str = "", has_dest: bool = Fa
 
 
 def _check_link_text_quality(output_pdf: Path) -> list[dict[str, Any]]:
-    """Scan output PDF for links whose /Contents text is non-descriptive."""
+    """Scan output PDF for links whose /Contents text is non-descriptive.
+
+    Raises if the PDF or a link annotation cannot be read.
+    """
     poor_links: list[dict[str, Any]] = []
-    try:
-        with pikepdf.Pdf.open(output_pdf) as pdf:
-            for page_idx, page in enumerate(pdf.pages, start=1):
-                annots = page.get("/Annots")
-                if not isinstance(annots, pikepdf.Array):
+    with pikepdf.Pdf.open(output_pdf) as pdf:
+        for page_idx, page in enumerate(pdf.pages, start=1):
+            annots = page.get("/Annots")
+            if not isinstance(annots, pikepdf.Array):
+                continue
+            for annotation in annots:
+                if not isinstance(annotation, pikepdf.Dictionary):
                     continue
-                for annotation in annots:
-                    try:
-                        subtype = annotation.get("/Subtype")
-                        if subtype != pikepdf.Name("/Link"):
-                            continue
-                        contents = str(annotation.get("/Contents", "")).strip()
-                        uri = ""
-                        action = annotation.get("/A")
-                        if action is not None and hasattr(action, "get"):
-                            uri = str(action.get("/URI", "")).strip()
-                        has_dest = annotation.get("/Dest") is not None or (
-                            action is not None
-                            and hasattr(action, "get")
-                            and str(action.get("/S", "")) == "/GoTo"
-                        )
-                        if _is_generated_link_contents(contents, uri=uri, has_dest=has_dest):
-                            continue
-                        if not contents or _is_poor_link_text(contents) or _is_implausible_link_text(contents):
-                            poor_links.append(
-                                {
-                                    "page": page_idx,
-                                    "text": contents or "(empty)",
-                                    "uri": uri,
-                                    "reason": (
-                                        "implausibly_long_or_sentence_like"
-                                        if contents and _is_implausible_link_text(contents)
-                                        else "non_descriptive"
-                                    ),
-                                }
-                            )
-                    except Exception:
-                        continue
-    except Exception:
-        logger.warning("Failed to check link quality in output PDF", exc_info=True)
+                subtype = annotation.get("/Subtype")
+                if subtype != pikepdf.Name("/Link"):
+                    continue
+                contents = str(annotation.get("/Contents", "")).strip()
+                uri = ""
+                action = annotation.get("/A")
+                if action is not None and hasattr(action, "get"):
+                    uri = str(action.get("/URI", "")).strip()
+                has_dest = annotation.get("/Dest") is not None or (
+                    action is not None
+                    and hasattr(action, "get")
+                    and str(action.get("/S", "")) == "/GoTo"
+                )
+                if _is_generated_link_contents(contents, uri=uri, has_dest=has_dest):
+                    continue
+                if not contents or _is_poor_link_text(contents) or _is_implausible_link_text(contents):
+                    poor_links.append(
+                        {
+                            "page": page_idx,
+                            "text": contents or "(empty)",
+                            "uri": uri,
+                            "reason": (
+                                "implausibly_long_or_sentence_like"
+                                if contents and _is_implausible_link_text(contents)
+                                else "non_descriptive"
+                            ),
+                        }
+                    )
     return poor_links
 
 
 def _check_internal_link_destinations(output_pdf: Path) -> list[dict[str, Any]]:
-    """Find internal links whose destinations do not resolve."""
-    broken: list[dict[str, Any]] = []
-    try:
-        with pikepdf.Pdf.open(output_pdf) as pdf:
-            named_dests: set[str] = set()
-            dests = pdf.Root.get("/Dests")
-            if isinstance(dests, pikepdf.Dictionary):
-                for key in dests.keys():
-                    canonical = _canonical_named_destination(key)
-                    if canonical:
-                        named_dests.add(canonical)
-            names = pdf.Root.get("/Names")
-            if isinstance(names, pikepdf.Dictionary):
-                dest_tree = names.get("/Dests")
-                if isinstance(dest_tree, pikepdf.Dictionary):
-                    for key, _ in _iter_name_tree_entries(dest_tree):
-                        named_dests.add(key)
+    """Find internal links whose destinations do not resolve.
 
-            for page_idx, page in enumerate(pdf.pages, start=1):
-                annots = page.get("/Annots")
-                if not isinstance(annots, pikepdf.Array):
+    Raises if the PDF or a link annotation cannot be read.
+    """
+    broken: list[dict[str, Any]] = []
+    with pikepdf.Pdf.open(output_pdf) as pdf:
+        named_dests: set[str] = set()
+        dests = pdf.Root.get("/Dests")
+        if isinstance(dests, pikepdf.Dictionary):
+            for key in dests.keys():
+                canonical = _canonical_named_destination(key)
+                if canonical:
+                    named_dests.add(canonical)
+        names = pdf.Root.get("/Names")
+        if isinstance(names, pikepdf.Dictionary):
+            dest_tree = names.get("/Dests")
+            if isinstance(dest_tree, pikepdf.Dictionary):
+                for key, _ in _iter_name_tree_entries(dest_tree):
+                    named_dests.add(key)
+
+        for page_idx, page in enumerate(pdf.pages, start=1):
+            annots = page.get("/Annots")
+            if not isinstance(annots, pikepdf.Array):
+                continue
+            for annotation in annots:
+                if not isinstance(annotation, pikepdf.Dictionary):
                     continue
-                for annotation in annots:
-                    try:
-                        subtype = annotation.get("/Subtype")
-                        if subtype != pikepdf.Name("/Link"):
-                            continue
-                        # Check /Dest
-                        dest = annotation.get("/Dest")
-                        if dest is not None:
-                            dest_name = _canonical_named_destination(dest)
-                            if dest_name is not None:
-                                if dest_name not in named_dests:
-                                    broken.append(
-                                        {
-                                            "page": page_idx,
-                                            "dest": dest_name,
-                                            "reason": "Named destination not found",
-                                        }
-                                    )
-                                continue
-                            if isinstance(dest, pikepdf.Array) and len(dest) >= 1:
-                                # Direct page reference — verify page object exists
-                                continue  # Direct references are generally valid
-                        # Check /A GoTo action
-                        action = annotation.get("/A")
-                        if action is not None and hasattr(action, "get"):
-                            action_type = str(action.get("/S", ""))
-                            if action_type == "/GoTo":
-                                goto_dest = action.get("/D")
-                                dest_name = _canonical_named_destination(goto_dest)
-                                if dest_name is not None:
-                                    if dest_name not in named_dests:
-                                        broken.append(
-                                            {
-                                                "page": page_idx,
-                                                "dest": dest_name,
-                                                "reason": "GoTo destination not found",
-                                            }
-                                        )
-                                elif isinstance(goto_dest, pikepdf.Array) and len(goto_dest) >= 1:
-                                    # Direct page ref in array — try to resolve
-                                    try:
-                                        page_ref = goto_dest[0]
-                                        if isinstance(page_ref, pikepdf.Object) and hasattr(
-                                            page_ref, "objgen"
-                                        ):
-                                            # Verify the referenced object exists
-                                            _ = page_ref.get("/Type")
-                                    except Exception:
-                                        broken.append(
-                                            {
-                                                "page": page_idx,
-                                                "dest": str(goto_dest),
-                                                "reason": "GoTo page reference unresolvable",
-                                            }
-                                        )
-                    except Exception:
+                subtype = annotation.get("/Subtype")
+                if subtype != pikepdf.Name("/Link"):
+                    continue
+                # Check /Dest
+                dest = annotation.get("/Dest")
+                if dest is not None:
+                    dest_name = _canonical_named_destination(dest)
+                    if dest_name is not None:
+                        if dest_name not in named_dests:
+                            broken.append(
+                                {
+                                    "page": page_idx,
+                                    "dest": dest_name,
+                                    "reason": "Named destination not found",
+                                }
+                            )
                         continue
-    except Exception:
-        logger.warning("Failed to check internal link destinations in output PDF", exc_info=True)
+                    if isinstance(dest, pikepdf.Array) and len(dest) >= 1:
+                        # Direct page reference — verify page object exists
+                        continue  # Direct references are generally valid
+                # Check /A GoTo action
+                action = annotation.get("/A")
+                if action is not None and hasattr(action, "get"):
+                    action_type = str(action.get("/S", ""))
+                    if action_type == "/GoTo":
+                        goto_dest = action.get("/D")
+                        dest_name = _canonical_named_destination(goto_dest)
+                        if dest_name is not None:
+                            if dest_name not in named_dests:
+                                broken.append(
+                                    {
+                                        "page": page_idx,
+                                        "dest": dest_name,
+                                        "reason": "GoTo destination not found",
+                                    }
+                                )
+                        elif isinstance(goto_dest, pikepdf.Array) and len(goto_dest) >= 1:
+                            # Direct page ref in array — try to resolve
+                            try:
+                                page_ref = goto_dest[0]
+                                if isinstance(page_ref, pikepdf.Object) and hasattr(
+                                    page_ref, "objgen"
+                                ):
+                                    # Verify the referenced object exists
+                                    _ = page_ref.get("/Type")
+                            except Exception:
+                                broken.append(
+                                    {
+                                        "page": page_idx,
+                                        "dest": str(goto_dest),
+                                        "reason": "GoTo page reference unresolvable",
+                                    }
+                                )
     return broken
 
 
@@ -1118,6 +1125,30 @@ def assess_fidelity(
         if metadata:
             existing.setdefault("metadata", {}).update(metadata)
 
+    def add_check_error(check: str, title: str, error: str) -> None:
+        # A gate check that could not run is not a pass: record the error and
+        # hold the document for a person.
+        checks.append(
+            {
+                "check": check,
+                "status": "error",
+                "message": f"The check could not run: {error}",
+                "metrics": {"error": error},
+            }
+        )
+        add_task(
+            f"review:check_error:{check}",
+            task_type="content_fidelity",
+            title=title,
+            detail=(
+                "An automatic check could not read the remediated PDF, so its result is unknown. "
+                "Check this part of the document by hand before distribution."
+            ),
+            severity="high",
+            blocking=True,
+            metadata={"check": check, "error": error},
+        )
+
     output_struct_counts = _output_struct_type_counts(output_pdf)
 
     violations = validation_report.get("violations", [])
@@ -1188,11 +1219,13 @@ def assess_fidelity(
 
     comparison_pdf = comparison_source_pdf or input_pdf
     using_alternate_source = comparison_pdf != input_pdf
-    source_text = _extract_pdf_text_sample(comparison_pdf)
-    output_text = _extract_pdf_text_sample(output_pdf)
+    source_text, source_text_error = _pdf_text_sample(comparison_pdf)
+    output_text, output_text_error = _pdf_text_sample(output_pdf)
     original_source_text = (
-        _extract_pdf_text_sample(input_pdf) if using_alternate_source else source_text
+        _pdf_text_sample(input_pdf)[0] if using_alternate_source else source_text
     )
+    # Every class but a scan without a text layer keeps its source text.
+    has_text_layer = classification != "scanned"
     meaningful_structure_elements = _meaningful_structure_element_count(structure_json)
 
     if classification == "scanned":
@@ -1267,7 +1300,13 @@ def assess_fidelity(
             }
         )
 
-    if len(source_text) >= TEXT_SAMPLE_MIN_CHARS and len(output_text) >= TEXT_SAMPLE_MIN_CHARS:
+    if output_text_error or (source_text_error and has_text_layer):
+        add_check_error(
+            "text_drift",
+            "Check the remediated text by hand",
+            output_text_error or source_text_error or "",
+        )
+    elif len(source_text) >= TEXT_SAMPLE_MIN_CHARS and len(output_text) >= TEXT_SAMPLE_MIN_CHARS:
         similarity = SequenceMatcher(None, source_text, output_text).ratio()
         length_ratio = len(output_text) / max(len(source_text), 1)
         status = "pass"
@@ -1461,6 +1500,35 @@ def assess_fidelity(
                     },
                 }
             )
+    elif has_text_layer and len(source_text) >= TEXT_SAMPLE_MIN_CHARS:
+        # The source has a text layer and the remediated PDF has lost most of it.
+        add_task(
+            "review:content_fidelity:text_missing",
+            task_type="content_fidelity",
+            title="Verify the remediated PDF still has its text",
+            detail=(
+                "The source PDF has a text layer, but little or no text could be extracted from "
+                "the remediated PDF. Check that its text is still present and readable."
+            ),
+            severity="high",
+            blocking=True,
+            metadata={
+                "source_chars": len(source_text),
+                "output_chars": len(output_text),
+            },
+        )
+        checks.append(
+            {
+                "check": "text_drift",
+                "status": "fail",
+                "message": "The remediated PDF has little or no extractable text.",
+                "metrics": {
+                    "source_chars": len(source_text),
+                    "output_chars": len(output_text),
+                    "classification": classification or "unknown",
+                },
+            }
+        )
     else:
         checks.append(
             {
@@ -1471,6 +1539,7 @@ def assess_fidelity(
                     "source_chars": len(source_text),
                     "output_chars": len(output_text),
                     "classification": classification or "unknown",
+                    **({"source_error": source_text_error} if source_text_error else {}),
                 },
             }
         )
@@ -1527,7 +1596,16 @@ def assess_fidelity(
         )
 
     fragments = _collect_structural_fragments(structure_json)
-    if fragments and output_text:
+    if output_text_error:
+        checks.append(
+            {
+                "check": "reading_order",
+                "status": "error",
+                "message": "The remediated PDF's text could not be read.",
+                "metrics": {"fragments_considered": len(fragments), "error": output_text_error},
+            }
+        )
+    elif fragments and output_text:
         order_metrics = _reading_order_metrics(fragments, output_text)
         hit_rate = float(order_metrics["hit_rate"])
         order_rate = float(order_metrics["order_rate"])
@@ -1826,8 +1904,15 @@ def assess_fidelity(
             }
         )
 
-    form_risk = _form_semantics_risk(output_pdf)
-    if form_risk["field_count"] > 0:
+    try:
+        form_risk = _form_semantics_risk(output_pdf)
+    except Exception as exc:
+        logger.warning("Form field check failed", exc_info=True)
+        form_risk = None
+        add_check_error(
+            "form_semantics", "Check form field labels by hand", _check_error_text(exc)
+        )
+    if form_risk is not None and form_risk["field_count"] > 0:
         if (
             form_risk["missing_labels"] > 0
             or form_risk["weak_labels"] > 0
@@ -1874,7 +1959,7 @@ def assess_fidelity(
                 },
             }
         )
-    else:
+    elif form_risk is not None:
         checks.append(
             {
                 "check": "form_semantics",
@@ -2042,82 +2127,96 @@ def assess_fidelity(
     )
 
     # ── 1A: Link text quality ─────────────────────────────────────────────
-    poor_links = _check_link_text_quality(output_pdf)
-    if poor_links:
-        pages_to_check = sorted(
+    try:
+        poor_links = _check_link_text_quality(output_pdf)
+    except Exception as exc:
+        logger.warning("Link text check failed", exc_info=True)
+        poor_links = None
+        add_check_error("link_text_quality", "Check link text by hand", _check_error_text(exc))
+    if poor_links is not None:
+        if poor_links:
+            pages_to_check = sorted(
+                {
+                    int(item["page"])
+                    for item in poor_links[:20]
+                    if isinstance(item, dict) and isinstance(item.get("page"), int)
+                }
+            )
+            add_task(
+                "review:link_text_quality",
+                task_type="annotation_description",
+                title="Review non-descriptive link text",
+                detail=(
+                    f"{len(poor_links)} link(s) use non-descriptive text such as "
+                    f'"{poor_links[0]["text"]}". Screen reader users rely on '
+                    "meaningful link labels to understand where links lead."
+                ),
+                severity="medium",
+                blocking=False,
+                metadata={
+                    "pages_to_check": pages_to_check,
+                    "poor_links": poor_links[:20],
+                },
+            )
+        checks.append(
             {
-                int(item["page"])
-                for item in poor_links[:20]
-                if isinstance(item, dict) and isinstance(item.get("page"), int)
+                "check": "link_text_quality",
+                "status": "warning" if poor_links else "pass",
+                "message": (
+                    f"{len(poor_links)} link(s) with non-descriptive text detected."
+                    if poor_links
+                    else "All link text appears descriptive."
+                ),
+                "metrics": {"poor_link_count": len(poor_links)},
             }
         )
-        add_task(
-            "review:link_text_quality",
-            task_type="annotation_description",
-            title="Review non-descriptive link text",
-            detail=(
-                f"{len(poor_links)} link(s) use non-descriptive text such as "
-                f'"{poor_links[0]["text"]}". Screen reader users rely on '
-                "meaningful link labels to understand where links lead."
-            ),
-            severity="medium",
-            blocking=False,
-            metadata={
-                "pages_to_check": pages_to_check,
-                "poor_links": poor_links[:20],
-            },
-        )
-    checks.append(
-        {
-            "check": "link_text_quality",
-            "status": "warning" if poor_links else "pass",
-            "message": (
-                f"{len(poor_links)} link(s) with non-descriptive text detected."
-                if poor_links
-                else "All link text appears descriptive."
-            ),
-            "metrics": {"poor_link_count": len(poor_links)},
-        }
-    )
 
     # ── 1C: Internal link destination validation ──────────────────────────
-    broken_links = _check_internal_link_destinations(output_pdf)
-    if broken_links:
-        pages_to_check = sorted(
+    try:
+        broken_links = _check_internal_link_destinations(output_pdf)
+    except Exception as exc:
+        logger.warning("Internal link check failed", exc_info=True)
+        broken_links = None
+        add_check_error(
+            "internal_link_destinations", "Check internal links by hand", _check_error_text(exc)
+        )
+    if broken_links is not None:
+        if broken_links:
+            pages_to_check = sorted(
+                {
+                    int(item["page"])
+                    for item in broken_links[:20]
+                    if isinstance(item, dict) and isinstance(item.get("page"), int)
+                }
+            )
+            add_task(
+                "review:broken_internal_links",
+                task_type="annotation_description",
+                title="Fix broken internal links",
+                detail=(
+                    f"{len(broken_links)} internal link(s) point to destinations "
+                    "that could not be resolved. These links may not function "
+                    "for any user, including those using assistive technology."
+                ),
+                severity="medium",
+                blocking=False,
+                metadata={
+                    "pages_to_check": pages_to_check,
+                    "broken_links": broken_links[:20],
+                },
+            )
+        checks.append(
             {
-                int(item["page"])
-                for item in broken_links[:20]
-                if isinstance(item, dict) and isinstance(item.get("page"), int)
+                "check": "internal_link_destinations",
+                "status": "warning" if broken_links else "pass",
+                "message": (
+                    f"{len(broken_links)} broken internal link destination(s) detected."
+                    if broken_links
+                    else "All internal link destinations resolve."
+                ),
+                "metrics": {"broken_link_count": len(broken_links)},
             }
         )
-        add_task(
-            "review:broken_internal_links",
-            task_type="annotation_description",
-            title="Fix broken internal links",
-            detail=(
-                f"{len(broken_links)} internal link(s) point to destinations "
-                "that could not be resolved. These links may not function "
-                "for any user, including those using assistive technology."
-            ),
-            severity="medium",
-            blocking=False,
-            metadata={
-                "pages_to_check": pages_to_check,
-                "broken_links": broken_links[:20],
-            },
-        )
-    checks.append(
-        {
-            "check": "internal_link_destinations",
-            "status": "warning" if broken_links else "pass",
-            "message": (
-                f"{len(broken_links)} broken internal link destination(s) detected."
-                if broken_links
-                else "All internal link destinations resolve."
-            ),
-            "metrics": {"broken_link_count": len(broken_links)},
-        }
-    )
 
     # ── Font text fidelity ────────────────────────────────────────────────
     font_remediation = validation_report.get("remediation", {}).get("font_remediation", {})
