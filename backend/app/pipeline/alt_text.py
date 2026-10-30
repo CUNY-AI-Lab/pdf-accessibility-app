@@ -1,10 +1,15 @@
 """Step 4: Generate figure semantics using a vision LLM."""
 
+import asyncio
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from app.config import Settings, get_settings
+from app.pipeline.figure_rules import content_protected, decorative_reasons
 from app.pipeline.structure import FigureInfo
+from app.services.alt_text_cache import AltTextCache, usable_description
 from app.services.intelligence_figures import generate_figures_intelligence
 from app.services.intelligence_normalize import confidence_label
 from app.services.llm_client import LlmClient
@@ -14,6 +19,9 @@ logger = logging.getLogger(__name__)
 # A figure the app could not describe: it has no alt text and waits for a
 # person. Nothing is approved or written in its place.
 NEEDS_DESCRIPTION = "pending_review"
+
+# Bump whenever the crop-description instructions or type templates change.
+PROMPT_VERSION = "3-exact-request-context"
 
 
 def _caption_fallback(caption: str | None) -> str:
@@ -149,13 +157,43 @@ async def generate_alt_text(
     *,
     job=None,
     original_filename: str = "",
+    settings: Settings | None = None,
+    structure: dict[str, Any] | None = None,
+    pdf_path: Path | None = None,
 ) -> list[AltTextResult]:
     """Generate alt text for each figure using a vision LLM."""
     results = []
     existing: dict[int, AltTextResult] = {}
     figures_for_intelligence: list[FigureInfo] = []
+    structure = structure or {}
+    rules = await asyncio.to_thread(
+        decorative_reasons, figures, structure=structure, pdf_path=pdf_path,
+    )
+    model = getattr(llm_client, "model", None)
+    cache = None
+    if isinstance(model, str) and model.strip():
+        settings = settings or get_settings()
+        # Both v1 and the runner keep processing/ beside uploads/ and output/.
+        # This file is outside per-job directories and the runner's state tar.
+        if settings.alt_text_cache_enabled:
+            cache = AltTextCache(settings.processing_dir.parent / "alt_text_cache.sqlite3")
 
     for fig in figures:
+        if fig.index in rules:
+            reason = rules[fig.index]
+            existing[fig.index] = AltTextResult(
+                figure_index=fig.index,
+                generated_text="decorative",
+                status="rejected",
+                suggested_action="mark_decorative",
+                confidence="high",
+                summary="Local evidence identified a decorative image.",
+                reason=reason,
+                reviewable=True,
+                remediation_intelligence={"source": "rule", "rule": reason.split(":", 1)[0],
+                                         "reason": reason},
+            )
+            continue
         if not fig.path.exists():
             logger.warning(f"Figure {fig.index} image not found: {fig.path}")
             fallback = _caption_fallback(fig.caption)
@@ -186,13 +224,35 @@ async def generate_alt_text(
         llm_client=llm_client,
         job=job,
         original_filename=original_filename,
-    )
+        **({"description_cache": cache, "prompt_version": PROMPT_VERSION} if cache else {}),
+    ) if figures_for_intelligence else []
+    decisions = {
+        figure.index: decision
+        for figure, decision in zip(
+            sorted(figures_for_intelligence, key=lambda figure: figure.index), adjudications, strict=False,
+        )
+    }
 
-    for fig, adjudication in zip(figures_for_intelligence, adjudications, strict=False):
+    for fig in figures:
+        if fig.index not in decisions:
+            continue
+        adjudication = decisions[fig.index]
         try:
             suggested_action = str(adjudication.get("suggested_action") or "").strip()
             confidence = confidence_label(adjudication.get("confidence"))
             resolved_kind = str(adjudication.get("resolved_kind") or "").strip() or None
+            if content_protected(fig, structure) and (
+                suggested_action == "mark_decorative" or adjudication.get("is_decorative")
+                or suggested_action == "reclassify_region" and resolved_kind == "artifact"
+            ):
+                adjudication = {
+                    **adjudication, "suggested_action": "manual_only", "is_decorative": False,
+                    "alt_text": "", "confidence": "low",
+                    "reason": "Captioned, referenced or classified content cannot be marked decorative.",
+                }
+                suggested_action = "manual_only"
+                confidence = "low"
+                resolved_kind = None
             if suggested_action == "reclassify_region" and resolved_kind:
                 existing[fig.index] = AltTextResult(
                     figure_index=fig.index,
@@ -211,6 +271,8 @@ async def generate_alt_text(
                 text = "decorative"
             else:
                 text = str(adjudication.get("alt_text") or "").strip()
+                if not usable_description(text):
+                    text = ""
             used_caption_fallback = False
             used_placeholder_fallback = False
             if not text:

@@ -3,7 +3,18 @@
 The pipeline records absolute paths (input, figures, output) in the job's
 database, so the runner keeps one layout under the settings' data root and
 the archive stores paths relative to it. Unpacking on any runner with the
-same layout restores a job exactly; nothing stays on the host between tasks.
+same layout restores a job exactly. Job files are removed after each task.
+
+A shared cache keeps generated figure descriptions keyed by hashes of the
+image and exact model request, model ID, and prompt version. It stores no
+source document text, captions, images, or job identifiers. It lives at
+processing_dir.parent / "alt_text_cache.sqlite3" (/app/data in production),
+outside job archives. Entries expire 48 hours after storage; reads do not
+extend their lifetime. Expired rows are deleted on open, get, and put.
+The cache holds at most 2,000 descriptions of at most 4,096 UTF-8 bytes each;
+the SQLite file is capped at 16 MiB, with LRU eviction and full auto-vacuum.
+ALT_TEXT_CACHE_ENABLED=false disables all cache file creation, reads, and
+writes. It defaults to true. Disabling it leaves any existing file untouched.
 """
 
 import shutil

@@ -59,6 +59,25 @@ for a commit on main. To update, run the same `up -d` with the new tag; a
 task in progress is lost and retried once by the Worker when its lease
 lapses (three minutes).
 
+The runner removes each job's working files after its task. A shared cache
+keeps generated figure descriptions keyed by hashes of the image and exact
+model request, model ID, and prompt version. It stores no source document
+text, captions, images, or job identifiers. The file is
+`/app/data/alt_text_cache.sqlite3` in the `runner_data` volume, outside job
+archives. Its path follows `PROCESSING_DIR`: it lives in that directory's
+parent.
+
+Entries expire 48 hours after storage. Reads do not extend that lifetime.
+Expired rows are deleted on cache open, get, and put. The cache holds at most
+2,000 descriptions of at most 4,096 UTF-8 bytes each. LRU eviction removes the
+least recently used entries when the count exceeds that bound. The SQLite
+file is capped at 16 MiB and uses full auto-vacuum.
+
+`ALT_TEXT_CACHE_ENABLED` defaults to `true`. Set
+`ALT_TEXT_CACHE_ENABLED=false` in `runner.env` and recreate the runner to
+turn it off. With it off, the runner creates no cache file and performs no
+cache reads or writes. Any existing cache file is left untouched.
+
 `RUNNER_TOKEN` must equal the Worker's `RUNNER_TOKEN` secret. To rotate it,
 set the new value on the Worker, then in `runner.env`, then restart the
 runner; tasks claimed under the old token fail their next call and retry.
