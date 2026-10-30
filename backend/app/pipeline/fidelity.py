@@ -7,6 +7,7 @@ import re
 from bisect import bisect_right
 from contextlib import contextmanager
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
@@ -811,7 +812,9 @@ def _is_generated_link_contents(text: str, *, uri: str = "", has_dest: bool = Fa
         return True
     if lowered.startswith("jump to destination ") or lowered.startswith("go to destination "):
         return True
-    if has_dest and (lowered == "link to destination" or lowered.startswith("link to destination ")):
+    if has_dest and (
+        lowered == "link to destination" or lowered.startswith("link to destination ")
+    ):
         return True
     if uri and lowered == f"link to {uri.lower()}":
         return True
@@ -849,7 +852,11 @@ def _check_link_text_quality(output_pdf: Path) -> list[dict[str, Any]]:
                 )
                 if _is_generated_link_contents(contents, uri=uri, has_dest=has_dest):
                     continue
-                if not contents or _is_poor_link_text(contents) or _is_implausible_link_text(contents):
+                if (
+                    not contents
+                    or _is_poor_link_text(contents)
+                    or _is_implausible_link_text(contents)
+                ):
                     poor_links.append(
                         {
                             "page": page_idx,
@@ -1127,22 +1134,48 @@ def _extract_font_review_targets(
     return targets[:12], sorted(pages_seen), sorted(fonts_seen)
 
 
-def assess_fidelity(
-    *,
-    input_pdf: Path,
-    output_pdf: Path,
-    comparison_source_pdf: Path | None = None,
-    structure_json: dict[str, Any],
-    alt_entries: list[dict[str, Any]],
-    validation_report: dict[str, Any],
-    raw_validation_report: dict[str, Any] | None = None,
-    tagging_metrics: dict[str, Any],
-    classification: str | None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    checks: list[dict[str, Any]] = []
-    tasks_by_key: dict[str, dict[str, Any]] = {}
+@dataclass(frozen=True)
+class _FidelityInputs:
+    """Inputs and shared samples used by the ordered fidelity checks."""
+
+    input_pdf: Path
+    output_pdf: Path
+    structure_json: dict[str, Any]
+    alt_entries: list[dict[str, Any]]
+    validation_report: dict[str, Any]
+    raw_validation_report: dict[str, Any] | None
+    classification: str | None
+    output_struct_counts: dict[str, int] | None
+    unresolved_errors: list[dict[str, Any]]
+    remaining_form_validation_errors: int
+    using_alternate_source: bool
+    source_text: str
+    source_text_error: str | None
+    output_text: str
+    output_text_error: str | None
+    original_source_text: str
+    has_text_layer: bool
+    meaningful_structure_elements: int
+    figure_captions: dict[int, str]
+    figure_pages: dict[int, int]
+    figure_targets: list[dict[str, Any]]
+    figure_count: int
+    tagged_figure_count: int
+    decorative_figure_count: int
+    covered_figure_count: int
+    table_count: int
+    tagged_table_count: int
+
+
+@dataclass
+class _FidelityCollector:
+    """Accumulate checks and merge tasks without changing their stable ordering."""
+
+    checks: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    tasks_by_key: dict[str, dict[str, Any]] = dataclass_field(default_factory=dict)
 
     def add_task(
+        self,
         key: str,
         *,
         task_type: str,
@@ -1153,9 +1186,9 @@ def assess_fidelity(
         source: str = "fidelity",
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        existing = tasks_by_key.get(key)
+        existing = self.tasks_by_key.get(key)
         if existing is None:
-            tasks_by_key[key] = {
+            self.tasks_by_key[key] = {
                 "task_type": task_type,
                 "title": title,
                 "detail": detail,
@@ -1174,10 +1207,10 @@ def assess_fidelity(
         if metadata:
             existing.setdefault("metadata", {}).update(metadata)
 
-    def add_check_error(check: str, title: str, error: str) -> None:
+    def add_check_error(self, check: str, title: str, error: str) -> None:
         # A gate check that could not run is not a pass: record the error and
         # hold the document for a person.
-        checks.append(
+        self.checks.append(
             {
                 "check": check,
                 "status": "error",
@@ -1185,7 +1218,7 @@ def assess_fidelity(
                 "metrics": {"error": error},
             }
         )
-        add_task(
+        self.add_task(
             f"review:check_error:{check}",
             task_type="content_fidelity",
             title=title,
@@ -1198,6 +1231,42 @@ def assess_fidelity(
             metadata={"check": check, "error": error},
         )
 
+    def result(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        tasks = sorted(
+            self.tasks_by_key.values(),
+            key=lambda task: (
+                0 if task["blocking"] else 1,
+                -_severity_rank(str(task.get("severity"))),
+                str(task.get("task_type")),
+            ),
+        )
+        blocking_tasks = [task for task in tasks if task["blocking"]]
+        advisory_tasks = [task for task in tasks if not task["blocking"]]
+
+        report = {
+            "passed": len(blocking_tasks) == 0,
+            "summary": {
+                "blocking_tasks": len(blocking_tasks),
+                "advisory_tasks": len(advisory_tasks),
+                "total_tasks": len(tasks),
+            },
+            "checks": self.checks,
+        }
+        return report, tasks
+
+
+def _build_fidelity_inputs(
+    *,
+    input_pdf: Path,
+    output_pdf: Path,
+    comparison_source_pdf: Path | None = None,
+    structure_json: dict[str, Any],
+    alt_entries: list[dict[str, Any]],
+    validation_report: dict[str, Any],
+    raw_validation_report: dict[str, Any] | None = None,
+    tagging_metrics: dict[str, Any],
+    classification: str | None,
+) -> _FidelityInputs:
     output_struct_counts = _output_struct_type_counts(output_pdf)
 
     violations = validation_report.get("violations", [])
@@ -1206,59 +1275,6 @@ def assess_fidelity(
         for violation in violations
         if isinstance(violation, dict) and str(violation.get("severity")) == "error"
     ]
-
-    if unresolved_errors:
-        checks.append(
-            {
-                "check": "compliance",
-                "status": "fail",
-                "message": f"{len(unresolved_errors)} validation rule(s) still require remediation.",
-                "metrics": {
-                    "remaining_rules": len(unresolved_errors),
-                    "remaining_errors": validation_report.get("summary", {}).get("errors", 0),
-                },
-            }
-        )
-        grouped: dict[str, dict[str, Any]] = {}
-        for violation in unresolved_errors:
-            task_type, title, detail = _task_for_violation(violation)
-            key = f"review:{task_type}"
-            entry = grouped.setdefault(
-                key,
-                {
-                    "task_type": task_type,
-                    "title": title,
-                    "detail": detail,
-                    "count": 0,
-                    "rules": [],
-                },
-            )
-            count = violation.get("count", 1)
-            entry["count"] += count if isinstance(count, int) and count > 0 else 1
-            rule_id = str(violation.get("rule_id") or "").strip()
-            if rule_id and rule_id not in entry["rules"]:
-                entry["rules"].append(rule_id)
-
-        for key, entry in grouped.items():
-            add_task(
-                key,
-                task_type=entry["task_type"],
-                title=entry["title"],
-                detail=f"{entry['detail']} Remaining occurrences: {entry['count']}.",
-                severity="high",
-                blocking=True,
-                source="validation",
-                metadata={"rules": entry["rules"], "count": entry["count"]},
-            )
-    else:
-        checks.append(
-            {
-                "check": "compliance",
-                "status": "pass",
-                "message": "No remaining validation errors.",
-                "metrics": {"remaining_rules": 0, "remaining_errors": 0},
-            }
-        )
 
     remaining_form_validation_errors = sum(
         int(violation.get("count", 1) or 1)
@@ -1270,447 +1286,10 @@ def assess_fidelity(
     using_alternate_source = comparison_pdf != input_pdf
     source_text, source_text_error = _pdf_text_sample(comparison_pdf)
     output_text, output_text_error = _pdf_text_sample(output_pdf)
-    original_source_text = (
-        _pdf_text_sample(input_pdf)[0] if using_alternate_source else source_text
-    )
+    original_source_text = _pdf_text_sample(input_pdf)[0] if using_alternate_source else source_text
     # Every class but a scan without a text layer keeps its source text.
     has_text_layer = classification != "scanned"
     meaningful_structure_elements = _meaningful_structure_element_count(structure_json)
-
-    if classification == "scanned":
-        ocr_metrics = _sample_visual_ink(input_pdf)
-        has_meaningful_ocr_text = len(output_text) >= SCANNED_TEXT_MIN_CHARS
-        has_meaningful_structure = meaningful_structure_elements > 0
-        sampled_pages = int(ocr_metrics.get("sampled_pages") or 0)
-        visually_blank = ocr_metrics.get("visually_blank")
-        status = "pass"
-        message = "Scanned-document OCR produced usable text or structure."
-
-        if sampled_pages == 0:
-            status = "skip"
-            message = "Skipped scanned OCR coverage check because page previews were unavailable."
-        elif visually_blank is True:
-            status = "skip"
-            message = "Sampled scanned pages appear visually blank; OCR coverage check skipped."
-        elif not has_meaningful_ocr_text and not has_meaningful_structure:
-            status = "fail"
-            message = (
-                "Scanned document appears to contain visible content, but OCR and structure extraction "
-                "did not produce usable text."
-            )
-            add_task(
-                "review:content_fidelity",
-                task_type="content_fidelity",
-                title="Verify OCR text coverage",
-                detail=(
-                    "The scanned PDF appears to contain visible page content, but OCR and structure extraction "
-                    "produced little or no usable text. Review the OCR result or rescan the source document."
-                ),
-                severity="high",
-                blocking=True,
-                metadata={
-                    "output_chars": len(output_text),
-                    "meaningful_structure_elements": meaningful_structure_elements,
-                    **ocr_metrics,
-                },
-            )
-        elif not has_meaningful_ocr_text:
-            status = "warning"
-            message = (
-                "Scanned document OCR produced limited extractable text; spot-check the result."
-            )
-            add_task(
-                "review:content_fidelity",
-                task_type="content_fidelity",
-                title="Spot-check OCR text coverage",
-                detail=(
-                    "The scanned PDF produced very little extractable text. Check whether the output text "
-                    "matches the visible content before distribution."
-                ),
-                severity="medium",
-                blocking=False,
-                metadata={
-                    "output_chars": len(output_text),
-                    "meaningful_structure_elements": meaningful_structure_elements,
-                    **ocr_metrics,
-                },
-            )
-
-        checks.append(
-            {
-                "check": "ocr_coverage",
-                "status": status,
-                "message": message,
-                "metrics": {
-                    "output_chars": len(output_text),
-                    "meaningful_structure_elements": meaningful_structure_elements,
-                    **ocr_metrics,
-                },
-            }
-        )
-
-    if output_text_error or (source_text_error and has_text_layer):
-        add_check_error(
-            "text_drift",
-            "Check the remediated text by hand",
-            output_text_error or source_text_error or "",
-        )
-    elif len(source_text) >= TEXT_SAMPLE_MIN_CHARS and len(output_text) >= TEXT_SAMPLE_MIN_CHARS:
-        similarity = SequenceMatcher(None, source_text, output_text).ratio()
-        length_ratio = len(output_text) / max(len(source_text), 1)
-        status = "pass"
-        original_similarity = None
-        original_length_ratio = None
-        if using_alternate_source and len(original_source_text) >= TEXT_SAMPLE_MIN_CHARS:
-            original_similarity = SequenceMatcher(None, original_source_text, output_text).ratio()
-            original_length_ratio = len(output_text) / max(len(original_source_text), 1)
-            if (
-                original_similarity < FIDELITY_THRESHOLDS.ocr_rescue_similarity_fail
-                or original_length_ratio < FIDELITY_THRESHOLDS.ocr_rescue_length_ratio_low
-                or original_length_ratio > FIDELITY_THRESHOLDS.ocr_rescue_length_ratio_high
-            ):
-                add_task(
-                    "review:content_fidelity:ocr_rescue",
-                    task_type="content_fidelity",
-                    title="Spot-check OCR rescue text fidelity",
-                    detail=(
-                        "OCR rescue replaced the original extractable text layer. "
-                        "Spot-check a few pages against the visible document before distribution."
-                    ),
-                    severity="medium",
-                    blocking=False,
-                    metadata={
-                        "comparison_source": "retag_input",
-                        "original_similarity": round(original_similarity, 4),
-                        "original_length_ratio": round(original_length_ratio, 4),
-                    },
-                )
-
-        is_ocr_document = classification in ("scanned", "mixed", "ocr_scan")
-
-        if is_ocr_document:
-            # For scanned/mixed PDFs, use asymmetric metrics: OCR legitimately
-            # adds text from images, so we measure whether the *original* text
-            # is preserved (containment + preservation) rather than whether the
-            # texts match symmetrically.
-            containment = partial_ratio(source_text, output_text)
-            preservation = _compute_preservation(source_text, output_text)
-
-            if (
-                containment < FIDELITY_THRESHOLDS.ocr_containment_fail
-                or preservation < FIDELITY_THRESHOLDS.ocr_preservation_fail
-                or length_ratio < FIDELITY_THRESHOLDS.ocr_length_ratio_fail_low
-            ):
-                status = "fail"
-                add_task(
-                    "review:content_fidelity",
-                    task_type="content_fidelity",
-                    title="Verify extracted text fidelity",
-                    detail=(
-                        "The original text may not be fully preserved in the remediated PDF. "
-                        "Check for corrupted or missing text in pages that had an existing text layer."
-                    ),
-                    severity="high",
-                    blocking=True,
-                    metadata={
-                        "similarity": round(similarity, 4),
-                        "length_ratio": round(length_ratio, 4),
-                        "containment": round(containment, 1),
-                        "preservation": round(preservation, 4),
-                    },
-                )
-            elif (
-                containment < FIDELITY_THRESHOLDS.ocr_containment_warn
-                or preservation < FIDELITY_THRESHOLDS.ocr_preservation_warn
-            ):
-                status = "warning"
-                add_task(
-                    "review:content_fidelity",
-                    task_type="content_fidelity",
-                    title="Spot-check extracted text fidelity",
-                    detail=(
-                        "Minor differences detected between source and remediated text. "
-                        "A manual spot-check of pages with existing text is recommended."
-                    ),
-                    severity="medium",
-                    blocking=False,
-                    metadata={
-                        "similarity": round(similarity, 4),
-                        "length_ratio": round(length_ratio, 4),
-                        "containment": round(containment, 1),
-                        "preservation": round(preservation, 4),
-                    },
-                )
-
-            checks.append(
-                {
-                    "check": "text_drift",
-                    "status": status,
-                    "message": (
-                        f"OCR document ({classification}): measured text containment and preservation "
-                        f"instead of symmetric similarity."
-                    ),
-                    "metrics": {
-                        "similarity": round(similarity, 4),
-                        "length_ratio": round(length_ratio, 4),
-                        "containment": round(containment, 1),
-                        "preservation": round(preservation, 4),
-                        "source_chars": len(source_text),
-                        "output_chars": len(output_text),
-                        "comparison_source": "retag_input"
-                        if using_alternate_source
-                        else "original_input",
-                        **(
-                            {"original_similarity": round(original_similarity, 4)}
-                            if original_similarity is not None
-                            else {}
-                        ),
-                        **(
-                            {"original_length_ratio": round(original_length_ratio, 4)}
-                            if original_length_ratio is not None
-                            else {}
-                        ),
-                    },
-                }
-            )
-        else:
-            # Digital PDFs: use strict symmetric similarity thresholds.
-            # The text layer should be preserved with minimal drift.
-            if (
-                similarity < FIDELITY_THRESHOLDS.digital_similarity_fail
-                or length_ratio < FIDELITY_THRESHOLDS.digital_length_ratio_fail_low
-                or length_ratio > FIDELITY_THRESHOLDS.digital_length_ratio_fail_high
-            ):
-                status = "fail"
-                add_task(
-                    "review:content_fidelity",
-                    task_type="content_fidelity",
-                    title="Verify extracted text fidelity",
-                    detail=(
-                        "The remediated PDF text differs substantially from the source text sample. "
-                        "Check for OCR drift, Unicode remaps, or missing content."
-                    ),
-                    severity="high",
-                    blocking=True,
-                    metadata={
-                        "similarity": round(similarity, 4),
-                        "length_ratio": round(length_ratio, 4),
-                    },
-                )
-            elif (
-                similarity < FIDELITY_THRESHOLDS.digital_similarity_warn
-                or length_ratio < FIDELITY_THRESHOLDS.digital_length_ratio_warn_low
-                or length_ratio > FIDELITY_THRESHOLDS.digital_length_ratio_warn_high
-            ):
-                status = "warning"
-                add_task(
-                    "review:content_fidelity",
-                    task_type="content_fidelity",
-                    title="Spot-check extracted text fidelity",
-                    detail=(
-                        "The remediated PDF text sample differs moderately from the source. "
-                        "A manual spot-check is recommended."
-                    ),
-                    severity="medium",
-                    blocking=False,
-                    metadata={
-                        "similarity": round(similarity, 4),
-                        "length_ratio": round(length_ratio, 4),
-                    },
-                )
-
-            checks.append(
-                {
-                    "check": "text_drift",
-                    "status": status,
-                    "message": (
-                        "Compared the final PDF against the source used for the final tagging pass."
-                        if using_alternate_source
-                        else "Compared source and remediated text samples."
-                    ),
-                    "metrics": {
-                        "similarity": round(similarity, 4),
-                        "length_ratio": round(length_ratio, 4),
-                        "source_chars": len(source_text),
-                        "output_chars": len(output_text),
-                        "comparison_source": "retag_input"
-                        if using_alternate_source
-                        else "original_input",
-                        **(
-                            {"original_similarity": round(original_similarity, 4)}
-                            if original_similarity is not None
-                            else {}
-                        ),
-                        **(
-                            {"original_length_ratio": round(original_length_ratio, 4)}
-                            if original_length_ratio is not None
-                            else {}
-                        ),
-                    },
-                }
-            )
-    elif has_text_layer and len(source_text) >= TEXT_SAMPLE_MIN_CHARS:
-        # The source has a text layer and the remediated PDF has lost most of it.
-        add_task(
-            "review:content_fidelity:text_missing",
-            task_type="content_fidelity",
-            title="Verify the remediated PDF still has its text",
-            detail=(
-                "The source PDF has a text layer, but little or no text could be extracted from "
-                "the remediated PDF. Check that its text is still present and readable."
-            ),
-            severity="high",
-            blocking=True,
-            metadata={
-                "source_chars": len(source_text),
-                "output_chars": len(output_text),
-            },
-        )
-        checks.append(
-            {
-                "check": "text_drift",
-                "status": "fail",
-                "message": "The remediated PDF has little or no extractable text.",
-                "metrics": {
-                    "source_chars": len(source_text),
-                    "output_chars": len(output_text),
-                    "classification": classification or "unknown",
-                },
-            }
-        )
-    else:
-        checks.append(
-            {
-                "check": "text_drift",
-                "status": "skip",
-                "message": "Skipped text-drift comparison due to limited extractable text.",
-                "metrics": {
-                    "source_chars": len(source_text),
-                    "output_chars": len(output_text),
-                    "classification": classification or "unknown",
-                    **({"source_error": source_text_error} if source_text_error else {}),
-                },
-            }
-        )
-
-    grounded_text = _grounded_text_risk(output_pdf, structure_json)
-    if grounded_text["target_count"] > 0:
-        add_task(
-            "review:content_fidelity:grounded_text",
-            task_type="content_fidelity",
-            title="Review suspicious extracted text",
-            detail=(
-                "Suspicious text blocks were found, and OCR on the same crop disagrees with the "
-                "extracted accessible text. A grounded semantic review is needed before treating this "
-                "as a release blocker."
-            ),
-            severity="medium",
-            blocking=False,
-            metadata={
-                "grounded_text_candidate": True,
-                "pages_to_check": sorted(
-                    {
-                        int(target["page"])
-                        for target in grounded_text["targets"]
-                        if isinstance(target.get("page"), int)
-                    }
-                ),
-                "flagged_blocks": grounded_text["targets"],
-                "encoding_problem_count": grounded_text["encoding_problem_count"],
-                "grounded_target_count": grounded_text["target_count"],
-            },
-        )
-        checks.append(
-            {
-                "check": "grounded_text_fidelity",
-                "status": "warning",
-                "message": "Found suspicious extracted blocks with contradictory OCR evidence; awaiting semantic adjudication.",
-                "metrics": {
-                    "candidate_blocks": grounded_text["target_count"],
-                    "encoding_problem_candidates": grounded_text["encoding_problem_count"],
-                },
-            }
-        )
-    else:
-        checks.append(
-            {
-                "check": "grounded_text_fidelity",
-                "status": "pass",
-                "message": "No suspicious text blocks with contradictory OCR evidence were detected.",
-                "metrics": {
-                    "candidate_blocks": 0,
-                    "encoding_problem_candidates": 0,
-                },
-            }
-        )
-
-    fragments = _collect_structural_fragments(structure_json)
-    if output_text_error:
-        checks.append(
-            {
-                "check": "reading_order",
-                "status": "error",
-                "message": "The remediated PDF's text could not be read.",
-                "metrics": {"fragments_considered": len(fragments), "error": output_text_error},
-            }
-        )
-    elif fragments and output_text:
-        order_metrics = _reading_order_metrics(fragments, output_text)
-        hit_rate = float(order_metrics["hit_rate"])
-        order_rate = float(order_metrics["order_rate"])
-        status = "pass"
-        if len(fragments) >= FIDELITY_THRESHOLDS.reading_order_min_fragments and (
-            hit_rate < FIDELITY_THRESHOLDS.reading_order_hit_rate_fail
-            or order_rate < FIDELITY_THRESHOLDS.reading_order_order_rate_fail
-        ):
-            status = "fail"
-            add_task(
-                "review:reading_order",
-                task_type="reading_order",
-                title="Verify reading order",
-                detail=(
-                    "Structural text fragments are not appearing in the remediated text in a stable order. "
-                    "Manual reading-order review is required."
-                ),
-                severity="high",
-                blocking=True,
-                metadata=order_metrics,
-            )
-        elif len(fragments) >= FIDELITY_THRESHOLDS.reading_order_min_fragments and (
-            hit_rate < FIDELITY_THRESHOLDS.reading_order_hit_rate_warn
-            or order_rate < FIDELITY_THRESHOLDS.reading_order_order_rate_warn
-        ):
-            status = "warning"
-            add_task(
-                "review:reading_order",
-                task_type="reading_order",
-                title="Spot-check reading order",
-                detail=(
-                    "The structural text order signal is weaker than expected. "
-                    "A manual reading-order spot-check is recommended."
-                ),
-                severity="medium",
-                blocking=False,
-                metadata=order_metrics,
-            )
-
-        checks.append(
-            {
-                "check": "reading_order",
-                "status": status,
-                "message": "Compared structural text fragments against remediated text order.",
-                "metrics": order_metrics,
-            }
-        )
-    else:
-        checks.append(
-            {
-                "check": "reading_order",
-                "status": "skip",
-                "message": "Skipped reading-order heuristic due to limited structural text.",
-                "metrics": {"fragments_considered": len(fragments)},
-            }
-        )
 
     elements = structure_json.get("elements", [])
     figure_captions: dict[int, str] = {}
@@ -1758,11 +1337,566 @@ def assess_fidelity(
         else 0
     )
     covered_figure_count = min(figure_count, tagged_figure_count + decorative_figure_count)
-    if figure_count > 0:
-        coverage = covered_figure_count / figure_count
-        status = "pass" if covered_figure_count >= figure_count else "warning"
-        if covered_figure_count < figure_count:
-            add_task(
+    tagged_tables = tagging_metrics.get("tables_tagged", 0)
+    tagged_table_count = (
+        tagged_tables if isinstance(tagged_tables, int) and tagged_tables >= 0 else 0
+    )
+    if output_struct_counts is not None:
+        tagged_table_count = max(0, output_struct_counts.get("Table", 0))
+    return _FidelityInputs(
+        input_pdf=input_pdf,
+        output_pdf=output_pdf,
+        structure_json=structure_json,
+        alt_entries=alt_entries,
+        validation_report=validation_report,
+        raw_validation_report=raw_validation_report,
+        classification=classification,
+        output_struct_counts=output_struct_counts,
+        unresolved_errors=unresolved_errors,
+        remaining_form_validation_errors=remaining_form_validation_errors,
+        using_alternate_source=using_alternate_source,
+        source_text=source_text,
+        source_text_error=source_text_error,
+        output_text=output_text,
+        output_text_error=output_text_error,
+        original_source_text=original_source_text,
+        has_text_layer=has_text_layer,
+        meaningful_structure_elements=meaningful_structure_elements,
+        figure_captions=figure_captions,
+        figure_pages=figure_pages,
+        figure_targets=figure_targets,
+        figure_count=figure_count,
+        tagged_figure_count=tagged_figure_count,
+        decorative_figure_count=decorative_figure_count,
+        covered_figure_count=covered_figure_count,
+        table_count=table_count,
+        tagged_table_count=tagged_table_count,
+    )
+
+
+def _check_compliance(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
+    if inputs.unresolved_errors:
+        out.checks.append(
+            {
+                "check": "compliance",
+                "status": "fail",
+                "message": f"{len(inputs.unresolved_errors)} validation rule(s) still require remediation.",
+                "metrics": {
+                    "remaining_rules": len(inputs.unresolved_errors),
+                    "remaining_errors": inputs.validation_report.get("summary", {}).get(
+                        "errors", 0
+                    ),
+                },
+            }
+        )
+        grouped: dict[str, dict[str, Any]] = {}
+        for violation in inputs.unresolved_errors:
+            task_type, title, detail = _task_for_violation(violation)
+            key = f"review:{task_type}"
+            entry = grouped.setdefault(
+                key,
+                {
+                    "task_type": task_type,
+                    "title": title,
+                    "detail": detail,
+                    "count": 0,
+                    "rules": [],
+                },
+            )
+            count = violation.get("count", 1)
+            entry["count"] += count if isinstance(count, int) and count > 0 else 1
+            rule_id = str(violation.get("rule_id") or "").strip()
+            if rule_id and rule_id not in entry["rules"]:
+                entry["rules"].append(rule_id)
+
+        for key, entry in grouped.items():
+            out.add_task(
+                key,
+                task_type=entry["task_type"],
+                title=entry["title"],
+                detail=f"{entry['detail']} Remaining occurrences: {entry['count']}.",
+                severity="high",
+                blocking=True,
+                source="validation",
+                metadata={"rules": entry["rules"], "count": entry["count"]},
+            )
+    else:
+        out.checks.append(
+            {
+                "check": "compliance",
+                "status": "pass",
+                "message": "No remaining validation errors.",
+                "metrics": {"remaining_rules": 0, "remaining_errors": 0},
+            }
+        )
+
+
+def _check_ocr_coverage(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
+    if inputs.classification == "scanned":
+        ocr_metrics = _sample_visual_ink(inputs.input_pdf)
+        has_meaningful_ocr_text = len(inputs.output_text) >= SCANNED_TEXT_MIN_CHARS
+        has_meaningful_structure = inputs.meaningful_structure_elements > 0
+        sampled_pages = int(ocr_metrics.get("sampled_pages") or 0)
+        visually_blank = ocr_metrics.get("visually_blank")
+        status = "pass"
+        message = "Scanned-document OCR produced usable text or structure."
+
+        if sampled_pages == 0:
+            status = "skip"
+            message = "Skipped scanned OCR coverage check because page previews were unavailable."
+        elif visually_blank is True:
+            status = "skip"
+            message = "Sampled scanned pages appear visually blank; OCR coverage check skipped."
+        elif not has_meaningful_ocr_text and not has_meaningful_structure:
+            status = "fail"
+            message = (
+                "Scanned document appears to contain visible content, but OCR and structure extraction "
+                "did not produce usable text."
+            )
+            out.add_task(
+                "review:content_fidelity",
+                task_type="content_fidelity",
+                title="Verify OCR text coverage",
+                detail=(
+                    "The scanned PDF appears to contain visible page content, but OCR and structure extraction "
+                    "produced little or no usable text. Review the OCR result or rescan the source document."
+                ),
+                severity="high",
+                blocking=True,
+                metadata={
+                    "output_chars": len(inputs.output_text),
+                    "meaningful_structure_elements": inputs.meaningful_structure_elements,
+                    **ocr_metrics,
+                },
+            )
+        elif not has_meaningful_ocr_text:
+            status = "warning"
+            message = (
+                "Scanned document OCR produced limited extractable text; spot-check the result."
+            )
+            out.add_task(
+                "review:content_fidelity",
+                task_type="content_fidelity",
+                title="Spot-check OCR text coverage",
+                detail=(
+                    "The scanned PDF produced very little extractable text. Check whether the output text "
+                    "matches the visible content before distribution."
+                ),
+                severity="medium",
+                blocking=False,
+                metadata={
+                    "output_chars": len(inputs.output_text),
+                    "meaningful_structure_elements": inputs.meaningful_structure_elements,
+                    **ocr_metrics,
+                },
+            )
+
+        out.checks.append(
+            {
+                "check": "ocr_coverage",
+                "status": status,
+                "message": message,
+                "metrics": {
+                    "output_chars": len(inputs.output_text),
+                    "meaningful_structure_elements": inputs.meaningful_structure_elements,
+                    **ocr_metrics,
+                },
+            }
+        )
+
+
+def _check_text_drift(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
+    if inputs.output_text_error or (inputs.source_text_error and inputs.has_text_layer):
+        out.add_check_error(
+            "text_drift",
+            "Check the remediated text by hand",
+            inputs.output_text_error or inputs.source_text_error or "",
+        )
+    elif (
+        len(inputs.source_text) >= TEXT_SAMPLE_MIN_CHARS
+        and len(inputs.output_text) >= TEXT_SAMPLE_MIN_CHARS
+    ):
+        similarity = SequenceMatcher(None, inputs.source_text, inputs.output_text).ratio()
+        length_ratio = len(inputs.output_text) / max(len(inputs.source_text), 1)
+        status = "pass"
+        original_similarity = None
+        original_length_ratio = None
+        if (
+            inputs.using_alternate_source
+            and len(inputs.original_source_text) >= TEXT_SAMPLE_MIN_CHARS
+        ):
+            original_similarity = SequenceMatcher(
+                None, inputs.original_source_text, inputs.output_text
+            ).ratio()
+            original_length_ratio = len(inputs.output_text) / max(
+                len(inputs.original_source_text), 1
+            )
+            if (
+                original_similarity < FIDELITY_THRESHOLDS.ocr_rescue_similarity_fail
+                or original_length_ratio < FIDELITY_THRESHOLDS.ocr_rescue_length_ratio_low
+                or original_length_ratio > FIDELITY_THRESHOLDS.ocr_rescue_length_ratio_high
+            ):
+                out.add_task(
+                    "review:content_fidelity:ocr_rescue",
+                    task_type="content_fidelity",
+                    title="Spot-check OCR rescue text fidelity",
+                    detail=(
+                        "OCR rescue replaced the original extractable text layer. "
+                        "Spot-check a few pages against the visible document before distribution."
+                    ),
+                    severity="medium",
+                    blocking=False,
+                    metadata={
+                        "comparison_source": "retag_input",
+                        "original_similarity": round(original_similarity, 4),
+                        "original_length_ratio": round(original_length_ratio, 4),
+                    },
+                )
+
+        is_ocr_document = inputs.classification in ("scanned", "mixed", "ocr_scan")
+
+        if is_ocr_document:
+            # For scanned/mixed PDFs, use asymmetric metrics: OCR legitimately
+            # adds text from images, so we measure whether the *original* text
+            # is preserved (containment + preservation) rather than whether the
+            # texts match symmetrically.
+            containment = partial_ratio(inputs.source_text, inputs.output_text)
+            preservation = _compute_preservation(inputs.source_text, inputs.output_text)
+
+            if (
+                containment < FIDELITY_THRESHOLDS.ocr_containment_fail
+                or preservation < FIDELITY_THRESHOLDS.ocr_preservation_fail
+                or length_ratio < FIDELITY_THRESHOLDS.ocr_length_ratio_fail_low
+            ):
+                status = "fail"
+                out.add_task(
+                    "review:content_fidelity",
+                    task_type="content_fidelity",
+                    title="Verify extracted text fidelity",
+                    detail=(
+                        "The original text may not be fully preserved in the remediated PDF. "
+                        "Check for corrupted or missing text in pages that had an existing text layer."
+                    ),
+                    severity="high",
+                    blocking=True,
+                    metadata={
+                        "similarity": round(similarity, 4),
+                        "length_ratio": round(length_ratio, 4),
+                        "containment": round(containment, 1),
+                        "preservation": round(preservation, 4),
+                    },
+                )
+            elif (
+                containment < FIDELITY_THRESHOLDS.ocr_containment_warn
+                or preservation < FIDELITY_THRESHOLDS.ocr_preservation_warn
+            ):
+                status = "warning"
+                out.add_task(
+                    "review:content_fidelity",
+                    task_type="content_fidelity",
+                    title="Spot-check extracted text fidelity",
+                    detail=(
+                        "Minor differences detected between source and remediated text. "
+                        "A manual spot-check of pages with existing text is recommended."
+                    ),
+                    severity="medium",
+                    blocking=False,
+                    metadata={
+                        "similarity": round(similarity, 4),
+                        "length_ratio": round(length_ratio, 4),
+                        "containment": round(containment, 1),
+                        "preservation": round(preservation, 4),
+                    },
+                )
+
+            out.checks.append(
+                {
+                    "check": "text_drift",
+                    "status": status,
+                    "message": (
+                        f"OCR document ({inputs.classification}): measured text containment and preservation "
+                        f"instead of symmetric similarity."
+                    ),
+                    "metrics": {
+                        "similarity": round(similarity, 4),
+                        "length_ratio": round(length_ratio, 4),
+                        "containment": round(containment, 1),
+                        "preservation": round(preservation, 4),
+                        "source_chars": len(inputs.source_text),
+                        "output_chars": len(inputs.output_text),
+                        "comparison_source": "retag_input"
+                        if inputs.using_alternate_source
+                        else "original_input",
+                        **(
+                            {"original_similarity": round(original_similarity, 4)}
+                            if original_similarity is not None
+                            else {}
+                        ),
+                        **(
+                            {"original_length_ratio": round(original_length_ratio, 4)}
+                            if original_length_ratio is not None
+                            else {}
+                        ),
+                    },
+                }
+            )
+        else:
+            # Digital PDFs: use strict symmetric similarity thresholds.
+            # The text layer should be preserved with minimal drift.
+            if (
+                similarity < FIDELITY_THRESHOLDS.digital_similarity_fail
+                or length_ratio < FIDELITY_THRESHOLDS.digital_length_ratio_fail_low
+                or length_ratio > FIDELITY_THRESHOLDS.digital_length_ratio_fail_high
+            ):
+                status = "fail"
+                out.add_task(
+                    "review:content_fidelity",
+                    task_type="content_fidelity",
+                    title="Verify extracted text fidelity",
+                    detail=(
+                        "The remediated PDF text differs substantially from the source text sample. "
+                        "Check for OCR drift, Unicode remaps, or missing content."
+                    ),
+                    severity="high",
+                    blocking=True,
+                    metadata={
+                        "similarity": round(similarity, 4),
+                        "length_ratio": round(length_ratio, 4),
+                    },
+                )
+            elif (
+                similarity < FIDELITY_THRESHOLDS.digital_similarity_warn
+                or length_ratio < FIDELITY_THRESHOLDS.digital_length_ratio_warn_low
+                or length_ratio > FIDELITY_THRESHOLDS.digital_length_ratio_warn_high
+            ):
+                status = "warning"
+                out.add_task(
+                    "review:content_fidelity",
+                    task_type="content_fidelity",
+                    title="Spot-check extracted text fidelity",
+                    detail=(
+                        "The remediated PDF text sample differs moderately from the source. "
+                        "A manual spot-check is recommended."
+                    ),
+                    severity="medium",
+                    blocking=False,
+                    metadata={
+                        "similarity": round(similarity, 4),
+                        "length_ratio": round(length_ratio, 4),
+                    },
+                )
+
+            out.checks.append(
+                {
+                    "check": "text_drift",
+                    "status": status,
+                    "message": (
+                        "Compared the final PDF against the source used for the final tagging pass."
+                        if inputs.using_alternate_source
+                        else "Compared source and remediated text samples."
+                    ),
+                    "metrics": {
+                        "similarity": round(similarity, 4),
+                        "length_ratio": round(length_ratio, 4),
+                        "source_chars": len(inputs.source_text),
+                        "output_chars": len(inputs.output_text),
+                        "comparison_source": "retag_input"
+                        if inputs.using_alternate_source
+                        else "original_input",
+                        **(
+                            {"original_similarity": round(original_similarity, 4)}
+                            if original_similarity is not None
+                            else {}
+                        ),
+                        **(
+                            {"original_length_ratio": round(original_length_ratio, 4)}
+                            if original_length_ratio is not None
+                            else {}
+                        ),
+                    },
+                }
+            )
+    elif inputs.has_text_layer and len(inputs.source_text) >= TEXT_SAMPLE_MIN_CHARS:
+        # The source has a text layer and the remediated PDF has lost most of it.
+        out.add_task(
+            "review:content_fidelity:text_missing",
+            task_type="content_fidelity",
+            title="Verify the remediated PDF still has its text",
+            detail=(
+                "The source PDF has a text layer, but little or no text could be extracted from "
+                "the remediated PDF. Check that its text is still present and readable."
+            ),
+            severity="high",
+            blocking=True,
+            metadata={
+                "source_chars": len(inputs.source_text),
+                "output_chars": len(inputs.output_text),
+            },
+        )
+        out.checks.append(
+            {
+                "check": "text_drift",
+                "status": "fail",
+                "message": "The remediated PDF has little or no extractable text.",
+                "metrics": {
+                    "source_chars": len(inputs.source_text),
+                    "output_chars": len(inputs.output_text),
+                    "classification": inputs.classification or "unknown",
+                },
+            }
+        )
+    else:
+        out.checks.append(
+            {
+                "check": "text_drift",
+                "status": "skip",
+                "message": "Skipped text-drift comparison due to limited extractable text.",
+                "metrics": {
+                    "source_chars": len(inputs.source_text),
+                    "output_chars": len(inputs.output_text),
+                    "classification": inputs.classification or "unknown",
+                    **(
+                        {"source_error": inputs.source_text_error}
+                        if inputs.source_text_error
+                        else {}
+                    ),
+                },
+            }
+        )
+
+
+def _check_grounded_text_fidelity(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
+    grounded_text = _grounded_text_risk(inputs.output_pdf, inputs.structure_json)
+    if grounded_text["target_count"] > 0:
+        out.add_task(
+            "review:content_fidelity:grounded_text",
+            task_type="content_fidelity",
+            title="Review suspicious extracted text",
+            detail=(
+                "Suspicious text blocks were found, and OCR on the same crop disagrees with the "
+                "extracted accessible text. A grounded semantic review is needed before treating this "
+                "as a release blocker."
+            ),
+            severity="medium",
+            blocking=False,
+            metadata={
+                "grounded_text_candidate": True,
+                "pages_to_check": sorted(
+                    {
+                        int(target["page"])
+                        for target in grounded_text["targets"]
+                        if isinstance(target.get("page"), int)
+                    }
+                ),
+                "flagged_blocks": grounded_text["targets"],
+                "encoding_problem_count": grounded_text["encoding_problem_count"],
+                "grounded_target_count": grounded_text["target_count"],
+            },
+        )
+        out.checks.append(
+            {
+                "check": "grounded_text_fidelity",
+                "status": "warning",
+                "message": "Found suspicious extracted blocks with contradictory OCR evidence; awaiting semantic adjudication.",
+                "metrics": {
+                    "candidate_blocks": grounded_text["target_count"],
+                    "encoding_problem_candidates": grounded_text["encoding_problem_count"],
+                },
+            }
+        )
+    else:
+        out.checks.append(
+            {
+                "check": "grounded_text_fidelity",
+                "status": "pass",
+                "message": "No suspicious text blocks with contradictory OCR evidence were detected.",
+                "metrics": {
+                    "candidate_blocks": 0,
+                    "encoding_problem_candidates": 0,
+                },
+            }
+        )
+
+
+def _check_reading_order(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
+    fragments = _collect_structural_fragments(inputs.structure_json)
+    if inputs.output_text_error:
+        out.checks.append(
+            {
+                "check": "reading_order",
+                "status": "error",
+                "message": "The remediated PDF's text could not be read.",
+                "metrics": {
+                    "fragments_considered": len(fragments),
+                    "error": inputs.output_text_error,
+                },
+            }
+        )
+    elif fragments and inputs.output_text:
+        order_metrics = _reading_order_metrics(fragments, inputs.output_text)
+        hit_rate = float(order_metrics["hit_rate"])
+        order_rate = float(order_metrics["order_rate"])
+        status = "pass"
+        if len(fragments) >= FIDELITY_THRESHOLDS.reading_order_min_fragments and (
+            hit_rate < FIDELITY_THRESHOLDS.reading_order_hit_rate_fail
+            or order_rate < FIDELITY_THRESHOLDS.reading_order_order_rate_fail
+        ):
+            status = "fail"
+            out.add_task(
+                "review:reading_order",
+                task_type="reading_order",
+                title="Verify reading order",
+                detail=(
+                    "Structural text fragments are not appearing in the remediated text in a stable order. "
+                    "Manual reading-order review is required."
+                ),
+                severity="high",
+                blocking=True,
+                metadata=order_metrics,
+            )
+        elif len(fragments) >= FIDELITY_THRESHOLDS.reading_order_min_fragments and (
+            hit_rate < FIDELITY_THRESHOLDS.reading_order_hit_rate_warn
+            or order_rate < FIDELITY_THRESHOLDS.reading_order_order_rate_warn
+        ):
+            status = "warning"
+            out.add_task(
+                "review:reading_order",
+                task_type="reading_order",
+                title="Spot-check reading order",
+                detail=(
+                    "The structural text order signal is weaker than expected. "
+                    "A manual reading-order spot-check is recommended."
+                ),
+                severity="medium",
+                blocking=False,
+                metadata=order_metrics,
+            )
+
+        out.checks.append(
+            {
+                "check": "reading_order",
+                "status": status,
+                "message": "Compared structural text fragments against remediated text order.",
+                "metrics": order_metrics,
+            }
+        )
+    else:
+        out.checks.append(
+            {
+                "check": "reading_order",
+                "status": "skip",
+                "message": "Skipped reading-order heuristic due to limited structural text.",
+                "metrics": {"fragments_considered": len(fragments)},
+            }
+        )
+
+
+def _check_figure_coverage(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
+    if inputs.figure_count > 0:
+        coverage = inputs.covered_figure_count / inputs.figure_count
+        status = "pass" if inputs.covered_figure_count >= inputs.figure_count else "warning"
+        if inputs.covered_figure_count < inputs.figure_count:
+            out.add_task(
                 "review:figure_semantics",
                 task_type="figure_semantics",
                 title="Verify figure semantics",
@@ -1773,59 +1907,55 @@ def assess_fidelity(
                 severity="high" if coverage < 0.75 else "medium",
                 blocking=True,
                 metadata={
-                    "detected_figures": figure_count,
-                    "tagged_figures": tagged_figure_count,
-                    "decorative_figures": decorative_figure_count,
+                    "detected_figures": inputs.figure_count,
+                    "tagged_figures": inputs.tagged_figure_count,
+                    "decorative_figures": inputs.decorative_figure_count,
                     "coverage": round(coverage, 4),
                     "pages_to_check": sorted(
                         {
                             int(target["page"])
-                            for target in figure_targets
+                            for target in inputs.figure_targets
                             if isinstance(target.get("page"), int)
                         }
                     ),
-                    "figure_review_targets": figure_targets[:20],
+                    "figure_review_targets": inputs.figure_targets[:20],
                 },
             )
-        checks.append(
+        out.checks.append(
             {
                 "check": "figure_coverage",
                 "status": status,
                 "message": "Compared detected figures against tagged or artifacted figures.",
                 "metrics": {
-                    "detected_figures": figure_count,
-                    "tagged_figures": tagged_figure_count,
-                    "decorative_figures": decorative_figure_count,
+                    "detected_figures": inputs.figure_count,
+                    "tagged_figures": inputs.tagged_figure_count,
+                    "decorative_figures": inputs.decorative_figure_count,
                     "coverage": round(coverage, 4),
                 },
             }
         )
     else:
-        checks.append(
+        out.checks.append(
             {
                 "check": "figure_coverage",
                 "status": "skip",
                 "message": "No figures detected in structure extraction.",
                 "metrics": {
                     "detected_figures": 0,
-                    "tagged_figures": tagged_figure_count,
-                    "decorative_figures": decorative_figure_count,
+                    "tagged_figures": inputs.tagged_figure_count,
+                    "decorative_figures": inputs.decorative_figure_count,
                 },
             }
         )
 
-    tagged_tables = tagging_metrics.get("tables_tagged", 0)
-    tagged_table_count = (
-        tagged_tables if isinstance(tagged_tables, int) and tagged_tables >= 0 else 0
-    )
-    if output_struct_counts is not None:
-        tagged_table_count = max(0, output_struct_counts.get("Table", 0))
-    if table_count > 0:
-        coverage = tagged_table_count / table_count
-        status = "pass" if tagged_table_count >= table_count else "warning"
-        if tagged_table_count < table_count:
-            table_targets = _table_review_targets(structure_json)
-            add_task(
+
+def _check_table_coverage(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
+    if inputs.table_count > 0:
+        coverage = inputs.tagged_table_count / inputs.table_count
+        status = "pass" if inputs.tagged_table_count >= inputs.table_count else "warning"
+        if inputs.tagged_table_count < inputs.table_count:
+            table_targets = _table_review_targets(inputs.structure_json)
+            out.add_task(
                 "review:table_semantics",
                 task_type="table_semantics",
                 title="Verify table semantics",
@@ -1836,8 +1966,8 @@ def assess_fidelity(
                 severity="high" if coverage < 0.75 else "medium",
                 blocking=True,
                 metadata={
-                    "detected_tables": table_count,
-                    "tagged_tables": tagged_table_count,
+                    "detected_tables": inputs.table_count,
+                    "tagged_tables": inputs.tagged_table_count,
                     "coverage": round(coverage, 4),
                     "pages_to_check": sorted(
                         {
@@ -1849,20 +1979,33 @@ def assess_fidelity(
                     "table_review_targets": table_targets,
                 },
             )
-        checks.append(
+        out.checks.append(
             {
                 "check": "table_coverage",
                 "status": status,
                 "message": "Compared detected tables against tagged tables.",
                 "metrics": {
-                    "detected_tables": table_count,
-                    "tagged_tables": tagged_table_count,
+                    "detected_tables": inputs.table_count,
+                    "tagged_tables": inputs.tagged_table_count,
                     "coverage": round(coverage, 4),
                 },
             }
         )
 
-        table_risk = _table_semantics_risk(structure_json)
+    else:
+        out.checks.append(
+            {
+                "check": "table_coverage",
+                "status": "skip",
+                "message": "No tables detected in structure extraction.",
+                "metrics": {"detected_tables": 0, "tagged_tables": inputs.tagged_table_count},
+            }
+        )
+
+
+def _check_table_risk(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
+    if inputs.table_count > 0:
+        table_risk = _table_semantics_risk(inputs.structure_json)
         if table_risk["complex_tables"] > 0:
             risk_targets = table_risk["targets"]
             risk_status = "warning"
@@ -1882,7 +2025,7 @@ def assess_fidelity(
                     "processing to confirm accessible table semantics."
                 )
 
-            add_task(
+            out.add_task(
                 "review:table_semantics_risk",
                 task_type="table_semantics",
                 title="Review complex table semantics",
@@ -1890,8 +2033,8 @@ def assess_fidelity(
                 severity=severity,
                 blocking=blocking,
                 metadata={
-                    "detected_tables": table_count,
-                    "tagged_tables": tagged_table_count,
+                    "detected_tables": inputs.table_count,
+                    "tagged_tables": inputs.tagged_table_count,
                     "complex_tables": table_risk["complex_tables"],
                     "high_risk_tables": table_risk["high_risk_tables"],
                     "risk_score": table_risk["risk_score"],
@@ -1906,7 +2049,7 @@ def assess_fidelity(
                 },
             )
 
-            checks.append(
+            out.checks.append(
                 {
                     "check": "table_risk",
                     "status": risk_status,
@@ -1919,7 +2062,7 @@ def assess_fidelity(
                 }
             )
         else:
-            checks.append(
+            out.checks.append(
                 {
                     "check": "table_risk",
                     "status": "pass",
@@ -1932,15 +2075,7 @@ def assess_fidelity(
                 }
             )
     else:
-        checks.append(
-            {
-                "check": "table_coverage",
-                "status": "skip",
-                "message": "No tables detected in structure extraction.",
-                "metrics": {"detected_tables": 0, "tagged_tables": tagged_table_count},
-            }
-        )
-        checks.append(
+        out.checks.append(
             {
                 "check": "table_risk",
                 "status": "skip",
@@ -1953,21 +2088,23 @@ def assess_fidelity(
             }
         )
 
+
+def _check_form_semantics(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     try:
-        form_risk = _form_semantics_risk(output_pdf)
+        form_risk = _form_semantics_risk(inputs.output_pdf)
     except Exception as exc:
         logger.warning("Form field check failed", exc_info=True)
         form_risk = None
-        add_check_error(
+        out.add_check_error(
             "form_semantics", "Check form field labels by hand", _check_error_text(exc)
         )
     if form_risk is not None and form_risk["field_count"] > 0:
         if (
             form_risk["missing_labels"] > 0
             or form_risk["weak_labels"] > 0
-            or remaining_form_validation_errors > 0
+            or inputs.remaining_form_validation_errors > 0
         ):
-            add_task(
+            out.add_task(
                 "review:form_semantics",
                 task_type="form_semantics",
                 title="Verify form field labels",
@@ -1981,7 +2118,7 @@ def assess_fidelity(
                     "field_count": form_risk["field_count"],
                     "missing_labels": form_risk["missing_labels"],
                     "weak_labels": form_risk["weak_labels"],
-                    "remaining_validation_errors": remaining_form_validation_errors,
+                    "remaining_validation_errors": inputs.remaining_form_validation_errors,
                     "pages_to_check": sorted(
                         {
                             int(target["page"])
@@ -1995,7 +2132,7 @@ def assess_fidelity(
             form_status = "fail"
         else:
             form_status = "pass"
-        checks.append(
+        out.checks.append(
             {
                 "check": "form_semantics",
                 "status": form_status,
@@ -2004,12 +2141,12 @@ def assess_fidelity(
                     "field_count": form_risk["field_count"],
                     "missing_labels": form_risk["missing_labels"],
                     "weak_labels": form_risk["weak_labels"],
-                    "remaining_validation_errors": remaining_form_validation_errors,
+                    "remaining_validation_errors": inputs.remaining_form_validation_errors,
                 },
             }
         )
     elif form_risk is not None:
-        checks.append(
+        out.checks.append(
             {
                 "check": "form_semantics",
                 "status": "skip",
@@ -2022,12 +2159,14 @@ def assess_fidelity(
             }
         )
 
+
+def _check_static_widget_artifacts(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     suspicious_widgets = _widget_targets_for_rationalization(
-        working_pdf=output_pdf,
-        structure_json=structure_json,
+        working_pdf=inputs.output_pdf,
+        structure_json=inputs.structure_json,
     )
     if suspicious_widgets:
-        add_task(
+        out.add_task(
             "review:form_semantics:static_widgets",
             task_type="form_semantics",
             title="Remove static widget artifacts",
@@ -2049,7 +2188,7 @@ def assess_fidelity(
                 "field_review_targets": suspicious_widgets[:12],
             },
         )
-        checks.append(
+        out.checks.append(
             {
                 "check": "static_widget_artifacts",
                 "status": "fail",
@@ -2060,7 +2199,7 @@ def assess_fidelity(
             }
         )
     else:
-        checks.append(
+        out.checks.append(
             {
                 "check": "static_widget_artifacts",
                 "status": "pass",
@@ -2071,12 +2210,14 @@ def assess_fidelity(
             }
         )
 
+
+def _check_visual_meaning_gap(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     missing_visual_figures = _collect_missing_visual_figure_targets(
-        working_pdf=output_pdf,
-        structure_json=structure_json,
+        working_pdf=inputs.output_pdf,
+        structure_json=inputs.structure_json,
     )
     if missing_visual_figures:
-        add_task(
+        out.add_task(
             "review:content_fidelity:visual_meaning_gap",
             task_type="content_fidelity",
             title="Add semantics for meaning-bearing page visuals",
@@ -2099,7 +2240,7 @@ def assess_fidelity(
                 "visual_targets": missing_visual_figures[:12],
             },
         )
-        checks.append(
+        out.checks.append(
             {
                 "check": "visual_meaning_gap",
                 "status": "fail",
@@ -2110,7 +2251,7 @@ def assess_fidelity(
             }
         )
     else:
-        checks.append(
+        out.checks.append(
             {
                 "check": "visual_meaning_gap",
                 "status": "pass",
@@ -2121,10 +2262,12 @@ def assess_fidelity(
             }
         )
 
+
+def _check_alt_text_provenance(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     machine_only_alt = 0
     caption_backed_alt = 0
     machine_only_alt_pages: set[int] = set()
-    for entry in alt_entries:
+    for entry in inputs.alt_entries:
         if not isinstance(entry, dict) or entry.get("status") != "approved":
             continue
         generated_text = _normalize_text(entry.get("generated_text"))
@@ -2132,18 +2275,20 @@ def assess_fidelity(
         if not generated_text or edited_text:
             continue
         figure_index = entry.get("figure_index")
-        caption_text = figure_captions.get(figure_index) if isinstance(figure_index, int) else ""
+        caption_text = (
+            inputs.figure_captions.get(figure_index) if isinstance(figure_index, int) else ""
+        )
         if caption_text and generated_text == caption_text:
             caption_backed_alt += 1
         else:
             machine_only_alt += 1
             if isinstance(figure_index, int):
-                page = figure_pages.get(figure_index)
+                page = inputs.figure_pages.get(figure_index)
                 if isinstance(page, int) and page > 0:
                     machine_only_alt_pages.add(page)
 
     if machine_only_alt > 0:
-        add_task(
+        out.add_task(
             "review:alt_text",
             task_type="alt_text",
             title="Spot-check generated alt text",
@@ -2162,7 +2307,7 @@ def assess_fidelity(
         status = "warning"
     else:
         status = "pass"
-    checks.append(
+    out.checks.append(
         {
             "check": "alt_text_provenance",
             "status": status,
@@ -2170,28 +2315,30 @@ def assess_fidelity(
             "metrics": {
                 "machine_only_alt": machine_only_alt,
                 "caption_backed_alt": caption_backed_alt,
-                "reviewed_alt_entries": len(alt_entries),
+                "reviewed_alt_entries": len(inputs.alt_entries),
             },
         }
     )
 
+
+def _check_figure_descriptions(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     # A figure the app could not describe ships with no alt text, never a
     # placeholder, and holds the document until a person describes it.
     try:
-        undescribed_figures = _output_figures_without_alt(output_pdf)
+        undescribed_figures = _output_figures_without_alt(inputs.output_pdf)
     except Exception as exc:
         logger.warning("Figure description check failed", exc_info=True)
         undescribed_figures = None
-        add_check_error(
+        out.add_check_error(
             "figure_descriptions", "Check figure descriptions by hand", _check_error_text(exc)
         )
     if undescribed_figures is not None:
         waiting_figures = [
             {
                 "figure_index": entry["figure_index"],
-                "page": figure_pages.get(entry["figure_index"]),
+                "page": inputs.figure_pages.get(entry["figure_index"]),
             }
-            for entry in alt_entries
+            for entry in inputs.alt_entries
             if isinstance(entry, dict)
             and isinstance(entry.get("figure_index"), int)
             and entry.get("status") != "rejected"
@@ -2201,7 +2348,7 @@ def assess_fidelity(
             )
         ]
         if undescribed_figures:
-            add_task(
+            out.add_task(
                 "review:alt_text:undescribed",
                 task_type="alt_text",
                 title="Describe figures that have no description",
@@ -2223,7 +2370,7 @@ def assess_fidelity(
                     "figures_awaiting_description": waiting_figures[:20],
                 },
             )
-        checks.append(
+        out.checks.append(
             {
                 "check": "figure_descriptions",
                 "status": "fail" if undescribed_figures else "pass",
@@ -2235,13 +2382,15 @@ def assess_fidelity(
             }
         )
 
+
+def _check_link_text(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     # ── 1A: Link text quality ─────────────────────────────────────────────
     try:
-        poor_links = _check_link_text_quality(output_pdf)
+        poor_links = _check_link_text_quality(inputs.output_pdf)
     except Exception as exc:
         logger.warning("Link text check failed", exc_info=True)
         poor_links = None
-        add_check_error("link_text_quality", "Check link text by hand", _check_error_text(exc))
+        out.add_check_error("link_text_quality", "Check link text by hand", _check_error_text(exc))
     if poor_links is not None:
         if poor_links:
             pages_to_check = sorted(
@@ -2251,7 +2400,7 @@ def assess_fidelity(
                     if isinstance(item, dict) and isinstance(item.get("page"), int)
                 }
             )
-            add_task(
+            out.add_task(
                 "review:link_text_quality",
                 task_type="annotation_description",
                 title="Review non-descriptive link text",
@@ -2267,7 +2416,7 @@ def assess_fidelity(
                     "poor_links": poor_links[:20],
                 },
             )
-        checks.append(
+        out.checks.append(
             {
                 "check": "link_text_quality",
                 "status": "warning" if poor_links else "pass",
@@ -2280,13 +2429,15 @@ def assess_fidelity(
             }
         )
 
+
+def _check_internal_links(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     # ── 1C: Internal link destination validation ──────────────────────────
     try:
-        broken_links = _check_internal_link_destinations(output_pdf)
+        broken_links = _check_internal_link_destinations(inputs.output_pdf)
     except Exception as exc:
         logger.warning("Internal link check failed", exc_info=True)
         broken_links = None
-        add_check_error(
+        out.add_check_error(
             "internal_link_destinations", "Check internal links by hand", _check_error_text(exc)
         )
     if broken_links is not None:
@@ -2298,7 +2449,7 @@ def assess_fidelity(
                     if isinstance(item, dict) and isinstance(item.get("page"), int)
                 }
             )
-            add_task(
+            out.add_task(
                 "review:broken_internal_links",
                 task_type="annotation_description",
                 title="Fix broken internal links",
@@ -2314,7 +2465,7 @@ def assess_fidelity(
                     "broken_links": broken_links[:20],
                 },
             )
-        checks.append(
+        out.checks.append(
             {
                 "check": "internal_link_destinations",
                 "status": "warning" if broken_links else "pass",
@@ -2327,8 +2478,10 @@ def assess_fidelity(
             }
         )
 
+
+def _check_font_text_fidelity(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     # ── Font text fidelity ────────────────────────────────────────────────
-    font_remediation = validation_report.get("remediation", {}).get("font_remediation", {})
+    font_remediation = inputs.validation_report.get("remediation", {}).get("font_remediation", {})
     unicode_gate = font_remediation.get("unicode_gate", {})
     font_diagnostics = (
         font_remediation.get("postflight_diagnostics")
@@ -2367,7 +2520,7 @@ def assess_fidelity(
             if isinstance(violation.get("count"), int) and violation.get("count", 1) > 0
             else 1
         )
-        for violation in unresolved_errors
+        for violation in inputs.unresolved_errors
         if isinstance(violation, dict)
         and (
             str(violation.get("category") or "").lower() == "fonts"
@@ -2377,7 +2530,7 @@ def assess_fidelity(
     font_rule_ids = sorted(
         {
             str(violation.get("rule_id") or "").strip()
-            for violation in unresolved_errors
+            for violation in inputs.unresolved_errors
             if isinstance(violation, dict)
             and (
                 str(violation.get("category") or "").lower() == "fonts"
@@ -2387,13 +2540,13 @@ def assess_fidelity(
         }
     )
     font_review_targets, pages_to_check, fonts_to_check = _extract_font_review_targets(
-        raw_validation_report,
+        inputs.raw_validation_report,
         set(font_rule_ids),
-        output_pdf=output_pdf,
+        output_pdf=inputs.output_pdf,
     )
     has_concrete_font_review = bool(font_review_targets or pages_to_check or fonts_to_check)
     if remaining_font_errors > 0 or has_concrete_font_review:
-        add_task(
+        out.add_task(
             "review:font_text_fidelity",
             task_type="font_text_fidelity",
             title="Verify accessible text against visible text",
@@ -2414,7 +2567,7 @@ def assess_fidelity(
                 "top_font_profiles": top_font_profiles,
             },
         )
-        checks.append(
+        out.checks.append(
             {
                 "check": "font_text_fidelity",
                 "status": "fail",
@@ -2430,7 +2583,7 @@ def assess_fidelity(
             }
         )
     else:
-        checks.append(
+        out.checks.append(
             {
                 "check": "font_text_fidelity",
                 "status": "pass",
@@ -2444,24 +2597,45 @@ def assess_fidelity(
             }
         )
 
-    tasks = sorted(
-        tasks_by_key.values(),
-        key=lambda task: (
-            0 if task["blocking"] else 1,
-            -_severity_rank(str(task.get("severity"))),
-            str(task.get("task_type")),
-        ),
-    )
-    blocking_tasks = [task for task in tasks if task["blocking"]]
-    advisory_tasks = [task for task in tasks if not task["blocking"]]
 
-    report = {
-        "passed": len(blocking_tasks) == 0,
-        "summary": {
-            "blocking_tasks": len(blocking_tasks),
-            "advisory_tasks": len(advisory_tasks),
-            "total_tasks": len(tasks),
-        },
-        "checks": checks,
-    }
-    return report, tasks
+def assess_fidelity(
+    *,
+    input_pdf: Path,
+    output_pdf: Path,
+    comparison_source_pdf: Path | None = None,
+    structure_json: dict[str, Any],
+    alt_entries: list[dict[str, Any]],
+    validation_report: dict[str, Any],
+    raw_validation_report: dict[str, Any] | None = None,
+    tagging_metrics: dict[str, Any],
+    classification: str | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    inputs = _build_fidelity_inputs(
+        input_pdf=input_pdf,
+        output_pdf=output_pdf,
+        comparison_source_pdf=comparison_source_pdf,
+        structure_json=structure_json,
+        alt_entries=alt_entries,
+        validation_report=validation_report,
+        raw_validation_report=raw_validation_report,
+        tagging_metrics=tagging_metrics,
+        classification=classification,
+    )
+    out = _FidelityCollector()
+    _check_compliance(inputs, out)
+    _check_ocr_coverage(inputs, out)
+    _check_text_drift(inputs, out)
+    _check_grounded_text_fidelity(inputs, out)
+    _check_reading_order(inputs, out)
+    _check_figure_coverage(inputs, out)
+    _check_table_coverage(inputs, out)
+    _check_table_risk(inputs, out)
+    _check_form_semantics(inputs, out)
+    _check_static_widget_artifacts(inputs, out)
+    _check_visual_meaning_gap(inputs, out)
+    _check_alt_text_provenance(inputs, out)
+    _check_figure_descriptions(inputs, out)
+    _check_link_text(inputs, out)
+    _check_internal_links(inputs, out)
+    _check_font_text_fidelity(inputs, out)
+    return out.result()
