@@ -242,24 +242,6 @@ def _record_response_usage(response_json: dict) -> None:
     )
 
 
-def record_external_llm_usage(
-    *,
-    prompt_tokens: int = 0,
-    completion_tokens: int = 0,
-    total_tokens: int = 0,
-    cost_usd: float = 0.0,
-) -> None:
-    recorder = _ACTIVE_USAGE_RECORDER.get()
-    if recorder is None:
-        return
-    recorder.record(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
-        cost_usd=cost_usd,
-    )
-
-
 class LlmClient:
     """Thin wrapper around a chat-completions API."""
 
