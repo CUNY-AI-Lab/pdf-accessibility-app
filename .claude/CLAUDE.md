@@ -29,7 +29,7 @@ Frontend proxies `/api` and `/health` to `http://localhost:8001` via Vite config
 
 ## Key Files
 - `backend/app/main.py` — FastAPI app entry point
-- `backend/app/pipeline/` — 6-step PDF accessibility pipeline
+- `backend/app/pipeline/` — 7-step PDF accessibility pipeline
 - `backend/app/api/` — API route handlers
 - `backend/app/models.py` — SQLAlchemy ORM models (Job, JobStep, AltTextEntry)
 - `frontend/src/pages/` — React pages (Upload, Dashboard, JobDetail, Review)
@@ -42,6 +42,7 @@ Frontend proxies `/api` and `/health` to `http://localhost:8001` via Vite config
 4. Alt Text (Vision LLM via OpenAI-compatible API)
 5. Tag (pikepdf PDF/UA)
 6. Validate (veraPDF)
+7. Fidelity (see below)
 
 ## Fidelity Check
 Post-remediation quality gate in `backend/app/pipeline/fidelity.py`. Runs after

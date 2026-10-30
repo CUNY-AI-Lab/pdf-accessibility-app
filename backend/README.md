@@ -117,7 +117,8 @@ There is no login flow, but job APIs only return documents created by the curren
 browser session. Uploaded files and job state expire after `JOB_TTL_HOURS`
 (`12` by default).
 This protects jobs inside the app's API surface; semantic LLM calls still go to
-the configured provider.
+the configured provider. Anonymous sessions apply only to local runs; people
+using the deployed v2 app sign in through Doorway (see `docs/architecture.md`).
 
 For HTTPS deployments, set `ANONYMOUS_SESSION_COOKIE_SECURE=true` so the cookie
 is only sent over secure transport. If the app is served through a reverse proxy

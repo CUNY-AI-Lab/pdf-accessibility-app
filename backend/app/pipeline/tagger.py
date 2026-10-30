@@ -363,11 +363,6 @@ def _region_bbox(region: "ContentRegion") -> dict[str, float] | None:
     return region.bbox
 
 
-def _bbox_tuple(bbox: dict[str, float]) -> tuple[float, float, float, float]:
-    """Convert bbox dict to an (l,b,r,t) tuple."""
-    return (bbox["l"], bbox["b"], bbox["r"], bbox["t"])
-
-
 def _bbox_area(bbox: dict[str, float] | None) -> float:
     """Compute bbox area."""
     if not bbox:
@@ -2183,11 +2178,6 @@ def _bbox_center(bbox: dict) -> tuple[float, float]:
     )
 
 
-def _distance(x1: float, y1: float, x2: float, y2: float) -> float:
-    """Euclidean distance between two points."""
-    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
-
-
 def _get_docling_parse_page(parser_doc: Any | None, page_index: int) -> Any | None:
     """Return a docling-parse page object for a 0-indexed page, if available."""
     if parser_doc is None:
@@ -2727,142 +2717,6 @@ class StructTreeBuilder:
         self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=toci_elem)
         self._struct_elems_created += 1
         return mcid
-
-    def add_table(
-        self,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        table_data: dict,
-        *,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        """Add a Table StructElem with rows, cells, /ID on THs, and /Headers on TDs."""
-        self._table_counter += 1
-        table_n = self._table_counter
-        owner = stream_owner or page_ref
-        num_rows = _as_positive_int(table_data.get("num_rows", 0), default=0)
-        num_cols = _as_positive_int(table_data.get("num_cols", 0), default=0)
-
-        table_elem_dict: dict = {
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/Table"),
-            "/P": self.doc_elem,
-            "/K": pikepdf.Array([]),
-        }
-        table_summary = _table_summary_text(table_data, num_rows=num_rows, num_cols=num_cols)
-        if table_summary:
-            table_elem_dict["/A"] = pikepdf.Dictionary({
-                "/O": pikepdf.Name("/Table"),
-                "/Summary": pikepdf.String(table_summary),
-            })
-        table_elem = self.pdf.make_indirect(pikepdf.Dictionary(table_elem_dict))
-        self._append_child(self.doc_elem, table_elem)
-        self._struct_elems_created += 1
-
-        raw_cells = table_data.get("cells", [])
-        cells = _complete_table_grid_cells(raw_cells, num_rows=num_rows, num_cols=num_cols)
-
-        if not cells:
-            mcid = self._alloc_mcid(owner)
-            table_elem["/K"] = self._make_mcr(mcid, page_ref, stream_owner=stream_owner)
-            self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=table_elem)
-            return mcid
-
-        rows: dict[int, list[dict]] = {}
-        for cell in cells:
-            row_idx = cell.get("row", 0)
-            if row_idx not in rows:
-                rows[row_idx] = []
-            rows[row_idx].append(cell)
-
-        # Collected during the build pass so we can set /Headers on TDs
-        # after all TH /IDs have been assigned.
-        th_info: list[tuple[int, int, int, int, str]] = []
-        # (row, col, row_span, col_span, cell_id)
-        td_info: list[tuple[int, int, pikepdf.Object]] = []
-        # (row, col, cell_elem)
-
-        first_mcid = None
-        for row_idx in sorted(rows.keys()):
-            row_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-                "/Type": pikepdf.Name("/StructElem"),
-                "/S": pikepdf.Name("/TR"),
-                "/P": table_elem,
-                "/K": pikepdf.Array([]),
-            }))
-            table_elem["/K"].append(row_elem)
-            self._struct_elems_created += 1
-
-            for cell in sorted(rows[row_idx], key=lambda c: c.get("col", 0)):
-                cell_type = "TH" if cell.get("is_header", False) else "TD"
-                col_idx = _as_positive_int(cell.get("col", 0), default=0)
-                mcid = self._alloc_mcid(owner)
-                if first_mcid is None:
-                    first_mcid = mcid
-                cell_elem_dict: dict = {
-                    "/Type": pikepdf.Name("/StructElem"),
-                    "/S": pikepdf.Name(f"/{cell_type}"),
-                    "/P": row_elem,
-                    "/K": self._make_mcr(mcid, page_ref, stream_owner=stream_owner),
-                }
-                attrs = pikepdf.Dictionary({
-                    "/O": pikepdf.Name("/Table"),
-                })
-                row_span = _as_positive_int(cell.get("row_span", 1), default=1)
-                col_span = _as_positive_int(cell.get("col_span", 1), default=1)
-                if row_span > 1:
-                    attrs["/RowSpan"] = row_span
-                if col_span > 1:
-                    attrs["/ColSpan"] = col_span
-
-                scope = ""
-                if cell_type == "TH":
-                    scope = "/Column"
-                    if bool(cell.get("row_header", False)):
-                        scope = "/Row"
-                    elif bool(cell.get("column_header", False)):
-                        scope = "/Column"
-                    elif col_idx == 0:
-                        scope = "/Row"
-                    attrs["/Scope"] = pikepdf.Name(scope)
-
-                    # Assign a unique /ID so TD cells can reference it.
-                    cell_id = f"t{table_n}-r{row_idx}-c{col_idx}"
-                    cell_elem_dict["/ID"] = pikepdf.String(cell_id)
-                    th_info.append((row_idx, col_idx, row_span, col_span, cell_id))
-
-                if len(attrs) > 1:
-                    cell_elem_dict["/A"] = attrs
-
-                cell_elem = self.pdf.make_indirect(pikepdf.Dictionary(cell_elem_dict))
-                row_elem["/K"].append(cell_elem)
-                self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=cell_elem)
-                self._struct_elems_created += 1
-
-                if cell_type == "TD":
-                    td_info.append((row_idx, col_idx, cell_elem))
-
-        # Second pass: set /Headers on each TD pointing to applicable THs.
-        if th_info and td_info:
-            for td_row, td_col, td_elem in td_info:
-                header_ids: list[str] = []
-                for th_row, th_col, th_rspan, th_cspan, th_id in th_info:
-                    # Column header: TH spans TD's column and is above it
-                    if th_col <= td_col < th_col + th_cspan and th_row + th_rspan <= td_row:
-                        header_ids.append(th_id)
-                    # Row header: TH spans TD's row and is to the left
-                    elif th_row <= td_row < th_row + th_rspan and th_col + th_cspan <= td_col:
-                        header_ids.append(th_id)
-                if header_ids:
-                    td_attrs = td_elem.get("/A")
-                    if td_attrs is None:
-                        td_attrs = pikepdf.Dictionary({"/O": pikepdf.Name("/Table")})
-                        td_elem["/A"] = td_attrs
-                    td_attrs["/Headers"] = pikepdf.Array(
-                        [pikepdf.String(h) for h in header_ids],
-                    )
-
-        return first_mcid if first_mcid is not None else 0
 
     def _ensure_fragmented_table(
         self,

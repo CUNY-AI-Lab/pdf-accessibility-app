@@ -20,13 +20,6 @@ from app.services.anonymous_sessions import (
     ensure_anonymous_session,
     set_anonymous_session_cookie,
 )
-from app.services.cail_identity import (
-    CAIL_IDENTITY_AUDIENCE,
-    CAIL_IDENTITY_HEADER,
-    CailIdentityConfigError,
-    CailIdentityVerifier,
-    load_cail_identity_verifier,
-)
 from app.services.file_storage import cleanup_job_files, ensure_dirs
 from app.services.job_manager import get_job_manager
 from app.services.job_state import (
@@ -73,7 +66,6 @@ def _cors_origins() -> list[str]:
 
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _CSRF_HEADER_NAME = "x-csrf-token"
-_PUBLIC_IDENTITY_PATHS = frozenset({"/health", "/health/ready"})
 _FRONTEND_HASHED_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _FRONTEND_DOCUMENT_CACHE_CONTROL = "no-cache, must-revalidate"
 _FRONTEND_ROOT_ASSETS = frozenset({"/cuny-ai-lab-logo.png", "/favicon.svg"})
@@ -88,40 +80,6 @@ def _is_frontend_asset_request(path: str) -> bool:
     """
 
     return path.startswith("/assets/") or path in _FRONTEND_ROOT_ASSETS
-
-
-def _identity_error(
-    *,
-    status_code: int,
-    code: str,
-    message: str,
-    retry: bool,
-) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={"error": {"code": code, "message": message}},
-        headers={
-            "Cache-Control": "no-store",
-            "X-Should-Retry": "true" if retry else "false",
-        },
-    )
-
-
-def _identity_boundary() -> tuple[bool, CailIdentityVerifier | None, bool]:
-    settings = get_settings()
-    configured = bool(settings.cail_identity_jwks.strip())
-    if not configured and not settings.cail_identity_required:
-        return False, None, False
-    try:
-        verifier = load_cail_identity_verifier(
-            jwks_json=settings.cail_identity_jwks,
-            issuer=settings.cail_identity_issuer,
-            audience=CAIL_IDENTITY_AUDIENCE,
-            clock_tolerance_seconds=settings.cail_identity_clock_tolerance_seconds,
-        )
-    except CailIdentityConfigError:
-        return settings.cail_identity_required, None, True
-    return settings.cail_identity_required, verifier, False
 
 
 def _normalized_origin(value: str) -> str | None:
@@ -333,8 +291,6 @@ def _register_frontend_routes(app: FastAPI, frontend_dist_dir: Path) -> None:
 
 
 def create_app(frontend_dist_dir: Path | None = None) -> FastAPI:
-    identity_required, identity_verifier, identity_config_error = _identity_boundary()
-
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info("Starting PDF Accessibility app...")
@@ -383,48 +339,11 @@ def create_app(frontend_dist_dir: Path | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def anonymous_session_middleware(request, call_next):
-        identity = None
-        if request.url.path not in _PUBLIC_IDENTITY_PATHS:
-            token = request.headers.get(CAIL_IDENTITY_HEADER)
-            if identity_config_error:
-                return _identity_error(
-                    status_code=503,
-                    code="identity_unavailable",
-                    message="Identity verification is temporarily unavailable.",
-                    retry=True,
-                )
-            if token:
-                if identity_verifier is None:
-                    return _identity_error(
-                        status_code=503,
-                        code="identity_unavailable",
-                        message="Identity verification is temporarily unavailable.",
-                        retry=True,
-                    )
-                identity = identity_verifier.verify(token)
-                if identity is None:
-                    return _identity_error(
-                        status_code=401,
-                        code="invalid_credential",
-                        message="Authentication is required.",
-                        retry=False,
-                    )
-            elif identity_required:
-                return _identity_error(
-                    status_code=401,
-                    code="invalid_credential",
-                    message="Authentication is required.",
-                    retry=False,
-                )
-        request.state.cail_identity = identity
         if request.method in {"GET", "HEAD"} and _is_frontend_asset_request(
             request.url.path
         ):
             return await call_next(request)
-        session, created = ensure_anonymous_session(
-            request,
-            identity_subject=identity.subject if identity is not None else None,
-        )
+        session, created = ensure_anonymous_session(request)
         if not _csrf_valid(request, session.token):
             response = JSONResponse(
                 status_code=403,
