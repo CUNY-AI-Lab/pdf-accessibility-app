@@ -4201,14 +4201,44 @@ def _reset_xmp_metadata(pdf: pikepdf.Pdf):
         logger.warning(f"Could not reset existing metadata stream: {e}")
 
 
+# Titles authoring tools write that say nothing about the document: an Office
+# "Microsoft Word - file.docx" prefix, a file name, or a stock placeholder.
+OFFICE_TITLE_PREFIX_RE = re.compile(r"^microsoft\s+(?:office\s+)?(?:word|powerpoint|excel)\s*-", re.I)
+FILE_NAME_TITLE_RE = re.compile(r"\.(?:pdf|docx?|pptx?|xlsx?|odt|odp|rtf|txt|indd|pages|key|tex)$", re.I)
+PLACEHOLDER_TITLE_RE = re.compile(
+    r"^(?:untitled(?:[\s_-]*\d+)?|untitled document|document\s*\d*|presentation\s*\d*|title)$",
+    re.I,
+)
+
+
+def _is_placeholder_document_title(title: str, original_filename: str) -> bool:
+    """Whether a document-info title only names the file or the tool that made it."""
+    text = " ".join(title.split())
+    if (
+        not text
+        or OFFICE_TITLE_PREFIX_RE.match(text)
+        or FILE_NAME_TITLE_RE.search(text)
+        or PLACEHOLDER_TITLE_RE.fullmatch(text)
+    ):
+        return True
+    name = Path(original_filename).name.casefold() if original_filename else ""
+    return bool(name) and text.casefold() in {name, Path(name).stem}
+
+
 def _set_document_title(pdf: pikepdf.Pdf, structure_json: dict, original_filename: str):
-    """Set the document title in XMP metadata and enable title display."""
+    """Set the document title in XMP metadata and enable title display.
+
+    The PDF's own title wins unless it is a placeholder (see
+    _is_placeholder_document_title); then the title the structure step
+    detected is used, and failing that the uploaded file's name."""
     existing_title = None
     try:
         if "/Title" in pdf.docinfo:
             existing_title = str(pdf.docinfo["/Title"]).strip()
     except Exception:
         pass
+    if existing_title and _is_placeholder_document_title(existing_title, original_filename):
+        existing_title = None
 
     title = existing_title or structure_json.get("title")
     if not title and original_filename:
