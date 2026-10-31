@@ -1,6 +1,7 @@
 """Table fallbacks exercised through tag_pdf and the screen-reader reader."""
 
 import copy
+import textwrap
 
 import pikepdf
 import pytest
@@ -12,7 +13,7 @@ from tests.pdf_fixtures import helvetica, rendered
 
 
 def _fixture(
-    path, rows, *, style=None, rule=None, ocr=False, strokes=(), spans=(), form=False, headers=None, label_style=False, section_style=False, offsets=()
+    path, rows, *, style=None, rule=None, ocr=False, strokes=(), spans=(), form=False, headers=None, label_style=False, section_style=False, offsets=(), font_size=10, row_height=30
 ):
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(612, 792))
@@ -35,7 +36,7 @@ def _fixture(
         for col, text in enumerate(texts):
             if text is None:
                 continue
-            x, y = 72 + col * 160 + (offsets[row] if offsets else 0), 700 - row * 30
+            x, y = 72 + col * 160 + (offsets[row] if offsets else 0), 700 - row * row_height
             cell = dict(
                 row=row,
                 col=col,
@@ -54,7 +55,7 @@ def _fixture(
                     is_header=True, row_header=scope == "Row", column_header=scope == "Column"
                 )
             if text:
-                face, size = ("F1", 10)
+                face, size = ("F1", font_size)
                 if (row == 0 and style) or (label_style and col == 0) or (section_style and col == 0 and all(not t for t in texts[1:])):
                     face, size = {
                         "bold": ("F2", 10),
@@ -62,8 +63,9 @@ def _fixture(
                         "size": ("F1", 12),
                         "small-size": ("F1", 10.5),
                     }[style or "bold"]
-                ops.append(f"BT {3 if ocr else 0} Tr /{face} {size} Tf {x} {y} Td ({text}) Tj ET")
-                slots.append(cell)
+                for line, part in enumerate(text.split("\n")):
+                    ops.append(f"BT {3 if ocr else 0} Tr /{face} {size} Tf {x} {y - line * (size + 2)} Td ({part}) Tj ET")
+                    slots.append(cell)
     for text, x, row in strokes:
         ops.append(f"BT {3 if ocr else 0} Tr /F1 10 Tf {x} {700 - row * 30} Td ({text}) Tj ET")
         slots.append(None)
@@ -71,7 +73,7 @@ def _fixture(
         ops.append(f"BT {3 if ocr else 0} Tr /F1 10 Tf 72 500 Td (Outside I 12) Tj ET")
         slots.append(None)
     if rule:
-        ops.append(rule)
+        ops.insert(0, rule)
     content = " ".join(ops).encode()
     if form:
         stream = pdf.make_stream(content)
@@ -87,9 +89,11 @@ def _fixture(
         # An OCR form leaves the page's own op list empty.
         if form:
             measured = reader.page(0).ops[("OCR",)]
+        boxes = {}
         for cell, op in zip(slots, measured, strict=True):
             if cell is not None:
-                box = union_bbox(g.bbox for g in op.glyphs)
+                boxes.setdefault(id(cell), []).extend(g.bbox for g in op.glyphs)
+                box = union_bbox(boxes[id(cell)])
                 cell["bbox"] = {s: box[s] + (1 if s in "rt" else -1) for s in "lbrt"}
     elements = [
         dict(
@@ -97,7 +101,7 @@ def _fixture(
             page=0,
             num_rows=len(rows),
             num_cols=len(rows[0]),
-            bbox=dict(l=60, b=690 - 30 * (len(rows) - 1), r=580, t=720),
+            bbox=dict(l=60, b=690 - row_height * (len(rows) - 1), r=580, t=720),
             cells=cells,
         )
     ]
@@ -142,7 +146,7 @@ def _assert_table(path, rows, headers):
             expected.append("<tr>")
             col = 0
             for cell in tr.K:
-                text = texts[col] or ""
+                text = " ".join((texts[col] or "").split())
                 scope = headers.get((row, col))
                 tag = "th" if scope else "td"
                 assert str(cell.S) == "/" + tag.upper()
@@ -163,6 +167,77 @@ def _assert_table(path, rows, headers):
 
 
 RULE = "60 690 m 400 690 l S"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal", ["bold", "font", "size", "fill", "rule", "caps"])
+async def test_short_schedule_labels_need_only_one_strong_signal(tmp_path, signal):
+    rows = [["Week", "Date", "Topic"], ["1", "9/1", "Course introduction"],
+            ["2", "9/8", "Research and discussion"]]
+    if signal == "caps":
+        rows[0] = [t.upper() for t in rows[0]]
+    kwargs = ({"style": signal} if signal in {"bold", "font", "size"} else
+              {"rule": "q .85 g 60 690 500 25 re f Q"} if signal == "fill" else
+              {"rule": "60 690 m 580 690 l S"} if signal == "rule" else {})
+    tagged = await _tag(tmp_path, rows, **kwargs)
+    _assert_table(tagged, rows, {(0, c): "Column" for c in range(3)})
+    with pikepdf.open(tagged) as pdf:
+        (table,) = _tables(pdf.Root.StructTreeRoot)
+        for tr in list(table.K)[1:]:
+            for col, cell in enumerate(tr.K):
+                assert str(table.K[0].K[col].ID) in [str(h) for h in cell.A.Headers]
+    # Shape alone, an unpainted band, and a tiny style change are insufficient.
+    rows[0] = ["Week", "Date", "Topic"]
+    for weak in [{}, {"style": "small-size"}, {"rule": "60 690 500 25 re n"}]:
+        _assert_table(await _tag(tmp_path, rows, **weak), rows, {})
+
+
+@pytest.mark.asyncio
+async def test_schedule_allows_one_missing_trailing_heading_but_no_interior_hole(tmp_path):
+    rows = [["Week", "Content", None], ["1", "Introduction to web design", "Homework 1"],
+            ["2", "HTML tags and lists", "Homework 2"]]
+    _assert_table(await _tag(tmp_path, rows, style="bold"), rows,
+                  {(0, 0): "Column", (0, 1): "Column"})
+    rows[0] = ["Week", None, "Content"]
+    _assert_table(await _tag(tmp_path, rows, style="bold"), rows, {})
+
+
+@pytest.mark.asyncio
+async def test_wrapped_fish_labels_over_prose_use_the_printed_rule(tmp_path):
+    rows = [["Fishing Stock", "Lead Analyst or Presenter", "Peer review conclusion from this meeting September 2021"],
+            ["Gulf of Maine cod -Enhanced review", "Charles Perretti", "Under retro-adjusted M=0.2 model stock is overfished and overfishing is occurring. Under M-ramp model stock is overfished but overfishing is not occurring."],
+            ["Georges Bank cod -Expedited review", "Kathy Sosebee", "Stock is overfished but overfishing unknown"]]
+    rows = [[textwrap.fill(t, width=32) for t in row] for row in rows]
+    _assert_table(await _tag(tmp_path, rows, rule="60 680 m 580 680 l S", font_size=8, row_height=90), rows,
+                  {(0, c): "Column" for c in range(3)})
+
+
+@pytest.mark.asyncio
+async def test_caps_sql_labels_over_varied_values_infer_headers(tmp_path):
+    rows = [["TABLE_NAME --------", "NUM_ROWS --------", "LAST_ANALYZED --------"],
+            ["DEPARTMENT", "200", "07/29/1999 00:59:51"],
+            ["EMPLOYEE", "4000", "07/29/1999 01:16:09"]]
+    _assert_table(await _tag(tmp_path, rows), rows, {(0, c): "Column" for c in range(3)})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal", ["bold", "rule", "caps"])
+async def test_single_signal_never_promotes_lists_definitions_or_repeated_records(tmp_path, signal):
+    cases = [
+        [["TERM", "DESCRIPTION"], ["Apple", "This is a long description of an apple in prose"],
+         ["Pear", "This is another long description of a pear in prose"]],
+        [["- Task", "- Due"], ["Write a long response", "September 1"],
+         ["Read the next chapter", "September 8"]],
+        [["TOPIC", "TOPIC", "DATE"], ["Introduction to design", "Read the first chapter", "9/1"],
+         ["Discussion of research", "Read the second chapter", "9/8"]],
+        [["MARCH", "APRIL", "MAY"], ["June", "July", "August"], ["September", "October", "November"]],
+        [["#7", "martes", "2/24"], ["#8", "jueves", "2/26"], ["#9", "martes", "3/3"]],
+    ]
+    for rows in cases:
+        if signal != "caps":
+            rows[0] = [t.title() for t in rows[0]]
+        kwargs = {"style": "bold"} if signal == "bold" else {"rule": RULE} if signal == "rule" else {}
+        _assert_table(await _tag(tmp_path, rows, **kwargs), rows, {})
 
 
 @pytest.mark.asyncio
