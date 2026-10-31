@@ -66,6 +66,8 @@ class MeasuredGlyph:
     # its text rendering matrix: 1 for a page drawn sideways to be shown
     # upright by /Rotate 90.
     turn: int = 0
+    font_name: str = ""
+    font_size: float = 0.0
 
 
 def code_spans(font, string: bytes) -> list[tuple[int, int]]:
@@ -257,6 +259,8 @@ class _Recorder(PDFLayoutAnalyzer):
         element, code = self.op_elements[len(self.op.glyphs)]
         glyph = MeasuredGlyph(
             text=char.get_text(),
+            font_name=char.fontname,
+            font_size=abs(fontsize) * math.hypot(matrix[2], matrix[3]),
             bbox=bbox,
             element=element,
             code=code,
