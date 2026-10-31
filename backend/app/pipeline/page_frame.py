@@ -43,6 +43,20 @@ class PageFrame:
         (x0, y0), (x1, y1) = self._point(box["l"], box["b"]), self._point(box["r"], box["t"])
         return {**box, "l": min(x0, x1), "b": min(y0, y1), "r": max(x0, x1), "t": max(y0, y1)}
 
+    def to_docling(self, box: Box) -> Box:
+        """A user-space box in Docling's frame: the inverse of to_user_space."""
+        (x0, y0), (x1, y1) = self._inverse(box["l"], box["b"]), self._inverse(box["r"], box["t"])
+        return {**box, "l": min(x0, x1), "b": min(y0, y1), "r": max(x0, x1), "t": max(y0, y1)}
+
+    def _inverse(self, x: float, y: float) -> tuple[float, float]:
+        if self.rotation == 90:
+            return y - self.bottom, self.right - x
+        if self.rotation == 180:
+            return self.right - x, self.top - y
+        if self.rotation == 270:
+            return self.top - y, x - self.left
+        return x - self.left, y - self.bottom
+
     def _point(self, x: float, y: float) -> tuple[float, float]:
         if self.rotation == 90:
             return self.right - y, self.bottom + x

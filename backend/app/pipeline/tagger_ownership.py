@@ -153,25 +153,12 @@ def _word_break(before: dict[str, float], after: dict[str, float]) -> bool:
     return gap > WORD_MARGIN * size or gap < -size
 
 
-def _word_owners(
-    measured: dict[int, MeasuredTextOp],
-    targets: list[ContentTarget],
-    *,
-    elements: list[dict] | None = None,
-    frame: PageFrame | None = None,
-    scanned: bool = False,
-    diagnostic: dict[str, int] | None = None,
-    stream_starts: set[int] | None = None,
-    vertical_rules: list[dict] | None = None,
-) -> dict[tuple, ContentTarget | None]:
-    """Each glyph's owner, decided for its whole word (see _owner_of), as
-    element text takes whole words: a box that stops short of a word's last
-    letters, or of a "%" drawn on its own, still holds them. Words are the
-    glyphs in drawing order, broken at white space and by _word_break. A
-    space glyph (some PDFs draw every word space) goes with the word before
-    it, or the first word if none precedes it, so the words around it stay
-    apart when read. Words and boxes are judged in the direction the text
-    runs, as a page drawn sideways for /Rotate runs up."""
+def _measured_words(
+    measured: dict[int, MeasuredTextOp], stream_starts: set[int] | None = None,
+) -> tuple[list[list[MeasuredGlyph]], list[tuple[MeasuredGlyph, int]]]:
+    """The words content is owned by (see _word_owners): glyphs in drawing
+    order, broken at white space and by _word_break, and each space glyph
+    with the index of the word before it."""
     words: list[list[MeasuredGlyph]] = []
     spaces: list[tuple[MeasuredGlyph, int]] = []
     previous: MeasuredGlyph | None = None
@@ -193,6 +180,29 @@ def _word_owners(
                 words.append([])
             words[-1].append(glyph)
             previous = glyph
+    return words, spaces
+
+
+def _word_owners(
+    measured: dict[int, MeasuredTextOp],
+    targets: list[ContentTarget],
+    *,
+    elements: list[dict] | None = None,
+    frame: PageFrame | None = None,
+    scanned: bool = False,
+    diagnostic: dict[str, int] | None = None,
+    stream_starts: set[int] | None = None,
+    vertical_rules: list[dict] | None = None,
+) -> dict[tuple, ContentTarget | None]:
+    """Each glyph's owner, decided for its whole word (see _owner_of), as
+    element text takes whole words: a box that stops short of a word's last
+    letters, or of a "%" drawn on its own, still holds them. Words are the
+    glyphs in drawing order, broken at white space and by _word_break. A
+    space glyph (some PDFs draw every word space) goes with the word before
+    it, or the first word if none precedes it, so the words around it stay
+    apart when read. Words and boxes are judged in the direction the text
+    runs, as a page drawn sideways for /Rotate runs up."""
+    words, spaces = _measured_words(measured, stream_starts)
     owners: dict[tuple, ContentTarget | None] = {}
     word_owner: list[ContentTarget | None] = []
     for word in words:
