@@ -11,6 +11,7 @@ interface OutcomeHeroProps {
   jobId: string;
   filename: string;
   status: TerminalStatus;
+  hasHtml?: boolean;
   appliedChangeCount?: number;
   reviewTaskCount?: number;
   blockingIssueCount?: number | null;
@@ -40,6 +41,7 @@ export default function OutcomeHero({
   jobId,
   filename,
   status,
+  hasHtml = false,
   appliedChangeCount = 0,
   reviewTaskCount = 0,
   blockingIssueCount = null,
@@ -89,6 +91,7 @@ export default function OutcomeHero({
             </p>
             <div className="flex flex-wrap items-center gap-3 mt-4">
               <DownloadButton jobId={jobId} filename={filename} type="pdf" />
+              {hasHtml && <DownloadButton jobId={jobId} filename={filename} type="html" />}
               {reviewContextStatus === "ready" && summary && (
                 <Link
                   to={`/jobs/${jobId}/review`}
@@ -137,6 +140,7 @@ export default function OutcomeHero({
           </p>
           <div className="flex flex-wrap items-center gap-3 mt-4">
             <DownloadButton jobId={jobId} filename={filename} type="pdf" />
+            {hasHtml && <DownloadButton jobId={jobId} filename={filename} type="html" />}
             {reviewContextStatus === "ready" && summary && (
               <Link
                 to={`/jobs/${jobId}/review`}

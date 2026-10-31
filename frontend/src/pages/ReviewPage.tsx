@@ -14,6 +14,7 @@ import {
   useValidation,
 } from "../api/jobs";
 import AppliedChangeCard from "../components/AppliedChangeCard";
+import DownloadButton from "../components/DownloadButton";
 import FidelityIssueCard from "../components/FidelityIssueCard";
 import { ChevronLeftIcon } from "../components/Icons";
 import ReviewTaskCard from "../components/ReviewTaskCard";
@@ -338,6 +339,7 @@ export default function ReviewPage() {
               >
                 Download Accessible PDF
               </a>
+              {job?.has_html && <DownloadButton jobId={job.id} filename={job.original_filename} type="html" />}
               <a
                 href={apiUrl(`/jobs/${id}/download/report.html`)}
                 download={job ? `report_${job.original_filename.replace(/\.pdf$/i, "")}.html` : undefined}
@@ -378,6 +380,7 @@ export default function ReviewPage() {
             >
               Download Accessible PDF
             </a>
+            {job?.has_html && <DownloadButton jobId={job.id} filename={job.original_filename} type="html" />}
             <a
               href={apiUrl(`/jobs/${id}/download/report.html`)}
               download={job ? `report_${job.original_filename.replace(/\.pdf$/i, "")}.html` : undefined}

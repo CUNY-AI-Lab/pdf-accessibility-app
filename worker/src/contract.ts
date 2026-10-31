@@ -15,6 +15,8 @@ const jsonRecord = z.record(z.string(), jsonValue);
 export const PIPELINE_STEPS = ["classify", "ocr", "structure", "alt_text", "tagging", "validation", "fidelity"];
 export const RERUN_STEPS = ["tagging", "validation", "fidelity"];
 export const OUTPUT_READY_STATUSES = ["complete", "manual_remediation"];
+// Optional revision output; older runners omit it. Counterpart: backend/app/runner/views.py.
+export const DOCUMENT_HTML_FILE = "document.html";
 export const ACTIVE_STATUSES = ["queued", "processing"];
 
 export const stepSchema = z.object({
@@ -122,7 +124,7 @@ export type ReviewAction = z.infer<typeof reviewActionSchema>;
 
 /** Files a runner may write for a revision. */
 export function isRunnerFileName(name: string): boolean {
-  return /^(?:views\/(?:review-tasks|applied-changes|figure-changes|report|batch-parts)\.json|report\.html|output\.pdf|state\.tar\.gz|figures\/\d{1,4}|previews\/\d{1,4})$/.test(
+  return name === DOCUMENT_HTML_FILE || /^(?:views\/(?:review-tasks|applied-changes|figure-changes|report|batch-parts)\.json|report\.html|output\.pdf|state\.tar\.gz|figures\/\d{1,4}|previews\/\d{1,4})$/.test(
     name,
   );
 }

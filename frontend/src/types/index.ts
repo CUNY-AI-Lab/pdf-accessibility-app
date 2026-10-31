@@ -43,6 +43,8 @@ export interface Job {
   /** Why the last review action could not be applied, when it could not. */
   notice?: string | null;
   validation_compliant?: boolean | null;
+  /** The v2 Worker's current revision includes an accessible HTML document. */
+  has_html?: boolean;
   created_at: string;
   updated_at: string;
   steps: PipelineStep[];

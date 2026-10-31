@@ -76,6 +76,7 @@ export const jobSchema = z.object({
   error: z.string().nullable(),
   notice: z.string().nullable(),
   original_filename: z.string(),
+  has_html: z.boolean(),
   page_count: z.number().nullable(),
   steps: z.array(z.object({ step_name: z.string(), status: z.string(), result: z.record(z.string(), z.unknown()).nullable() })),
 });
@@ -153,7 +154,7 @@ export async function putFile(task: TestTask, name: string, body: BodyInit, type
 }
 
 /** Run a claimed process task to a reviewable result, as the runner would. */
-export async function finishProcess(task: TestTask, status = "manual_remediation"): Promise<Response> {
+export async function finishProcess(task: TestTask, status = "manual_remediation", documentHtml?: string): Promise<Response> {
   const files: [string, string, string][] = [
     ["views/applied-changes.json", JSON.stringify(CHANGES), "application/json"],
     ["views/figure-changes.json", JSON.stringify(CHANGES), "application/json"],
@@ -170,6 +171,7 @@ export async function finishProcess(task: TestTask, status = "manual_remediation
     ["figures/0", "figure-bytes", "image/png"],
     ["state.tar.gz", "state-bytes", "application/gzip"],
   ];
+  if (documentHtml !== undefined) files.push(["document.html", documentHtml, "text/html; charset=utf-8"]);
   for (const [name, body, type] of files) {
     const response = await putFile(task, name, body, type);
     if (response.status !== 204) throw new Error(`upload of ${name} answered ${response.status}`);

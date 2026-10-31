@@ -21,12 +21,15 @@ from app.api.jobs import job_to_response
 from app.models import AltTextEntry, AppliedChange, Job, ReviewTask
 from app.schemas import ValidationReportResponse
 from app.services.applied_changes import change_to_response_payload, list_figure_changes
+from app.services.html_export import export_html
 from app.services.html_report import render_batch_parts, render_html_report
 from app.services.pdf_preview import render_page_png_bytes
 
 logger = logging.getLogger(__name__)
 
 OUTPUT_READY_STATUSES = frozenset({"complete", "manual_remediation"})
+# Optional revision output; counterpart: worker/src/contract.ts.
+DOCUMENT_HTML_FILE = "document.html"
 PREVIEW_PAGES_PER_TASK = 3
 PREVIEW_TARGET_KEYS = (
     "poor_links",
@@ -152,6 +155,19 @@ async def render_views(db: AsyncSession, job_id: str) -> RenderedViews:
 
     if job.output_path and Path(job.output_path).exists():
         rendered.files.append(RenderedFile("output.pdf", Path(job.output_path), "application/pdf"))
+        try:
+            document = await asyncio.to_thread(export_html, Path(job.output_path))
+            rendered.files.append(
+                RenderedFile(DOCUMENT_HTML_FILE, document.encode("utf-8"), "text/html; charset=utf-8")
+            )
+        except Exception as exc:
+            # Exception messages and tracebacks may contain document text or
+            # paths. Keep this optional-output diagnostic to identifiers/types.
+            logger.warning(json.dumps({
+                "event": "html_export_failed",
+                "job_id": job_id,
+                "error_type": type(exc).__name__,
+            }))
 
     for entry in alt_texts:
         image = Path(entry.image_path) if entry.image_path else None
