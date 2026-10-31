@@ -8,6 +8,13 @@ from typing import Any, TypeGuard
 
 import pikepdf
 
+from app.pipeline.document_title import FILE_NAME_TITLE_RE as FILE_NAME_TITLE_RE
+from app.pipeline.document_title import OFFICE_TITLE_PREFIX_RE as OFFICE_TITLE_PREFIX_RE
+from app.pipeline.document_title import PLACEHOLDER_TITLE_RE as PLACEHOLDER_TITLE_RE
+from app.pipeline.document_title import (
+    _is_placeholder_document_title as _is_placeholder_document_title,
+)
+from app.pipeline.document_title import select_document_title
 from app.pipeline.fonts.resources import TAGGER_RESOURCES, _has_embedded_font, _iter_pdf_fonts
 from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
 from app.pipeline.pdf_repair import add_missing_icc_components
@@ -60,50 +67,15 @@ def _reset_xmp_metadata(pdf: pikepdf.Pdf):
         logger.warning(f"Could not reset existing metadata stream: {e}")
 
 
-# Titles authoring tools write that say nothing about the document: an Office
-# "Microsoft Word - file.docx" prefix, a file name, or a stock placeholder.
-OFFICE_TITLE_PREFIX_RE = re.compile(r"^microsoft\s+(?:office\s+)?(?:word|powerpoint|excel)\s*-", re.I)
-FILE_NAME_TITLE_RE = re.compile(r"\.(?:pdf|docx?|pptx?|xlsx?|odt|odp|rtf|txt|indd|pages|key|tex)$", re.I)
-PLACEHOLDER_TITLE_RE = re.compile(
-    r"^(?:untitled(?:[\s_-]*\d+)?|untitled document|document\s*\d*|presentation\s*\d*|title)$",
-    re.I,
-)
-
-
-def _is_placeholder_document_title(title: str, original_filename: str) -> bool:
-    """Whether a document-info title only names the file or the tool that made it."""
-    text = " ".join(title.split())
-    if (
-        not text
-        or OFFICE_TITLE_PREFIX_RE.match(text)
-        or FILE_NAME_TITLE_RE.search(text)
-        or PLACEHOLDER_TITLE_RE.fullmatch(text)
-    ):
-        return True
-    name = Path(original_filename).name.casefold() if original_filename else ""
-    return bool(name) and text.casefold() in {name, Path(name).stem}
-
-
-def _set_document_title(pdf: pikepdf.Pdf, structure_json: dict, original_filename: str):
-    """Set the document title in XMP metadata and enable title display.
-
-    The PDF's own title wins unless it is a placeholder (see
-    _is_placeholder_document_title); then the title the structure step
-    detected is used, and failing that the uploaded file's name."""
-    existing_title = None
-    try:
-        if "/Title" in pdf.docinfo:
-            existing_title = str(pdf.docinfo["/Title"]).strip()
-    except Exception:
-        pass
-    if existing_title and _is_placeholder_document_title(existing_title, original_filename):
-        existing_title = None
-
-    title = existing_title or structure_json.get("title")
-    if not title and original_filename:
-        title = Path(original_filename).stem.replace("_", " ").replace("-", " ")
-    if not title:
-        title = "Untitled Document"
+def _set_document_title(
+    pdf: pikepdf.Pdf, structure_json: dict, original_filename: str,
+    *, pdf_path: Path | None = None,
+):
+    """Write one evidence-based title to Info and XMP before enabling display."""
+    decision = select_document_title(pdf_path, structure_json, original_filename, source_pdf=pdf)
+    title = decision["title"]
+    # Read XMP's title before dropping potentially malformed source metadata.
+    _reset_xmp_metadata(pdf)
 
     try:
         pdf.docinfo["/Title"] = pikepdf.String(title)

@@ -459,8 +459,7 @@ async def tag_pdf(
             tags_added += 1
 
             # 3. Set document title
-            _reset_xmp_metadata(pdf)
-            title = _set_document_title(pdf, structure_json, original_filename)
+            title = _set_document_title(pdf, structure_json, original_filename, pdf_path=input_path)
             title_set = bool(title)
             _set_pdfua_identification(pdf)
             _normalize_optional_content_configs(pdf)
