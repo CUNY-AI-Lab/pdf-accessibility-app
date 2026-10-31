@@ -135,6 +135,22 @@ class Settings(BaseSettings):
     docling_serve_timeout: int = 300  # 5 min
     docling_serve_ocr_engine: str = "rapidocr"
 
+    # Table structure from a small local vision model (PaddleOCR-VL-1.5),
+    # text from the page (app/pipeline/table_model.py). Off unless a URL is
+    # set: an OpenAI-compatible endpoint on the pipeline host, never the
+    # Gateway. A table whose model grid does not align keeps Docling's.
+    table_model_url: str = ""
+    table_model_name: str = "paddleocr-vl-1.5"
+    table_model_timeout: float = 60.0
+    # The share of both texts that must align (born digital, then OCR'd
+    # pages, whose text aligns less reliably): measured best on the
+    # olmOCR-Bench tables categories.
+    table_model_min_coverage: float = 0.7
+    table_model_min_coverage_scan: float = 0.9
+    # On scans, read a cell as the model's text where it differs from the OCR
+    # text only by known OCR confusions (as /ActualText).
+    table_model_scan_text: bool = False
+
 
     # Runner (v2): pulls work from the Worker at runner_worker_url, which
     # relays each job's model calls with that person's Gateway credential.

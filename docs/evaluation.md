@@ -133,6 +133,142 @@ mostly hurt tools that tag without `/ActualText`. The October 7 results below
 were re-measured with that reader (opendataloader-pdf on multi-column
 pages 56.6% → 64.8%, Adobe on printed books 81.5% → 83.7%).
 
+## Results with AI steps on, real documents (2026-10-31)
+
+We ran the whole pipeline with its AI steps on, as production runs it,
+over the gold and CUNY round trips and 17 untagged CUNY documents
+(`cuny_untagged`,
+[backend/eval/](../backend/eval/README.md#untagged-cuny-documents)). The
+code is main at `e128b6e` in `pdf-a11y-eval:branch`, with docling-serve
+1.35.0 on the Mac Studio's GPU (MPS, one worker). The model is
+`qwen3-vl-235b-a22b-instruct`, the one production's pipeline host on
+actual-dell uses: `deploy/actual-dell` sets no `LLM_MODEL`, so the app's
+default applies, and the Worker's relay passes the request's model
+through. We recorded the 925 model responses in the cassette, so a rerun
+of the same documents costs nothing. `pipeline_bench.py` writes each
+run's outcome to its `run.json`, and `scripts/outcome_report.py` prints
+it. The judge is `deepseek-v4-pro-0813`, as in September.
+
+### Titles, language and alt text against the authors'
+
+| Set | Title (1–5) | Titles at 4+ | Language | Author figures given usable alt text | Alt text (1–5) |
+|---|---:|---:|---:|---:|---:|
+| `gold_rt` (11 documents) | 4.27 | 9 | 11/11 | 115 of 163 | 3.02 |
+| `gold_rt` without the Danish magazine | 4.60 | 9 | 10/10 | 53 of 83 | 3.92 |
+| `cuny_rt` (19 documents) | 4.89 | 18 | 19/19 | 12 of 16 | 4.25 |
+
+The magazine has 62 of the gold set's 115 judged descriptions. The scorer
+pairs each author figure with the app's figure at the same position on
+the page, and in the magazine the author's order and the app's order
+differ. About 20 of its 34 scores of 1 or 2 come from pairs of different
+pictures (a coffee press with a tea cozy, a phone screen with Louis
+Braille). In most of the others the author named a person or a logo and
+the model did not; since 10-30 the figure prompt has told the model not to
+infer identities or copy captions. The model wrote every description in
+English for a Danish magazine, and the title step chose the magazine's
+first heading, "KÆRE BIDRAGYDER" ("Dear contributor"), which scored 1. September's bake-off (3.75, 110 of 163) ran older code with
+older scoring, and we have not re-run it.
+
+### Release outcomes
+
+| Set | Documents | Complete | veraPDF compliant | Held with blocking tasks the review screen does not show | Held with no failed check |
+|---|---:|---:|---:|---:|---:|
+| `gold_rt` | 11 | 1 | 8 | 6 | 3 |
+| `cuny_rt` | 19 | 2 | 3 | 16 | 0 |
+| `cuny_untagged` | 17 | 5 | 11 | 9 | 2 |
+
+Documents held by each release gate check (failed or could not run):
+
+| Check | `gold_rt` | `cuny_rt` | `cuny_untagged` |
+|---|---:|---:|---:|
+| `compliance` (veraPDF) | 3 | 16 | 6 |
+| `table_headers` | 5 | 6 | 6 |
+| `figure_descriptions` | 3 | 2 | 5 |
+| `font_text_fidelity` | 0 | 15 | 2 |
+| `table_risk` | 2 | 1 | 4 |
+| `text_drift` | 1 | 0 | 1 |
+
+- Unembedded fonts. 15 of the 19 CUNY round trips fail veraPDF rule
+  7.21.4.1-1 because Arial or Times New Roman is not embedded on the
+  authors' own pages (after Academic Works' cover sheet). Stripping the
+  tags leaves the fonts as they were, and the pipeline does not embed
+  them, so the release gate holds all 15 on this rule and on
+  `font_text_fidelity`.
+  [pdfua_rule_coverage_matrix.md](pdfua_rule_coverage_matrix.md) lists the
+  font rules as covered.
+- Blocking tasks the person cannot see. The pipeline creates review tasks
+  of the types `font_text_fidelity`, `figure_semantics`, `reading_order`
+  and `form_semantics` as blocking, and the review screen shows only the
+  types in `review_surface.USER_VISIBLE_REVIEW_TASK_TYPES`, which leaves
+  these out. A person cannot see or resolve them. When a detected figure
+  is not tagged, `figure_coverage` reports a warning and adds a blocking
+  `figure_semantics` task; that task alone holds five documents (three
+  gold, two untagged).
+- Tables. `table_headers` fails on 17 documents across the three sets,
+  including two born-digital syllabi with simple schedule tables.
+- Short scans. The pipeline released four of the nine Academic Works scans
+  as complete. OCR gave each a text layer, three got their title from the
+  repository's cover sheet, and none has a figure.
+
+### Untagged CUNY documents
+
+| Document | Kind | Pages | Classified | Status | Held by | veraPDF | Figures with alt text | Seconds | Cost (USD) |
+|---|---|---:|---|---|---|---|---:|---:|---:|
+| `bb_pubs_348` | book chapter (scan) | 4 | mixed | complete | | yes | 0/0 | 20 | 0.003 |
+| `bb_pubs_360` | book chapter (scan) | 4 | mixed | complete | | yes | 0/0 | 37 | 0.003 |
+| `bb_pubs_361` | book chapter (scan) | 4 | mixed | manual | `table_risk` | yes | 0/0 | 92 | 0.020 |
+| `bb_pubs_363` | book chapter (scan) | 5 | mixed | manual | hidden task only | yes | 0/0 | 27 | 0.006 |
+| `bb_pubs_492` | article (scan) | 2 | mixed | complete | | yes | 0/0 | 17 | 0.003 |
+| `bx_arch_minutes_1392` | minutes (scan) | 4 | scanned | complete | | yes | 0/0 | 29 | 0.000 |
+| `cc_oers_365` | syllabus (scan) | 9 | mixed | manual | `compliance` (7.1-3) | no | 0/0 | 143 | 0.015 |
+| `jj_pubs_384` | book chapter (scan) | 15 | scanned | manual | `table_headers` | yes | 0/0 | 87 | 0.016 |
+| `nc_pubs_23` | book chapter (scan) | 16 | scanned | manual | `compliance`, `figure_descriptions` | no | 0/1 | 93 | 0.013 |
+| `wsq_236` | journal front matter | 2 | digital | manual | hidden task only | yes | 1/1 | 31 | 0.009 |
+| `gc_cs_tr_403` | report | 58 | mixed | manual | `compliance`, `table_headers`, `table_risk`, `figure_descriptions`, `font_text_fidelity` | no | 21/22 | 152 | 0.118 |
+| `ccny_business_communications_syllabus` | syllabus | 11 | digital | manual | `table_headers` | yes | 0/0 | 38 | 0.010 |
+| `citytech_buf_2246_syllabus` | syllabus | 10 | digital | manual | `table_headers` | yes | 1/1 | 75 | 0.048 |
+| `citytech_cst_1101_syllabus` | syllabus | 3 | digital | complete | | yes | 0/0 | 9 | 0.003 |
+| `cuny_elo_badging_in_stem_slides` | slides | 24 | mixed | manual | `compliance`, `text_drift`, `table_headers`, `table_risk`, `figure_descriptions` | no | 39/40 | 176 | 0.119 |
+| `gc_political_science_newsletter_2016` | newsletter | 22 | mixed | manual | `compliance`, `table_headers`, `table_risk`, `figure_descriptions`, `font_text_fidelity` | no | 75/108 | 420 | 0.308 |
+| `gc_sociology_newsletter_2020_02` | newsletter | 19 | mixed | manual | `compliance`, `figure_descriptions` | no | 9/12 | 68 | 0.039 |
+
+veraPDF still finds figures without alt text (7.3-1) in five documents,
+an unembedded font in one, a font without a Unicode mapping (7.21.7-1) in
+one, and content neither marked nor an artifact (7.1-3) in the scanned
+syllabus. The classifier calls 10 documents mixed, either because
+Academic Works put a born-digital cover sheet in front of a scan or
+because born-digital pages carry large pictures.
+
+We read ten generated descriptions (the first described figures of six
+documents) and every title against the page images. Six descriptions are
+accurate. Four are wrong. The model described a newsletter's masthead
+with the caption of the photo below it, described three rows of a
+sign-language figure identically when their mouth shapes differ, read the
+LaGuardia logo's "LAGCC" as "LACCC", and invented a red border around a
+black logo. Six of the ten figures are logos or mastheads. Of the 17
+titles, 11 are accurate, and nine of the accurate ones are the Academic
+Works record title printed on the cover sheet. Two are generic ("Front Matter",
+"Syllabus Draft - Business Communications"). Four are wrong, three of them
+section or slide headings ("February Calendar", "Awards Night 2016", "What
+is a Digital Badge?") and one a file name ("CST-1101-CLASS_SYLLABUS_2023").
+The title is right for one of the six campus documents, which have no
+cover sheet.
+
+### Cost and time
+
+| Set | Pages | Model requests | Tokens in / out | Cost at catalog price | Median per document | Most | Median seconds |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `gold_rt` | 224 | 397 | 1.56M / 44k | $0.95 | $0.035 | $0.35 (84-page report) | 105 |
+| `cuny_rt` | 282 | 230 | 0.90M / 30k | $0.56 | $0.019 | $0.08 | 51 |
+| `cuny_untagged` | 212 | 344 | 1.23M / 30k | $0.73 | $0.013 | $0.31 (22-page newsletter, 149 requests) | 68 |
+
+We priced the tokens at the Gateway's catalog price ($0.53 and $2.66 per
+million), because the Gateway reports no cost per call and the app
+records `cost_usd` as 0. The judge's 157 judgments cost $0.32. The
+fidelity check used 37% of pipeline seconds on both round trips and 20% on
+the untagged set, where OCR and alt text used more. We timed the runs on a
+Mac GPU, and production's times on actual-dell will differ.
+
 ## Results (2026-10-31)
 
 Main at `5af226b`, AI steps off, re-tagging all 1,926 captures from
@@ -540,7 +676,9 @@ cap, and occasional malformed JSON; such pages fall back to Tesseract.
   month of free tier.
 - opendataloader-pdf on the scanned samples and printed books (it needs a
   text layer, so it would need our OCR first).
-- The AI steps (title, language, alt text) on the CUNY documents.
-- veraPDF failures on the gold and CUNY sets.
 - CUNY documents in languages other than English, and pages of untagged
   CUNY articles and dissertations with per-page tests.
+- Alt text scored with figures paired by place on the page, not by order,
+  where the author's and the app's reading orders differ.
+- Born-digital articles and slides from Academic Works, which challenged
+  automated downloads on 2026-10-31.
