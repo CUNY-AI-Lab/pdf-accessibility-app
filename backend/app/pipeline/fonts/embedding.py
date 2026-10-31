@@ -149,6 +149,10 @@ def _embed_system_fonts_sync(
         for key, value in length_info.items():
             stream[pikepdf.Name(f"/{key}")] = int(value)
         descriptor[pikepdf.Name(fontfile_key)] = stream
+        if fontfile_key == "/FontFile" and font_dict.get("/Subtype") == pikepdf.Name("/TrueType"):
+            # URW base-35 substitutes are Type 1 programs. Retain the source's
+            # character encoding, ToUnicode, and explicit PDF widths verbatim.
+            font_dict[pikepdf.Name("/Subtype")] = pikepdf.Name("/Type1")
         _apply_type1_width_metrics(font_dict, descriptor, font_name)
         if pikepdf.Name("/FontName") not in descriptor and font_name:
             descriptor[pikepdf.Name("/FontName")] = pikepdf.Name(
