@@ -179,6 +179,7 @@ from app.pipeline.tagger_geometry import _resolve_dictionary as _resolve_diction
 from app.pipeline.tagger_geometry import _safe_float as _safe_float
 from app.pipeline.tagger_geometry import _table_cell_bbox as _table_cell_bbox
 from app.pipeline.tagger_geometry import _transform_point as _transform_point
+from app.pipeline.tagger_layout_tables import _layout_table_plan
 from app.pipeline.tagger_link_labels import (
     _best_annotation_source_element as _best_annotation_source_element,
 )
@@ -521,6 +522,9 @@ async def tag_pdf(
                 for ops in glyph_reader.page(page_index).ops.values():
                     stream_starts.add(len(eligible_ops))
                     eligible_ops.extend(ops)
+                for elem in page_elems:
+                    if elem.get("type") == "table":
+                        elem["_layout_table"] = _layout_table_plan(elem, page_elems)
                 _infer_table_headers(
                     page_elems, [g for op in eligible_ops for g in op.glyphs], page,
                 )
@@ -645,7 +649,12 @@ async def tag_pdf(
                         elif t == "heading":
                             headings_tagged += 1
                         elif t == "table":
-                            tables_tagged += 1
+                            if layout := elem.get("_layout_table"):
+                                lists_tagged += sum(
+                                    len(b["groups"]) for b in layout["blocks"] if b["role"] == "L"
+                                )
+                            else:
+                                tables_tagged += 1
                         elif t == "list_item":
                             lists_tagged += 1
                 else:

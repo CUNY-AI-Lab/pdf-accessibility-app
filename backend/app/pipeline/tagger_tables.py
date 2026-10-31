@@ -196,6 +196,7 @@ def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page
         index
         for index, table in enumerate(elements)
         if table.get("type") == "table"
+        and not table.get("_layout_table")
         and table.get("num_rows", 0) >= 2
         and table.get("num_cols", 0) >= 2
         and not any(
@@ -446,7 +447,7 @@ def _list_numbering_name(marker: Any, *, enumerated: bool = False) -> str | None
     if len(token) == 1 and token.isalpha():
         return "UpperAlpha" if token.isupper() else "LowerAlpha"
 
-    if text in {"-", "*", "+"} or (len(text) == 1 and ord(text) in {0x2022, 0x25CF}):
+    if text in {"-", "*", "+"} or (len(text) == 1 and ord(text) in {0x2022, 0x25CF, 0x2666, 0x25C6}):
         return "Disc"
     if len(text) == 1 and ord(text) in {0x25E6, 0x25CB}:
         return "Circle"
