@@ -31,6 +31,7 @@ import {
 } from "./contract";
 import type { Env } from "./env";
 import { randomToken, sha256Hex } from "./http";
+import { type FailureReason, jobFinished, parseReportChecks, parseReviewTasks } from "./outcome";
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -509,7 +510,7 @@ export class JobBoard extends DurableObject<Env> {
       const needsGateway = kind !== "sync";
       const gatewayExp = row.gateway_exp ?? 0;
       if (needsGateway && gatewayExp - now < LIMITS.claimMinimumMs) {
-        this.failRow(row, MESSAGES.signInEnding, now);
+        this.failRow(row, MESSAGES.signInEnding, "sign_in_ending", now);
         continue;
       }
       const lease = randomToken();
@@ -627,27 +628,91 @@ export class JobBoard extends DurableObject<Env> {
     );
     this.endTask(id, now);
     if (row.rev > 0) await this.deleteFiles(`jobs/${id}/r${row.rev}/`);
+    if (row.task_kind !== "sync") {
+      await this.logFinished(row, result.job, `jobs/${id}/r${row.next_rev ?? row.rev + 1}/`, files, now);
+    }
     return true;
+  }
+
+  /**
+   * The job_finished event for a task that returned a result (src/outcome.ts),
+   * from the runner's job view and the review tasks and gate checks it
+   * uploaded with it. The event is a report: a view that cannot be read
+   * leaves its part empty and does not change what the runner is told.
+   */
+  private async logFinished(row: JobRow, job: JobView, prefix: string, files: string[], now: number): Promise<void> {
+    const read = async (name: string): Promise<string | null> => {
+      if (!files.includes(name)) return null;
+      try {
+        return (await (await this.env.FILES.get(`${prefix}${name}`))?.text()) ?? null;
+      } catch {
+        return null;
+      }
+    };
+    const [tasks, report] = await Promise.all([read("views/review-tasks.json"), read("views/report.json")]);
+    const event = jobFinished(
+      {
+        jobId: row.id,
+        kind: row.task_kind ?? "process",
+        attempt: row.attempt,
+        since: taskStart(row),
+        status: job.status,
+        failure: job.status === "failed" ? "pipeline" : null,
+        classification: job.classification,
+        pages: job.page_count,
+        validationCompliant: job.validation_compliant,
+        steps: job.steps,
+        stepsBefore: job.steps,
+        reviewTasks: tasks === null ? [] : parseReviewTasks(tasks),
+        checks: report === null ? [] : parseReportChecks(report),
+      },
+      now,
+    );
+    console.log(JSON.stringify(event));
   }
 
   async fail(id: string, lease: string, error: string, now: number): Promise<boolean> {
     const row = await this.heldRow(id, lease, now);
     if (row === null) return false;
     if (row.task_kind === "sync") this.endTask(id, now);
-    else this.failRow(row, error, now);
+    else this.failRow(row, error, "runner", now);
     return true;
   }
 
-  private failRow(row: JobRow, error: string, now: number): void {
+  private failRow(row: JobRow, error: string, reason: FailureReason, now: number): void {
+    const before = parseSteps(row.steps_json);
+    const steps = failSteps(before, error, now);
     this.sql.exec(
       "UPDATE jobs SET status = 'failed', error = ?, steps_json = ?, updated_at = ? WHERE id = ?",
       error,
-      JSON.stringify(failSteps(parseSteps(row.steps_json), error, now)),
+      JSON.stringify(steps),
       now,
       row.id,
     );
     this.sql.exec("UPDATE jobs SET pending_review_json = NULL WHERE id = ?", row.id);
     this.endTask(row.id, now);
+    // The error is the person's message and may name their document; the
+    // event keeps only the reason.
+    const record = toRecord(row);
+    const event = jobFinished(
+      {
+        jobId: row.id,
+        kind: row.task_kind ?? "process",
+        attempt: row.attempt,
+        since: taskStart(row),
+        status: "failed",
+        failure: reason,
+        classification: record.classification,
+        pages: record.pageCount,
+        validationCompliant: null,
+        steps,
+        stepsBefore: before,
+        reviewTasks: [],
+        checks: [],
+      },
+      now,
+    );
+    console.log(JSON.stringify(event));
   }
 
   /** Requeue or fail tasks whose runner went quiet, end overdue ones, and delete old jobs. */
@@ -662,7 +727,7 @@ export class JobBoard extends DurableObject<Env> {
     for (const row of this.rows("SELECT * FROM jobs WHERE task_state = 'claimed'")) {
       if ((row.deadline ?? 0) < now) {
         if (row.task_kind === "sync") this.endTask(row.id, now);
-        else this.failRow(row, MESSAGES.deadline, now);
+        else this.failRow(row, MESSAGES.deadline, "deadline", now);
       } else if ((row.lease_expires ?? 0) < now) {
         if (row.task_kind === "sync") this.endTask(row.id, now);
         else if (row.attempt < LIMITS.attempts) {
@@ -674,7 +739,7 @@ export class JobBoard extends DurableObject<Env> {
             JSON.stringify(row.task_kind === "process" ? pendingSteps() : parseSteps(row.steps_json)),
             row.id,
           );
-        } else this.failRow(row, MESSAGES.interrupted, now);
+        } else this.failRow(row, MESSAGES.interrupted, "interrupted", now);
       }
     }
     for (const row of this.rows("SELECT * FROM jobs WHERE updated_at < ?", now - LIMITS.retentionMs)) {
@@ -695,6 +760,11 @@ export class JobBoard extends DurableObject<Env> {
 
 /** The fields of the runner's JobResponse that the Worker does not own. */
 type ViewSummary = Pick<JobView, "classification" | "ocr_language" | "page_count" | "validation_compliant">;
+
+/** When the person asked for the task: the upload for a process task, the request for a review. */
+function taskStart(row: JobRow): number {
+  return row.task_kind === "process" ? row.created_at : (row.task_queued_at ?? row.created_at);
+}
 
 function viewSummary(job: JobView): ViewSummary {
   return {

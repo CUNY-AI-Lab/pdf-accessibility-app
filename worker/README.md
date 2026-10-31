@@ -33,6 +33,27 @@ With `E2E_BROWSER=1` it uploads through the app in Chromium
 (`dev/ui_check.py`, via the backend's Playwright) and follows the job page to
 its download link.
 
+## Outcomes
+
+When a process or review task ends, the JobBoard logs one `job_finished`
+event to Workers Observability (`src/outcome.ts`): the final status
+(`complete`, `manual_remediation`, `failed`) and why a job failed, its
+classification and pages, each step's seconds, the review tasks by type and
+how many block, blocking tasks the review screen does not show, the release
+gate checks that failed or could not run, and the model use the steps
+report. It takes these from the runner's job view and the review tasks and
+report it uploads, and holds no file name, person, error message, or text
+from the document. `dev/outcomes.ts` reads the events for a window (up to
+the seven days Workers Logs keep) and prints the totals:
+
+```bash
+bun dev/outcomes.ts --days 7 --price-in 0.53 --price-out 2.66
+```
+
+It needs `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`. The Gateway
+reports no cost per call, so the cost comes from the tokens at the prices
+given (the model's catalog price per million tokens).
+
 ## Configuration
 
 - Bindings: `GATEWAY` (service `cail-model-api`), `FILES` (R2
