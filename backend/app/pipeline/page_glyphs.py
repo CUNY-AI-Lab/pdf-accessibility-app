@@ -168,7 +168,7 @@ class _Recorder(PDFLayoutAnalyzer):
         self.form_name: str | None = None
         self.marked: list[_MarkedContent] = []
         self.op: MeasuredTextOp | None = None
-        self.op_elements: list[int] = []
+        self.op_elements: list[tuple[int, tuple[int, int]]] = []
 
     def enter_stream(self) -> None:
         key: StreamKey = (

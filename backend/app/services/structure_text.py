@@ -27,6 +27,7 @@ import pikepdf
 
 from app.pipeline.page_glyphs import MeasuredGlyph, PdfGlyphReader, StreamKey
 from app.pipeline.pdfium_text import read_page_text
+from app.services.pdf_objects import pdf_integer, pdf_name, pdf_page_key
 
 BLOCK_ROLES = {
     "P",
@@ -70,7 +71,7 @@ def _cell_spans(node: pikepdf.Dictionary) -> str:
     for owner in owners:
         if isinstance(owner, pikepdf.Dictionary) and owner.get("/O") == "/Table":
             for key, name in (("/RowSpan", "rowspan"), ("/ColSpan", "colspan")):
-                if int(owner.get(key, 1)) > 1:
+                if pdf_integer(owner.get(key)) > 1:
                     spans += f' {name}="{int(owner[key])}"'
     return spans
 
@@ -101,9 +102,11 @@ HEADING_LEVELS = {"Title": 1, "H": 1, **{f"H{level}": level for level in range(1
 def _standard_role(node: pikepdf.Dictionary, role_map) -> str:
     """The structure type after following the role map (and, in PDF 2.0,
     the element's namespace role map)."""
-    role = node.get("/S")
+    role = pdf_name(node.get("/S"))
     namespace = node.get("/NS")
     for _ in range(10):
+        if role is None:
+            break
         mapped = None
         if isinstance(namespace, pikepdf.Dictionary):
             namespace_map = namespace.get("/RoleMapNS")
@@ -115,7 +118,7 @@ def _standard_role(node: pikepdf.Dictionary, role_map) -> str:
             mapped = role_map[role]
         if mapped is None or mapped == role:
             break
-        role = mapped
+        role = pdf_name(mapped)
     return str(role or "").lstrip("/")
 
 
@@ -152,7 +155,7 @@ def _screen_reader_text(
     exclude_figure_interiors: bool = False,
 ) -> tuple[str, list[str], list[set[int]], list[set[int]]]:
     with PdfGlyphReader(pdf_path) as glyphs, pikepdf.open(pdf_path) as pdf:
-        page_index = {page.objgen: index for index, page in enumerate(pdf.pages)}
+        page_index = {page.obj.objgen: index for index, page in enumerate(pdf.pages)}
         page_blocks: list[list[str]] = [[] for _ in pdf.pages]
         replaced: list[set[int]] = [set() for _ in pdf.pages]
         root = pdf.Root.get("/StructTreeRoot")
@@ -182,8 +185,8 @@ def _screen_reader_text(
                     if found is not None:
                         return found
             elif isinstance(node, pikepdf.Dictionary):
-                if "/Pg" in node:
-                    return page_index.get(node.Pg.objgen)
+                if (page_key := pdf_page_key(node.get("/Pg"))) is not None:
+                    return page_index.get(page_key)
                 return first_page(node.get("/K"))
             return None
 
@@ -250,8 +253,8 @@ def _screen_reader_text(
                 return
             if node.get("/Type") == "/OBJR":
                 return
-            if "/Pg" in node:
-                page = page_index.get(node.Pg.objgen, page)
+            if (page_key := pdf_page_key(node.get("/Pg"))) is not None:
+                page = page_index.get(page_key, page)
             role = _standard_role(node, role_map)
             if exclude_figure_interiors and role in {"Figure", "Formula"}:
                 collect_replaced(node.get("/K"), page)
@@ -310,8 +313,8 @@ def _screen_reader_text(
                     replaced[number].update(pages_text[number].marked.get((path, mcid), []))
                 return
             if isinstance(node, pikepdf.Dictionary):
-                if "/Pg" in node:
-                    page = page_index.get(node.Pg.objgen, page)
+                if (page_key := pdf_page_key(node.get("/Pg"))) is not None:
+                    page = page_index.get(page_key, page)
                 collect_replaced(node.get("/K"), page)
 
         walk(root.get("/K"), None, blocks)

@@ -174,7 +174,7 @@ def _image_text_pages(pdf_path: Path, candidates: list[int]) -> list[int]:
 
 def _has_invisible_text(page: pdfium.PdfPage) -> bool:
     return any(
-        page_object.type == pdfium_c.FPDF_PAGEOBJ_TEXT
+        pdfium_c.FPDFPageObj_GetType(page_object.raw) == pdfium_c.FPDF_PAGEOBJ_TEXT
         and pdfium_c.FPDFTextObj_GetTextRenderMode(page_object.raw)
         == pdfium_c.FPDF_TEXTRENDERMODE_INVISIBLE
         for page_object in page.get_objects(max_depth=15)

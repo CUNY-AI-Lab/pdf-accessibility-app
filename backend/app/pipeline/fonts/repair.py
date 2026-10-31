@@ -11,6 +11,7 @@ from app.pipeline.fonts.resources import (
     _obj_key,
     _resolve_dictionary,
 )
+from app.services.pdf_objects import pdf_text
 
 
 def _parse_cid_widths_array(widths_obj) -> dict[int, int]:
@@ -169,7 +170,7 @@ def _repair_pdf_font_dicts_sync(
         if (
             isinstance(descriptor, pikepdf.Dictionary)
             and pikepdf.Name("/CIDSet") in descriptor
-            and FONT_SUBSET_RE.match(str(cid_font.get("/BaseFont", "")).lstrip("/"))
+            and FONT_SUBSET_RE.match(pdf_text(cid_font.get("/BaseFont")).lstrip("/"))
         ):
             del descriptor[pikepdf.Name("/CIDSet")]
             stats["cidset_removed"] += 1

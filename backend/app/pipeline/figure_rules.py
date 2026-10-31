@@ -15,6 +15,7 @@ import pikepdf
 from PIL import Image
 
 from app.pipeline.structure import FigureInfo
+from app.services.pdf_objects import pdf_dictionary, pdf_named_resource
 
 TINY_SIDE_PT = 12.0
 POSITION_TOLERANCE_PT = 2.0
@@ -104,7 +105,11 @@ def _covered_boxes(pdf_path: Path | None) -> dict[int, list[tuple[float, ...]]]:
                         sx, sy, tx, ty = ctm
                         ctm = (sx * a, sy * d, sx * e + tx, sy * f + ty)
                     elif op == "Do":
-                        obj = page.Resources.get("/XObject", {}).get(operands[0])
+                        resources = pdf_dictionary(page.get("/Resources"))
+                        obj = pdf_named_resource(
+                            resources.get("/XObject") if resources is not None else None,
+                            operands[0],
+                        )
                         if obj is None or obj.get("/Subtype") != pikepdf.Name("/Image"):
                             supported = False
                             break
@@ -181,7 +186,7 @@ def decorative_reasons(
             reasons[figure.index] = "invisible_image: every crop pixel has zero alpha."
         elif box and any(
             all(abs(a - b) <= 0.01 for a, b in zip(box, hidden, strict=True))
-            for hidden in covered.get(figure.page, [])
+            for hidden in (covered.get(figure.page, []) if figure.page is not None else [])
         ):
             reasons[figure.index] = "fully_covered: a later opaque PDF rectangle covers the entire image."
         elif box and isinstance(figure.page, int) and _page_furniture(figure, page_boxes):

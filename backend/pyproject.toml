@@ -56,6 +56,8 @@ packages = ["app"]
 # The argument, optional and index checks are off: pikepdf objects are
 # dynamically typed, so those rules report mostly false positives here.
 pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
 include = ["app"]
 typeCheckingMode = "basic"
 reportArgumentType = "none"
@@ -68,7 +70,7 @@ reportAssignmentType = "none"
 reportOperatorIssue = "none"
 reportReturnType = "none"
 reportCallIssue = "error"
-reportPossiblyUnbound = "error"
+reportPossiblyUnboundVariable = "error"
 reportAttributeAccessIssue = "error"
 reportUndefinedVariable = "error"
 

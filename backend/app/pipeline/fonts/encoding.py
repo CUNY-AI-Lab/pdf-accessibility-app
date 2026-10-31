@@ -1,7 +1,10 @@
 """Simple-font encodings, ToUnicode CMaps, and text operand cleanup."""
 
 import re
+from collections.abc import Iterable
 from io import BytesIO
+
+import pikepdf
 
 from app.pipeline.fonts.names import FONT_NAME_RE, _base_font_name
 
@@ -251,13 +254,15 @@ def _simple_font_zero_byte_repair_candidate(
     return unresolved_used_codes == {0}
 
 
-def _sanitize_text_showing_zero_bytes(op: str, operands) -> tuple[list[object], int]:
-    import pikepdf
-
+def _sanitize_text_showing_zero_bytes(
+    op: str, operands: Iterable[pikepdf.Object | int | float],
+) -> tuple[list[pikepdf.Object | int | float], int]:
     removed = 0
     new_operands = list(operands)
 
-    def _strip_zero_bytes(value):
+    def _strip_zero_bytes(
+        value: pikepdf.Object | int | float,
+    ) -> pikepdf.Object | int | float:
         nonlocal removed
         try:
             raw = bytes(value)

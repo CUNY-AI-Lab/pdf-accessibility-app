@@ -143,7 +143,7 @@ def _dominant_image_regions(pdf_path: Path) -> dict[int, dict[str, Any]]:
                     "xobject_name": str(region.xobject_name or ""),
                 }
                 for region in image_regions
-                if _bbox_area(region.bbox) > 0.0
+                if isinstance(region.bbox, dict) and _bbox_area(region.bbox) > 0.0
             ]
             if not region_payloads:
                 continue

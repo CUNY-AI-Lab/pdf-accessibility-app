@@ -26,6 +26,7 @@ import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 
 from app.pipeline.page_glyphs import StreamKey
+from app.services.pdf_objects import pdf_named_resource
 
 # pdfium's code for a hyphen that breaks a word at a line end.
 LINE_END_HYPHEN = "\x02"
@@ -214,7 +215,7 @@ class PdfiumText:
             if local_clip is not None:
                 local_clip = parent.on_rect(*local_clip)
                 clip = _intersect_boxes(clip, local_clip) if clip is not None else local_clip
-            if obj.type == pdfium_c.FPDF_PAGEOBJ_FORM:
+            if pdfium_c.FPDFPageObj_GetType(obj.raw) == pdfium_c.FPDF_PAGEOBJ_FORM:
                 matrices[obj.level] = obj.get_matrix().multiply(parent)
                 clips[obj.level] = clip
                 continue
@@ -364,7 +365,7 @@ def _object_marked_refs(
     forms = sum(
         1
         for page_object in page.get_objects(max_depth=15)
-        if page_object.type == pdfium_c.FPDF_PAGEOBJ_FORM
+        if pdfium_c.FPDFPageObj_GetType(page_object.raw) == pdfium_c.FPDF_PAGEOBJ_FORM
     )
     aligned = forms == len(form_paths)
     open_forms: dict[int, StreamKey | None] = {}
@@ -378,7 +379,7 @@ def _object_marked_refs(
         if stream is not None:
             references.update((stream, mcid) for mcid in _object_mcids(page_object.raw))
         streams[_address(page_object.raw)] = references
-        if page_object.type == pdfium_c.FPDF_PAGEOBJ_FORM:
+        if pdfium_c.FPDFPageObj_GetType(page_object.raw) == pdfium_c.FPDF_PAGEOBJ_FORM:
             path = next(paths, None) if aligned else None
             readable = path is not None and stream is not None and path not in drawn
             open_forms[level] = path if readable else None
@@ -404,7 +405,7 @@ def _form_paths_in_order(owner: pikepdf.Object, prefix: StreamKey = ()) -> list[
         if str(instruction.operator) != "Do" or not instruction.operands:
             continue
         name = instruction.operands[0]
-        xobject = xobjects.get(name)
+        xobject = pdf_named_resource(xobjects, name)
         if isinstance(xobject, pikepdf.Stream) and xobject.get("/Subtype") == "/Form":
             path = (*prefix, str(name).lstrip("/"))
             paths.append(path)
@@ -490,9 +491,9 @@ def _pagination_page_indices(page: pdfium.PdfPage) -> set[int]:
                 or _mark_string(mark, b"Subtype") in {"Header", "Footer"}
             ):
                 pagination = True
-        if obj.type == pdfium_c.FPDF_PAGEOBJ_FORM:
+        if pdfium_c.FPDFPageObj_GetType(obj.raw) == pdfium_c.FPDF_PAGEOBJ_FORM:
             enclosing[obj.level] = pagination
-        elif pagination and obj.type == pdfium_c.FPDF_PAGEOBJ_TEXT:
+        elif pagination and pdfium_c.FPDFPageObj_GetType(obj.raw) == pdfium_c.FPDF_PAGEOBJ_TEXT:
             objects.add(_address(obj.raw))
     marked: set[int] = set()
     textpage = page.get_textpage()
@@ -568,9 +569,9 @@ def _artifact_indices(page: pdfium.PdfPage) -> set[int]:
         for index in range(pdfium_c.FPDFPageObj_CountMarks(obj.raw)):
             if _mark_string(pdfium_c.FPDFPageObj_GetMark(obj.raw, index)) == "Artifact":
                 artifact = True
-        if obj.type == pdfium_c.FPDF_PAGEOBJ_FORM:
+        if pdfium_c.FPDFPageObj_GetType(obj.raw) == pdfium_c.FPDF_PAGEOBJ_FORM:
             enclosing[obj.level] = artifact
-        elif artifact and obj.type == pdfium_c.FPDF_PAGEOBJ_TEXT:
+        elif artifact and pdfium_c.FPDFPageObj_GetType(obj.raw) == pdfium_c.FPDF_PAGEOBJ_TEXT:
             objects.add(_address(obj.raw))
     textpage = page.get_textpage()
     try:

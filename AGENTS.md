@@ -3,7 +3,7 @@
 Read README.md and docs/cail-integration-plan.md (the plan of record) first.
 The fleet rules in the CAIL workspace AGENTS.md apply.
 
-- `scripts/check.sh` is the source gate: backend (ruff, pytest), frontend
+- `scripts/check.sh` is the source gate: backend (ruff, pyright, pytest), frontend
   (eslint, build), and the Worker (`worker/`: oxlint with the anti-slop
   profile, types, build, workerd tests). Run it before pushing.
 - The runner contract is defined twice, in `worker/src/contract.ts` and

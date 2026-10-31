@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.models import AltTextEntry, AppliedChange, Job, JobStep, ReviewTask
-from app.pipeline.alt_text import figure_applied_change_specs, generate_alt_text
+from app.pipeline.alt_text import AltTextResult, figure_applied_change_specs, generate_alt_text
 from app.pipeline.classify import classify_pdf
 from app.pipeline.fidelity import _table_semantics_risk, assess_fidelity
 
@@ -839,7 +839,7 @@ def _reclassified_figure_cover(
 
 def _apply_figure_reclassification(
     structure_json: dict[str, object],
-    alt_texts: list[object],
+    alt_texts: list[AltTextResult],
     *,
     working_pdf: Path | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -870,7 +870,7 @@ def _apply_figure_reclassification(
         audit["reason"] = "missing_structure"
         return structure_json, audit
 
-    reclassified: dict[int, object] = {}
+    reclassified: dict[int, AltTextResult] = {}
     for item in alt_texts:
         figure_index = getattr(item, "figure_index", None)
         status = str(getattr(item, "status", "") or "").strip()
@@ -2459,7 +2459,7 @@ class Candidate:
     alt_entries: list[dict[str, object]]
     review_tasks: list[dict[str, object]] = dataclass_field(default_factory=list)
     applied_change_specs: list[dict[str, object]] = dataclass_field(default_factory=list)
-    grounded_text_adjudication: dict[str, object] = dataclass_field(default_factory=dict)
+    grounded_text_adjudication: dict[str, object] | None = None
 
 
 def _candidate_job(job: Job, candidate: Candidate) -> Job:
@@ -3118,18 +3118,18 @@ async def _store_candidate_result(
     alt_entry_by_index = {entry.figure_index: entry for entry in alt_entries}
     for change_spec in candidate.applied_change_specs:
         task_type = str(change_spec.get("task_type") or "review_change")
-        metadata = (
-            change_spec.get("metadata") if isinstance(change_spec.get("metadata"), dict) else {}
-        )
-        before = (
-            change_spec.get("before") if isinstance(change_spec.get("before"), dict) else {}
-        )
-        after = change_spec.get("after") if isinstance(change_spec.get("after"), dict) else {}
-        undo_payload = (
-            change_spec.get("undo_payload")
-            if isinstance(change_spec.get("undo_payload"), dict)
-            else {}
-        )
+        metadata = change_spec.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        before = change_spec.get("before")
+        if not isinstance(before, dict):
+            before = {}
+        after = change_spec.get("after")
+        if not isinstance(after, dict):
+            after = {}
+        undo_payload = change_spec.get("undo_payload")
+        if not isinstance(undo_payload, dict):
+            undo_payload = {}
         if task_type == "figure_semantics":
             figure_index_raw = metadata.get("figure_index", undo_payload.get("figure_index"))
             try:

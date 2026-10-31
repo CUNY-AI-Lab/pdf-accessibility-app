@@ -9,6 +9,7 @@ import logging
 import re
 import subprocess
 from dataclasses import dataclass, field
+from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -1503,12 +1504,9 @@ async def extract_structure(
     else:
         def _convert():
             try:
-                from docling.datamodel.base_models import InputFormat
-                from docling.datamodel.pipeline_options import (
-                    PdfPipelineOptions,
-                    RapidOcrOptions,
-                )
-                from docling.document_converter import DocumentConverter, PdfFormatOption
+                base_models = import_module("docling.datamodel.base_models")
+                pipeline_options_module = import_module("docling.datamodel.pipeline_options")
+                document_converter = import_module("docling.document_converter")
             except ImportError:
                 raise RuntimeError(
                     "Local Docling is not installed. Either set DOCLING_SERVE_URL to use "
@@ -1517,16 +1515,16 @@ async def extract_structure(
                 )
 
             def _convert_one(path: Path):
-                pipeline_options = PdfPipelineOptions(
+                pipeline_options = pipeline_options_module.PdfPipelineOptions(
                     generate_picture_images=include_figure_images,
                     images_scale=2.0,
                     do_picture_classification=True,
                     do_table_structure=True,
-                    ocr_options=RapidOcrOptions(backend="torch"),
+                    ocr_options=pipeline_options_module.RapidOcrOptions(backend="torch"),
                 )
-                converter = DocumentConverter(
+                converter = document_converter.DocumentConverter(
                     format_options={
-                        InputFormat.PDF: PdfFormatOption(
+                        base_models.InputFormat.PDF: document_converter.PdfFormatOption(
                             pipeline_options=pipeline_options,
                         ),
                     }

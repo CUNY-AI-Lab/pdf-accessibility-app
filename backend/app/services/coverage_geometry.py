@@ -9,6 +9,7 @@ import pikepdf
 
 from app.pipeline.page_glyphs import StreamKey
 from app.pipeline.pdfium_text import Box, PdfiumText
+from app.services.pdf_objects import pdf_page_key
 from app.services.structure_text import _form_paths, _standard_role
 
 
@@ -36,7 +37,7 @@ def figure_boxes_for_coverage(pdf_path: Path, raw: PdfiumText) -> list[list[Box]
         root = pdf.Root.get("/StructTreeRoot")
         if root is None:
             return boxes
-        pages = {page.objgen: index for index, page in enumerate(pdf.pages)}
+        pages = {page.obj.objgen: index for index, page in enumerate(pdf.pages)}
         role_map = root.get("/RoleMap")
         paths: dict[int, dict[tuple[int, int], StreamKey]] = {}
         bounds: dict[int, dict[tuple[StreamKey, int], list[Box]]] = {}
@@ -49,8 +50,8 @@ def figure_boxes_for_coverage(pdf_path: Path, raw: PdfiumText) -> list[list[Box]
                 for kid in node:
                     yield from refs(kid, page)
             elif isinstance(node, pikepdf.Dictionary):
-                if "/Pg" in node:
-                    page = pages.get(node.Pg.objgen, page)
+                if (page_key := pdf_page_key(node.get("/Pg"))) is not None:
+                    page = pages.get(page_key, page)
                 if node.get("/Type") == "/MCR":
                     if page is not None:
                         stream = node.get("/Stm")
@@ -69,8 +70,8 @@ def figure_boxes_for_coverage(pdf_path: Path, raw: PdfiumText) -> list[list[Box]
                 return
             if not isinstance(node, pikepdf.Dictionary):
                 return
-            if "/Pg" in node:
-                page = pages.get(node.Pg.objgen, page)
+            if (page_key := pdf_page_key(node.get("/Pg"))) is not None:
+                page = pages.get(page_key, page)
             if _standard_role(node, role_map) == "Figure":
                 references = list(refs(node.get("/K"), page))
                 rect = _layout_box(node)
