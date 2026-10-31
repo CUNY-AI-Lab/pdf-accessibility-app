@@ -1,5 +1,6 @@
 """Build structure elements, MCIDs, annotations and the ParentTree."""
 
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -7,6 +8,7 @@ from typing import Any
 import pikepdf
 
 from app.pipeline.tagger_geometry import _as_positive_int, _obj_key
+from app.pipeline.tagger_layout_tables import BULLET, MARKER
 from app.pipeline.tagger_link_labels import _infer_link_contents
 from app.pipeline.tagger_tables import (
     _complete_table_grid_cells,
@@ -514,6 +516,11 @@ class StructTreeBuilder:
             self._fragmented_table_cache[table_key] = {}
             return {}
 
+        if layout := table_data.get("_layout_table"):
+            cell_structs = self._add_layout_table(cells, layout)
+            self._fragmented_table_cache[table_key] = cell_structs
+            return cell_structs
+
         self._table_counter += 1
         table_n = self._table_counter
         table_elem_dict: dict = {
@@ -620,6 +627,52 @@ class StructTreeBuilder:
 
         self._fragmented_table_cache[table_key] = cell_structs
         return cell_structs
+
+    def _add_layout_table(self, cells: list[dict], layout: dict) -> dict:
+        """Keep cell ownership and MCID allocation, changing only the tags.
+
+        Each original cell remains a content owner. Adjacent cells belonging
+        to one list entry become spans in one paragraph, so label/title/page
+        fragments are heard together. ParentTree points at those same owners.
+        """
+        def node(role, parent):
+            elem = self.pdf.make_indirect(pikepdf.Dictionary({
+                "/Type": pikepdf.Name("/StructElem"), "/S": pikepdf.Name(f"/{role}"),
+                "/P": parent, "/K": pikepdf.Array([]),
+            }))
+            self._append_child(parent, elem)
+            self._struct_elems_created += 1
+            return elem
+
+        container = node("Div", self.doc_elem)
+        lookup = {(c["row"], c["col"]): c for c in cells}
+        owners = {}
+        for block in layout["blocks"]:
+            parent = node("L", container) if block["role"] == "L" else container
+            for group in block["groups"]:
+                paragraph_parent = parent
+                body_group = group
+                if block["role"] == "L":
+                    item = node("LI", parent)
+                    first = lookup[tuple(group[0])]
+                    text = str(first.get("text") or "").strip()
+                    marker = MARKER.match(text)
+                    _set_list_numbering_attr(parent, marker[1] if marker else text)
+                    if len(group) > 1 and re.fullmatch(rf"{BULLET}|\d+(?:\.\d+)*|[A-Za-z]", text):
+                        label = node("Lbl", item)
+                        if actual_text := str(first.get("actual_text") or "").strip():
+                            label["/ActualText"] = pikepdf.String(actual_text)
+                        owners[tuple(group[0])] = label
+                        body_group = group[1:]
+                    paragraph_parent = node("LBody", item)
+                paragraph = node("P", paragraph_parent)
+                for key in body_group:
+                    cell = lookup[tuple(key)]
+                    owner = node("Span", paragraph) if len(body_group) > 1 else paragraph
+                    if actual_text := str(cell.get("actual_text") or "").strip():
+                        owner["/ActualText"] = pikepdf.String(actual_text)
+                    owners[tuple(key)] = owner
+        return owners
 
     def add_table_cell_fragment(
         self,
