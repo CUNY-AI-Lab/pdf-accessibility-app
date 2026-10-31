@@ -3,6 +3,7 @@
 import math
 import re
 from collections import Counter
+from statistics import median
 from typing import Any
 
 import pikepdf
@@ -154,6 +155,39 @@ def _numeric_table_text(text: str) -> bool:
     return bool(re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", value))
 
 
+def _simple_label_row(first: list[dict], rows: dict[int, list[dict]]) -> bool:
+    """Short, distinct labels over contrasting data, never a first data record.
+
+    Length alone is weak evidence: require contrast in at least half the labelled columns,
+    on at least two populated body rows. Typography or a rule must corroborate
+    this shape at the call site. Printed SQL separator dashes are not labels.
+    """
+    labels = [(c, re.sub(r"\s+[-_]{3,}$", "", str(c.get("text") or "").strip()))
+              for c in first if str(c.get("text") or "").strip()]
+    if len(labels) < 2 or len({t.casefold() for _, t in labels}) != len(labels):
+        return False
+    if any(not t[0].isalpha() or len(t) > 80 or len(t.split()) > 10 for _, t in labels):
+        return False
+    if sum(len(t.split()) <= 6 for _, t in labels) < max(2, math.ceil(len(labels) / 2)):
+        return False
+    body_rows = [cs for r, cs in rows.items() if r > 0
+                 and sum(bool(str(c.get("text") or "").strip()) for c in cs) >= 2]
+    if len(body_rows) < 2:
+        return False
+    contrasts = 0
+    for cell, label in labels:
+        values = [str(c.get("text") or "").strip() for cs in body_rows for c in cs
+                  if c.get("col", 0) == cell.get("col", 0) and c.get("text")]
+        if len(values) < 2 or len({v.casefold() for v in values}) < 2:
+            continue
+        # Numbers, dates and numbered weeks differ from alphabetic labels.
+        # Compare median lengths so a long outlier cannot dominate a large column.
+        if (sum(bool(re.search(r"\d", v)) for v in values) >= 0.75 * len(values)
+                or median(len(v) for v in values) >= max(len(label) * 1.5, len(label) + 8)):
+            contrasts += 1
+    return contrasts >= max(2, math.ceil(len(labels) / 2))
+
+
 def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page) -> None:
     """Conservative tag-time fallbacks for the PubTables canonicalization
     cases. Any extractor header flag disables inference for that table.
@@ -193,6 +227,14 @@ def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page
         regular_first = (
             len(first) == table["num_cols"]
             and [c.get("col", 0) for c in first] == list(range(table["num_cols"]))
+            and all(c.get("row_span", 1) == 1 and c.get("col_span", 1) == 1 for c in first)
+        )
+        # Docling omits the empty final heading in some syllabus schedules.
+        # Permit exactly that edge slot, never an interior hole or a span.
+        label_grid = regular_first or (
+            len(first) == table["num_cols"] - 1
+            and len(first) >= 2
+            and [c.get("col", 0) for c in first] == list(range(len(first)))
             and all(c.get("row_span", 1) == 1 and c.get("col_span", 1) == 1 for c in first)
         )
 
@@ -248,7 +290,7 @@ def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page
         style_difference = False
         body_styles = [s for c in body if (s := style(c)) is not None]
         top_styles = [style(c) for c in top_nonblank]
-        if (regular_first and len(body_styles) >= 2
+        if (label_grid and len(body_styles) >= 2
                 and (len(top_styles) >= 2 or (blank_corner and len(top_styles) == 1))):
             body_style, count = Counter(body_styles).most_common(1)[0]
             if count / len(body) >= 0.8 and all(top_styles):
@@ -265,7 +307,7 @@ def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page
             g for c in rows.get(1, []) for g in cell_glyphs.get((index, 1, c.get("col", 0)), [])
         ]
         if (
-            regular_first
+            label_grid
             and (len(top_nonblank) >= 2 or blank_corner)
             and top_drawn
             and next_drawn
@@ -311,6 +353,11 @@ def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page
             regular_first and len(top_nonblank) >= max(1, table["num_cols"] - 1)
             and all(not _numeric_table_text(text(c)) for c in top_nonblank)
             and sum((blank_corner, style_difference, rule_below, numeric_contrast)) >= 2
+        )
+        caps = bool(top_nonblank) and all(text(c).isupper() for c in top_nonblank)
+        column_header = column_header or (
+            label_grid and _simple_label_row(first, rows)
+            and (style_difference or rule_below or caps)
         )
         if column_header:
             for cell in first:
