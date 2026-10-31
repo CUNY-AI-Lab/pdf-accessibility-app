@@ -1366,6 +1366,19 @@ def _save_docling_figures(doc_dict: dict, figures_dir: Path) -> list[FigureInfo]
     return figures
 
 
+def docling_table_cell_matching(classification_type: str | None) -> bool:
+    """Whether Docling should match table cells to the PDF's own text cells.
+
+    Matching keeps a well-made PDF's cells, so it stays on for digital and
+    mixed documents. On fully scanned documents the text cells come from OCR
+    and often merge columns; measured on olmOCR-Bench, turning matching off
+    there raised the scanned tables category from 58.2% to 61.3% (41 tests
+    fixed, 10 broken) at a cost of 0.016 TEDS on the scanned CUNY round
+    trip, while on born-digital documents it cost 0.06 TEDS.
+    """
+    return classification_type not in {"scanned", "ocr_scan"}
+
+
 async def _convert_via_docling_serve(
     pdf_path: Path,
     job_dir: Path,
@@ -1374,6 +1387,7 @@ async def _convert_via_docling_serve(
     ocr_engine: str = "rapidocr",
     token: str = "",
     include_figure_images: bool = True,
+    table_cell_matching: bool = True,
 ) -> tuple[dict, list[FigureInfo]]:
     """Send PDF to a docling-serve instance and return (doc_dict, figures).
 
@@ -1406,6 +1420,8 @@ async def _convert_via_docling_serve(
             # style; without it every heading comes back as level 1.
             "do_pdf_heading_hierarchy": "true",
         }
+        if not table_cell_matching:
+            data["table_cell_matching"] = "false"
         if include_figure_images:
             data.update({
                 "image_export_mode": "embedded",
@@ -1481,6 +1497,7 @@ async def extract_structure(
     job_dir: Path,
     *,
     include_figure_images: bool = True,
+    table_cell_matching: bool = True,
 ) -> StructureResult:
     """Extract document structure using Docling.
 
@@ -1499,6 +1516,7 @@ async def extract_structure(
             settings.docling_serve_ocr_engine,
             settings.docling_serve_token,
             include_figure_images,
+            table_cell_matching=table_cell_matching,
         )
         processed_pdf_path = pdf_path
     else:
@@ -1521,6 +1539,9 @@ async def extract_structure(
                     do_picture_classification=True,
                     do_table_structure=True,
                     ocr_options=pipeline_options_module.RapidOcrOptions(backend="torch"),
+                )
+                pipeline_options.table_structure_options.do_cell_matching = (
+                    table_cell_matching
                 )
                 converter = document_converter.DocumentConverter(
                     format_options={
