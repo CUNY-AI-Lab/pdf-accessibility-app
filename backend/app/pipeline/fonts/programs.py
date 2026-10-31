@@ -56,6 +56,36 @@ GHOSTSCRIPT_TYPE1_DESCRIPTOR_SPECS = {
 }
 
 
+def _metric_compatible_names(font_name: str) -> tuple[str, str] | None:
+    """Return only known Arial/Times/Courier equivalents, including PDF style aliases."""
+    normalized = _normalize_font_name(font_name)
+    families = (
+        (("arial", "helvetica"), "LiberationSans", "Helvetica"),
+        (("timesnewromanps", "timesnewroman", "times"), "LiberationSerif", "Times"),
+        (("couriernewps", "couriernew", "courier"), "LiberationMono", "Courier"),
+    )
+    styles = {
+        "": "Regular", "mt": "Regular", "roman": "Regular",
+        "bold": "Bold", "boldmt": "Bold",
+        "italic": "Italic", "italicmt": "Italic", "oblique": "Italic",
+        "bolditalic": "BoldItalic", "bolditalicmt": "BoldItalic",
+        "boldoblique": "BoldItalic",
+    }
+    for aliases, liberation, standard in families:
+        for alias in aliases:
+            if not normalized.startswith(alias):
+                continue
+            style = styles.get(normalized[len(alias):])
+            if style is None:
+                continue
+            if standard == "Times":
+                suffix = "Roman" if style == "Regular" else style
+            else:
+                suffix = "" if style == "Regular" else style.replace("Italic", "Oblique")
+            return f"{liberation}-{style}", f"{standard}-{suffix}".rstrip("-")
+    return None
+
+
 def _local_embed_support_kind(font_dict, descendant_subtype=None) -> str:
     import pikepdf
 
@@ -275,6 +305,14 @@ def _ghostscript_resource_font_dir() -> Path | None:
             candidate = parent / suffix
             if candidate.exists():
                 return candidate
+        # Debian installs resources under a versioned Ghostscript directory,
+        # and the base-35 programs themselves in the system font tree.
+        for candidate in sorted((parent / "share/ghostscript").glob("*/Resource/Font")):
+            if candidate.is_dir():
+                return candidate
+        candidate = parent / "share/fonts/type1/urw-base35"
+        if candidate.is_dir():
+            return candidate
     return None
 
 
@@ -294,6 +332,9 @@ def _ghostscript_font_metrics_dir() -> Path | None:
             candidate = parent / suffix
             if candidate.exists():
                 return candidate
+        candidate = parent / "share/fonts/type1/urw-base35"
+        if candidate.is_dir():
+            return candidate
     return None
 
 
@@ -317,7 +358,9 @@ def _ghostscript_type1_font_program(
 
     path = resource_dir / resource_name
     if not path.exists():
-        return None, None, None
+        path = resource_dir / f"{resource_name}.t1"
+        if not path.exists():
+            return None, None, None
 
     try:
         raw = path.read_bytes()
@@ -357,7 +400,9 @@ def _ghostscript_type1_descriptor(
 
     path = metrics_dir / spec["afm"]
     if not path.exists():
-        return None
+        path = metrics_dir / f"{GHOSTSCRIPT_TYPE1_SUBSTITUTES[normalized]}.afm"
+        if not path.exists():
+            return None
 
     try:
         afm = afmLib.AFM(str(path))
@@ -404,6 +449,27 @@ def _local_font_program(
     support_kind = _local_embed_support_kind(font_dict, descendant_subtype=descendant_subtype)
     if support_kind in {"truetype", "cidfonttype2"}:
         font_bytes, matched_name = _system_font_program(font_name)
+        # CIDFontType2 character codes may be original glyph IDs. A different
+        # font's glyph order is not compatible, even when its metrics match.
+        encoding = font_dict.get("/Encoding")
+        if isinstance(encoding, pikepdf.Dictionary):
+            encoding = encoding.get("/BaseEncoding")
+        descriptor = font_dict.get("/FontDescriptor")
+        symbolic = isinstance(descriptor, pikepdf.Dictionary) and int(descriptor.get("/Flags") or 0) & 4
+        substitutes = _metric_compatible_names(font_name)
+        if (
+            not font_bytes
+            and support_kind == "truetype"
+            and not symbolic
+            and str(encoding) in {"/WinAnsiEncoding", "/MacRomanEncoding", "/StandardEncoding"}
+            and substitutes is not None
+        ):
+            liberation, standard = substitutes
+            font_bytes, matched_name = _system_font_program(liberation)
+            if not font_bytes:
+                type1_bytes, matched_name, lengths = _ghostscript_type1_font_program(standard)
+                if type1_bytes and lengths:
+                    return type1_bytes, matched_name, "/FontFile", lengths
         if not font_bytes:
             return None, None, None, None
         return (

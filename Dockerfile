@@ -35,7 +35,7 @@ RUN apt-get update \
         default-jre-headless \
         fontconfig \
         fonts-dejavu-core \
-        fonts-liberation \
+        fonts-liberation2 \
         ghostscript \
         gnupg \
         libspatialindex-dev \
