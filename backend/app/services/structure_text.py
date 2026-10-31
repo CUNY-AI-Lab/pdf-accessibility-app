@@ -26,7 +26,7 @@ from pathlib import Path
 import pikepdf
 
 from app.pipeline.page_glyphs import MeasuredGlyph, PdfGlyphReader, StreamKey
-from app.pipeline.pdfium_text import read_page_text
+from app.pipeline.pdfium_text import PageText, read_page_text
 from app.services.pdf_objects import pdf_integer, pdf_name, pdf_page_key
 
 BLOCK_ROLES = {
@@ -122,6 +122,57 @@ def _standard_role(node: pikepdf.Dictionary, role_map) -> str:
     return str(role or "").lstrip("/")
 
 
+class MarkedContentReader:
+    """Shared PDFium reading and word-boundary state for tag-tree consumers.
+
+    Callers reset ``last_read`` after block boundaries or element ActualText,
+    exactly as the screen-reader traversal does. Form paths and marked-content
+    ActualText use the same glyph reader in both HTML and plain-text exports.
+    """
+
+    def __init__(self, pdf: pikepdf.Pdf, glyphs: PdfGlyphReader, pages_text: list[PageText]):
+        self.pdf = pdf
+        self.glyphs = glyphs
+        self.pages_text = pages_text
+        self.marked: dict[int, dict[tuple[StreamKey, int], list[MeasuredGlyph | str]]] = {}
+        self.form_paths: dict[int, dict[tuple[int, int], StreamKey]] = {}
+        self.last_read: tuple[int, int] | None = None
+
+    def read(self, page: int, stream: pikepdf.Object | None, mcid: int) -> str | None:
+        parts: list[str] = []
+        if page not in self.marked:
+            self.marked[page] = self.glyphs.page(page).marked
+            self.form_paths[page] = _form_paths(self.pdf.pages[page].obj)
+        path = () if stream is None else self.form_paths[page].get(stream.objgen)
+        if path is None:
+            return None
+        page_text = self.pages_text[page]
+        indices = page_text.marked.get((path, mcid))
+        if not indices:
+            # Marked content that draws no text may still carry /ActualText.
+            actual_texts = [
+                item for item in self.marked[page].get((path, mcid), []) if isinstance(item, str)
+            ]
+            if actual_texts:
+                if self.last_read is not None:
+                    parts.append(" ")
+                parts.append(" ".join(actual_texts))
+                self.last_read = None
+            return "".join(parts) if actual_texts else None
+        previous = self.last_read
+        if previous is not None and (
+            previous[0] != page or page_text.breaks_between(previous[1], indices[0])
+        ):
+            parts.append(" ")
+        actual_texts = [
+            item for item in self.marked[page].get((path, mcid), []) if isinstance(item, str)
+        ]
+        parts.append(page_text.text(indices, actual_texts))
+        self.last_read = (page, indices[-1])
+
+        return "".join(parts)
+
+
 def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: bool = False) -> str:
     return _screen_reader_text(pdf_path, figure_text=figure_text, markdown=markdown)[0]
 
@@ -164,12 +215,8 @@ def _screen_reader_text(
         pages_text = read_page_text(pdf_path)
         role_map = root.get("/RoleMap")
         blocks: list[str] = []
-        marked: dict[int, dict[tuple[StreamKey, int], list[MeasuredGlyph | str]]] = {}
-        form_paths: dict[int, dict[tuple[int, int], StreamKey]] = {}
-        # Where the last marked content read ended (page, character index),
-        # to decide whether the next starts a new word; None after a block
-        # break or /ActualText.
-        last_read: list[tuple[int, int] | None] = [None]
+        reader = MarkedContentReader(pdf, glyphs, pages_text)
+        form_paths = reader.form_paths
         last_page: list[int | None] = [None]
 
         def emit(text: str, page: int | None, out: list[str]) -> None:
@@ -191,35 +238,9 @@ def _screen_reader_text(
             return None
 
         def read_mcid(page: int, stream: pikepdf.Object | None, mcid: int, out: list[str]) -> None:
-            if page not in marked:
-                marked[page] = glyphs.page(page).marked
-                form_paths[page] = _form_paths(pdf.pages[page].obj)
-            path = () if stream is None else form_paths[page].get(stream.objgen)
-            if path is None:
-                return
-            page_text = pages_text[page]
-            indices = page_text.marked.get((path, mcid))
-            if not indices:
-                # Marked content that draws no text may still carry /ActualText.
-                actual_texts = [
-                    item for item in marked[page].get((path, mcid), []) if isinstance(item, str)
-                ]
-                if actual_texts:
-                    if last_read[0] is not None:
-                        emit(" ", page, out)
-                    emit(" ".join(actual_texts), page, out)
-                    last_read[0] = None
-                return
-            previous = last_read[0]
-            if previous is not None and (
-                previous[0] != page or page_text.breaks_between(previous[1], indices[0])
-            ):
-                emit(" ", page, out)
-            actual_texts = [
-                item for item in marked[page].get((path, mcid), []) if isinstance(item, str)
-            ]
-            emit(page_text.text(indices, actual_texts), page, out)
-            last_read[0] = (page, indices[-1])
+            text = reader.read(page, stream, mcid)
+            if text is not None:
+                emit(text, page, out)
 
         def inline(node, page) -> str:
             parts: list[str] = []
@@ -281,7 +302,7 @@ def _screen_reader_text(
                 return
             if "/ActualText" in node:
                 emit(str(node.ActualText), page if page is not None else first_page(node), out)
-                last_read[0] = None
+                reader.last_read = None
                 if role in BLOCK_ROLES:
                     emit("\n", page if page is not None else first_page(node), out)
                 return
@@ -294,7 +315,7 @@ def _screen_reader_text(
                 walk(kids, page, out)
             if role in BLOCK_ROLES:
                 emit("\n\n" if markdown else "\n", page if page is not None else last_page[0], out)
-                last_read[0] = None
+                reader.last_read = None
 
         def collect_replaced(node, page) -> None:
             if isinstance(node, pikepdf.Array):

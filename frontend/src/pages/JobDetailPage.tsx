@@ -161,6 +161,7 @@ export default function JobDetailPage() {
           <OutcomeHero
             jobId={job.id}
             filename={job.original_filename}
+            hasHtml={job.has_html === true}
             status={job.status as "complete" | "manual_remediation" | "failed"}
             appliedChangeCount={appliedChangeCount}
             reviewTaskCount={followUpCount}

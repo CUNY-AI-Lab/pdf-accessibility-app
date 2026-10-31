@@ -8,6 +8,7 @@ import {
   type AppliedChange,
   batchPartsSchema,
   type BatchParts,
+  DOCUMENT_HTML_FILE,
   editRequestSchema,
   OUTPUT_READY_STATUSES,
   type ReviewAction,
@@ -90,6 +91,13 @@ export async function handleApi(request: Request, env: Env, path: string, person
       if (!outputReady(job) || !job.files.includes("output.pdf")) return detail(404, "Accessible PDF not yet available");
       return file(env, job, "output.pdf", attachment(`accessible_${safeFilename(job.originalFilename)}`));
     }
+    if (route === "download/document.html") {
+      if (!outputReady(job) || !job.files.includes(DOCUMENT_HTML_FILE)) {
+        return detail(404, "Accessible HTML not yet available");
+      }
+      const stem = safeFilename(job.originalFilename).replace(/\.pdf$/i, "");
+      return file(env, job, DOCUMENT_HTML_FILE, attachment(`accessible_${stem}.html`));
+    }
     if (route === "download/report") {
       if (!outputReady(job) || !job.files.includes("views/report.json")) {
         return detail(404, "Validation report not yet available");
@@ -134,6 +142,11 @@ async function file(env: Env, job: JobRecord, name: string, disposition: string 
   if (object === null) return detail(404, "File not found");
   const headers = new Headers({ "cache-control": "private, no-store" });
   object.writeHttpMetadata(headers);
+  if (name === DOCUMENT_HTML_FILE) {
+    headers.set("content-type", "text/html; charset=utf-8");
+    headers.set("content-security-policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'");
+    headers.set("x-content-type-options", "nosniff");
+  }
   if (disposition !== null) headers.set("content-disposition", disposition);
   return new Response(object.body, { headers });
 }

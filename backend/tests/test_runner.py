@@ -22,6 +22,7 @@ from app.runner.state import (
 )
 from app.runner.views import preview_pages_for_task
 from app.services.llm_client import current_model_endpoint
+from tests.pdf_fixtures import tagged_text_pages
 
 WORKER = "https://tools.test/pdf-accessibility/runner"
 JOB_ID = "0b3c9a52-6f0e-4b8e-9d1c-1f6a3c2b7e10"
@@ -237,7 +238,81 @@ async def test_preflight_refusal_fails_the_task_with_its_reason(tmp_path, monkey
     assert worker.completed is None
 
 
-async def _saved_state(settings) -> bytes:
+@pytest.mark.parametrize("status", ["complete", "manual_remediation"])
+async def test_process_uploads_accessible_html_from_final_pdf(tmp_path, monkeypatch, quiet_previews, status):
+    settings = _settings(tmp_path)
+    worker = FakeWorker()
+    client = worker.client()
+    final_pdf = b""
+
+    async def fake_pipeline(job_id, session_maker, settings_arg, sink):
+        nonlocal final_pdf
+        await _finish_as_reviewed(session_maker, settings_arg, job_id)
+        async with session_maker() as db:
+            job = await db.get(Job, job_id)
+            tagged_text_pages(
+                settings_arg.output_dir / job_id / "accessible_syllabus.pdf",
+                actual_text="Final reviewed text & fixes", running_head=True,
+            )
+            final_pdf = (settings_arg.output_dir / job_id / "accessible_syllabus.pdf").read_bytes()
+            job.status = status
+            await db.commit()
+
+    monkeypatch.setattr(runner_tasks, "run_pipeline", fake_pipeline)
+    await runner_tasks.run_task(client, _task(), settings)
+    await client.close()
+
+    assert worker.failed is None
+    assert worker.completed["job"]["status"] == status
+    assert "document.html" in worker.completed["files"]
+    content_type, document = worker.uploads["document.html"]
+    assert content_type == "text/html; charset=utf-8"
+    assert b"Final reviewed text &amp; fixes" in document
+    assert b"running head" not in document
+    assert document.startswith(b"<!doctype html>")
+    assert worker.uploads["output.pdf"] == ("application/pdf", final_pdf)
+
+
+@pytest.mark.parametrize("status", ["complete", "manual_remediation"])
+async def test_html_export_failure_still_completes_pdf_with_safe_diagnostic(
+    tmp_path, monkeypatch, quiet_previews, caplog, status,
+):
+    settings = _settings(tmp_path)
+    worker = FakeWorker()
+    client = worker.client()
+
+    async def fake_pipeline(job_id, session_maker, settings_arg, sink):
+        await _finish_as_reviewed(session_maker, settings_arg, job_id)
+        async with session_maker() as db:
+            job = await db.get(Job, job_id)
+            job.status = status
+            await db.commit()
+
+    def failed_export(path):
+        assert path.name == "accessible_syllabus.pdf"
+        raise RuntimeError("DOCUMENT_SECRET /private/sensitive.pdf")
+
+    monkeypatch.setattr(runner_tasks, "run_pipeline", fake_pipeline)
+    monkeypatch.setattr(runner_views, "export_html", failed_export)
+    await runner_tasks.run_task(client, _task(), settings)
+    await client.close()
+
+    assert worker.failed is None
+    assert worker.completed["job"]["status"] == status
+    assert worker.uploads["output.pdf"] == ("application/pdf", PDF)
+    assert "document.html" not in worker.uploads
+    assert "document.html" not in worker.completed["files"]
+    records = [record for record in caplog.records if record.name == runner_views.__name__]
+    assert len(records) == 1
+    assert json.loads(records[0].getMessage()) == {
+        "event": "html_export_failed", "job_id": JOB_ID, "error_type": "RuntimeError",
+    }
+    assert records[0].exc_info is None
+    assert "DOCUMENT_SECRET" not in caplog.text
+    assert "/private/sensitive.pdf" not in caplog.text
+
+
+async def _saved_state(settings, *, actual_text=None) -> bytes:
     engine, session_maker = await open_job_database(settings, JOB_ID)
     pdf = input_path(settings, JOB_ID)
     pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -254,12 +329,49 @@ async def _saved_state(settings) -> bytes:
         )
         await db.commit()
     await _finish_as_reviewed(session_maker, settings, JOB_ID)
+    if actual_text is not None:
+        tagged_text_pages(
+            settings.output_dir / JOB_ID / "accessible_syllabus.pdf", actual_text=actual_text,
+        )
     await engine.dispose()
     archive = pack_state(settings, JOB_ID, settings.upload_dir.parent / "saved.tar.gz")
     body = archive.read_bytes()
     archive.unlink()
     remove_job_files(settings, JOB_ID)
     return body
+
+
+@pytest.mark.parametrize("kind", ["review", "sync"])
+async def test_later_tasks_regenerate_accessible_html(tmp_path, monkeypatch, quiet_previews, kind):
+    settings = _settings(tmp_path)
+    worker = FakeWorker(state=await _saved_state(settings, actual_text="Previously reviewed content"))
+    client = worker.client()
+
+    async def fake_rerun(job_id, db, settings_arg, sink):
+        tagged_text_pages(
+            settings_arg.output_dir / job_id / "accessible_syllabus.pdf",
+            actual_text="New reviewer fix & reading",
+        )
+        job = await db.get(Job, job_id)
+        job.status = "manual_remediation"
+        job.output_path = str(settings_arg.output_dir / job_id / "accessible_syllabus.pdf")
+        await db.commit()
+
+    monkeypatch.setattr(runner_tasks, "run_tagging_and_validation", fake_rerun)
+    task = _task(kind, action={"type": "edit", "change_id": 1, "text": "Revised description"})
+    await runner_tasks.run_task(client, task, settings)
+    await client.close()
+
+    assert worker.failed is None
+    assert "document.html" in worker.completed["files"]
+    document = worker.uploads["document.html"][1]
+    if kind == "review":
+        assert b"New reviewer fix &amp; reading" in document
+        assert b"Previously reviewed content" not in document
+    else:
+        assert b"Previously reviewed content" in document
+    with tarfile.open(fileobj=io.BytesIO(worker.uploads["state.tar.gz"][1]), mode="r:gz") as archive:
+        assert not any(member.name.endswith(".html") for member in archive.getmembers())
 
 
 @pytest.mark.asyncio

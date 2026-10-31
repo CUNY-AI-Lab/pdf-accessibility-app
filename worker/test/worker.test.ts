@@ -233,6 +233,80 @@ describe("the runner", () => {
   });
 });
 
+describe("accessible HTML downloads", () => {
+  const documentHtml = "<!doctype html><html lang=\"en\"><body><h1>Reviewed document</h1></body></html>";
+
+  it.each(["complete", "manual_remediation"])("serves the owner's HTML with attachment and content-security headers for %s", async (status) => {
+    const id = await createdJobId(await upload());
+    const task = await claim();
+    if (task === null) throw new Error("no task");
+    expect((await finishProcess(task, status, documentHtml)).status).toBe(204);
+    expect((await job(id)).has_html).toBe(true);
+    // Headers must be enforced by the serving route, even if stored metadata
+    // came from a runner that sent a different content type.
+    await env.FILES.put(`jobs/${id}/r1/document.html`, documentHtml, {
+      httpMetadata: { contentType: "application/octet-stream" },
+    });
+    const response = await api(`/jobs/${id}/download/document.html`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(response.headers.get("content-disposition")).toContain('attachment; filename="accessible_syllabus.html"');
+    expect(response.headers.get("content-security-policy")).toBe("default-src 'none'; img-src data:; style-src 'unsafe-inline'");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+    expect(await response.text()).toBe(documentHtml);
+    const asBob = await signedIn(bob);
+    expect((await api(`/jobs/${id}/download/document.html`, { as: asBob })).status).toBe(404);
+    expect((await api(`/jobs/${id}/download`, { as: asBob })).status).toBe(404);
+  });
+
+  it("accepts older runner completions without HTML and hides unlisted files", async () => {
+    const id = await createdJobId(await upload());
+    expect((await job(id)).has_html).toBe(false);
+    const task = await claim();
+    if (task === null) throw new Error("no task");
+    expect((await putFile(task, "document.html", documentHtml, "text/html")).status).toBe(204);
+    // The optional file is deliberately absent from the completed manifest.
+    expect((await finishProcess(task, "complete")).status).toBe(204);
+    expect((await job(id)).has_html).toBe(false);
+    expect((await api(`/jobs/${id}/download/document.html`)).status).toBe(404);
+    expect((await api(`/jobs/${id}/download`)).status).toBe(200);
+  });
+
+  it("returns 404 when a listed HTML object is missing", async () => {
+    const id = await createdJobId(await upload());
+    const task = await claim();
+    if (task === null) throw new Error("no task");
+    expect((await finishProcess(task, "complete", documentHtml)).status).toBe(204);
+    await env.FILES.delete(`jobs/${id}/r1/document.html`);
+    expect((await api(`/jobs/${id}/download/document.html`)).status).toBe(404);
+    expect((await api(`/jobs/${id}/download`)).status).toBe(200);
+  });
+
+  it("drops the prior HTML when a reviewed revision has only a PDF", async () => {
+    const id = await createdJobId(await upload());
+    const first = await claim();
+    if (first === null) throw new Error("no task");
+    expect((await finishProcess(first, "manual_remediation", documentHtml)).status).toBe(204);
+    expect((await job(id)).has_html).toBe(true);
+    const edit = await api(`/jobs/${id}/applied-changes/1/edit`, {
+      method: "POST",
+      headers: { origin: ORIGIN, "content-type": "application/json" },
+      body: JSON.stringify({ text: "Reviewed image description" }),
+    });
+    expect(edit.status).toBe(200);
+    expect((await job(id)).has_html).toBe(false);
+    expect((await api(`/jobs/${id}/download/document.html`)).status).toBe(404);
+    const review = await claim();
+    if (review === null) throw new Error("no review task");
+    expect((await finishProcess(review)).status).toBe(204);
+    expect((await job(id)).has_html).toBe(false);
+    expect((await api(`/jobs/${id}/download/document.html`)).status).toBe(404);
+    expect((await api(`/jobs/${id}/download`)).status).toBe(200);
+    expect(await env.FILES.get(`jobs/${id}/r1/document.html`)).toBeNull();
+  });
+});
+
 describe("leases and retention", () => {
   it("retries a job whose runner went quiet once, then fails it", async () => {
     const id = await createdJobId(await upload());
