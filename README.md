@@ -218,7 +218,8 @@ bun run lint
 bun run build
 ```
 
-From the repository root, run the credential-free backend/frontend check:
+From the repository root, run the credential-free source gate (backend Ruff,
+Pyright and pytest; frontend lint/build; Worker checks):
 
 ```bash
 ./scripts/check.sh

@@ -25,6 +25,7 @@ from app.pipeline.fonts.resources import (
     _obj_key,
     _resolve_dictionary,
 )
+from app.services.pdf_objects import pdf_named_resource
 
 
 def _repair_pdf_tounicode_sync(
@@ -99,7 +100,7 @@ def _repair_pdf_tounicode_sync(
             op = str(instr.operator)
             operands = list(instr.operands) if hasattr(instr, "operands") else []
             if op == "Tf" and operands and isinstance(fonts, pikepdf.Dictionary):
-                font_ref = fonts.get(operands[0])
+                font_ref = pdf_named_resource(fonts, operands[0])
                 current_font = _resolve_dictionary(font_ref)
                 continue
 
@@ -120,7 +121,7 @@ def _repair_pdf_tounicode_sync(
                 continue
 
             if op == "Do" and operands and isinstance(xobjects, pikepdf.Dictionary):
-                xobject = _resolve_dictionary(xobjects.get(operands[0]))
+                xobject = _resolve_dictionary(pdf_named_resource(xobjects, operands[0]))
                 if not _is_form_xobject(xobject):
                     continue
                 child_resources = _resolve_dictionary(xobject.get("/Resources")) or resources
@@ -226,7 +227,7 @@ def _repair_pdf_tounicode_sync(
             current_instruction = instr
 
             if op == "Tf" and operands and isinstance(fonts, pikepdf.Dictionary):
-                current_font = _resolve_dictionary(fonts.get(operands[0]))
+                current_font = _resolve_dictionary(pdf_named_resource(fonts, operands[0]))
             elif op in ("Tj", "TJ", "'", '"') and isinstance(current_font, pikepdf.Dictionary):
                 font_key = _obj_key(current_font)
                 if font_key in zero_byte_candidate_fonts:
@@ -241,7 +242,7 @@ def _repair_pdf_tounicode_sync(
                         sanitized_font_keys.add(font_key)
                         changed = True
             elif op == "Do" and operands and isinstance(xobjects, pikepdf.Dictionary):
-                xobject = _resolve_dictionary(xobjects.get(operands[0]))
+                xobject = _resolve_dictionary(pdf_named_resource(xobjects, operands[0]))
                 if _is_form_xobject(xobject):
                     child_resources = _resolve_dictionary(xobject.get("/Resources")) or resources
                     _sanitize_simple_font_zero_bytes(pdf, xobject, child_resources)

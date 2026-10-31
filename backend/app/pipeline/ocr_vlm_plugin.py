@@ -109,7 +109,8 @@ def _complete(base_url: str, headers: dict[str, str], body: dict, deadline: floa
     global _credential_refused
     if _credential_refused:
         raise GatewayOcrError("the Gateway refused this job's credential")
-    for delay in (*RETRY_DELAYS_SECONDS, None):
+    retry_delays = iter(RETRY_DELAYS_SECONDS)
+    while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise GatewayOcrError("page time limit reached")
@@ -121,15 +122,15 @@ def _complete(base_url: str, headers: dict[str, str], body: dict, deadline: floa
         )
         if _refused(response):
             _credential_refused = True
-            break
+            raise GatewayOcrError(f"Gateway returned {response.status_code}")
+        if response.status_code == 200:
+            answer = response.json()
+            logger.info("Gateway OCR usage: %s", answer.get("usage"))
+            return answer["choices"][0]
+        delay = next(retry_delays, None)
         if response.status_code not in NO_ANSWER_STATUSES or delay is None:
-            break
+            raise GatewayOcrError(f"Gateway returned {response.status_code}")
         time.sleep(min(delay, max(deadline - time.monotonic(), 0)))
-    if response.status_code != 200:
-        raise GatewayOcrError(f"Gateway returned {response.status_code}")
-    answer = response.json()
-    logger.info("Gateway OCR usage: %s", answer.get("usage"))
-    return answer["choices"][0]
 
 
 def _request_lines(image: Image.Image) -> list[dict]:

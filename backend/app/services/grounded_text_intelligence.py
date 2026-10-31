@@ -73,8 +73,8 @@ def apply_grounded_text_adjudication(
             for index, task in enumerate(review_tasks)
             if str(task.get("task_type") or "") == "content_fidelity"
             and str(task.get("source") or "fidelity") == "fidelity"
-            and isinstance(task.get("metadata"), dict)
-            and bool(task["metadata"].get("grounded_text_candidate"))
+            and isinstance(metadata := task.get("metadata"), dict)
+            and bool(metadata.get("grounded_text_candidate"))
         ),
         None,
     )
@@ -172,8 +172,8 @@ async def adjudicate_grounded_text_candidates(
             for task in review_tasks
             if str(task.get("task_type") or "") == "content_fidelity"
             and str(task.get("source") or "fidelity") == "fidelity"
-            and isinstance(task.get("metadata"), dict)
-            and bool(task["metadata"].get("grounded_text_candidate"))
+            and isinstance(metadata := task.get("metadata"), dict)
+            and bool(metadata.get("grounded_text_candidate"))
         ),
         None,
     )

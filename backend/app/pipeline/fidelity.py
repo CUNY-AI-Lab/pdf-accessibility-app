@@ -29,6 +29,7 @@ from app.services.page_intelligence import (
     collect_grounded_text_candidates,
 )
 from app.services.pdf_context import parse_verapdf_context_path
+from app.services.pdf_objects import pdf_integer, pdf_text
 from app.services.pdf_operator_context import extract_operator_text_context
 from app.services.pdf_preview import render_page_png_bytes
 from app.services.semantic_pretag_policy import (
@@ -385,7 +386,7 @@ def _output_tables_without_headers(pdf_path: Path) -> list[dict[str, Any]]:
                         owners = attributes if isinstance(attributes, pikepdf.Array) else [attributes]
                         width += max(
                             (
-                                int(owner.get("/ColSpan", 1))
+                                pdf_integer(owner.get("/ColSpan"))
                                 for owner in owners
                                 if isinstance(owner, pikepdf.Dictionary) and owner.get("/O") == "/Table"
                             ),
@@ -944,15 +945,15 @@ def _check_link_text_quality(output_pdf: Path) -> list[dict[str, Any]]:
                 subtype = annotation.get("/Subtype")
                 if subtype != pikepdf.Name("/Link"):
                     continue
-                contents = str(annotation.get("/Contents", "")).strip()
+                contents = pdf_text(annotation.get("/Contents")).strip()
                 uri = ""
                 action = annotation.get("/A")
                 if action is not None and hasattr(action, "get"):
-                    uri = str(action.get("/URI", "")).strip()
+                    uri = pdf_text(action.get("/URI")).strip()
                 has_dest = annotation.get("/Dest") is not None or (
                     action is not None
                     and hasattr(action, "get")
-                    and str(action.get("/S", "")) == "/GoTo"
+                    and pdf_text(action.get("/S")) == "/GoTo"
                 )
                 if _is_generated_link_contents(contents, uri=uri, has_dest=has_dest):
                     continue
@@ -1027,7 +1028,7 @@ def _check_internal_link_destinations(output_pdf: Path) -> list[dict[str, Any]]:
                 # Check /A GoTo action
                 action = annotation.get("/A")
                 if action is not None and hasattr(action, "get"):
-                    action_type = str(action.get("/S", ""))
+                    action_type = pdf_text(action.get("/S"))
                     if action_type == "/GoTo":
                         goto_dest = action.get("/D")
                         dest_name = _canonical_named_destination(goto_dest)

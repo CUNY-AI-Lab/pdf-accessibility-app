@@ -1,10 +1,12 @@
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypedDict
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -112,7 +114,24 @@ def _applied_change_to_response(change: AppliedChange) -> AppliedChangeResponse:
     return AppliedChangeResponse(**change_to_response_payload(change))
 
 
-def _snapshot_rerun_job_state(job: Job) -> dict[str, object | None]:
+class RerunJobSnapshot(TypedDict):
+    status: str
+    error: str | None
+    output_path: str | None
+    validation_json: str | None
+    fidelity_json: str | None
+    updated_at: datetime
+
+
+class RerunStepSnapshot(TypedDict):
+    status: str
+    started_at: datetime | None
+    completed_at: datetime | None
+    result_json: str | None
+    error: str | None
+
+
+def _snapshot_rerun_job_state(job: Job) -> RerunJobSnapshot:
     return {
         "status": job.status,
         "error": job.error,
@@ -123,7 +142,7 @@ def _snapshot_rerun_job_state(job: Job) -> dict[str, object | None]:
     }
 
 
-def _snapshot_rerun_step_state(steps: list[JobStep]) -> dict[str, dict[str, object | None]]:
+def _snapshot_rerun_step_state(steps: list[JobStep]) -> dict[str, RerunStepSnapshot]:
     return {
         step.step_name: {
             "status": step.status,
@@ -139,7 +158,7 @@ def _snapshot_rerun_step_state(steps: list[JobStep]) -> dict[str, dict[str, obje
 def _restore_rerun_job_state(
     job: Job,
     *,
-    snapshot: dict[str, object | None],
+    snapshot: RerunJobSnapshot,
 ) -> None:
     job.status = str(snapshot["status"] or "manual_remediation")
     job.error = str(snapshot["error"]) if snapshot["error"] is not None else None
@@ -156,7 +175,7 @@ def _restore_rerun_job_state(
 def _restore_rerun_step_state(
     steps: list[JobStep],
     *,
-    snapshot: dict[str, dict[str, object | None]],
+    snapshot: dict[str, RerunStepSnapshot],
 ) -> None:
     for step in steps:
         state = snapshot.get(step.step_name)
@@ -209,7 +228,7 @@ async def _restart_tagging_with_current_state(
             updated_at=datetime.now(UTC),
         )
     )
-    if claim_result.rowcount != 1:
+    if not isinstance(claim_result, CursorResult) or claim_result.rowcount != 1:
         raise HTTPException(status_code=409, detail=_REVIEW_ACTION_IN_PROGRESS_DETAIL)
 
     job.status = "processing"

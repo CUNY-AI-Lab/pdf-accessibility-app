@@ -22,6 +22,7 @@ from app.pipeline.fonts.resources import (
     _resolve_dictionary,
 )
 from app.pipeline.fonts.rules import FONT_UNICODE_RULE_MARKERS
+from app.services.pdf_objects import pdf_named_resource
 
 logger = logging.getLogger("app.pipeline.orchestrator")
 
@@ -109,6 +110,7 @@ def _unicode_repair_gate_from_diagnostics(
     violations=None,
 ) -> dict[str, object]:
     """Decide whether automatic ToUnicode repair is deterministic enough to run."""
+    blocked_examples: list[str] = []
     profile: dict[str, object] = {
         "allow_automatic": False,
         "safe_type0_candidates": 0,
@@ -116,7 +118,7 @@ def _unicode_repair_gate_from_diagnostics(
         "blocked_simple_fonts": 0,
         "safe_candidate_count": 0,
         "blocked_candidate_count": 0,
-        "blocked_examples": [],
+        "blocked_examples": blocked_examples,
         "reason": "",
     }
     has_invalid_unicode_rules = any(
@@ -172,11 +174,10 @@ def _unicode_repair_gate_from_diagnostics(
             continue
 
         profile["blocked_simple_fonts"] = int(profile["blocked_simple_fonts"]) + 1
-        examples = profile["blocked_examples"]
-        if isinstance(examples, list) and len(examples) < 5:
+        if len(blocked_examples) < 5:
             name = str(item.get("base_font") or "(unnamed)")
-            if name not in examples:
-                examples.append(name)
+            if name not in blocked_examples:
+                blocked_examples.append(name)
 
     safe_candidates = int(profile["safe_type0_candidates"]) + int(profile["safe_simple_candidates"])
     blocked_candidates = int(profile["blocked_simple_fonts"])
@@ -186,8 +187,7 @@ def _unicode_repair_gate_from_diagnostics(
     if safe_candidates > 0:
         profile["reason"] = "deterministic font candidates available"
     elif blocked_candidates > 0:
-        examples = profile.get("blocked_examples") or []
-        suffix = f" ({', '.join(examples)})" if examples else ""
+        suffix = f" ({', '.join(blocked_examples)})" if blocked_examples else ""
         profile["reason"] = (
             "unicode issues appear tied to simple fonts without explicit encoding" + suffix
         )
@@ -264,7 +264,7 @@ def _inspect_font_diagnostics(
             xobjects = _resolve_dictionary(resources.get("/XObject"))
             target_font_in_scope = False
             if isinstance(fonts, pikepdf.Dictionary):
-                for font_obj in fonts.values():
+                for _, font_obj in fonts.items():
                     font_dict = _resolve_dictionary(font_obj)
                     font_key = (
                         _obj_key(font_dict) if isinstance(font_dict, pikepdf.Dictionary) else None
@@ -286,7 +286,7 @@ def _inspect_font_diagnostics(
                 op = str(instr.operator)
                 operands = list(instr.operands) if hasattr(instr, "operands") else []
                 if op == "Tf" and operands and isinstance(fonts, pikepdf.Dictionary):
-                    current_font = _resolve_dictionary(fonts.get(operands[0]))
+                    current_font = _resolve_dictionary(pdf_named_resource(fonts, operands[0]))
                     continue
 
                 if op in ("Tj", "TJ", "'", '"') and isinstance(current_font, pikepdf.Dictionary):
@@ -306,7 +306,7 @@ def _inspect_font_diagnostics(
                     continue
 
                 if op == "Do" and operands and isinstance(xobjects, pikepdf.Dictionary):
-                    xobject = _resolve_dictionary(xobjects.get(operands[0]))
+                    xobject = _resolve_dictionary(pdf_named_resource(xobjects, operands[0]))
                     if not _is_form_xobject(xobject):
                         continue
                     child_resources = _resolve_dictionary(xobject.get("/Resources")) or resources

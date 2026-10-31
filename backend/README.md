@@ -129,6 +129,21 @@ same-origin requests when the proxy forwards the public `Host` and
 
 ## Tests
 
+The repository source gate runs Ruff, Pyright, and the backend tests before
+the frontend and Worker checks:
+
+```bash
+./scripts/check.sh
+```
+
+Run the focused backend type check from `backend/` after syncing the dev extra:
+
+```bash
+PYRIGHT_PYTHON_GLOBAL_NODE=1 .venv/bin/pyright
+```
+
+Run the backend tests alone:
+
 ```bash
 cd backend
 PYTHONPATH=. uv run pytest tests -q

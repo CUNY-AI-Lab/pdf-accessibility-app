@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypeGuard
 
 import pikepdf
 from docling_core.types.doc.page import TextCellUnit
@@ -42,6 +42,7 @@ from app.pipeline.page_glyphs import MeasuredGlyph, MeasuredTextOp, PdfGlyphRead
 from app.pipeline.pdf_repair import add_missing_icc_components
 from app.pipeline.pdfium_text import PdfiumText
 from app.pipeline.reading_order import choose_order
+from app.services.pdf_objects import pdf_dictionary, pdf_text
 
 logger = logging.getLogger(__name__)
 
@@ -1245,13 +1246,14 @@ def _infer_link_contents(
 ) -> str:
     """Create a useful /Contents description for link annotations."""
     try:
-        existing = str(annotation.get("/Contents", "")).strip()
+        existing = pdf_text(annotation.get("/Contents")).strip()
     except Exception:
         existing = ""
 
+    action = None
     try:
-        action = annotation.get("/A")
-        uri = str(action.get("/URI", "")).strip() if action is not None and hasattr(action, "get") else ""
+        action = pdf_dictionary(annotation.get("/A"))
+        uri = pdf_text(action.get("/URI")).strip() if action is not None else ""
     except Exception:
         uri = ""
     try:
@@ -2693,7 +2695,7 @@ class StructTreeBuilder:
         owner: pikepdf.Object,
         page_index: int,
         mcid: int,
-        elem: pikepdf.Object,
+        elem: pikepdf.Object | None,
     ) -> None:
         """Register an MCID-to-StructElem mapping for one page or form stream owner."""
         owner_key = self._content_owner_key(owner)
@@ -3314,7 +3316,7 @@ class StructTreeBuilder:
         if "/ActualText" in parent:
             del parent["/ActualText"]
         annotation["/P"] = page_ref
-        if not str(annotation.get("/Contents", "")).strip():
+        if not pdf_text(annotation.get("/Contents")).strip():
             annotation["/Contents"] = pikepdf.String(_infer_link_contents(annotation))
 
         link_elem = self.pdf.make_indirect(pikepdf.Dictionary({
@@ -3433,7 +3435,7 @@ class StructTreeBuilder:
             mcid_entries = entry["mcids"]
             elem_array = pikepdf.Array([])
             for _mcid, elem in sorted(mcid_entries, key=lambda x: x[0]):
-                elem_array.append(elem if elem is not None else pikepdf.Null())
+                elem_array.append(elem)
 
             parent_tree_nums.append(struct_parents_idx)
             parent_tree_nums.append(self.pdf.make_indirect(elem_array))
@@ -4177,8 +4179,8 @@ def _figure_of(
     return best
 
 
-_ARTIFACT_MARK = "artifact"
-_PASSTHROUGH_MARK = "passthrough"
+_ARTIFACT_MARK: Literal["artifact"] = "artifact"
+_PASSTHROUGH_MARK: Literal["passthrough"] = "passthrough"
 
 
 @dataclass
@@ -4186,7 +4188,7 @@ class PreparedContent:
     instructions: list
     regions: list[ContentRegion]
     text_runs: list[TextShowRun]
-    marks: dict[int, ContentTarget | int | str]
+    marks: dict[int, ContentTarget | int | Literal["artifact", "passthrough"]]
     passthrough: list[ContentRegion]
 
 
@@ -4233,7 +4235,7 @@ def _prepare_content_stream(
     if measured is not None:
         _apply_measured_geometry(regions, text_runs, measured)
 
-    mark_by_idx: dict[int, ContentTarget | int | str] = {}
+    mark_by_idx: dict[int, ContentTarget | int | Literal["artifact", "passthrough"]] = {}
     for run in text_runs:
         op = measured.get(run.instruction_idx) if measured is not None else None
         owner = (
@@ -4415,7 +4417,7 @@ def _rewrite_content_stream(
     tagged: set[int] = set(decorative_covered)
 
     new_instructions: list = []
-    active: ContentTarget | int | str | None = None
+    active: ContentTarget | int | Literal["artifact"] | None = None
     pending_path: list = []
 
     def close_active() -> None:
@@ -4424,7 +4426,7 @@ def _rewrite_content_stream(
             new_instructions.append(_make_emc())
             active = None
 
-    def open_mark(mark: ContentTarget | int | str) -> None:
+    def open_mark(mark: ContentTarget | int | Literal["artifact"]) -> None:
         """Open the marked content for a mark, or an artifact if no
         structure element can hold it."""
         nonlocal active
@@ -4683,8 +4685,9 @@ def _should_artifact_nonsemantic_page_content(
     has_image_xobject = False
     xobjects = {}
     try:
-        resources = page.get("/Resources", {})
-        xobjects = resources.get("/XObject", {}) or {}
+        resources = pdf_dictionary(page.get("/Resources"))
+        if resources is not None:
+            xobjects = pdf_dictionary(resources.get("/XObject")) or {}
     except Exception:
         xobjects = {}
 
@@ -4835,7 +4838,7 @@ def _normalize_optional_content_configs(pdf: pikepdf.Pdf) -> int:
             return
 
         try:
-            name = str(config.get("/Name", "")).strip()
+            name = pdf_text(config.get("/Name")).strip()
         except Exception:
             name = ""
         if not name:
@@ -4989,7 +4992,7 @@ def _normalize_media_clip_data_dicts(pdf: pikepdf.Pdf) -> int:
             text,
         )
 
-    def _is_mapping(obj) -> bool:
+    def _is_mapping(obj: object) -> TypeGuard[pikepdf.Dictionary | pikepdf.Stream]:
         return isinstance(obj, (pikepdf.Dictionary, pikepdf.Stream))
 
     def _derive_media_clip_label(media_clip) -> str:
@@ -5249,7 +5252,7 @@ def _tag_link_annotations(
             continue
         has_link_annotation = True
         _normalize_annotation_rect(annotation)
-        current_contents = str(annotation.get("/Contents", "")).strip()
+        current_contents = pdf_text(annotation.get("/Contents")).strip()
         inferred_contents = _infer_link_contents(
             annotation,
             page_elements,
@@ -5383,7 +5386,7 @@ def _tag_widget_annotations(
             continue
 
         _normalize_annotation_rect(annotation)
-        if not str(annotation.get("/TU", "")).strip():
+        if not pdf_text(annotation.get("/TU")).strip():
             inferred_name = _infer_widget_accessible_name(annotation, docling_page_widgets)
             if inferred_name:
                 annotation["/TU"] = pikepdf.String(inferred_name)
@@ -5497,7 +5500,7 @@ def _infer_annotation_contents(
     # Text note — extract user comment if present
     if subtype_str in ("/Text", "/Note"):
         try:
-            contents = str(annotation.get("/Contents", "")).strip()
+            contents = pdf_text(annotation.get("/Contents")).strip()
             if contents:
                 return contents
         except Exception:
@@ -5507,7 +5510,7 @@ def _infer_annotation_contents(
     # Free text annotation
     if subtype_str == "/FreeText":
         try:
-            contents = str(annotation.get("/Contents", "")).strip()
+            contents = pdf_text(annotation.get("/Contents")).strip()
             if contents:
                 return contents
         except Exception:
@@ -5529,7 +5532,7 @@ def _infer_annotation_contents(
     # Stamp
     if subtype_str == "/Stamp":
         try:
-            name = str(annotation.get("/Name", "")).strip().lstrip("/")
+            name = pdf_text(annotation.get("/Name")).strip().lstrip("/")
             if name:
                 return f"Stamp: {name}"
         except Exception:
@@ -5565,7 +5568,7 @@ def _ensure_annotation_baseline(page: pikepdf.Page):
             subtype = annotation.get("/Subtype")
             if subtype == pikepdf.Name("/Widget"):
                 continue
-            if str(annotation.get("/Contents", "")).strip():
+            if pdf_text(annotation.get("/Contents")).strip():
                 continue
             if subtype == pikepdf.Name("/Link"):
                 annotation["/Contents"] = pikepdf.String(_infer_link_contents(annotation))

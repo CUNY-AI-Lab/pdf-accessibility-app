@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import pikepdf
@@ -42,17 +42,11 @@ def add_missing_icc_components(pdf: pikepdf.Pdf) -> int:
 def pdfminer_readable(pdf_path: Path) -> Iterator[Path]:
     """The PDF itself, or a repaired copy when it has objects pdfminer
     cannot read."""
-    with pikepdf.open(pdf_path) as pdf:
-        if not add_missing_icc_components(pdf):
-            repaired = None
-        else:
-            tmp = tempfile.TemporaryDirectory()
-            repaired = Path(tmp.name) / "repaired.pdf"
-            pdf.save(repaired)
-    if repaired is None:
-        yield pdf_path
-        return
-    try:
+    with ExitStack() as cleanup:
+        with pikepdf.open(pdf_path) as pdf:
+            repaired = pdf_path
+            if add_missing_icc_components(pdf):
+                tmp = cleanup.enter_context(tempfile.TemporaryDirectory())
+                repaired = Path(tmp) / "repaired.pdf"
+                pdf.save(repaired)
         yield repaired
-    finally:
-        tmp.cleanup()
