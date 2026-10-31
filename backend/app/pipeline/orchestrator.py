@@ -628,6 +628,7 @@ def _build_validation_payload(
             "links_tagged": tagging_result.links_tagged,
             "bookmarks_added": tagging_result.bookmarks_added,
             "title_set": tagging_result.title_set,
+            "reading_order_diagnostics": getattr(tagging_result, "reading_order_diagnostics", []),
             "lang_set": tagging_result.lang_set,
         },
         "semantic_coverage": _semantic_coverage_summary(
@@ -2839,6 +2840,7 @@ def _tagging_step_result(tagging_result, pretag_details):
         "links_tagged": tagging_result.links_tagged,
         "bookmarks_added": tagging_result.bookmarks_added,
         "title_set": tagging_result.title_set,
+        "reading_order_diagnostics": getattr(tagging_result, "reading_order_diagnostics", []),
         "grounded_text_auto_applied": bool(pretag_grounded_text.get("applied")),
         "grounded_text_auto_applied_count": int(
             pretag_grounded_text.get("applied_count", 0) or 0

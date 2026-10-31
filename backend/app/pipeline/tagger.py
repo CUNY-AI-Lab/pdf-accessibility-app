@@ -41,6 +41,7 @@ from app.pipeline.page_frame import PageFrame
 from app.pipeline.page_glyphs import MeasuredGlyph, MeasuredTextOp, PdfGlyphReader, union_bbox
 from app.pipeline.pdf_repair import add_missing_icc_components
 from app.pipeline.pdfium_text import PdfiumText
+from app.pipeline.reading_order import choose_order
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,8 @@ WEAK_FIGURE_ALT_RE = re.compile(
     r"^(?:element\s+\d+|figure\s*\d*|image\s*\d*|graphic\s*\d*|picture\s*\d*|illustration\s*\d*|decorative)$",
     re.IGNORECASE,
 )
+
+
 @dataclass
 class TaggingResult:
     output_path: Path
@@ -121,12 +124,15 @@ class TaggingResult:
     decorative_figures_artifacted: int = 0
     bookmarks_added: int = 0
     title_set: bool = False
+    reading_order_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    # Zero-based page index and unclaimed word counts (including words
+    # deliberately left hidden); exact Artifact owners are already claimed.
+    unowned_words_by_page: list[dict[str, int]] = field(default_factory=list)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared pikepdf helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
 
 def _obj_key(obj) -> tuple[int, int] | None:
     """Return the (objgen) identity tuple for a pikepdf indirect object.
@@ -446,21 +452,25 @@ def _element_boxes(item: dict[str, Any]) -> list[dict[str, float]]:
 @dataclass(frozen=True)
 class ContentTarget:
     """A box content can belong to: one of a text or artifact element's
-    boxes, or a table cell. Targets of the same element (or cell) are the
-    same owner."""
+    boxes, a table cell, or a link nested inside either. Targets of the
+    same element, cell, and link are the same owner."""
 
     elem_idx: int
     cell_key: tuple[int, int] | None = None
     box: dict[str, float] = field(default_factory=dict, compare=False, hash=False)
     cell: dict | None = field(default=None, compare=False, hash=False)
+    list_label: bool = False
+    link_key: tuple[int, int] | None = None
+    annotation: pikepdf.Object | None = field(default=None, compare=False, hash=False)
 
 
 def _content_targets(elements: list[dict]) -> list[ContentTarget]:
     """Every box text can belong to: each cell of a table with cells, and
     each box of a text or artifact element (a table without cells is read
-    as text)."""
+    as text), with link boxes nested inside their source owners."""
     targets: list[ContentTarget] = []
-    for idx, elem in enumerate(elements):
+    # Preserve ownership tie breaks when the page vote reorders elements.
+    for idx, elem in sorted(enumerate(elements), key=lambda pair: pair[1].get("_docling_order", pair[0])):
         elem_type = elem.get("type")
         cells = [cell for cell in elem.get("cells") or [] if isinstance(cell, dict)]
         if elem_type == "table" and cells:
@@ -471,8 +481,16 @@ def _content_targets(elements: list[dict]) -> list[ContentTarget]:
                         _as_positive_int(cell.get("row", 0), default=0),
                         _as_positive_int(cell.get("col", 0), default=0),
                     )
+                    for annotation, link_box in cell.get("_link_targets", []):
+                        targets.append(ContentTarget(
+                            idx, key, link_box, cell, link_key=annotation.objgen, annotation=annotation,
+                        ))
                     targets.append(ContentTarget(idx, key, box, cell))
         elif elem_type in LINK_TEXT_ELEMENT_TYPES or elem_type in {"artifact", "table"}:
+            for annotation, box in elem.get("_link_targets", []):
+                targets.append(ContentTarget(
+                    idx, box=box, link_key=annotation.objgen, annotation=annotation,
+                ))
             targets.extend(ContentTarget(idx, None, box) for box in _element_boxes(elem))
     return targets
 
@@ -499,13 +517,15 @@ def _owner_of(
     run from the font's descent to its ascent, taller than the ink Docling
     draws its boxes around, so height is judged by the middle. Of several
     (nested boxes, such as line numbers inside a paragraph's box), the
-    smallest. Height and width are the text's own, for text that runs
-    `turn` quarter turns from left to right."""
+    smallest. A link refines that owner's content even when its annotation
+    rectangle has more padding than the owner's box. Height and width are
+    the text's own, for text that runs `turn` quarter turns from left to right."""
     box = _upright(box, turn)
     middle = (box["b"] + box["t"]) / 2
     width = box["r"] - box["l"]
     best: ContentTarget | None = None
     best_area = math.inf
+    links: list[tuple[float, ContentTarget]] = []
     for target in targets:
         target_box = _upright(target.box, turn)
         if not target_box["b"] <= middle <= target_box["t"]:
@@ -517,6 +537,9 @@ def _owner_of(
             share = 1.0 if target_box["l"] <= box["l"] <= target_box["r"] else 0.0
         area = _bbox_area(target_box)
         if share < 0.5:
+            continue
+        if target.link_key is not None:
+            links.append((area, target))
             continue
         if (
             best is not None and target.cell is not None and best.cell is not None
@@ -533,6 +556,13 @@ def _owner_of(
             better = area < best_area
         if better:
             best, best_area = target, area
+    if best is not None:
+        best_link, best_link_area = None, math.inf
+        for area, target in links:
+            if (target.elem_idx, target.cell_key) == (best.elem_idx, best.cell_key) and area < best_link_area:
+                best_link, best_link_area = target, area
+        if best_link is not None:
+            return best_link
     return best
 
 
@@ -558,7 +588,15 @@ def _word_break(before: dict[str, float], after: dict[str, float]) -> bool:
 
 
 def _word_owners(
-    measured: dict[int, MeasuredTextOp], targets: list[ContentTarget]
+    measured: dict[int, MeasuredTextOp],
+    targets: list[ContentTarget],
+    *,
+    elements: list[dict] | None = None,
+    frame: PageFrame | None = None,
+    scanned: bool = False,
+    diagnostic: dict[str, int] | None = None,
+    stream_starts: set[int] | None = None,
+    vertical_rules: list[dict] | None = None,
 ) -> dict[tuple, ContentTarget | None]:
     """Each glyph's owner, decided for its whole word (see _owner_of), as
     element text takes whole words: a box that stops short of a word's last
@@ -572,6 +610,8 @@ def _word_owners(
     spaces: list[tuple[MeasuredGlyph, int]] = []
     previous: MeasuredGlyph | None = None
     for idx in sorted(measured):
+        if stream_starts and idx in stream_starts:
+            previous = None
         for glyph in measured[idx].glyphs:
             if not glyph.text.strip():
                 spaces.append((glyph, len(words) - 1))
@@ -594,10 +634,347 @@ def _word_owners(
         word_owner.append(owner)
         for glyph in word:
             owners[_glyph_key(glyph)] = owner
+    before = sum(owner is None for owner in word_owner)
+    if elements is not None and frame is not None:
+        _recover_unowned_words(words, word_owner, targets, elements, frame, scanned, vertical_rules or [])
+        for word, owner in zip(words, word_owner, strict=True):
+            for glyph in word:
+                owners[_glyph_key(glyph)] = owner
+    if diagnostic is not None:
+        diagnostic["before"] = before
+        diagnostic["after"] = sum(owner is None for owner in word_owner)
     for glyph, word_index in spaces:
         if word_owner:
             owners[_glyph_key(glyph)] = word_owner[max(word_index, 0)]
     return owners
+
+
+# Only unclaimed text is subject to these guards. Existing ownership wins.
+UNOWNED_MARGIN_BAND = 0.08
+SCAN_PICTURE_MIN_PAGE_SHARE = 0.80
+NEARBY_LINE_HEIGHTS = 1.5
+LIST_LABEL_MAX_LINE_HEIGHTS = 2.0
+
+
+def _axis_gap(a: dict, b: dict, low: str, high: str) -> float:
+    return max(a[low] - b[high], b[low] - a[high], 0.0)
+
+
+def _column_overlap(a: dict, b: dict) -> float:
+    width = min(a["r"] - a["l"], b["r"] - b["l"])
+    return max(0.0, min(a["r"], b["r"]) - max(a["l"], b["l"])) / max(width, 1.0)
+
+
+def _fallback_reading_order(box: dict, elements: list[dict], turn: int) -> float:
+    """Place new text beside its nearest existing reading-order anchor.
+
+    Preserve Docling's order between existing elements, including columns;
+    within the gap after/before an anchor, increasing distance moves the new
+    paragraph farther after/before it.
+    """
+    anchors = []
+    for elem in elements:
+        if elem.get("type") not in LINK_TEXT_ELEMENT_TYPES | {"table", "figure"} or elem.get(
+            "fallback"
+        ):
+            continue
+        for raw in _element_boxes(elem):
+            other = _upright(raw, turn)
+            gap = _axis_gap(box, other, "b", "t")
+            anchors.append(
+                (
+                    _column_overlap(box, other) < 0.5,
+                    gap,
+                    _axis_gap(box, other, "l", "r"),
+                    elem["reading_order"],
+                    other,
+                )
+            )
+    if not anchors:
+        return -box["t"] + box["l"] / 100000
+    _, gap, _, order, other = min(anchors, key=lambda item: item[:4])
+    distance = abs(other["t"] - box["t"])
+    offset = 0.49 * (distance + 1) / (distance + max(box["t"] - box["b"], 1) + 1)
+    return order + (offset if box["t"] < other["t"] else -offset)
+
+
+def _word_lines(
+    indices: list[int], words: list[list[MeasuredGlyph]], boxes: list[dict]
+) -> list[list[int]]:
+    """Physical lines, split at column gutters wider than two line heights."""
+    lines: list[list[int]] = []
+    for index in sorted(
+        indices,
+        key=lambda i: (
+            words[i][0].turn,
+            -_upright(boxes[i], words[i][0].turn)["t"],
+            _upright(boxes[i], words[i][0].turn)["l"],
+        ),
+    ):
+        box = _upright(boxes[index], words[index][0].turn)
+        for line in reversed(lines):
+            last = line[-1]
+            other = _upright(boxes[last], words[last][0].turn)
+            height = max(box["t"] - box["b"], 1.0)
+            if (
+                words[last][0].turn == words[index][0].turn
+                and abs(box["b"] - other["b"]) <= 0.5 * height
+                and _axis_gap(box, other, "l", "r") <= 2 * height
+            ):
+                line.append(index)
+                break
+        else:
+            lines.append([index])
+    return lines
+
+
+def _recover_unowned_words(
+    words: list[list[MeasuredGlyph]],
+    owners: list[ContentTarget | None],
+    targets: list[ContentTarget],
+    elements: list[dict],
+    frame: PageFrame,
+    scanned: bool,
+    vertical_rules: list[dict],
+) -> None:
+    """Recover text missed by layout boxes without disturbing any exact owner.
+
+    Table rows precede hanging list labels, then nearby text in the same
+    column. Remaining body words become paragraphs, grouped by physical line.
+    Figure text is excluded unless an OCR layer is under a scan-sized picture.
+    All comparisons run upright, like the primary ownership rule.
+    """
+    if all(owner is not None for owner in owners):
+        return
+    boxes = [union_bbox(g.bbox for g in word) for word in words]
+    original = list(owners)
+    line_boxes = {}
+    for line in _word_lines(list(range(len(words))), words, boxes):
+        line_box = union_bbox(boxes[i] for i in line)
+        for i in line:
+            line_boxes[i] = line_box
+    page_box = {"l": frame.left, "b": frame.bottom, "r": frame.right, "t": frame.top}
+    page_turn = frame.rotation // 90
+    displayed_page = _upright(page_box, page_turn)
+    pending: list[int] = []
+    for index, (word, raw_box) in enumerate(zip(words, boxes, strict=True)):
+        if owners[index] is not None:
+            continue
+        turn = word[0].turn
+        box = _upright(raw_box, turn)
+        line_box = _upright(line_boxes[index], turn)
+        height = max(box["t"] - box["b"], 1.0)
+        displayed = _upright(raw_box, page_turn)
+        middle = (displayed["b"] + displayed["t"]) / 2
+        band = UNOWNED_MARGIN_BAND * (displayed_page["t"] - displayed_page["b"])
+        if not displayed_page["b"] + band < middle < displayed_page["t"] - band:
+            continue
+        # Explicit pagination regions remain hidden, even when a word only
+        # grazes their box and so missed the primary half-width rule.
+        if any(
+            elem.get("artifact_type", elem.get("type")) in {"page_header", "page_footer"}
+            and any(
+                _bbox_intersection(line_boxes[index], region) > 0 for region in _element_boxes(elem)
+            )
+            for elem in elements
+        ):
+            continue
+
+        tables = [
+            ContentTarget(i, box=region)
+            for i, elem in enumerate(elements)
+            if elem.get("type") == "table"
+            for region in _element_boxes(elem)
+        ]
+        # Unowned single strokes near table geometry are usually OCR's
+        # reading of a rule. Keep exactly owned letters and body words.
+        if "".join(g.text for g in word) in {"|", "l", "I", "!"}:
+            near_table = any(
+                _axis_gap(box, _upright(target.box, turn), "l", "r") <= height / 2
+                and _axis_gap(box, _upright(target.box, turn), "b", "t") <= height / 2
+                for target in tables
+            )
+            near_rule = any(
+                rule["t"] - rule["b"] >= 3 * max(rule["r"] - rule["l"], 1)
+                and _axis_gap(box, rule, "l", "r") <= height / 2
+                and _axis_gap(box, rule, "b", "t") == 0
+                for raw_rule in vertical_rules for rule in [_upright(raw_rule, turn)]
+            )
+            if near_table or near_rule:
+                continue
+        table = _owner_of(raw_box, tables, turn)
+        if table is not None:
+            rows: dict[int, list[ContentTarget]] = {}
+            for target in targets:
+                if target.elem_idx == table.elem_idx and target.cell_key is not None:
+                    rows.setdefault(target.cell_key[0], []).append(target)
+            if rows:
+                row = min(
+                    rows.values(),
+                    key=lambda cells: (
+                        _axis_gap(box, union_bbox(_upright(c.box, turn) for c in cells), "b", "t"),
+                        abs(
+                            sum(
+                                _upright(c.box, turn)["b"] + _upright(c.box, turn)["t"]
+                                for c in cells
+                            )
+                            / (2 * len(cells))
+                            - (box["b"] + box["t"]) / 2
+                        ),
+                    ),
+                )
+                owners[index] = min(
+                    row,
+                    key=lambda cell: (
+                        -max(
+                            0,
+                            min(box["r"], _upright(cell.box, turn)["r"])
+                            - max(box["l"], _upright(cell.box, turn)["l"]),
+                        ),
+                        _axis_gap(box, _upright(cell.box, turn), "l", "r"),
+                        abs(
+                            sum(_upright(cell.box, turn)[s] for s in ("l", "r"))
+                            - box["l"]
+                            - box["r"]
+                        ),
+                    ),
+                )
+                continue
+
+        labels = []
+        nearby = []
+        for target in targets:
+            elem = elements[target.elem_idx]
+            if elem.get("type") not in LINK_TEXT_ELEMENT_TYPES:
+                continue
+            other = _upright(target.box, turn)
+            if (
+                elem.get("type") == "list_item"
+                and 0 <= other["l"] - box["r"] <= LIST_LABEL_MAX_LINE_HEIGHTS * height
+            ):
+                # Use the item's actual owned words, not its multi-line box,
+                # to establish that the number is on the same physical line.
+                if any(
+                    owner is not None
+                    and owner.elem_idx == target.elem_idx
+                    and words[j][0].turn == turn
+                    and abs(
+                        sum(_upright(boxes[j], turn)[s] for s in ("b", "t")) - box["b"] - box["t"]
+                    )
+                    <= height
+                    for j, owner in enumerate(original)
+                ):
+                    labels.append((other["l"] - box["r"], target))
+            # A correction's ActualText replaces all its descendants; new
+            # words must get their own P rather than be hidden by it.
+            if elem.get("type") == "formula" or _element_actual_text(elem):
+                continue
+            gap = _axis_gap(box, other, "b", "t")
+            if _column_overlap(line_box, other) >= 0.5 and gap <= NEARBY_LINE_HEIGHTS * height:
+                nearby.append((gap, abs(other["t"] - box["t"]), target))
+        if labels:
+            owners[index] = dataclasses.replace(
+                min(labels, key=lambda item: item[:1])[1], list_label=True
+            )
+            continue
+
+        pictures = [
+            region
+            for elem in elements
+            if elem.get("type") in {"figure", "picture"}
+            for region in _element_boxes(elem)
+            if _owner_of(raw_box, [ContentTarget(0, box=region)], turn)
+        ]
+        scan_picture = scanned and any(
+            _bbox_intersection(region, page_box)
+            >= SCAN_PICTURE_MIN_PAGE_SHARE * _bbox_area(page_box)
+            for region in pictures
+        )
+        if pictures and not scan_picture:
+            continue
+        if nearby and not scan_picture:
+            owners[index] = min(nearby, key=lambda item: item[:2])[2]
+        else:
+            pending.append(index)
+
+    # A physical line is a safe P boundary when layout supplied no text box.
+    lines = _word_lines(pending, words, boxes)
+    for line in lines:
+        raw_box = union_bbox(boxes[i] for i in line)
+        turn = words[line[0]][0].turn
+        elem = {
+            "type": "paragraph",
+            "page": elements[0].get("page", 0) if elements else 0,
+            "bbox": raw_box,
+            "fallback": True,
+            "reading_order": _fallback_reading_order(_upright(raw_box, turn), elements, turn),
+        }
+        target = ContentTarget(len(elements), box=raw_box)
+        elements.append(elem)
+        for index in line:
+            owners[index] = target
+
+
+def _page_vertical_rules(owner, initial_ctm=IDENTITY, ancestors=frozenset()) -> list[dict]:
+    """Painted straight rules in page coordinates, including inside forms."""
+    try:
+        instructions = _strip_existing_markers(
+            list(pikepdf.parse_content_stream(owner)), owner.get("/Resources")
+        )
+    except pikepdf.PdfError:
+        return []
+    ctm, stack, pending, rules = initial_ctm, [], [], []
+    point = None
+    for instruction in instructions:
+        op, operands = str(instruction.operator), instruction.operands
+        if op == "q":
+            stack.append(ctm)
+        elif op == "Q" and stack:
+            ctm = stack.pop()
+        elif op == "cm" and len(operands) == 6:
+            ctm = _mat_multiply(tuple(float(v) for v in operands), ctm)
+        elif op in {"m", "l"} and len(operands) == 2:
+            end = _transform_point(ctm, *(float(v) for v in operands))
+            if op == "l" and point is not None:
+                pending.append({"l": min(point[0], end[0]), "r": max(point[0], end[0]),
+                                "b": min(point[1], end[1]), "t": max(point[1], end[1])})
+            point = end
+        elif op == "re" and len(operands) == 4:
+            x, y, width, height = (float(v) for v in operands)
+            points = [_transform_point(ctm, a, b) for a, b in
+                      [(x, y), (x + width, y), (x + width, y + height), (x, y + height)]]
+            for first, last in zip(points, points[1:] + points[:1], strict=True):
+                pending.append({"l": min(first[0], last[0]), "r": max(first[0], last[0]),
+                                "b": min(first[1], last[1]), "t": max(first[1], last[1])})
+        elif op in PATH_PAINTING_OPERATORS:
+            if op != "n":
+                rules.extend(box for box in pending if
+                             min(box["r"] - box["l"], box["t"] - box["b"]) <= 2
+                             and max(box["r"] - box["l"], box["t"] - box["b"]) >= 6)
+            pending, point = [], None
+    for call in _extract_form_invocations(owner, instructions):
+        if call.stream.objgen not in ancestors:
+            rules.extend(_page_vertical_rules(
+                call.stream, _mat_multiply(call.initial_ctm, initial_ctm),
+                ancestors | {call.stream.objgen},
+            ))
+    return rules
+
+
+def _page_has_hidden_text(owner, ancestors=frozenset()) -> bool:
+    try:
+        instructions = _strip_existing_markers(
+            list(pikepdf.parse_content_stream(owner)), owner.get("/Resources")
+        )
+    except pikepdf.PdfError:
+        return False
+    if _text_runs_look_like_hidden_ocr_layer(_extract_text_show_runs(instructions)):
+        return True
+    return any(
+        _page_has_hidden_text(call.stream, ancestors | {call.stream.objgen})
+        for call in _extract_form_invocations(owner, instructions)
+        if call.stream.objgen not in ancestors
+    )
 
 
 def _owner_of_glyphs(
@@ -670,17 +1047,9 @@ def _normalize_heading_hierarchy(elements: list[dict]) -> None:
     if not headings:
         return
 
-    sorted_headings = sorted(
-        headings,
-        key=lambda h: (
-            _as_positive_int(h.get("page", 0), default=0),
-            -_safe_float((h.get("bbox") or {}).get("t", 0.0)),
-            _safe_float((h.get("bbox") or {}).get("l", 0.0)),
-        ),
-    )
     # The open sections, outermost first: (level given, level assigned).
     open_sections: list[tuple[int, int]] = []
-    for heading in sorted_headings:
+    for heading in headings:
         level = _as_positive_int(heading.get("level", 1), default=1)
         while open_sections and open_sections[-1][0] >= level:
             open_sections.pop()
@@ -2267,12 +2636,13 @@ class StructTreeBuilder:
         self._source_element_structs: dict[Any, pikepdf.Object] = {}
         self._headings: list[dict] = []
         self._struct_elems_created = 0
-        # The reading-order position (see _elements_in_user_space) of the
+        # The chosen reading-order position (see _page_reading_order) of the
         # element whose content is being tagged, and that of each element
         # added to /Document, so a page's elements can be put in reading
         # order (see order_page_kids).
-        self.reading_order: int | None = None
-        self._reading_order_of: dict[tuple[int, int], int] = {}
+        self.reading_order: float | None = None
+        self._reading_order_of: dict[tuple[int, int], float] = {}
+        self._link_structs: dict[tuple[int, int], pikepdf.Object] = {}
         self._list_cache: dict[str, tuple[pikepdf.Object, pikepdf.Object | None]] = {}
         self._note_counter = 0
         self._table_counter = 0
@@ -2371,7 +2741,7 @@ class StructTreeBuilder:
     def order_page_kids(self, start: int) -> None:
         """Put the elements added to /Document since position ``start`` (one
         page's) in reading order. The content stream draws them in whatever
-        order its producer chose; Docling orders them as they are read. An
+        order its producer chose; the page vote selects their reading order. An
         element without a position keeps its place after the one before it.
         """
         kids = self.doc_elem.get("/K")
@@ -2444,6 +2814,33 @@ class StructTreeBuilder:
             elem["/K"] = mcr
         self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=elem)
         return mcid
+
+    def move_fragment_to_list_label(
+        self, body: pikepdf.Object, owner: pikepdf.Object, mcid: int
+    ) -> None:
+        """Read a recovered hanging marker before the body's fragments.
+
+        Keep the existing LBody (and its deliberate ActualText) intact; the
+        label is a sibling, so a correction cannot swallow the marker.
+        """
+        item = body["/P"]
+        label = next((kid for kid in item.K if kid.get("/S") == "/Lbl"), None)
+        if label is None:
+            label = self.pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name.StructElem, S=pikepdf.Name.Lbl, P=item, K=pikepdf.Array([])
+                )
+            )
+            item.K = pikepdf.Array([label, *list(item.K)])
+            self._struct_elems_created += 1
+        kids = body.get("/K")
+        kids = list(kids) if isinstance(kids, pikepdf.Array) else [kids]
+        # The allocated fragment is always last, even when it is the first
+        # fragment and the body held a single MCR rather than an array.
+        label.K.append(kids.pop())
+        body.K = pikepdf.Array(kids)
+        entry = self._content_owner_entries[self._content_owner_key(owner)]
+        entry["mcids"] = [(key, label if key == mcid else elem) for key, elem in entry["mcids"]]
 
     def _add_struct_elem(
         self,
@@ -2908,6 +3305,8 @@ class StructTreeBuilder:
         except Exception:
             return False
 
+        if annotation.objgen in self._link_structs:
+            return True
         if parent is None:
             parent = self.doc_elem
         # ActualText replaces an element's whole subtree for a screen reader,
@@ -2930,9 +3329,36 @@ class StructTreeBuilder:
             }),
         }))
         self._append_child(parent, link_elem)
+        self._link_structs[annotation.objgen] = link_elem
         self._object_parent_entries.append((annotation, link_elem))
         self._struct_elems_created += 1
         return True
+
+    def put_mcid_in_link(
+        self, owner: pikepdf.Object, mcid: int,
+        page_ref: pikepdf.Object, annotation: pikepdf.Object,
+    ) -> None:
+        """Move a just-allocated text fragment into its inline Link, keeping
+        the Link at that fragment's position among the paragraph's children."""
+        parent = self._struct_elem_for_mcid(owner, mcid)
+        if parent is None:
+            return
+        kids = parent.get("/K")
+        kids = list(kids) if isinstance(kids, pikepdf.Array) else [kids]
+        # The allocator just appended this MCR; earlier fragments stay put.
+        mcr = kids.pop()
+        parent["/K"] = pikepdf.Array(kids)
+        self.add_link_annotation(page_ref, annotation, parent=parent)
+        link = self._link_structs[annotation.objgen]
+        link_kids = link.get("/K")
+        link_kids = list(link_kids) if isinstance(link_kids, pikepdf.Array) else [link_kids]
+        # Keep the OBJR once, after the Link's marked content.
+        link["/K"] = pikepdf.Array([*link_kids[:-1], mcr, link_kids[-1]])
+        entries = self._content_owner_entries[self._content_owner_key(owner)]["mcids"]
+        for index, (registered_mcid, _elem) in enumerate(entries):
+            if registered_mcid == mcid:
+                entries[index] = (mcid, link)
+                break
 
     def add_widget_annotation(self, page_ref: pikepdf.Object, annotation: pikepdf.Object) -> bool:
         """Attach a /Form StructElem to a widget annotation via OBJR."""
@@ -3449,6 +3875,7 @@ def _elements_in_user_space(elements: list[dict], frames: list[PageFrame]) -> li
     for order, element in enumerate(elements):
         element = copy.deepcopy(element)
         element["reading_order"] = order
+        element["_docling_order"] = order
         page = element.get("page")
         if isinstance(page, int) and 0 <= page < len(frames):
             frame = frames[page]
@@ -3739,7 +4166,7 @@ def _figure_of(
         return None
     best: int | None = None
     best_share = 0.5
-    for idx, elem in enumerate(elements):
+    for idx, elem in sorted(enumerate(elements), key=lambda pair: pair[1].get("_docling_order", pair[0])):
         figure_box = elem.get("bbox")
         if elem.get("type") != "figure" or not isinstance(figure_box, dict):
             continue
@@ -3754,47 +4181,43 @@ _ARTIFACT_MARK = "artifact"
 _PASSTHROUGH_MARK = "passthrough"
 
 
-def _rewrite_content_stream(
-    pdf: pikepdf.Pdf,
+@dataclass
+class PreparedContent:
+    instructions: list
+    regions: list[ContentRegion]
+    text_runs: list[TextShowRun]
+    marks: dict[int, ContentTarget | int | str]
+    passthrough: list[ContentRegion]
+
+
+def _prepare_content_stream(
     content_owner,
     page_index: int,
     elements: list[dict],
-    builder: StructTreeBuilder,
-    page_ref: pikepdf.Object,
-    alt_lookup: dict[int, str],
-    decorative_figures: set[int] | None = None,
     *,
     initial_ctm: tuple[float, float, float, float, float, float] = IDENTITY,
-    stream_owner: pikepdf.Object | None = None,
     passthrough_regions: list[ContentRegion] | None = None,
     measured_ops: list[MeasuredTextOp] | None = None,
-) -> set[int]:
-    """Mark a content stream's content for the elements it belongs to.
-
-    Each text-showing unit (a TJ string, or a whole Tj) belongs to the text
-    element or table cell holding at least half of it (see _owner_of), TJs
-    being split where the owner changes; each image belongs to the figure it
-    overlaps (see _figure_of). Consecutive content with one owner is one
-    marked-content sequence. Everything else that paints is an artifact, a
-    path object wrapped whole; OCR form calls pass through unmarked, to be
-    tagged inside the form. Returns the indices of the elements tagged."""
+    word_owners: dict[tuple, ContentTarget | None] | None = None,
+) -> PreparedContent | None:
+    """Assign content to elements without writing tags. Used both for the
+    drawing-order vote and the rewrite, including split strings and cells."""
     try:
         instructions = list(pikepdf.parse_content_stream(content_owner))
     except Exception as e:
         logger.warning(f"Could not parse content stream for page {page_index}: {e}")
-        return set()
+        return None
 
     instructions = _strip_existing_markers(instructions, content_owner.get("/Resources"))
     if not instructions:
-        return set()
+        return None
 
-    decorative_figures = decorative_figures or set()
     passthrough_regions = passthrough_regions or []
     targets = _content_targets(elements)
     measured = _measured_by_instruction(instructions, measured_ops)
-    word_owners: dict[tuple, ContentTarget | None] = {}
     if measured is not None:
-        word_owners = _word_owners(measured, targets)
+        if word_owners is None:
+            word_owners = _word_owners(measured, targets)
         instructions, measured, new_index = _split_text_ops_across_targets(
             instructions, measured, word_owners
         )
@@ -3804,6 +4227,7 @@ def _rewrite_content_stream(
             )
             for region in passthrough_regions
         ]
+    word_owners = word_owners or {}
     regions = _extract_content_regions(instructions, content_owner, initial_ctm=initial_ctm)
     text_runs = _extract_text_show_runs(instructions, initial_ctm=initial_ctm)
     if measured is not None:
@@ -3846,6 +4270,137 @@ def _rewrite_content_stream(
                 mark = marks.most_common(1)[0][0]
                 for j in range(start, index + 1):
                     mark_by_idx[j] = mark
+
+    return PreparedContent(instructions, regions, text_runs, mark_by_idx, passthrough_regions)
+
+
+def _remap_word_owners(owners: dict, before: list[dict], after: list[dict]) -> None:
+    indices = {id(elem): index for index, elem in enumerate(after)}
+    owners.update({
+        key: dataclasses.replace(owner, elem_idx=indices[id(before[owner.elem_idx])])
+        for key, owner in owners.items() if owner is not None
+    })
+
+
+def _page_reading_order(
+    page: pikepdf.Page, page_index: int, elements: list[dict],
+    page_ops: dict[tuple[str, ...], list[MeasuredTextOp]], frame: PageFrame,
+    decorative_figures: set[int],
+    *, word_owners: dict[tuple, ContentTarget | None] | None = None,
+) -> dict:
+    """Vote before building any structure or normalizing heading levels.
+
+    Forms are placed at their page invocation, not after page content. The
+    preparation pass is discarded per page to bound memory; the rewrite
+    repeats the same ownership calculation with the chosen element order.
+    """
+    first: dict[int, tuple[int, ...]] = {}
+
+    def visit(owner, path=(), prefix=(), initial_ctm=IDENTITY, ancestors=frozenset()):
+        try:
+            instructions = _strip_existing_markers(
+                list(pikepdf.parse_content_stream(owner)), owner.get("/Resources")
+            )
+        except pikepdf.PdfError:
+            return
+        forms = _extract_form_invocations(owner, instructions)
+        passthrough = [
+            ContentRegion(
+                kind="passthrough", start_idx=call.start_idx, end_idx=call.end_idx,
+                instructions=call.instructions, xobject_name=call.xobject_name,
+            ) for call in forms
+        ]
+        prepared = _prepare_content_stream(
+            owner, page_index, elements, initial_ctm=initial_ctm,
+            passthrough_regions=passthrough, measured_ops=page_ops.get(path),
+            word_owners=word_owners,
+        )
+        if prepared is None:
+            return
+        for index, instruction in enumerate(prepared.instructions):
+            if not _instruction_paints_content(instruction):
+                continue
+            mark = prepared.marks.get(index)
+            if isinstance(mark, ContentTarget):
+                element_index = mark.elem_idx
+            elif isinstance(mark, int):
+                element_index = mark
+            else:
+                continue
+            key = id(elements[element_index])
+            position = (*prefix, index, 0)
+            first[key] = min(first.get(key, position), position)
+        for call, region in zip(forms, prepared.passthrough, strict=True):
+            if call.stream.objgen in ancestors:
+                continue
+            visit(
+                call.stream, (*path, call.xobject_name.lstrip("/")),
+                (*prefix, region.start_idx), _mat_multiply(call.initial_ctm, initial_ctm),
+                ancestors | {call.stream.objgen},
+            )
+
+    visit(page)
+
+    semantic = [
+        elem for elem in elements
+        if elem.get("type") != "artifact"
+        and not (elem.get("type") == "figure" and elem.get("figure_index") in decorative_figures)
+    ]
+    boxes = [
+        _upright(elem["bbox"], frame.rotation // 90) if isinstance(elem.get("bbox"), dict) else None
+        for elem in semantic
+    ]
+    chosen, diagnostics = choose_order(
+        boxes, {i: first[id(elem)] for i, elem in enumerate(semantic) if id(elem) in first},
+    )
+    # Artifacts keep their slots. All existing consumers receive the chosen
+    # sequence through the same list and reading_order keys as before.
+    ordered = iter(semantic[i] for i in chosen)
+    semantic_ids = {id(elem) for elem in semantic}
+    before = list(elements)
+    elements[:] = [next(ordered) if id(elem) in semantic_ids else elem for elem in elements]
+    if word_owners is not None:
+        _remap_word_owners(word_owners, before, elements)
+    for order, elem in enumerate(elements):
+        elem["reading_order"] = order
+    return {"page": page_index, **diagnostics}
+
+
+def _rewrite_content_stream(
+    pdf: pikepdf.Pdf,
+    content_owner,
+    page_index: int,
+    elements: list[dict],
+    builder: StructTreeBuilder,
+    page_ref: pikepdf.Object,
+    alt_lookup: dict[int, str],
+    decorative_figures: set[int] | None = None,
+    *,
+    initial_ctm: tuple[float, float, float, float, float, float] = IDENTITY,
+    stream_owner: pikepdf.Object | None = None,
+    passthrough_regions: list[ContentRegion] | None = None,
+    measured_ops: list[MeasuredTextOp] | None = None,
+    word_owners: dict[tuple, ContentTarget | None] | None = None,
+) -> set[int]:
+    """Mark a content stream's content for the elements it belongs to.
+
+    Each text-showing unit (a TJ string, or a whole Tj) belongs to the text
+    element or table cell holding at least half of it (see _owner_of), TJs
+    being split where the owner changes; each image belongs to the figure it
+    overlaps (see _figure_of). Consecutive content with one owner is one
+    marked-content sequence. Everything else that paints is an artifact, a
+    path object wrapped whole; OCR form calls pass through unmarked, to be
+    tagged inside the form. Returns the indices of the elements tagged."""
+    prepared = _prepare_content_stream(
+        content_owner, page_index, elements, initial_ctm=initial_ctm,
+        passthrough_regions=passthrough_regions, measured_ops=measured_ops,
+        word_owners=word_owners,
+    )
+    if prepared is None:
+        return set()
+    instructions, regions, text_runs = prepared.instructions, prepared.regions, prepared.text_runs
+    mark_by_idx = prepared.marks
+    decorative_figures = decorative_figures or set()
 
     overlay_targets: list[tuple[ContentRegion, int]] = []
     decorative_covered: set[int] = set()
@@ -3905,6 +4460,14 @@ def _rewrite_content_stream(
             active = _ARTIFACT_MARK
             return
         tag, mcid, actual_text = allocated
+        if isinstance(mark, ContentTarget) and mark.list_label:
+            body = builder.source_element_struct(elem)
+            if body is not None:
+                builder.move_fragment_to_list_label(body, stream_owner or page_ref, mcid)
+                tag = "Lbl"
+        if isinstance(mark, ContentTarget) and mark.annotation is not None:
+            builder.put_mcid_in_link(stream_owner or page_ref, mcid, page_ref, mark.annotation)
+            tag, actual_text = "Link", None
         new_instructions.append(_make_bdc(tag, mcid, actual_text=actual_text))
         tagged.add(elem_idx)
         active = mark
@@ -4718,11 +5281,93 @@ def _tag_link_annotations(
     return tagged
 
 
+def _prepare_link_targets(page: pikepdf.Page, builder: StructTreeBuilder, elements: list[dict]) -> None:
+    """Make link text a nested ownership target before splitting text runs.
+    QuadPoints describe each line of a wrapped link; its Rect alone would
+    also capture unrelated words between those lines."""
+    annots = page.get("/Annots")
+    if not isinstance(annots, pikepdf.Array):
+        return
+    for index, annotation in enumerate(annots):
+        try:
+            if annotation.get("/Subtype") != pikepdf.Name("/Link"):
+                continue
+        except Exception:
+            continue
+        _normalize_annotation_rect(annotation)
+        if not annotation.is_indirect:
+            try:
+                annotation = builder.pdf.make_indirect(pikepdf.Dictionary(annotation))
+                annots[index] = annotation
+            except Exception:
+                continue
+        parent = _best_annotation_source_element(
+            annotation, elements, allowed_types=LINK_TEXT_ELEMENT_TYPES | {"table"},
+        )
+        if parent is None:
+            continue
+        if parent.get("type") == "table" and parent.get("cells"):
+            parent = _best_bbox_match(
+                _rect_array_to_bbox(annotation.get("/Rect")),
+                [dict(cell, bbox=_table_cell_bbox(parent, cell), source=cell)
+                 for cell in parent["cells"] if isinstance(cell, dict)],
+            )
+            if parent is None:
+                continue
+            parent = parent["source"]
+        boxes = []
+        quads = annotation.get("/QuadPoints")
+        if isinstance(quads, pikepdf.Array) and len(quads) % 8 == 0:
+            try:
+                for offset in range(0, len(quads), 8):
+                    points = [float(quads[offset + i]) for i in range(8)]
+                    box = {"l": min(points[::2]), "r": max(points[::2]),
+                           "b": min(points[1::2]), "t": max(points[1::2])}
+                    if all(math.isfinite(value) for value in points) and _bbox_area(box) > 0:
+                        boxes.append(box)
+            except (TypeError, ValueError):
+                boxes = []
+        if not boxes:
+            box = _rect_array_to_bbox(annotation.get("/Rect"))
+            if box:
+                boxes.append(box)
+        parent.setdefault("_link_targets", []).extend((annotation, box) for box in boxes)
+
+
+def _widget_label_order(annotation: pikepdf.Object, elements: list[dict]) -> float | None:
+    """Place a field just after the closest label to its left on the same
+    line, or, failing that, the closest text above it."""
+    rect = _rect_array_to_bbox(annotation.get("/Rect"))
+    if rect is None:
+        return None
+    same_line = []
+    above = []
+    for element in elements:
+        if element.get("type") not in LINK_TEXT_ELEMENT_TYPES or not _element_accessible_text(element):
+            continue
+        order = element.get("reading_order")
+        if order is None:
+            continue
+        for box in _element_boxes(element):
+            middle = (box["b"] + box["t"]) / 2
+            if rect["b"] <= middle <= rect["t"] and box["l"] < rect["l"]:
+                same_line.append((max(0, rect["l"] - box["r"]), -order, order))
+            elif box["b"] >= rect["t"]:
+                horizontal_gap = max(box["l"] - rect["r"], rect["l"] - box["r"], 0)
+                above.append((box["b"] - rect["t"], horizontal_gap, -order, order))
+    if same_line:
+        return min(same_line)[-1] + 0.5
+    if above:
+        return min(above)[-1] + 0.5
+    return None
+
+
 def _tag_widget_annotations(
     page: pikepdf.Page,
     page_ref: pikepdf.Object,
     builder: StructTreeBuilder,
     docling_page_widgets: list[dict[str, Any]] | None = None,
+    page_elements: list[dict[str, Any]] | None = None,
 ) -> int:
     """Tag widget annotations as /Form struct elements using OBJR."""
     annots = page.get("/Annots")
@@ -4750,9 +5395,11 @@ def _tag_widget_annotations(
             except Exception:
                 continue
 
+        builder.reading_order = _widget_label_order(annotation, page_elements or [])
         if builder.add_widget_annotation(page_ref, annotation):
             tagged += 1
 
+    builder.reading_order = None
     return tagged
 
 
@@ -4971,10 +5618,12 @@ async def tag_pdf(
 
             # 1. Mark PDF as tagged
             if "/MarkInfo" not in pdf.Root:
-                pdf.Root["/MarkInfo"] = pikepdf.Dictionary({
-                    "/Marked": True,
-                    "/Suspects": False,
-                })
+                pdf.Root["/MarkInfo"] = pikepdf.Dictionary(
+                    {
+                        "/Marked": True,
+                        "/Suspects": False,
+                    }
+                )
             else:
                 pdf.Root["/MarkInfo"]["/Marked"] = True
                 pdf.Root["/MarkInfo"]["/Suspects"] = False
@@ -5018,12 +5667,13 @@ async def tag_pdf(
             for fig_idx, source_alt in source_figure_alt_lookup.items():
                 if _is_weak_figure_alt_text(source_alt):
                     continue
-                if fig_idx in decorative_figures or _is_weak_figure_alt_text(alt_lookup.get(fig_idx)):
+                if fig_idx in decorative_figures or _is_weak_figure_alt_text(
+                    alt_lookup.get(fig_idx)
+                ):
                     decorative_figures.discard(fig_idx)
                     alt_lookup[fig_idx] = source_alt
 
             # Group elements by page
-            _normalize_heading_hierarchy([elem for elem in elements if not elem.get("continuation")])
             pages_elements: dict[int, list[dict]] = {}
             for elem in elements:
                 pg = elem.get("page", 0)
@@ -5031,6 +5681,46 @@ async def tag_pdf(
                     pages_elements[pg] = []
                 pages_elements[pg].append(elem)
             _attach_glyph_text(pages_elements, pdfium_text)
+            reading_order_diagnostics = []
+            unowned_words_by_page = []
+            page_owners = {}
+            nonsemantic_pages = set()
+            for page_index, page in enumerate(pdf.pages):
+                page_elems = pages_elements.setdefault(page_index, [])
+                nonsemantic = not page_elems and _should_artifact_nonsemantic_page_content(
+                    input_path, page, page_index
+                )
+                if nonsemantic:
+                    nonsemantic_pages.add(page_index)
+                _prepare_link_targets(page, builder, page_elems)
+                eligible_ops, stream_starts = [], set()
+                for ops in glyph_reader.page(page_index).ops.values():
+                    stream_starts.add(len(eligible_ops))
+                    eligible_ops.extend(ops)
+                diagnostic = {"page": page_index, "before": 0, "after": 0}
+                owners = _word_owners(
+                    dict(enumerate(eligible_ops)), _content_targets(page_elems),
+                    elements=None if nonsemantic else page_elems, frame=frames[page_index],
+                    scanned=_page_has_hidden_text(page), diagnostic=diagnostic,
+                    stream_starts=stream_starts, vertical_rules=_page_vertical_rules(page),
+                )
+                for index, elem in enumerate(page_elems):
+                    if elem.get("fallback"):
+                        elem["page"] = page_index
+                        elem["_docling_order"] = index
+                # Fallback anchors supply their initial logical position. The
+                # same recovered ownership then informs both vote and rewrite.
+                before = list(page_elems)
+                page_elems.sort(key=lambda elem: elem["reading_order"])
+                _remap_word_owners(owners, before, page_elems)
+                reading_order_diagnostics.append(_page_reading_order(
+                    page, page_index, page_elems, glyph_reader.page(page_index).ops,
+                    frames[page_index], decorative_figures, word_owners=owners,
+                ))
+                page_owners[page_index] = owners
+                unowned_words_by_page.append(diagnostic)
+            elements = [elem for pg in sorted(pages_elements) for elem in pages_elements[pg]]
+            _normalize_heading_hierarchy([elem for elem in elements if not elem.get("continuation")])
 
             figures_tagged = 0
             headings_tagged = 0
@@ -5044,21 +5734,30 @@ async def tag_pdf(
                 page_elems = pages_elements.get(page_index, [])
                 page_glyphs = glyph_reader.page(page_index)
                 page_words = _items_in_user_space(
-                    _build_docling_parse_page_words(parser_doc, page_index, docling_parse_word_cache),
+                    _build_docling_parse_page_words(
+                        parser_doc, page_index, docling_parse_word_cache
+                    ),
                     frames[page_index],
                 )
                 page_hyperlinks = _items_in_user_space(
-                    _build_docling_parse_page_hyperlinks(parser_doc, page_index, docling_parse_hyperlink_cache),
+                    _build_docling_parse_page_hyperlinks(
+                        parser_doc, page_index, docling_parse_hyperlink_cache
+                    ),
                     frames[page_index],
                 )
                 page_widgets = _items_in_user_space(
-                    _build_docling_parse_page_widgets(parser_doc, page_index, docling_parse_widget_cache),
+                    _build_docling_parse_page_widgets(
+                        parser_doc, page_index, docling_parse_widget_cache
+                    ),
                     frames[page_index],
                 )
                 page["/Tabs"] = pikepdf.Name("/S")
                 page_tagged_elements: list[dict] = []
                 first_page_kid = len(builder.doc_elem.get("/K") or [])
-                if page_elems:
+                nonsemantic_page = page_index in nonsemantic_pages
+                has_words = any(op.glyphs for ops in page_glyphs.ops.values() for op in ops)
+                if not nonsemantic_page and (page_elems or has_words):
+                    page_word_owners = page_owners[page_index]
                     def rewrite(owner, path=(), initial_ctm=IDENTITY, ancestors=frozenset()):
                         try:
                             instructions = _strip_existing_markers(
@@ -5086,6 +5785,7 @@ async def tag_pdf(
                             stream_owner=None if not path else owner,
                             passthrough_regions=passthrough,
                             measured_ops=page_glyphs.ops.get(path),
+                            word_owners=page_word_owners,
                         )
                         for form in forms:
                             if form.stream.objgen in ancestors:
@@ -5121,17 +5821,23 @@ async def tag_pdf(
                             tables_tagged += 1
                         elif t == "list_item":
                             lists_tagged += 1
-                elif _should_artifact_nonsemantic_page_content(input_path, page, page_index):
-                    _rewrite_content_stream(
-                        pdf, page, page_index, [],
-                        builder, page.obj, alt_lookup,
-                        decorative_figures=decorative_figures,
-                        measured_ops=page_glyphs.ops.get(()),
-                    )
+                else:
+                    if nonsemantic_page:
+                        _rewrite_content_stream(
+                            pdf,
+                            page,
+                            page_index,
+                            [],
+                            builder,
+                            page.obj,
+                            alt_lookup,
+                            decorative_figures=decorative_figures,
+                            measured_ops=page_glyphs.ops.get(()),
+                        )
 
-                builder.order_page_kids(first_page_kid)
                 builder.reading_order = None
-                _ensure_annotation_baseline(page)
+                _tag_widget_annotations(page, page.obj, builder, page_widgets, page_tagged_elements)
+                builder.order_page_kids(first_page_kid)
                 links_tagged += _tag_link_annotations(
                     page,
                     page.obj,
@@ -5140,7 +5846,6 @@ async def tag_pdf(
                     page_words,
                     page_hyperlinks,
                 )
-                _tag_widget_annotations(page, page.obj, builder, page_widgets)
                 annotations_tagged += _tag_generic_annotations(page, page.obj, builder)
 
             # 5. Finalize structure tree
@@ -5183,6 +5888,8 @@ async def tag_pdf(
             decorative_figures_artifacted=decorative_figures_artifacted,
             bookmarks_added=bookmarks_added,
             title_set=title_set,
+            reading_order_diagnostics=reading_order_diagnostics,
+            unowned_words_by_page=unowned_words_by_page,
         )
 
     def _tag_with_forms():
