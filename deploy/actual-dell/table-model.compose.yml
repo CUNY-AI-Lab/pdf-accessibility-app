@@ -1,0 +1,73 @@
+# SKETCH, NOT DEPLOYED. The table-model step (backend/app/pipeline/table_model.py)
+# on actual-dell, beside docling-serve, if a production trial is approved.
+# Nothing here has run on the host; the memory and latency figures below are
+# from Apple silicon (MLX) and the PaddleOCR documentation, to be measured on
+# the RTX 5000 Ada before a trial.
+#
+# Design: one small server, ~/services/table-model/ on the host, reachable only
+# on 127.0.0.1 (the runner uses host networking, like docling-serve).
+#
+# - PaddleOCR-VL-1.5 (0.9B, Apache-2.0) with transformers, bf16; weights about
+#   1.9 GB. On a Mac (MLX, bf16) a table took 0.7 s median, 3.6 s p95, and
+#   peaked at 3.1 GB including the weights.
+# - Loads on the first table and drops the model after IDLE_MINUTES without
+#   one; idle, the process holds only its CUDA context.
+# - One request at a time. A request arriving while one runs, or when the GPU
+#   has less than MIN_FREE_GB free before loading, is answered 503 at once; the
+#   runner then keeps Docling's grid for the rest of that document
+#   (TableModelUnavailable). No queue on a shared GPU.
+# - A hard cap on PyTorch's allocations (VRAM_GB, via
+#   torch.cuda.set_per_process_memory_fraction): past it a request fails
+#   with out-of-memory instead of growing. Docker cannot cap GPU memory itself.
+# - No CPU fallback by default: on the Mac's CPU (transformers, float32) a
+#   table took 8.3 s median and up to 46 s, about 11 times the GPU, so a busy
+#   GPU means Docling's table.
+# - Pass use_cache=True to generate: the model's config.json sets use_cache
+#   false, and without the KV cache one table ran past 150 s on that CPU.
+#
+# The runner turns the step on with, in runner.env:
+#   TABLE_MODEL_URL=http://127.0.0.1:8150/v1
+#   TABLE_MODEL_TIMEOUT=30
+#   TABLE_MODEL_MIN_COVERAGE=0.7
+#   TABLE_MODEL_MIN_COVERAGE_SCAN=0.9
+#   TABLE_MODEL_SCAN_TEXT=false
+#
+# Before a trial: build the image from deploy/actual-dell/table-model/server.py
+# with pinned torch/transformers (transformers >= 5.0 has the model), pin the
+# model revision, and measure peak VRAM, latency and cold load on the host.
+services:
+  table-model:
+    # Placeholder: an image built from this repository with the server and
+    # pinned dependencies, published like the runner's.
+    image: ghcr.io/cuny-ai-lab/pdf-accessibility-table-model:${TABLE_MODEL_IMAGE_TAG:?set to a published commit}
+    container_name: table-model
+    restart: unless-stopped
+    command:
+      - python
+      - server.py
+      - --host=127.0.0.1
+      - --port=8150
+      - --device=cuda
+      - --model=/models/PaddleOCR-VL-1.5
+      - --log=/tmp/requests.jsonl
+      - --idle-minutes=${IDLE_MINUTES:-10}
+      - --vram-gb=${VRAM_GB:-4}
+      - --min-free-gb=${MIN_FREE_GB:-6}
+    network_mode: host
+    environment:
+      HF_HUB_OFFLINE: "1"
+      OMP_NUM_THREADS: "2"
+    volumes:
+      # The model at a pinned revision, downloaded once (about 2 GB).
+      - table_model_weights:/models:ro
+    mem_limit: 6g
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  table_model_weights:

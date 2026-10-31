@@ -1791,6 +1791,36 @@ def _tagging_regressions(candidate, current) -> list[str]:
     return regressions
 
 
+async def _apply_table_model(
+    working_pdf: Path, structure_json: dict, settings: Settings
+) -> tuple[dict, dict]:
+    """Docling's tables rebuilt on the table model's grids (table_model.py)
+    when TABLE_MODEL_URL is set. A model that is down, busy or slow leaves
+    every table as Docling found it; the job never fails here."""
+    if not settings.table_model_url:
+        return structure_json, {"enabled": False}
+    from app.pipeline.table_model import HttpReader, rewrite_tables
+
+    reader = HttpReader(
+        settings.table_model_url, settings.table_model_name, timeout=settings.table_model_timeout
+    )
+    try:
+        structure, audit = await rewrite_tables(
+            working_pdf,
+            structure_json,
+            reader,
+            min_coverage=settings.table_model_min_coverage,
+            min_coverage_scan=settings.table_model_min_coverage_scan,
+            correct_scan_text=settings.table_model_scan_text,
+        )
+    except Exception as exc:
+        # The step is optional: any failure keeps Docling's tables.
+        logger.warning("Table model step failed for %s: %r", working_pdf.name, exc)
+        return structure_json, {"enabled": True, "error": repr(exc)}
+    audit["enabled"] = True
+    return structure, audit
+
+
 async def _update_step(
     db: AsyncSession,
     job_id: str,
@@ -2176,6 +2206,9 @@ async def _run_pipeline(
                 )
             )
             structure.figures_count = len(structure.figures)
+            structure.document_json, table_model_audit = await _apply_table_model(
+                working_pdf, structure.document_json, settings
+            )
 
             elements = structure.document_json.get("elements", [])
             headings_count = sum(1 for el in elements if el.get("type") == "heading")
@@ -2204,6 +2237,7 @@ async def _run_pipeline(
                     "structure_intelligence_llm_usage": structure_intelligence_llm_usage,
                     "docling_escalation_plan": docling_escalation_plan,
                     "synthetic_figure_rationalization": synthetic_figure_rationalization,
+                    "table_model": table_model_audit,
                 },
             )
             job_manager.emit_progress(

@@ -584,6 +584,10 @@ class StructTreeBuilder:
 
                 if len(attrs) > 1:
                     cell_elem_dict["/A"] = attrs
+                # A deliberate correction of the cell's text (the table
+                # model's reading of a known OCR confusion, see table_model).
+                if actual_text := str(cell.get("actual_text") or "").strip():
+                    cell_elem_dict["/ActualText"] = pikepdf.String(actual_text)
 
                 cell_elem = self.pdf.make_indirect(pikepdf.Dictionary(cell_elem_dict))
                 row_elem["/K"].append(cell_elem)
