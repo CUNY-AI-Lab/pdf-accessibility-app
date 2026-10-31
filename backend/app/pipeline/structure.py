@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.config import get_settings
+from app.pipeline.document_title import select_document_title
 from app.pipeline.language import (
     detect_language as _detect_language,
 )
@@ -1151,6 +1152,12 @@ def _extract_title_from_docling(
     pdf_path: Path | None = None,
 ) -> str | None:
     """Extract a document title from Docling, rejecting common caption false positives."""
+    if pdf_path:
+        decision = select_document_title(
+            pdf_path, {"elements": elements or [], "title": doc_dict.get("title")}, pdf_path.name,
+        )
+        if decision["source"] not in {"filename", "text"}:
+            return decision["title"]
     for item in doc_dict.get("texts", []):
         if not isinstance(item, dict) or item.get("label") != "title":
             continue
@@ -1610,6 +1617,10 @@ async def extract_structure(
     elements = _expand_toc_item_tables(elements)
     elements = _rebuild_toc_with_docling_parse(elements, toc_source_pdf)
     title = _extract_title_from_docling(doc_dict, elements, pdf_path=pdf_path)
+    title_evidence = await asyncio.to_thread(
+        select_document_title, toc_source_pdf, {"title": title, "elements": elements}, pdf_path.name,
+    )
+    title = title_evidence["title"]
     document_language = _infer_document_language(elements, title)
     native_toc = await asyncio.to_thread(_extract_native_toc_from_pdf, toc_source_pdf)
 
@@ -1622,6 +1633,7 @@ async def extract_structure(
         "source": str(pdf_path.name),
         "page_count": page_count,
         "title": title,
+        "title_evidence": title_evidence,
         "language": document_language,
         "elements": elements,
         "figures_count": figures_count,

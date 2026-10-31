@@ -141,6 +141,9 @@ async def tag_lines(tmp_path, lines, *, image=False, decorative=False):
         elements.append({"type": "figure", "page": 0, "figure_index": 0,
                          "bbox": {"l": 40, "b": 80, "r": 160, "t": 160}})
     page.Contents = pdf.make_stream(b"\n".join(commands))
+    # This fixture tests export of a reviewed metadata title, independently
+    # of document-title inference from its synthetic heading sequence.
+    pdf.docinfo["/Title"] = "Reviewed <document>"
     pdf.save(source)
     pdf.close()
     await tag_pdf(
