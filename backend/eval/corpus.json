@@ -706,5 +706,211 @@
         }
       ]
     }
+  ],
+  "untagged": [
+    {
+      "subset": "cuny_untagged",
+      "drawn": "2026-10-31",
+      "documents": [
+        {
+          "name": "cc_oers_365",
+          "kind": "syllabus",
+          "title": "Psychology and the Black Experience",
+          "year": "2021",
+          "pages": 9,
+          "scanned": true,
+          "tags": "repository cover sheet only",
+          "url": "https://academicworks.cuny.edu/context/cc_oers/article/1404/viewcontent",
+          "origin": "https://academicworks.cuny.edu/cc_oers/365",
+          "sha256": "82bc32b195f2a64a63d0904297319128b10824d7f10f4f5dcee25b79702ef2ac"
+        },
+        {
+          "name": "jj_pubs_384",
+          "kind": "book chapter",
+          "title": "A Global Comparison of Women in the Workforce: Moving Toward Innovative Change",
+          "year": "2018",
+          "pages": 15,
+          "scanned": true,
+          "tags": "repository cover sheet only",
+          "url": "https://academicworks.cuny.edu/context/jj_pubs/article/1406/viewcontent",
+          "origin": "https://academicworks.cuny.edu/jj_pubs/384",
+          "sha256": "edc0c948211129f3b70f8e69cf97cdc9510f4a1a5e4ef3d825a2f0b04f1b1877"
+        },
+        {
+          "name": "nc_pubs_23",
+          "kind": "book chapter",
+          "title": "Circles of Values: Integrating Maya Knowledge into Belizean Schools",
+          "year": "2012",
+          "pages": 16,
+          "scanned": true,
+          "tags": "repository cover sheet only",
+          "url": "https://academicworks.cuny.edu/context/nc_pubs/article/1023/viewcontent",
+          "origin": "https://academicworks.cuny.edu/nc_pubs/23",
+          "sha256": "03e90ecd0ddb7c4299db8e308bf8becf50b9d9c94fe0d2c47f76f4d56099aff0"
+        },
+        {
+          "name": "bb_pubs_348",
+          "kind": "book chapter",
+          "title": "Preface in New Approaches to the Study of Marine Mammals",
+          "year": "2012",
+          "pages": 4,
+          "scanned": true,
+          "tags": "repository cover sheet only",
+          "url": "https://academicworks.cuny.edu/context/bb_pubs/article/1365/viewcontent",
+          "origin": "https://academicworks.cuny.edu/bb_pubs/348",
+          "sha256": "951b31d293cf59a60262d8dc017d1f7c3be2cf6036ec7819d909c9cdb8a325aa"
+        },
+        {
+          "name": "bb_pubs_363",
+          "kind": "book chapter",
+          "title": "National Science Foundation, U.S",
+          "year": "2010",
+          "pages": 5,
+          "scanned": true,
+          "tags": "repository cover sheet only",
+          "url": "https://academicworks.cuny.edu/context/bb_pubs/article/1380/viewcontent",
+          "origin": "https://academicworks.cuny.edu/bb_pubs/363",
+          "sha256": "07839d322c8357132156e5f9bf55cf59de87f5fb9deb71aebdc15f5d470a1edf"
+        },
+        {
+          "name": "bb_pubs_360",
+          "kind": "book chapter",
+          "title": "Evolution of hypogean fauna",
+          "year": "2004",
+          "pages": 4,
+          "scanned": true,
+          "tags": "repository cover sheet only",
+          "url": "https://academicworks.cuny.edu/context/bb_pubs/article/1377/viewcontent",
+          "origin": "https://academicworks.cuny.edu/bb_pubs/360",
+          "sha256": "0cfab392c61c5df9f70d53b17daf5f4e504c5b56f3a601eb874f6273bd165574"
+        },
+        {
+          "name": "bb_pubs_361",
+          "kind": "book chapter",
+          "title": "Pisces (Fishes): Amblyopsidae",
+          "year": "2004",
+          "pages": 4,
+          "scanned": true,
+          "tags": "repository cover sheet only",
+          "url": "https://academicworks.cuny.edu/context/bb_pubs/article/1378/viewcontent",
+          "origin": "https://academicworks.cuny.edu/bb_pubs/361",
+          "sha256": "99a708533165808e760a67f9d70aa5e64e78bf1047ef61b20eb01d52ce062ec4"
+        },
+        {
+          "name": "bb_pubs_492",
+          "kind": "article",
+          "title": "New national park for Venezuela",
+          "year": "1988",
+          "pages": 2,
+          "scanned": true,
+          "tags": "repository cover sheet only",
+          "url": "https://academicworks.cuny.edu/context/bb_pubs/article/1512/viewcontent",
+          "origin": "https://academicworks.cuny.edu/bb_pubs/492",
+          "sha256": "068c55f98630358dc7068f731294f239f102dc92585b92df4822cb7f468f2e6a"
+        },
+        {
+          "name": "bx_arch_minutes_1392",
+          "kind": "minutes",
+          "title": "University Faculty Senate Minutes April 11, 1972",
+          "year": "1972",
+          "pages": 4,
+          "scanned": true,
+          "tags": "none",
+          "url": "https://academicworks.cuny.edu/context/bx_arch_minutes/article/2391/viewcontent",
+          "origin": "https://academicworks.cuny.edu/bx_arch_minutes/1392",
+          "sha256": "26a6822eec28277d0de86c33b0c96ae5a8c49008ddab6d17eda3ac973e481133"
+        },
+        {
+          "name": "wsq_236",
+          "kind": "journal front matter",
+          "title": "Front Matter",
+          "year": "1978",
+          "pages": 2,
+          "scanned": false,
+          "tags": "repository cover sheet only",
+          "url": "https://academicworks.cuny.edu/context/wsq/article/1381/viewcontent",
+          "origin": "https://academicworks.cuny.edu/wsq/236",
+          "sha256": "300d1c9600cf17136ad3ffde81a8fff5a64108a76c02586819408fa7d93a704f"
+        },
+        {
+          "name": "gc_cs_tr_403",
+          "kind": "report",
+          "title": "TR-2015001: A Survey and Critique of Facial Expression Synthesis in Sign Language Animation",
+          "year": "2015",
+          "pages": 58,
+          "scanned": false,
+          "tags": "repository cover sheet only",
+          "url": "https://academicworks.cuny.edu/context/gc_cs_tr/article/1402/viewcontent",
+          "origin": "https://academicworks.cuny.edu/gc_cs_tr/403",
+          "sha256": "e0baf5f58edca2b781b79b223a7a1902b95801efc882fd733736d50c702e60de"
+        },
+        {
+          "name": "ccny_business_communications_syllabus",
+          "kind": "syllabus",
+          "title": "Business Communications syllabus draft, Spring 2023",
+          "pages": 11,
+          "scanned": false,
+          "tags": "none",
+          "url": "https://www.ccny.cuny.edu/sites/default/files/2023-01/ColinPowellSchool_CCNY_Economics&Business_BusinessCommunications_Spring2023.pdf",
+          "origin": "https://www.ccny.cuny.edu/sites/default/files/2023-01/ColinPowellSchool_CCNY_Economics&Business_BusinessCommunications_Spring2023.pdf",
+          "sha256": "71bf72e15f4ab6f0662d38f8a829e6941ae8c3a96de49b99bd1bbbb18d48a71c"
+        },
+        {
+          "name": "citytech_cst_1101_syllabus",
+          "kind": "syllabus",
+          "title": "CST 1101 class syllabus, 2023",
+          "pages": 3,
+          "scanned": false,
+          "tags": "none",
+          "url": "https://openlab.citytech.cuny.edu/lnewell/files/2025/05/CST-1101-CLASS_SYLLABUS_2023.pdf",
+          "origin": "https://openlab.citytech.cuny.edu/lnewell/files/2025/05/CST-1101-CLASS_SYLLABUS_2023.pdf",
+          "sha256": "4c800ea7a7d2aa91272f08ee9be38d910a8d7d7fd4ed08b2a229db742f3d28de"
+        },
+        {
+          "name": "citytech_buf_2246_syllabus",
+          "kind": "syllabus",
+          "title": "BUF 2246 syllabus, 2024",
+          "pages": 10,
+          "scanned": false,
+          "tags": "none",
+          "url": "https://openlab.citytech.cuny.edu/annamolina-eportfolio/files/2024/11/BUF-2246-Syllabus.pdf",
+          "origin": "https://openlab.citytech.cuny.edu/annamolina-eportfolio/files/2024/11/BUF-2246-Syllabus.pdf",
+          "sha256": "81afee1b6a793567c071653aca0a7abaf6a2f7e105e5b4883be57fc5edaadba8"
+        },
+        {
+          "name": "gc_sociology_newsletter_2020_02",
+          "kind": "newsletter",
+          "title": "Sociology newsletter, February 2020",
+          "pages": 19,
+          "scanned": false,
+          "tags": "none",
+          "url": "https://www.gc.cuny.edu/sites/default/files/2021-09/Sociology-February-2020-Newsletter.pdf",
+          "origin": "https://www.gc.cuny.edu/sites/default/files/2021-09/Sociology-February-2020-Newsletter.pdf",
+          "sha256": "7d6ad75dfcd9e0a4c30d5cd892cf5a54c8eab7acee6d7fc6886cb8c76fc7c986"
+        },
+        {
+          "name": "gc_political_science_newsletter_2016",
+          "kind": "newsletter",
+          "title": "Homo Politicus, Political Science newsletter, Fall 2016",
+          "pages": 22,
+          "scanned": false,
+          "tags": "none",
+          "url": "https://www.gc.cuny.edu/sites/default/files/2021-10/HomoPoliticusFall2016_reduced.pdf",
+          "origin": "https://www.gc.cuny.edu/sites/default/files/2021-10/HomoPoliticusFall2016_reduced.pdf",
+          "sha256": "a5568deb90113736800ccb51a3faaabc582411ac26769d9de204492313389815"
+        },
+        {
+          "name": "cuny_elo_badging_in_stem_slides",
+          "kind": "slides",
+          "title": "Incorporating Experiential Learning and Badging in STEM, 2019 ELO Symposium",
+          "pages": 24,
+          "scanned": false,
+          "tags": "none",
+          "url": "https://www.cuny.edu/wp-content/uploads/sites/4/page-assets/academics/current-initiatives/experiential-learning/2019-elo-symposium/Incorporating-Experiental-Learning-and-Badging-in-STEM.pdf",
+          "origin": "https://www.cuny.edu/wp-content/uploads/sites/4/page-assets/academics/current-initiatives/experiential-learning/2019-elo-symposium/Incorporating-Experiental-Learning-and-Badging-in-STEM.pdf",
+          "sha256": "77eb96259bce234c5b06a5f948bc522ada869308ded3e388c9631cba2113a31d"
+        }
+      ]
+    }
   ]
 }

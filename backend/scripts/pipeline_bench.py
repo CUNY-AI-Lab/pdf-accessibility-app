@@ -19,9 +19,11 @@ capture holds ``capture.json``: what produced it (commit, image, docling-serve
 and Docling versions and device, OCR engine and versions, date).
 
 Beside each page, ``<stem>.run.json`` records the run: each pipeline step's
-status and seconds, docling-serve cache use, and model requests, tokens and
-cost. ``--docling-cache`` answers a conversion done before from disk, and
-``--cassette`` records or replays model calls (``bench_caches.py``).
+status and seconds, docling-serve cache use, model requests, tokens and cost,
+and its outcome (the release gate's checks, veraPDF's remaining rules, the
+review tasks a person sees, and each figure's alt text). ``--docling-cache``
+answers a conversion done before from disk, and ``--cassette`` records or
+replays model calls (``bench_caches.py``).
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import app.pipeline.orchestrator as orchestrator
 from app.api.jobs import PIPELINE_STEPS
 from app.config import get_settings
-from app.models import Base, Job, JobStep
+from app.models import AltTextEntry, Base, Job, JobStep, ReviewTask
 from app.services.job_manager import JobManager
 
 BACKEND = Path(__file__).resolve().parent.parent
@@ -144,6 +146,54 @@ async def step_ledger(session_maker, job_id: str) -> list[dict]:
         return steps
 
 
+async def run_outcome(session_maker, job_id: str) -> dict:
+    """What the run decided: the release gate's checks, veraPDF's verdict and
+    remaining rules, the review tasks a person sees, and each figure's alt
+    text, as the app stored them."""
+    async with session_maker() as db:
+        job = await db.get(Job, job_id)
+        tasks = (await db.execute(select(ReviewTask).where(ReviewTask.job_id == job_id))).scalars()
+        alts = (
+            await db.execute(select(AltTextEntry).where(AltTextEntry.job_id == job_id))
+        ).scalars()
+        validation = json.loads(job.validation_json) if job and job.validation_json else {}
+        fidelity = validation.get("fidelity") or {}
+        return {
+            "validation_compliant": validation.get("compliant"),
+            "remaining_rules": sorted(
+                {
+                    str(violation.get("rule_id"))
+                    for violation in validation.get("violations") or []
+                    if violation.get("severity") == "error"
+                }
+            ),
+            "fidelity_passed": fidelity.get("passed"),
+            "fidelity_summary": fidelity.get("summary"),
+            "checks": [
+                {"check": check.get("check"), "status": check.get("status")}
+                for check in fidelity.get("checks") or []
+            ],
+            "review_tasks": [
+                {
+                    "task_type": task.task_type,
+                    "blocking": task.blocking,
+                    "severity": task.severity,
+                    "source": task.source,
+                    "title": task.title,
+                }
+                for task in tasks
+            ],
+            "alt_texts": [
+                {
+                    "figure_index": entry.figure_index,
+                    "status": entry.status,
+                    "text": entry.edited_text or entry.generated_text,
+                }
+                for entry in sorted(alts, key=lambda entry: entry.figure_index)
+            ],
+        }
+
+
 async def remediate(
     pdf: Path, session_maker, settings, job_manager
 ) -> tuple[Path | None, str, str, str]:
@@ -220,6 +270,7 @@ async def main() -> None:
                     "status": status,
                     "seconds": round(time.monotonic() - started, 2),
                     "steps": await step_ledger(session_maker, job_id),
+                    "outcome": await run_outcome(session_maker, job_id),
                     **ledger.as_dict(),
                 }
                 (out_dir / f"{pdf.stem}.run.json").write_text(json.dumps(run, indent=1))
