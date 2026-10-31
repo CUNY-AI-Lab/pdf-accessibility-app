@@ -150,7 +150,7 @@ from app.pipeline.llm_operations import (
 from app.pipeline.ocr import run_ocr
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.pdfium_text import PdfiumText
-from app.pipeline.structure import extract_structure
+from app.pipeline.structure import docling_table_cell_matching, extract_structure
 from app.pipeline.tagger import TaggingResult, is_placeholder_alt_text, tag_pdf
 from app.pipeline.validator import ValidationResult, validate_pdf
 from app.services.applied_changes import add_applied_change
@@ -1967,7 +1967,11 @@ async def _run_pipeline(
             await _update_step(db, job_id, "structure", "running")
             job_manager.emit_progress(job_id, step="structure", status="running")
 
-            structure = await extract_structure(working_pdf, job_dir)
+            structure = await extract_structure(
+                working_pdf,
+                job_dir,
+                table_cell_matching=docling_table_cell_matching(classification.type),
+            )
             if structure.processed_pdf_path:
                 working_pdf = structure.processed_pdf_path
             docling_escalation_plan = docling_structure_escalation_plan(structure.document_json)

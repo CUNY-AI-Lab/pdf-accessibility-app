@@ -100,6 +100,7 @@ def install_docling_cache(directory: Path) -> None:
         ocr_engine: str = "rapidocr",
         token: str = "",
         include_figure_images: bool = True,
+        table_cell_matching: bool = True,
     ):
         if base_url not in versions:
             headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -109,6 +110,7 @@ def install_docling_cache(directory: Path) -> None:
         options = {
             "ocr_engine": ocr_engine,
             "include_figure_images": include_figure_images,
+            "table_cell_matching": table_cell_matching,
             "code": code,
         }
         key = docling_cache_key(pdf_path.read_bytes(), options, versions[base_url])
@@ -126,7 +128,14 @@ def install_docling_cache(directory: Path) -> None:
             )
             return doc_dict, figures
         doc_dict, figures = await convert(
-            pdf_path, job_dir, base_url, timeout, ocr_engine, token, include_figure_images
+            pdf_path,
+            job_dir,
+            base_url,
+            timeout,
+            ocr_engine,
+            token,
+            include_figure_images,
+            table_cell_matching=table_cell_matching,
         )
         write_atomically(path, gzip.compress(json.dumps(doc_dict).encode(), compresslevel=6))
         ledger.docling.append(
