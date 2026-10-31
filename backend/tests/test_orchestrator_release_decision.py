@@ -50,7 +50,11 @@ def _blocking(task_type: str = "table_semantics") -> dict[str, object]:
         "blocking": True,
         "status": "pending_review",
         "source": "fidelity",
-        "metadata": {},
+        "metadata": {"check": {
+            "table_semantics": "table_headers",
+            "content_fidelity": "tagged_text_coverage",
+            "alt_text": "figure_descriptions",
+        }.get(task_type)},
     }
 
 
@@ -69,7 +73,10 @@ def _fidelity(tasks: list[dict[str, object]]) -> dict[str, object]:
             "advisory_tasks": len(tasks) - blocking,
             "total_tasks": len(tasks),
         },
-        "checks": [],
+        "checks": [
+            {"check": task["metadata"]["check"], "status": "fail"}
+            for task in tasks if task.get("metadata", {}).get("check")
+        ],
     }
 
 
@@ -82,6 +89,7 @@ async def _run_release(
     structure_json: dict | None = None,
     auto_structure_specs: list[dict[str, object]] | None = None,
     font_map_candidate: bool = False,
+    fidelity_checks: list[dict[str, object]] | None = None,
 ):
     """Run the tagging/validation flow and return (job, review task rows, tagged names)."""
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -137,7 +145,10 @@ async def _run_release(
 
     def fake_assess_fidelity(*, output_pdf, **_kwargs):
         tasks = [dict(task) for task in fidelity_tasks.get(Path(output_pdf).name, [])]
-        return _fidelity(tasks), tasks
+        report = _fidelity(tasks)
+        if fidelity_checks is not None:
+            report["checks"] = fidelity_checks
+        return report, tasks
 
     async def fake_grounded_text(**kwargs):
         return kwargs["structure_json"], _audit(applied_code_text_count=0)
@@ -269,7 +280,7 @@ async def test_blocking_fidelity_task_holds_a_compliant_output(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_hidden_blocking_task_still_holds_the_output(tmp_path, monkeypatch):
+async def test_figure_semantics_task_is_advisory_and_output_is_released(tmp_path, monkeypatch):
     job, review_rows, _ = await _run_release(
         tmp_path,
         monkeypatch,
@@ -277,15 +288,14 @@ async def test_hidden_blocking_task_still_holds_the_output(tmp_path, monkeypatch
         fidelity_tasks={TAGGED: [_blocking("figure_semantics")]},
     )
 
-    # figure_semantics is not a user-visible task type, but it still blocks release.
-    assert job.status == "manual_remediation"
-    assert review_rows == []
-    assert json.loads(job.fidelity_json)["summary"]["blocking_tasks"] == 1
+    assert job.status == "complete"
+    assert [(row.task_type, row.blocking) for row in review_rows] == [("figure_semantics", False)]
+    assert json.loads(job.fidelity_json)["summary"]["blocking_tasks"] == 0
 
 
 @pytest.mark.asyncio
 async def test_noncompliant_output_is_held_even_when_fidelity_passes(tmp_path, monkeypatch):
-    job, _, _ = await _run_release(
+    job, rows, _ = await _run_release(
         tmp_path,
         monkeypatch,
         compliant={TAGGED: False},
@@ -294,6 +304,7 @@ async def test_noncompliant_output_is_held_even_when_fidelity_passes(tmp_path, m
 
     assert job.status == "manual_remediation"
     assert json.loads(job.validation_json)["compliant"] is False
+    assert len(rows) == 1 and rows[0].blocking and rows[0].title and rows[0].detail
 
 
 @pytest.mark.asyncio
@@ -339,7 +350,8 @@ async def test_auto_structure_retry_is_adopted_only_when_compliant_and_better(
     ("candidate_tasks", "expected_output", "expected_status"),
     [
         ([], FONT_MAP, "complete"),
-        ([_blocking("font_text_fidelity"), _blocking("table_semantics")], TAGGED, "manual_remediation"),
+        ([_blocking("font_text_fidelity"), _blocking("table_semantics")], FONT_MAP, "manual_remediation"),
+        ([_blocking("table_semantics"), _blocking("table_semantics")], TAGGED, "manual_remediation"),
     ],
 )
 async def test_font_map_candidate_is_adopted_only_when_fidelity_is_not_worse(
@@ -362,3 +374,77 @@ async def test_font_map_candidate_is_adopted_only_when_fidelity_is_not_worse(
     assert job.status == expected_status
     font_map_audit = json.loads(job.validation_json)["remediation"]["llm_font_map_auto"]
     assert font_map_audit["applied"] is (expected_output == FONT_MAP)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_type",
+    ["font_text_fidelity", "figure_semantics", "reading_order", "form_semantics",
+     "table_semantics", "content_fidelity", "annotation_description", "alt_text"],
+)
+async def test_advisory_tasks_cannot_hold_a_compliant_output(tmp_path, monkeypatch, task_type):
+    task = _blocking(task_type)
+    task["metadata"] = {}
+    job, rows, _ = await _run_release(
+        tmp_path, monkeypatch,
+        compliant={TAGGED: True}, fidelity_tasks={TAGGED: [task]},
+    )
+    assert job.status == "complete"
+    assert [(row.task_type, row.blocking) for row in rows] == [(task_type, False)]
+    assert json.loads(job.fidelity_json)["summary"]["advisory_tasks"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("check", "status"),
+    [("tagged_text_coverage", "fail"), ("figure_descriptions", "fail"),
+     ("table_headers", "fail"), ("form_semantics", "error")],
+)
+async def test_named_failure_holds_with_a_visible_explanation_even_without_tasks(
+    tmp_path, monkeypatch, check, status,
+):
+    job, rows, _ = await _run_release(
+        tmp_path, monkeypatch,
+        compliant={TAGGED: True}, fidelity_tasks={TAGGED: []},
+        fidelity_checks=[{"check": check, "status": status}],
+    )
+    assert job.status == "manual_remediation"
+    assert len(rows) == 1
+    assert rows[0].blocking and rows[0].title and rows[0].detail
+    assert json.loads(rows[0].metadata_json)["check"] == check
+    assert json.loads(job.fidelity_json)["passed"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_type", ["reading_order", "font_text_fidelity", "form_semantics"])
+async def test_verapdf_failure_has_visible_validation_tasks(tmp_path, monkeypatch, task_type):
+    task = _blocking(task_type)
+    task["source"] = "validation"
+    task["detail"] = "veraPDF found a remaining accessibility failure."
+    job, rows, _ = await _run_release(
+        tmp_path, monkeypatch,
+        compliant={TAGGED: False}, fidelity_tasks={TAGGED: [task]},
+    )
+    assert job.status == "manual_remediation"
+    assert [(row.task_type, row.blocking) for row in rows] == [(task_type, True)]
+    assert rows[0].title and rows[0].detail
+
+
+@pytest.mark.asyncio
+async def test_model_adjudication_cannot_turn_an_advisory_into_a_hold(tmp_path, monkeypatch):
+    async def adjudicate(*, review_tasks, fidelity_report, **_kwargs):
+        task = _blocking("content_fidelity")
+        task["metadata"] = {"grounded_text_llm_adjudicated": True}
+        review_tasks.append(task)
+        fidelity_report["checks"].append({"check": "grounded_text_fidelity", "status": "fail"})
+        return review_tasks, fidelity_report, {}
+
+    monkeypatch.setattr(orchestrator, "_adjudicate_grounded_text_candidates", adjudicate)
+    job, rows, _ = await _run_release(
+        tmp_path, monkeypatch, compliant={TAGGED: True}, fidelity_tasks={TAGGED: []},
+    )
+    assert job.status == "complete"
+    assert len(rows) == 1 and rows[0].blocking is False
+    assert json.loads(job.fidelity_json)["checks"] == [
+        {"check": "grounded_text_fidelity", "status": "warning"},
+    ]

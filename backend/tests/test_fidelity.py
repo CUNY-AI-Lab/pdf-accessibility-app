@@ -173,7 +173,7 @@ def test_fidelity_form_semantics_fails_when_validator_still_has_form_errors(monk
     )
 
     form_check = next(check for check in report["checks"] if check["check"] == "form_semantics")
-    assert form_check["status"] == "fail"
+    assert form_check["status"] == "warning"
     assert form_check["metrics"]["remaining_validation_errors"] == 3
     form_task = next(task for task in tasks if task["task_type"] == "form_semantics")
     assert form_task["blocking"] is True
@@ -545,7 +545,7 @@ def test_collect_structural_fragments_skips_toc_elements():
     ]
 
 
-def test_scanned_fidelity_fails_when_visible_scan_has_no_ocr_text_or_structure(monkeypatch):
+def test_scanned_fidelity_advises_when_visible_scan_has_no_ocr_text_or_structure(monkeypatch, tmp_path):
     monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "")
     monkeypatch.setattr(
         fidelity,
@@ -560,8 +560,8 @@ def test_scanned_fidelity_fails_when_visible_scan_has_no_ocr_text_or_structure(m
     )
 
     report, tasks = assess_fidelity(
-        input_pdf=Path("scan.pdf"),
-        output_pdf=Path("out.pdf"),
+        input_pdf=_blank_output_pdf(tmp_path, "scan.pdf"),
+        output_pdf=_blank_output_pdf(tmp_path),
         structure_json={"elements": []},
         alt_entries=[],
         validation_report=_validation_report(compliant=True, violations=[]),
@@ -569,13 +569,13 @@ def test_scanned_fidelity_fails_when_visible_scan_has_no_ocr_text_or_structure(m
         classification="scanned",
     )
 
-    assert report["passed"] is False
+    assert report["passed"] is True
     assert any(
-        check["check"] == "ocr_coverage" and check["status"] == "fail"
+        check["check"] == "ocr_coverage" and check["status"] == "warning"
         for check in report["checks"]
     )
     assert any(
-        task["task_type"] == "content_fidelity" and task["blocking"]
+        task["task_type"] == "content_fidelity" and not task["blocking"]
         for task in tasks
     )
 
@@ -804,7 +804,7 @@ def test_fidelity_allows_advisory_machine_alt_without_blocking(monkeypatch, tmp_
     assert any(task["task_type"] == "alt_text" and not task["blocking"] for task in tasks)
 
 
-def test_fidelity_flags_large_text_drift(monkeypatch):
+def test_fidelity_flags_large_text_drift(monkeypatch, tmp_path):
     samples = {
         "in.pdf": "alpha beta gamma delta " * 80,
         "out.pdf": "omega sigma lambda " * 80,
@@ -816,8 +816,8 @@ def test_fidelity_flags_large_text_drift(monkeypatch):
     )
 
     report, tasks = assess_fidelity(
-        input_pdf=Path("in.pdf"),
-        output_pdf=Path("out.pdf"),
+        input_pdf=_blank_output_pdf(tmp_path, "in.pdf"),
+        output_pdf=_blank_output_pdf(tmp_path),
         structure_json={"elements": []},
         alt_entries=[],
         validation_report=_validation_report(compliant=True, violations=[]),
@@ -825,8 +825,8 @@ def test_fidelity_flags_large_text_drift(monkeypatch):
         classification="digital",
     )
 
-    assert report["passed"] is False
-    assert any(task["task_type"] == "content_fidelity" and task["blocking"] for task in tasks)
+    assert report["passed"] is True
+    assert any(task["task_type"] == "content_fidelity" and not task["blocking"] for task in tasks)
 
 
 def test_grounded_text_risk_flags_spacing_issue(monkeypatch):
@@ -1102,7 +1102,7 @@ def test_fidelity_does_not_block_on_single_reading_order_outlier(monkeypatch, tm
     assert not any(task["task_type"] == "reading_order" and task["blocking"] for task in tasks)
 
 
-def test_fidelity_blocks_truly_scrambled_reading_order(monkeypatch):
+def test_fidelity_advises_on_scrambled_pdfminer_reading_order(monkeypatch, tmp_path):
     fragments = [
         "alpha section heading long enough",
         "bravo section heading long enough",
@@ -1117,8 +1117,8 @@ def test_fidelity_blocks_truly_scrambled_reading_order(monkeypatch):
     monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: output_text)
 
     report, tasks = assess_fidelity(
-        input_pdf=Path("in.pdf"),
-        output_pdf=Path("out.pdf"),
+        input_pdf=_blank_output_pdf(tmp_path, "in.pdf"),
+        output_pdf=_blank_output_pdf(tmp_path),
         structure_json={"elements": [{"type": "heading", "text": text} for text in fragments]},
         alt_entries=[],
         validation_report=_validation_report(compliant=True, violations=[]),
@@ -1126,8 +1126,8 @@ def test_fidelity_blocks_truly_scrambled_reading_order(monkeypatch):
         classification="digital",
     )
 
-    assert report["passed"] is False
-    assert any(task["task_type"] == "reading_order" and task["blocking"] for task in tasks)
+    assert report["passed"] is True
+    assert any(task["task_type"] == "reading_order" and not task["blocking"] for task in tasks)
 
 
 def test_table_semantics_risk_ignores_simple_regular_table():
@@ -1220,7 +1220,7 @@ def test_table_semantics_risk_keeps_sparse_text_risk_even_when_llm_confirmed():
     assert risk["targets"][0]["llm_confirmed"] is True
 
 
-def test_fidelity_flags_high_risk_complex_tables(monkeypatch):
+def test_fidelity_flags_high_risk_complex_tables(monkeypatch, tmp_path):
     monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "program students history 45")
     monkeypatch.setattr(fidelity, "_sample_visual_ink", lambda path: {
         "sampled_pages": 1,
@@ -1248,8 +1248,8 @@ def test_fidelity_flags_high_risk_complex_tables(monkeypatch):
     }
 
     report, tasks = assess_fidelity(
-        input_pdf=Path("in.pdf"),
-        output_pdf=Path("out.pdf"),
+        input_pdf=_blank_output_pdf(tmp_path, "in.pdf"),
+        output_pdf=_blank_output_pdf(tmp_path),
         structure_json=structure,
         alt_entries=[],
         validation_report=_validation_report(compliant=True, violations=[]),
@@ -1257,9 +1257,9 @@ def test_fidelity_flags_high_risk_complex_tables(monkeypatch):
         classification="digital",
     )
 
-    assert report["passed"] is False
+    assert report["passed"] is True
     task = next(task for task in tasks if task["task_type"] == "table_semantics")
-    assert task["blocking"] is True
+    assert task["blocking"] is False
     assert task["source"] == "fidelity"
     assert task["metadata"]["complex_tables"] == 1
     assert task["metadata"]["high_risk_tables"] == 1
@@ -1267,7 +1267,7 @@ def test_fidelity_flags_high_risk_complex_tables(monkeypatch):
     assert task["metadata"]["table_review_targets"][0]["table_review_id"] == "review-0"
 
 
-def test_fidelity_uses_output_struct_tree_for_table_coverage(monkeypatch):
+def test_fidelity_uses_output_struct_tree_for_table_coverage(monkeypatch, tmp_path):
     monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
     monkeypatch.setattr(fidelity, "_output_struct_type_counts", lambda path: {"Document": 1})
     monkeypatch.setattr(fidelity, "_sample_visual_ink", lambda path: {
@@ -1279,8 +1279,8 @@ def test_fidelity_uses_output_struct_tree_for_table_coverage(monkeypatch):
     })
 
     report, tasks = assess_fidelity(
-        input_pdf=Path("in.pdf"),
-        output_pdf=Path("out.pdf"),
+        input_pdf=_blank_output_pdf(tmp_path, "in.pdf"),
+        output_pdf=_blank_output_pdf(tmp_path),
         structure_json={
             "elements": [
                 {
@@ -1303,15 +1303,15 @@ def test_fidelity_uses_output_struct_tree_for_table_coverage(monkeypatch):
     )
 
     table_check = next(check for check in report["checks"] if check["check"] == "table_coverage")
-    assert report["passed"] is False
+    assert report["passed"] is True
     assert table_check["status"] == "warning"
     assert table_check["metrics"]["tagged_tables"] == 0
     task = next(task for task in tasks if task["task_type"] == "table_semantics")
-    assert task["blocking"] is True
+    assert task["blocking"] is False
     assert task["metadata"]["tagged_tables"] == 0
 
 
-def test_fidelity_blocks_when_detected_figures_are_not_tagged(monkeypatch):
+def test_fidelity_advises_when_detected_figures_are_not_tagged(monkeypatch, tmp_path):
     monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
     monkeypatch.setattr(fidelity, "_sample_visual_ink", lambda path: {
         "sampled_pages": 1,
@@ -1322,8 +1322,8 @@ def test_fidelity_blocks_when_detected_figures_are_not_tagged(monkeypatch):
     })
 
     report, tasks = assess_fidelity(
-        input_pdf=Path("in.pdf"),
-        output_pdf=Path("out.pdf"),
+        input_pdf=_blank_output_pdf(tmp_path, "in.pdf"),
+        output_pdf=_blank_output_pdf(tmp_path),
         structure_json={
             "elements": [
                 {
@@ -1352,12 +1352,12 @@ def test_fidelity_blocks_when_detected_figures_are_not_tagged(monkeypatch):
         classification="digital",
     )
 
-    assert report["passed"] is False
+    assert report["passed"] is True
     figure_check = next(check for check in report["checks"] if check["check"] == "figure_coverage")
     assert figure_check["status"] == "warning"
     assert figure_check["metrics"]["coverage"] == 0.0
     task = next(task for task in tasks if task["task_type"] == "figure_semantics")
-    assert task["blocking"] is True
+    assert task["blocking"] is False
     assert task["metadata"]["detected_figures"] == 2
     assert task["metadata"]["tagged_figures"] == 0
     assert task["metadata"]["pages_to_check"] == [1, 3]
@@ -1516,19 +1516,56 @@ def test_output_that_keeps_its_text_passes(tmp_path):
     assert not [task for task in tasks if task["blocking"]]
 
 
+@pytest.mark.parametrize("key", ["Alt", "ActualText"])
+@pytest.mark.parametrize("description", ["", "[Figure]", "A chart of enrollment by year"])
+def test_only_figures_without_usable_descriptions_hold_the_output(tmp_path, key, description):
+    pdf = described_text(tmp_path / "figure.pdf", key=key, description=description)
+    report, tasks = _assess_real(pdf, pdf)
+    held = description in {"", "[Figure]"}
+    assert report["passed"] is not held
+    assert _check(report, "figure_descriptions")["status"] == ("fail" if held else "pass")
+    assert any(task["blocking"] and task["task_type"] == "alt_text" for task in tasks) is held
+
+
+def test_residual_font_targets_are_advisory_without_verapdf_failure(tmp_path, monkeypatch):
+    pdf = _text_pdf(tmp_path / "out.pdf")
+    monkeypatch.setattr(fidelity, "_extract_font_review_targets", lambda *args, **kwargs: (
+        [{"page": 1, "font": "F1"}], [1], ["F1"],
+    ))
+    report, tasks = _assess_real(pdf, pdf)
+    assert report["passed"] is True
+    assert _check(report, "font_text_fidelity")["status"] == "warning"
+    task = next(task for task in tasks if task["task_type"] == "font_text_fidelity")
+    assert task["blocking"] is False
+    assert task["metadata"]["pages_to_check"] == [1]
+
+
+def test_form_label_quality_is_advisory_without_verapdf_failure(tmp_path, monkeypatch):
+    pdf = _text_pdf(tmp_path / "out.pdf")
+    monkeypatch.setattr(fidelity, "_form_semantics_risk", lambda _: {
+        "field_count": 1, "missing_labels": 1, "weak_labels": 0,
+        "targets": [{"page": 1}],
+    })
+    report, tasks = _assess_real(pdf, pdf)
+    assert report["passed"] is True
+    assert _check(report, "form_semantics")["status"] == "warning"
+    task = next(task for task in tasks if task["task_type"] == "form_semantics")
+    assert task["blocking"] is False
+
+
 @pytest.mark.parametrize("classification", ["digital", "mixed", "ocr_scan"])
-def test_output_that_lost_its_text_is_held(tmp_path, classification):
+def test_source_text_loss_is_advisory_when_output_has_no_coverage_failure(tmp_path, classification):
     source = _text_pdf(tmp_path / "in.pdf")
     output = _blank_output_pdf(tmp_path)
 
     report, tasks = _assess_real(source, output, classification)
 
-    assert report["passed"] is False
-    assert _check(report, "text_drift")["status"] == "fail"
+    assert report["passed"] is True
+    assert _check(report, "text_drift")["status"] == "warning"
     lost = [
         task
         for task in tasks
-        if task["task_type"] == "content_fidelity" and task["blocking"]
+        if task["task_type"] == "content_fidelity" and not task["blocking"]
     ]
     assert len(lost) == 1
     assert lost[0]["metadata"]["output_chars"] == 0

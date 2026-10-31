@@ -5,7 +5,7 @@ from app.services.review_surface import (
 )
 
 
-def test_filter_user_visible_review_tasks_keeps_only_legible_follow_up_types():
+def test_filter_user_visible_review_tasks_keeps_accessibility_diagnostics():
     review_tasks = [
         {"task_type": "annotation_description", "blocking": False},
         {"task_type": "alt_text", "blocking": False},
@@ -19,16 +19,18 @@ def test_filter_user_visible_review_tasks_keeps_only_legible_follow_up_types():
     assert [task["task_type"] for task in filtered] == [
         "annotation_description",
         "alt_text",
+        "reading_order",
         "table_semantics",
+        "font_text_fidelity",
     ]
 
 
 def test_user_visible_review_task_types_match_product_surface():
     assert is_user_visible_review_task_type("annotation_description") is True
     assert is_user_visible_review_task_type("alt_text") is True
-    assert is_user_visible_review_task_type("reading_order") is False
+    assert is_user_visible_review_task_type("reading_order") is True
     assert is_user_visible_review_task_type("table_semantics") is True
-    assert is_user_visible_review_task_type("form_semantics") is False
+    assert is_user_visible_review_task_type("form_semantics") is True
 
 
 def test_only_legible_applied_changes_are_reviewable():

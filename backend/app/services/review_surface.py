@@ -7,6 +7,10 @@ USER_VISIBLE_REVIEW_TASK_TYPES = frozenset(
         "alt_text",
         "annotation_description",
         "content_fidelity",
+        "font_text_fidelity",
+        "form_semantics",
+        "reading_order",
+        "figure_semantics",
         "table_semantics",
     }
 )
