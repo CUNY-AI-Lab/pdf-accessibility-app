@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from bisect import bisect_right
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -19,7 +21,9 @@ from PIL import Image
 from rapidfuzz.distance import Levenshtein
 from rapidfuzz.fuzz import partial_ratio
 
+from app.pipeline.pdfium_text import PdfiumText, pagination_artifact_indices
 from app.pipeline.tagger import is_placeholder_alt_text
+from app.services.coverage_geometry import figure_boxes_for_coverage
 from app.services.form_fields import extract_widget_fields
 from app.services.page_intelligence import (
     collect_grounded_text_candidates,
@@ -30,6 +34,7 @@ from app.services.pdf_preview import render_page_png_bytes
 from app.services.semantic_pretag_policy import (
     widget_targets_for_rationalization as _widget_targets_for_rationalization,
 )
+from app.services.structure_text import _standard_role, screen_reader_coverage_text
 from app.services.visual_figure_rationalization import (
     collect_missing_visual_figure_targets as _collect_missing_visual_figure_targets,
 )
@@ -86,9 +91,9 @@ _GENERATED_LINK_TEXT_RE = re.compile(
 class FidelityThresholds:
     """Tunable cutoffs for post-remediation fidelity checks.
 
-    Every threshold is empirically tuned against the CUNY corpus. When bumping
-    a value, update both the default and the rationale comment so the next
-    person tuning it understands why the previous value was chosen.
+    When calibrating a value against the CUNY corpus, update both the default
+    and the rationale comment so the next person tuning it understands why
+    the previous value was chosen.
     """
 
     # --- Link-text quality ------------------------------------------------
@@ -109,6 +114,14 @@ class FidelityThresholds:
     text_sample_min_chars: int = 300
     # Per-page minimum to count a page as "has a text layer" in scanned mode.
     scanned_text_min_chars: int = 40
+
+    # --- Tagged text coverage (whole document and each page) --------------
+    # Ordinary coverage gaps are noisy on picture OCR and handwriting.
+    # Block only catastrophic losses; all other sub-97% pages are advisory.
+    tagged_text_coverage_fail: float = 0.50
+    tagged_text_coverage_warn: float = 0.97
+    tagged_text_coverage_min_page_words: int = 100
+    tagged_text_coverage_min_missing_words: int = 50
 
     # --- Visual ink sampling (scanned-PDF classifier) --------------------
     # Most scan jobs have a blank cover; sampling the first 3 pages is enough
@@ -311,6 +324,97 @@ def _output_figures_without_alt(pdf_path: Path) -> list[dict[str, Any]]:
             walk(node.get("/K"))
 
         walk(struct_root.get("/K"))
+    return missing
+
+
+def _output_tables_without_headers(pdf_path: Path) -> list[dict[str, Any]]:
+    """Inspect actual table tags, independently of extraction metadata or /Summary."""
+    missing: list[dict[str, Any]] = []
+    with pikepdf.Pdf.open(pdf_path) as pdf:
+        root = pdf.Root.get("/StructTreeRoot")
+        if not isinstance(root, pikepdf.Dictionary):
+            return missing
+        role_map = root.get("/RoleMap")
+        page_numbers = {page.obj.objgen: number for number, page in enumerate(pdf.pages, start=1)}
+        seen: set[tuple[int, int]] = set()
+        table_index = 0
+
+        def role(node) -> str:
+            return _standard_role(node, role_map) if "/S" in node else ""
+
+        def descendants(node, visited=None):
+            if visited is None:
+                visited = set()
+            if isinstance(node, pikepdf.Array):
+                for kid in node:
+                    yield from descendants(kid, visited)
+            elif isinstance(node, pikepdf.Dictionary):
+                if node.is_indirect:
+                    if node.objgen in visited:
+                        raise ValueError("Repeated or cyclic table structure element")
+                    visited.add(node.objgen)
+                yield node
+                yield from descendants(node.get("/K"), visited)
+
+        def walk(node, page: int | None = None) -> None:
+            nonlocal table_index
+            if isinstance(node, pikepdf.Array):
+                for kid in node:
+                    walk(kid, page)
+                return
+            if not isinstance(node, pikepdf.Dictionary):
+                return
+            if node.is_indirect:
+                if node.objgen in seen:
+                    raise ValueError("Repeated or cyclic structure element")
+                seen.add(node.objgen)
+            pg = node.get("/Pg")
+            if isinstance(pg, pikepdf.Dictionary):
+                page = page_numbers.get(pg.objgen, page)
+            if role(node) == "Table":
+                table_index += 1
+                nodes = list(descendants(node.get("/K")))
+                rows = [kid for kid in nodes if role(kid) == "TR"]
+                columns = 0
+                for row in rows:
+                    width = 0
+                    for cell in descendants(row.get("/K")):
+                        if role(cell) not in {"TH", "TD"}:
+                            continue
+                        attributes = cell.get("/A")
+                        owners = attributes if isinstance(attributes, pikepdf.Array) else [attributes]
+                        width += max(
+                            (
+                                int(owner.get("/ColSpan", 1))
+                                for owner in owners
+                                if isinstance(owner, pikepdf.Dictionary) and owner.get("/O") == "/Table"
+                            ),
+                            default=1,
+                        )
+                    columns = max(columns, width)
+                has_headers = any(role(kid) == "TH" for kid in nodes)
+                min_rows = 3 if columns == 2 else 2
+                if len(rows) >= min_rows and columns >= 2 and not has_headers:
+                    if page is None:
+                        page = next(
+                            (
+                                page_numbers[kid.Pg.objgen]
+                                for kid in nodes
+                                if "/Pg" in kid and kid.Pg.objgen in page_numbers
+                            ),
+                            None,
+                        )
+                    missing.append(
+                        {
+                            "page": page,
+                            "table_index": table_index,
+                            "rows": len(rows),
+                            "columns": columns,
+                        }
+                    )
+            walk(node.get("/K"), page)
+
+        walk(root.get("/K"))
     return missing
 
 
@@ -1765,6 +1869,178 @@ def _check_text_drift(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
         )
 
 
+def _coverage_words(text: str) -> list[str]:
+    """Fold Unicode case/forms, remove discretionary hyphens, split punctuation."""
+    return re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", text).casefold().replace("\u00ad", ""))
+
+
+def _coverage_margin_position(word: str, box, width: float, height: float):
+    left, bottom, right, top = box
+    x, y = (left + right) / (2 * width), (bottom + top) / (2 * height)
+    if y <= 0.10 or y >= 0.90 or x <= 0.10 or x >= 0.90:
+        return re.sub(r"\d+", "#", word), round(x, 2), round(y, 2)
+    return None
+
+
+def _check_tagged_text_coverage(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
+    try:
+        heard_text, heard_pages, replaced, marked = screen_reader_coverage_text(
+            inputs.output_pdf,
+        )
+        pagination = pagination_artifact_indices(inputs.output_pdf)
+        raw_pages: list[list[tuple[str, tuple[str, float, float] | None]]] = []
+        figure_totals: list[int] = []
+        pagination_totals: list[int] = []
+        off_page_totals: list[int] = []
+        artifact_figure_totals: list[int] = []
+        raw_totals: list[int] = []
+        deduplicated_totals: list[int] = []
+        duplicate_totals: list[int] = []
+        repeated: Counter = Counter()
+        with PdfiumText(inputs.output_pdf) as raw:
+            figure_boxes = figure_boxes_for_coverage(inputs.output_pdf, raw)
+            if len(heard_pages) != len(raw.document):
+                raise ValueError("Screen-reader and text-layer page counts differ")
+            for page_index in range(len(raw.document)):
+                page = raw.document[page_index]
+                width, height = page.get_size()
+                words = []
+                raw_totals.append(sum(len(_coverage_words(text)) for text, _ in raw.words(page_index)))
+                duplicates = raw.duplicate_indices(page_index, preferred_indices=marked[page_index])
+                deduplicated_total = sum(
+                    len(_coverage_words(text))
+                    for text, _ in raw.words(page_index, excluded_indices=duplicates)
+                )
+                deduplicated_totals.append(deduplicated_total)
+                duplicate_totals.append(len(duplicates))
+                off_page, artifact_figure = raw.spatial_exclusions(page_index, figure_boxes[page_index])
+                visible_indices = duplicates | off_page
+                visible_total = sum(
+                    len(_coverage_words(text)) for text, _ in raw.words(page_index, excluded_indices=visible_indices)
+                )
+                off_page_totals.append(deduplicated_total - visible_total)
+                mapped_indices = visible_indices | replaced[page_index]
+                mapped_total = sum(
+                    len(_coverage_words(text)) for text, _ in raw.words(page_index, excluded_indices=mapped_indices)
+                )
+                figure_excluded = mapped_indices | artifact_figure
+                without_figures = raw.words(page_index, excluded_indices=figure_excluded)
+                figure_total = sum(len(_coverage_words(text)) for text, _ in without_figures)
+                artifact_figure_totals.append(mapped_total - figure_total)
+                figure_totals.append(visible_total - figure_total)
+                # Typed furniture still supplies repetition evidence for other
+                # pages whose same running head/footer is untyped.
+                repeated.update({
+                    position for text, box in without_figures for word in _coverage_words(text)
+                    if (position := _coverage_margin_position(word, box, width, height)) is not None
+                })
+                eligible_words = raw.words(
+                    page_index, excluded_indices=figure_excluded | pagination[page_index]
+                )
+                pagination_totals.append(figure_total - sum(
+                    len(_coverage_words(text)) for text, _ in eligible_words
+                ))
+                for text, box in eligible_words:
+                    for word in _coverage_words(text):
+                        words.append((word, _coverage_margin_position(word, box, width, height)))
+                raw_pages.append(words)
+                # Do not retain every PDFium page's character cache for long PDFs.
+                raw.pages.pop(page_index, None)
+
+        pages = []
+        overall_raw: Counter = Counter()
+        overall_heard = Counter(_coverage_words(heard_text))
+        for number, (words, heard) in enumerate(zip(raw_pages, heard_pages, strict=True), start=1):
+            eligible = Counter(word for word, pos in words if pos is None or repeated[pos] < 3)
+            spoken = Counter(_coverage_words(heard))
+            total = eligible.total()
+            matched = (eligible & spoken).total()
+            pages.append(
+                {
+                    "page": number,
+                    "raw_words": raw_totals[number - 1],
+                    "deduplicated_words": deduplicated_totals[number - 1],
+                    "excluded_duplicate_characters": duplicate_totals[number - 1],
+                    "excluded_off_page_words": off_page_totals[number - 1],
+                    "excluded_artifact_figure_words": artifact_figure_totals[number - 1],
+                    "excluded_figure_words": figure_totals[number - 1],
+                    # Retain the original metric key for report consumers.
+                    "excluded_described_words": figure_totals[number - 1],
+                    "excluded_pagination_words": pagination_totals[number - 1],
+                    "excluded_furniture_words": pagination_totals[number - 1] + len(words) - total,
+                    "eligible_words": total,
+                    "matched_words": matched,
+                    "missing_words": total - matched,
+                    "coverage": matched / total if total else 1.0,
+                }
+            )
+            overall_raw.update(eligible)
+        total = overall_raw.total()
+        matched = (overall_raw & overall_heard).total()
+        coverage = matched / total if total else 1.0
+        fail = FIDELITY_THRESHOLDS.tagged_text_coverage_fail
+        warn = FIDELITY_THRESHOLDS.tagged_text_coverage_warn
+        min_page = FIDELITY_THRESHOLDS.tagged_text_coverage_min_page_words
+        min_missing = FIDELITY_THRESHOLDS.tagged_text_coverage_min_missing_words
+        substantial_pages = [
+            page for page in pages
+            if page["eligible_words"] >= min_page and page["missing_words"] >= min_missing
+        ]
+        failing_pages = [page["page"] for page in substantial_pages if page["coverage"] < fail]
+        warning_pages = [page["page"] for page in pages if page["coverage"] < warn]
+        blocking = (coverage < fail and total - matched >= min_missing) or bool(failing_pages)
+        advisory = coverage < warn or bool(warning_pages)
+        metrics = {
+            "coverage": coverage,
+            "raw_words": sum(page["raw_words"] for page in pages),
+            "excluded_furniture_words": sum(page["excluded_furniture_words"] for page in pages),
+            "excluded_off_page_words": sum(page["excluded_off_page_words"] for page in pages),
+            "excluded_artifact_figure_words": sum(page["excluded_artifact_figure_words"] for page in pages),
+            "excluded_figure_words": sum(page["excluded_figure_words"] for page in pages),
+            "excluded_described_words": sum(page["excluded_described_words"] for page in pages),
+            "excluded_pagination_words": sum(page["excluded_pagination_words"] for page in pages),
+            "deduplicated_words": sum(page["deduplicated_words"] for page in pages),
+            "excluded_duplicate_characters": sum(page["excluded_duplicate_characters"] for page in pages),
+            "eligible_words": total,
+            "matched_words": matched,
+            "missing_words": total - matched,
+            "blocking_threshold": fail,
+            "advisory_threshold": warn,
+            "min_page_words": min_page,
+            "min_missing_words": min_missing,
+            "blocking_pages": failing_pages,
+            "advisory_pages": warning_pages,
+            "pages": pages,
+        }
+    except Exception as exc:
+        logger.warning("Tagged text coverage check failed", exc_info=True)
+        out.add_check_error(
+            "tagged_text_coverage", "Check tagged text coverage by hand", _check_error_text(exc)
+        )
+        return
+    if blocking or advisory:
+        out.add_task(
+            "review:tagged_text_coverage",
+            task_type="content_fidelity",
+            title="Restore text missing from the tags" if blocking else "Spot-check tagged text coverage",
+            detail=(
+                "Some text-layer words are missing from the screen-reader reading. "
+                f"Review artifacts and untagged content on pages {', '.join(map(str, warning_pages))}."
+            ),
+            severity="high" if blocking else "medium",
+            blocking=blocking,
+            metadata={"check": "tagged_text_coverage", "pages_to_check": warning_pages, **metrics},
+        )
+    out.checks.append(
+        {
+            "check": "tagged_text_coverage",
+            "status": "fail" if blocking else "warning" if advisory else "pass",
+            "message": "Compared all text-layer words with the tag-order reading, overall and per page.",
+            "metrics": metrics,
+        }
+    )
+
+
 def _check_grounded_text_fidelity(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     grounded_text = _grounded_text_risk(inputs.output_pdf, inputs.structure_json)
     if grounded_text["target_count"] > 0:
@@ -2003,6 +2279,38 @@ def _check_table_coverage(inputs: _FidelityInputs, out: _FidelityCollector) -> N
         )
 
 
+def _check_table_headers(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
+    try:
+        missing = _output_tables_without_headers(inputs.output_pdf)
+    except Exception as exc:
+        logger.warning("Table header check failed", exc_info=True)
+        out.add_check_error("table_headers", "Check table headers by hand", _check_error_text(exc))
+        return
+    for table in missing:
+        page, index = table["page"], table["table_index"]
+        out.add_task(
+            f"review:table_headers:{index}",
+            task_type="table_semantics",
+            title=f"Add headers to table {index} on page {page or 'unknown'}",
+            detail=(
+                f"Table {index} on page {page or 'unknown'} has {table['rows']} rows and "
+                f"{table['columns']} columns "
+                "but no TH header cells. A table summary does not identify its headers."
+            ),
+            severity="high",
+            blocking=True,
+            metadata={**table, "pages_to_check": [page] if page is not None else []},
+        )
+    out.checks.append(
+        {
+            "check": "table_headers",
+            "status": "fail" if missing else "pass",
+            "message": "Checked multirow, multicolumn table tags for header cells.",
+            "metrics": {"tables_without_headers": missing},
+        }
+    )
+
+
 def _check_table_risk(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     if inputs.table_count > 0:
         table_risk = _table_semantics_risk(inputs.structure_json)
@@ -2212,10 +2520,17 @@ def _check_static_widget_artifacts(inputs: _FidelityInputs, out: _FidelityCollec
 
 
 def _check_visual_meaning_gap(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
-    missing_visual_figures = _collect_missing_visual_figure_targets(
-        working_pdf=inputs.output_pdf,
-        structure_json=inputs.structure_json,
-    )
+    try:
+        missing_visual_figures = _collect_missing_visual_figure_targets(
+            working_pdf=inputs.output_pdf,
+            structure_json=inputs.structure_json,
+        )
+    except Exception as exc:
+        logger.warning("Visual meaning gap check failed", exc_info=True)
+        out.add_check_error(
+            "visual_meaning_gap", "Check page visuals by hand", _check_error_text(exc)
+        )
+        return
     if missing_visual_figures:
         out.add_task(
             "review:content_fidelity:visual_meaning_gap",
@@ -2625,10 +2940,12 @@ def assess_fidelity(
     _check_compliance(inputs, out)
     _check_ocr_coverage(inputs, out)
     _check_text_drift(inputs, out)
+    _check_tagged_text_coverage(inputs, out)
     _check_grounded_text_fidelity(inputs, out)
     _check_reading_order(inputs, out)
     _check_figure_coverage(inputs, out)
     _check_table_coverage(inputs, out)
+    _check_table_headers(inputs, out)
     _check_table_risk(inputs, out)
     _check_form_semantics(inputs, out)
     _check_static_widget_artifacts(inputs, out)

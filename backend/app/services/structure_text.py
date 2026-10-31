@@ -120,11 +120,44 @@ def _standard_role(node: pikepdf.Dictionary, role_map) -> str:
 
 
 def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: bool = False) -> str:
+    return _screen_reader_text(pdf_path, figure_text=figure_text, markdown=markdown)[0]
+
+
+def screen_reader_text_with_pages(pdf_path: Path) -> tuple[str, list[str]]:
+    """The full tag-order reading and its text on each page (zero-based).
+
+    An /ActualText spanning pages belongs to its element's /Pg, or its first
+    descendant page when /Pg is absent. It is read once, as in the full reading.
+    """
+    text, pages, _, _ = _screen_reader_text(pdf_path)
+    return text, pages
+
+
+def screen_reader_coverage_text(
+    pdf_path: Path,
+) -> tuple[str, list[str], list[set[int]], list[set[int]]]:
+    """Reading plus raw character indices inside Figures/Formulas.
+
+    Descendant MCIDs inherit /Pg, and MCRs can override it and name a Form
+    XObject with /Stm. Match their (stream path, MCID) to PDFium's character
+    map, rather than exempting a figure's rectangle or matching its words.
+    The last result identifies marked characters, to prefer a marked copy
+    when PDFium retains coincident duplicate drawings of the same glyphs.
+    """
+    return _screen_reader_text(pdf_path, exclude_figure_interiors=True)
+
+
+def _screen_reader_text(
+    pdf_path: Path, *, figure_text: bool = False, markdown: bool = False,
+    exclude_figure_interiors: bool = False,
+) -> tuple[str, list[str], list[set[int]], list[set[int]]]:
     with PdfGlyphReader(pdf_path) as glyphs, pikepdf.open(pdf_path) as pdf:
         page_index = {page.objgen: index for index, page in enumerate(pdf.pages)}
+        page_blocks: list[list[str]] = [[] for _ in pdf.pages]
+        replaced: list[set[int]] = [set() for _ in pdf.pages]
         root = pdf.Root.get("/StructTreeRoot")
         if root is None:
-            return ""
+            return "", ["" for _ in pdf.pages], replaced, [set() for _ in pdf.pages]
         pages_text = read_page_text(pdf_path)
         role_map = root.get("/RoleMap")
         blocks: list[str] = []
@@ -134,6 +167,25 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
         # to decide whether the next starts a new word; None after a block
         # break or /ActualText.
         last_read: list[tuple[int, int] | None] = [None]
+        last_page: list[int | None] = [None]
+
+        def emit(text: str, page: int | None, out: list[str]) -> None:
+            out.append(text)
+            if out is blocks and page is not None:
+                page_blocks[page].append(text)
+                last_page[0] = page
+
+        def first_page(node) -> int | None:
+            if isinstance(node, pikepdf.Array):
+                for kid in node:
+                    found = first_page(kid)
+                    if found is not None:
+                        return found
+            elif isinstance(node, pikepdf.Dictionary):
+                if "/Pg" in node:
+                    return page_index.get(node.Pg.objgen)
+                return first_page(node.get("/K"))
+            return None
 
         def read_mcid(page: int, stream: pikepdf.Object | None, mcid: int, out: list[str]) -> None:
             if page not in marked:
@@ -151,19 +203,19 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
                 ]
                 if actual_texts:
                     if last_read[0] is not None:
-                        out.append(" ")
-                    out.append(" ".join(actual_texts))
+                        emit(" ", page, out)
+                    emit(" ".join(actual_texts), page, out)
                     last_read[0] = None
                 return
             previous = last_read[0]
             if previous is not None and (
                 previous[0] != page or page_text.breaks_between(previous[1], indices[0])
             ):
-                out.append(" ")
+                emit(" ", page, out)
             actual_texts = [
                 item for item in marked[page].get((path, mcid), []) if isinstance(item, str)
             ]
-            out.append(page_text.text(indices, actual_texts))
+            emit(page_text.text(indices, actual_texts), page, out)
             last_read[0] = (page, indices[-1])
 
         def inline(node, page) -> str:
@@ -201,6 +253,8 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
             if "/Pg" in node:
                 page = page_index.get(node.Pg.objgen, page)
             role = _standard_role(node, role_map)
+            if exclude_figure_interiors and role in {"Figure", "Formula"}:
+                collect_replaced(node.get("/K"), page)
             if markdown and role in HEADING_LEVELS:
                 text = inline(node, page)
                 if text:
@@ -223,10 +277,10 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
                     out.append(f"</{tag}>\n")
                 return
             if "/ActualText" in node:
-                out.append(str(node.ActualText))
+                emit(str(node.ActualText), page if page is not None else first_page(node), out)
                 last_read[0] = None
                 if role in BLOCK_ROLES:
-                    out.append("\n")
+                    emit("\n", page if page is not None else first_page(node), out)
                 return
             if role == "Artifact" or (
                 role == "Figure" and not (figure_text and "/Alt" not in node)
@@ -236,9 +290,35 @@ def screen_reader_text(pdf_path: Path, *, figure_text: bool = False, markdown: b
             if kids is not None:
                 walk(kids, page, out)
             if role in BLOCK_ROLES:
-                out.append("\n\n" if markdown else "\n")
+                emit("\n\n" if markdown else "\n", page if page is not None else last_page[0], out)
                 last_read[0] = None
+
+        def collect_replaced(node, page) -> None:
+            if isinstance(node, pikepdf.Array):
+                for kid in node:
+                    collect_replaced(kid, page)
+                return
+            ref = marked_ref(node, page)
+            if ref is not None:
+                number, stream, mcid = ref
+                if number is None:
+                    return
+                if number not in form_paths:
+                    form_paths[number] = _form_paths(pdf.pages[number].obj)
+                path = () if stream is None else form_paths[number].get(stream.objgen)
+                if path is not None:
+                    replaced[number].update(pages_text[number].marked.get((path, mcid), []))
+                return
+            if isinstance(node, pikepdf.Dictionary):
+                if "/Pg" in node:
+                    page = page_index.get(node.Pg.objgen, page)
+                collect_replaced(node.get("/K"), page)
 
         walk(root.get("/K"), None, blocks)
     text = "".join(blocks)
-    return re.sub(r"[ \t]+", " ", re.sub(r"\n\s*\n+", "\n\n", text)).strip()
+    return (
+        re.sub(r"[ \t]+", " ", re.sub(r"\n\s*\n+", "\n\n", text)).strip(),
+        ["".join(parts).strip() for parts in page_blocks],
+        replaced,
+        [{index for indices in page.marked.values() for index in indices} for page in pages_text],
+    )
