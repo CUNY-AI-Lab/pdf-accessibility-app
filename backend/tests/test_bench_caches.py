@@ -24,7 +24,9 @@ def test_docling_cache_key_follows_bytes_options_and_version():
 async def test_docling_cache_answers_a_repeated_conversion_from_disk(tmp_path, monkeypatch):
     calls = []
 
-    async def convert(pdf_path, job_dir, base_url, timeout, ocr_engine, token, figures):
+    async def convert(
+        pdf_path, job_dir, base_url, timeout, ocr_engine, token, figures, table_cell_matching=True
+    ):
         calls.append(pdf_path)
         return {"name": "converted"}, []
 
