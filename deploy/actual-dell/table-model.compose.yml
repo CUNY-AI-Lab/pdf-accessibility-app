@@ -1,8 +1,7 @@
 # SKETCH, NOT DEPLOYED. The table-model step (backend/app/pipeline/table_model.py)
 # on actual-dell, beside docling-serve, if a production trial is approved.
-# Nothing here has run on the host; the memory and latency figures below are
-# from Apple silicon (MLX) and the PaddleOCR documentation, to be measured on
-# the RTX 5000 Ada before a trial.
+# The server ran on the host once, for a measurement trial on 2026-10-31
+# (below); it is not wired to the runner.
 #
 # Design: one small server, ~/services/table-model/ on the host, reachable only
 # on 127.0.0.1 (the runner uses host networking, like docling-serve).
@@ -32,9 +31,23 @@
 #   TABLE_MODEL_MIN_COVERAGE_SCAN=0.9
 #   TABLE_MODEL_SCAN_TEXT=false
 #
-# Before a trial: build the image from deploy/actual-dell/table-model/server.py
-# with pinned torch/transformers (transformers >= 5.0 has the model), pin the
-# model revision, and measure peak VRAM, latency and cold load on the host.
+# Trial on actual-dell, 2026-10-31: server.py in the docling-serve-cu128
+# v1.35.0 image (torch 2.11.0+cu128, transformers 5.17.0, which has the model),
+# weights at revision 2a4195faa5e7914c12f2fc601d72c81caf8d2da5, 40 table crops
+# from the benchmark captures, one at a time:
+# - Memory: PyTorch peak 2.06 GB; the GPU's used memory rose 2.5 GB while
+#   loaded and 0.3-0.4 GB idle (CUDA context only, before the first load and
+#   after the idle unload). Host memory 1.85 GB. Cold load 1.7 s from disk.
+# - Latency: 4.9 s median per table, 52 s p95; the Mac (MLX) took 1.1 s median
+#   on the same crops. Decoding ran at 55-120 tokens/s with the GPU about 23%
+#   busy, so transformers' per-token overhead, not the GPU, sets the speed.
+#   Two crops ran to the 4,096-token cap, as they did on the Mac;
+#   TABLE_MODEL_TIMEOUT=30 would cut them and keep Docling's grid.
+# - Answers: 26 of 40 identical to the Mac's, most others at least 94%
+#   similar, so the Mac measurements carry over.
+# - A second request while one ran was answered 503 in 1 ms.
+# A faster decoder (vLLM, or transformers with a static cache and compile)
+# would be needed before this runs in production; neither has been tried.
 services:
   table-model:
     # Placeholder: an image built from this repository with the server and
