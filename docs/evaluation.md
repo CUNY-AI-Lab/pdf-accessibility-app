@@ -210,6 +210,31 @@ Documents held by each release gate check (failed or could not run):
   as complete. OCR gave each a text layer, three got their title from the
   repository's cover sheet, and none has a figure.
 
+### After the fixes (2026-10-31, `b0d9b79`)
+
+The same 47 documents again, at `b0d9b79`, with:
+- the hold policy (#40);
+- embedded standard fonts (#42);
+- simple table headers (#41);
+- titles (#43);
+- layout grids tagged as lists (#44).
+
+The same docling-serve and model were used. The cassette answered 877 model requests, and 10 went to the model.
+
+| Set | Documents | Complete before | Complete after | veraPDF compliant before | veraPDF compliant after |
+|---|---:|---:|---:|---:|---:|
+| `gold_rt` | 11 | 1 | 6 | 8 | 8 |
+| `cuny_rt` | 19 | 2 | 14 | 3 | 16 |
+| `cuny_untagged` | 17 | 5 | 8 | 11 | 11 |
+| **Total** | **47** | **8** | **28** | **22** | **35** |
+
+- **Hold policy:** replayed on the recorded outcomes, it accounts for 8 → 15 by itself. It stopped holding on checks the review screen didn't show: `font_text_fidelity`, `table_risk` and `text_drift`.
+- **The rest of the gain:** most of it is the CUNY round trips passing veraPDF once their fonts were embedded.
+- **Remaining holds:** 19 documents, all with a visible task. They overlap:
+  - **A figure without a description: 10.** In every one, veraPDF fails rule 7.3-1, which flags the same missing alternative text, and three of them also fail other rules.
+  - **A data table without header cells: 11.** Seven are held for this alone.
+  - **Other veraPDF failures only: 2.**
+
 ### Untagged CUNY documents
 
 | Document | Kind | Pages | Classified | Status | Held by | veraPDF | Figures with alt text | Seconds | Cost (USD) |
