@@ -129,9 +129,122 @@ go from 30.5% to 91.7%). Results published before 2026-10-05 put a space
 between glyphs by our own gap rule rather than as a PDF engine does. Results
 published before 2026-10-07 joined two marked-content sequences without a
 space even where the PDF draws a space character at the edge of one, which
-mostly hurt tools that tag without `/ActualText`. Every number below was
-re-measured with the current reader (opendataloader-pdf on multi-column
+mostly hurt tools that tag without `/ActualText`. The October 7 results below
+were re-measured with that reader (opendataloader-pdf on multi-column
 pages 56.6% → 64.8%, Adobe on printed books 81.5% → 83.7%).
+
+## Results (2026-10-31)
+
+Main at `5af226b`, AI steps off, re-tagging all 1,926 captures from
+`pipe_8a81fdc` as `retag_5af226b`: no tagging failures. The baseline is the
+October 30 re-tag `retag_8a81fdc` (`retag_main` has identical per-test
+results), scored again with the current reader. These are the same captured
+inputs on both sides, not new OCR or Docling runs. The pipeline's later font
+repairs on 220 captures are not replayed. Earlier results remain as history.
+
+Counts below exclude olmOCR-Bench's baseline sanity checks, which the older
+tables included in their test totals. olmOCR scores and every test's pass/fail
+result are identical with the October 7 reader and the current reader.
+Fixed and broken are paired against the baseline; no tests are unpaired.
+
+| Subset (scored tests) | Baseline | Main (both readers) | Fixed | Broken |
+|---|---:|---:|---:|---:|
+| `old_print` (509) | 93.9% | 93.9% | 0 | 0 |
+| `multi_column_s60` (219) | 72.6% | 72.6% | 0 | 0 |
+| `multi_column_s60_scan` (219) | 67.6% | 67.6% | 0 | 0 |
+| `tables_s60` (335) | 69.3% | 70.1% | 4 | 1 |
+| `tables_s60_scan` (335) | 56.7% | 57.6% | 3 | 0 |
+| `headers_footers_s60` (169) | 95.9% | 95.9% | 0 | 0 |
+| `headers_footers_s60_scan` (169) | 89.3% | 89.3% | 0 | 0 |
+| `old_scans` (526) | 24.1% | 24.1% | 0 | 0 |
+| `multi_column` (884) | 71.8% | 74.3% | 22 | 0 |
+| `multi_column_scan` (884) | 73.3% | 73.4% | 2 | 1 |
+| `tables` (1,020) | 69.1% | 71.1% | 21 | 1 |
+| `tables_scan` (1,020) | 58.2% | 59.0% | 8 | 0 |
+| `headers_footers` (753) | 92.7% | 92.2% | 0 | 4 |
+| `headers_footers_scan` (753) | 90.8% | 90.8% | 0 | 0 |
+
+Round trips with the current reader, including gold rebuilt from the
+author-tagged originals with that reader. The scanned CUNY documents use the
+same gold as their born-digital originals.
+
+| Round trip (NID / TEDS / MHS / MHS-L) | Baseline | Main |
+|---|---|---|
+| `gold_rt` | 0.865 / 0.545 / 0.578 / 0.436 | 0.879 / 0.545 / 0.618 / 0.463 |
+| `cuny_rt` | 0.967 / 0.714 / 0.520 / 0.385 | 0.966 / 0.715 / 0.520 / 0.384 |
+| `cuny_rt_scan` | 0.947 / 0.610 / 0.507 / 0.358 | 0.948 / 0.610 / 0.507 / 0.358 |
+
+### Corrections
+
+The #29 work corrected reading of nested marked content, including marks
+around Form invocations. Its coverage check also joins words containing
+soft hyphens and discounts an unmarked shadow copy only when a coincident
+tagged copy exists. The soft-hyphen and shadow-text rules belong to the
+coverage check; they do not add benchmark passes. Coverage calibration is in
+[tagged-text-coverage-calibration.md](tagged-text-coverage-calibration.md).
+
+The corrected reader changes the CUNY gold for `cc_oers_420` (list and table
+text) and `qb_oers_7` (chart labels). The table below holds each tagged output
+fixed and changes the reader on both the output and the gold. These changes
+are scoring corrections, not gains from re-tagging. The October 7 reader is
+the reader at `8a81fdc`, unchanged since October 7; its rebuilt gold matches
+the stored gold.
+
+| Round trip (NID / TEDS / MHS / MHS-L) | Output | October 7 reader | Current reader |
+|---|---|---|---|
+| `gold_rt` | Baseline | 0.865 / 0.545 / 0.578 / 0.436 | 0.865 / 0.545 / 0.578 / 0.436 |
+| `gold_rt` | Main | 0.879 / 0.545 / 0.618 / 0.463 | 0.879 / 0.545 / 0.618 / 0.463 |
+| `cuny_rt` | Baseline | 0.965 / 0.683 / 0.520 / 0.385 | 0.967 / 0.714 / 0.520 / 0.385 |
+| `cuny_rt` | Main | 0.964 / 0.683 / 0.519 / 0.384 | 0.966 / 0.715 / 0.520 / 0.384 |
+| `cuny_rt_scan` | Baseline | 0.946 / 0.582 / 0.507 / 0.358 | 0.947 / 0.610 / 0.507 / 0.358 |
+| `cuny_rt_scan` | Main | 0.946 / 0.583 / 0.507 / 0.358 | 0.948 / 0.610 / 0.507 / 0.358 |
+
+### Merged changes
+
+The combined paired counts are above. Individual change measurements below
+were recorded with the PRs; they are not separate re-runs for this section.
+
+| PR | Change and measured contribution |
+|---|---|
+| #21 | Release-gate fixes: hold incomplete or unreadable remediations, preserve empty formulas' glyph text, reject placeholder figure descriptions and document titles. Re-tagging does not exercise the release decision. |
+| #27 | Tag text inside Form XObjects; fix list order, splitting of quote text operators, Type 3 glyph boxes, overlapping cells, and source `/ActualText`. Its whole-category measurement fixed 39 tests and broke 5. Recovered form text exposes running heads Docling labels as body; main's `headers_footers` losses include those heads and an over-broad absent test for “98”. |
+| #28 | Vote between Docling, drawing order and XY-cut; recover unclaimed text; put link text inside Link. Its measurement fixed 7 tests and broke 1, with gold NID +0.014, MHS +0.040, MHS-L +0.027. The broken table test is a recovered “US$)” joining the neighboring heading cell. |
+| #29 | Gate text reachable through the tags and tables without headers, and correct the shared reader. Re-tagging measures the reader correction above, not the new holds. |
+| #32 | Disable Docling's `table_cell_matching` on scanned documents. This is a docling-serve request option; captured tagger inputs cannot measure it. Pipeline results are below. |
+| #33 | Infer table headers only on strong evidence and remove OCR'd rule strokes repeated at cell edges. Its measurement fixed 7 `tables_scan` tests and 3 in the sample, with none broken. |
+
+#32 was measured by a **pipeline run against `8a81fdc`**, not by re-tagging.
+These are that experiment's figures, with its reader and gold, not the
+current-reader round-trip figures above. Its gains cannot be added to the
+re-tagging gains without a new pipeline run.
+
+| Subset / measure | Pipeline baseline | `table_cell_matching=false` |
+|---|---:|---:|
+| `tables_scan` | 58.2% | 61.3% |
+| `tables_s60_scan` | 56.7% | 58.5% |
+| `cuny_rt_scan`, TEDS | 0.582 | 0.566 |
+
+### Experiments not adopted
+
+Recorded experiment results; not re-run here. The olmOCR 2 measurements were
+pipeline runs against `8a81fdc`, placing its text on Tesseract's boxes.
+PaddleOCR-VL's own table HTML was substituted for each tagged table; that
+does not show that its cells can be mapped back onto page glyphs.
+
+| Experiment | Subset / measure | Baseline | Experiment | Fixed / broken |
+|---|---|---:|---:|---:|
+| olmOCR 2 on Tesseract boxes | `old_scans` | 24.1% | 40.7% | 93 / 6 |
+| olmOCR 2 on Tesseract boxes | `old_print` | 93.9% | 98.2% | 27 / 5 |
+| olmOCR 2 with alignment guard | `old_scans` | 24.1% | 29.3% | |
+| olmOCR 2 with alignment guard | `old_print` | 93.9% | 95.7% | |
+| PaddleOCR-VL-1.5's own table HTML | `tables` | 69.1% | 77.7% | 153 / 65 |
+| PaddleOCR-VL-1.5's own table HTML | `tables_scan` | 58.2% | 79.9% | 256 / 35 |
+| PaddleOCR-VL mapped to the tagger's cells | `tables_s60` | 69.3% | 63.9% | 19 / 37 |
+| granite-docling's own HTML | `tables_s60` | 69.3% | 67.5% | |
+| Heading levels from document-wide evidence | MHS-L | 0.3915 | 0.3906 | One document changed |
+
+olmOCR 2 rewrote `$10,596,928` as `$10,506,928`, “millionnaire” as
+“millionaire”, and “chronographic use” as “chronograph used”.
 
 ## Results (2026-10-07)
 
