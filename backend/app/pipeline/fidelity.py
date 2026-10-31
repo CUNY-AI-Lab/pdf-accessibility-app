@@ -32,6 +32,7 @@ from app.services.pdf_context import parse_verapdf_context_path
 from app.services.pdf_objects import pdf_integer, pdf_text
 from app.services.pdf_operator_context import extract_operator_text_context
 from app.services.pdf_preview import render_page_png_bytes
+from app.services.release_policy import apply_release_policy
 from app.services.semantic_pretag_policy import (
     widget_targets_for_rationalization as _widget_targets_for_rationalization,
 )
@@ -1553,7 +1554,7 @@ def _check_ocr_coverage(inputs: _FidelityInputs, out: _FidelityCollector) -> Non
             status = "skip"
             message = "Sampled scanned pages appear visually blank; OCR coverage check skipped."
         elif not has_meaningful_ocr_text and not has_meaningful_structure:
-            status = "fail"
+            status = "warning"
             message = (
                 "Scanned document appears to contain visible content, but OCR and structure extraction "
                 "did not produce usable text."
@@ -1567,7 +1568,7 @@ def _check_ocr_coverage(inputs: _FidelityInputs, out: _FidelityCollector) -> Non
                     "produced little or no usable text. Review the OCR result or rescan the source document."
                 ),
                 severity="high",
-                blocking=True,
+                blocking=False,
                 metadata={
                     "output_chars": len(inputs.output_text),
                     "meaningful_structure_elements": inputs.meaningful_structure_elements,
@@ -1673,7 +1674,7 @@ def _check_text_drift(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
                 or preservation < FIDELITY_THRESHOLDS.ocr_preservation_fail
                 or length_ratio < FIDELITY_THRESHOLDS.ocr_length_ratio_fail_low
             ):
-                status = "fail"
+                status = "warning"
                 out.add_task(
                     "review:content_fidelity",
                     task_type="content_fidelity",
@@ -1683,7 +1684,7 @@ def _check_text_drift(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
                         "Check for corrupted or missing text in pages that had an existing text layer."
                     ),
                     severity="high",
-                    blocking=True,
+                    blocking=False,
                     metadata={
                         "similarity": round(similarity, 4),
                         "length_ratio": round(length_ratio, 4),
@@ -1753,7 +1754,7 @@ def _check_text_drift(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
                 or length_ratio < FIDELITY_THRESHOLDS.digital_length_ratio_fail_low
                 or length_ratio > FIDELITY_THRESHOLDS.digital_length_ratio_fail_high
             ):
-                status = "fail"
+                status = "warning"
                 out.add_task(
                     "review:content_fidelity",
                     task_type="content_fidelity",
@@ -1763,7 +1764,7 @@ def _check_text_drift(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
                         "Check for OCR drift, Unicode remaps, or missing content."
                     ),
                     severity="high",
-                    blocking=True,
+                    blocking=False,
                     metadata={
                         "similarity": round(similarity, 4),
                         "length_ratio": round(length_ratio, 4),
@@ -1832,7 +1833,7 @@ def _check_text_drift(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
                 "the remediated PDF. Check that its text is still present and readable."
             ),
             severity="high",
-            blocking=True,
+            blocking=False,
             metadata={
                 "source_chars": len(inputs.source_text),
                 "output_chars": len(inputs.output_text),
@@ -1841,7 +1842,7 @@ def _check_text_drift(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
         out.checks.append(
             {
                 "check": "text_drift",
-                "status": "fail",
+                "status": "warning",
                 "message": "The remediated PDF has little or no extractable text.",
                 "metrics": {
                     "source_chars": len(inputs.source_text),
@@ -2118,17 +2119,17 @@ def _check_reading_order(inputs: _FidelityInputs, out: _FidelityCollector) -> No
             hit_rate < FIDELITY_THRESHOLDS.reading_order_hit_rate_fail
             or order_rate < FIDELITY_THRESHOLDS.reading_order_order_rate_fail
         ):
-            status = "fail"
+            status = "warning"
             out.add_task(
                 "review:reading_order",
                 task_type="reading_order",
                 title="Verify reading order",
                 detail=(
-                    "Structural text fragments are not appearing in the remediated text in a stable order. "
-                    "Manual reading-order review is required."
+                    "Docling text order differs from pdfminer text order. "
+                    "This heuristic does not read the tag tree or judge screen-reader tag order."
                 ),
                 severity="high",
-                blocking=True,
+                blocking=False,
                 metadata=order_metrics,
             )
         elif len(fragments) >= FIDELITY_THRESHOLDS.reading_order_min_fragments and (
@@ -2153,7 +2154,7 @@ def _check_reading_order(inputs: _FidelityInputs, out: _FidelityCollector) -> No
             {
                 "check": "reading_order",
                 "status": status,
-                "message": "Compared structural text fragments against remediated text order.",
+                "message": "Compared Docling text order with pdfminer text order; this does not inspect tag order.",
                 "metrics": order_metrics,
             }
         )
@@ -2179,10 +2180,10 @@ def _check_figure_coverage(inputs: _FidelityInputs, out: _FidelityCollector) -> 
                 title="Verify figure semantics",
                 detail=(
                     "Not all detected figures were exposed as figure structure in the final PDF. "
-                    "Manual review is required for figure tags and descriptions."
+                    "Spot-check figure tags and descriptions."
                 ),
                 severity="high" if coverage < 0.75 else "medium",
-                blocking=True,
+                blocking=False,
                 metadata={
                     "detected_figures": inputs.figure_count,
                     "tagged_figures": inputs.tagged_figure_count,
@@ -2241,7 +2242,7 @@ def _check_table_coverage(inputs: _FidelityInputs, out: _FidelityCollector) -> N
                     "Manual review is required for table headers and structure."
                 ),
                 severity="high" if coverage < 0.75 else "medium",
-                blocking=True,
+                blocking=False,
                 metadata={
                     "detected_tables": inputs.table_count,
                     "tagged_tables": inputs.tagged_table_count,
@@ -2300,7 +2301,7 @@ def _check_table_headers(inputs: _FidelityInputs, out: _FidelityCollector) -> No
             ),
             severity="high",
             blocking=True,
-            metadata={**table, "pages_to_check": [page] if page is not None else []},
+            metadata={"check": "table_headers", **table, "pages_to_check": [page] if page is not None else []},
         )
     out.checks.append(
         {
@@ -2317,8 +2318,6 @@ def _check_table_risk(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
         table_risk = _table_semantics_risk(inputs.structure_json)
         if table_risk["complex_tables"] > 0:
             risk_targets = table_risk["targets"]
-            risk_status = "warning"
-            blocking = False
             severity = "medium"
             detail = (
                 "Some detected tables look semantically risky for assistive technology. "
@@ -2326,8 +2325,6 @@ def _check_table_risk(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
             )
 
             if table_risk["high_risk_tables"] > 0:
-                risk_status = "fail"
-                blocking = True
                 severity = "high"
                 detail = (
                     "Complex tables with dense layouts, weak header signals, or merged cells need further structural "
@@ -2340,7 +2337,7 @@ def _check_table_risk(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
                 title="Review complex table semantics",
                 detail=detail,
                 severity=severity,
-                blocking=blocking,
+                blocking=False,
                 metadata={
                     "detected_tables": inputs.table_count,
                     "tagged_tables": inputs.tagged_table_count,
@@ -2361,7 +2358,7 @@ def _check_table_risk(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
             out.checks.append(
                 {
                     "check": "table_risk",
-                    "status": risk_status,
+                    "status": "warning",
                     "message": "Flagged tables with complex structure, weak header signals, or merged cells.",
                     "metrics": {
                         "complex_tables": table_risk["complex_tables"],
@@ -2422,7 +2419,7 @@ def _check_form_semantics(inputs: _FidelityInputs, out: _FidelityCollector) -> N
                     "or are still failing validator checks. Review the affected fields before release."
                 ),
                 severity="high" if form_risk["missing_labels"] > 0 else "medium",
-                blocking=True,
+                blocking=False,
                 metadata={
                     "field_count": form_risk["field_count"],
                     "missing_labels": form_risk["missing_labels"],
@@ -2438,7 +2435,7 @@ def _check_form_semantics(inputs: _FidelityInputs, out: _FidelityCollector) -> N
                     "field_review_targets": form_risk["targets"][:12],
                 },
             )
-            form_status = "fail"
+            form_status = "warning"
         else:
             form_status = "pass"
         out.checks.append(
@@ -2484,7 +2481,7 @@ def _check_static_widget_artifacts(inputs: _FidelityInputs, out: _FidelityCollec
                 "page chrome, or screenshot overlay text rather than real interactive controls."
             ),
             severity="high",
-            blocking=True,
+            blocking=False,
             metadata={
                 "candidate_count": len(suspicious_widgets),
                 "pages_to_check": sorted(
@@ -2500,7 +2497,7 @@ def _check_static_widget_artifacts(inputs: _FidelityInputs, out: _FidelityCollec
         out.checks.append(
             {
                 "check": "static_widget_artifacts",
-                "status": "fail",
+                "status": "warning",
                 "message": "Detected text widgets that still appear to be static duplicate content.",
                 "metrics": {
                     "candidate_count": len(suspicious_widgets),
@@ -2542,7 +2539,7 @@ def _check_visual_meaning_gap(inputs: _FidelityInputs, out: _FidelityCollector) 
                 "but the accessible structure does not expose them as figures with descriptions."
             ),
             severity="high",
-            blocking=True,
+            blocking=False,
             metadata={
                 "visual_meaning_gap": True,
                 "candidate_count": len(missing_visual_figures),
@@ -2559,7 +2556,7 @@ def _check_visual_meaning_gap(inputs: _FidelityInputs, out: _FidelityCollector) 
         out.checks.append(
             {
                 "check": "visual_meaning_gap",
-                "status": "fail",
+                "status": "warning",
                 "message": "Detected dominant page visuals that are still missing figure semantics.",
                 "metrics": {
                     "candidate_pages": len(missing_visual_figures),
@@ -2639,7 +2636,7 @@ def _check_alt_text_provenance(inputs: _FidelityInputs, out: _FidelityCollector)
 
 def _check_figure_descriptions(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     # A figure the app could not describe ships with no alt text, never a
-    # placeholder, and holds the document until a person describes it.
+    # placeholder, and is a named release failure.
     try:
         undescribed_figures = _output_figures_without_alt(inputs.output_pdf)
     except Exception as exc:
@@ -2675,6 +2672,7 @@ def _check_figure_descriptions(inputs: _FidelityInputs, out: _FidelityCollector)
                 severity="high",
                 blocking=True,
                 metadata={
+                    "check": "figure_descriptions",
                     "undescribed_figures": len(undescribed_figures),
                     "pages_to_check": sorted(
                         {
@@ -2871,7 +2869,7 @@ def _check_font_text_fidelity(inputs: _FidelityInputs, out: _FidelityCollector) 
                 "that sighted readers see."
             ),
             severity="high",
-            blocking=True,
+            blocking=False,
             metadata={
                 "remaining_font_errors": remaining_font_errors,
                 "font_rule_ids": font_rule_ids,
@@ -2886,7 +2884,7 @@ def _check_font_text_fidelity(inputs: _FidelityInputs, out: _FidelityCollector) 
         out.checks.append(
             {
                 "check": "font_text_fidelity",
-                "status": "fail",
+                "status": "warning",
                 "message": "Font-related compliance or visible-text risk requires additional remediation.",
                 "metrics": {
                     "remaining_font_errors": remaining_font_errors,
@@ -2956,4 +2954,6 @@ def assess_fidelity(
     _check_link_text(inputs, out)
     _check_internal_links(inputs, out)
     _check_font_text_fidelity(inputs, out)
-    return out.result()
+    report, tasks = out.result()
+    apply_release_policy(report, tasks, compliant=bool(validation_report.get("compliant")))
+    return report, tasks

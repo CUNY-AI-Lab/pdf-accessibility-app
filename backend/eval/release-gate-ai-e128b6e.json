@@ -1,0 +1,483 @@
+{
+  "summary": {
+    "cuny_rt": {
+      "documents": 19,
+      "before": {
+        "complete": 2,
+        "manual_remediation": 17
+      },
+      "after": {
+        "complete": 2,
+        "manual_remediation": 17
+      },
+      "hold_reasons": {
+        "compliance": 16,
+        "table_headers": 6,
+        "figure_descriptions": 2
+      }
+    },
+    "cuny_untagged": {
+      "documents": 17,
+      "before": {
+        "complete": 5,
+        "manual_remediation": 12
+      },
+      "after": {
+        "complete": 8,
+        "manual_remediation": 9
+      },
+      "hold_reasons": {
+        "compliance": 6,
+        "table_headers": 6,
+        "figure_descriptions": 5
+      }
+    },
+    "gold_rt": {
+      "documents": 11,
+      "before": {
+        "manual_remediation": 10,
+        "complete": 1
+      },
+      "after": {
+        "manual_remediation": 6,
+        "complete": 5
+      },
+      "hold_reasons": {
+        "compliance": 3,
+        "table_headers": 5,
+        "figure_descriptions": 3
+      }
+    },
+    "total": {
+      "documents": 47,
+      "before": {
+        "complete": 8,
+        "manual_remediation": 39
+      },
+      "after": {
+        "complete": 15,
+        "manual_remediation": 32
+      },
+      "hold_reasons": {
+        "compliance": 25,
+        "table_headers": 17,
+        "figure_descriptions": 10
+      }
+    }
+  },
+  "documents": [
+    {
+      "set": "cuny_rt",
+      "document": "bb_oers_125",
+      "before": "complete",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "cuny_rt",
+      "document": "cc_conf_hic_216",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "cc_conf_hic_340",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "cc_oers_420",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "table_headers"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "gc_etds_6742",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "table_headers"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "gc_pubs_581",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "ho_oers_47",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "jj_arch_pubs_99",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "figure_descriptions"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "kb_oers_29",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "kb_oers_36",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "table_headers",
+        "figure_descriptions"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "le_oers_102",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "table_headers"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "lg_oers_113",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "lg_oers_98",
+      "before": "complete",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "cuny_rt",
+      "document": "ny_oers_33",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "table_headers"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "qb_oers_222",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "table_headers"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "qb_oers_7",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "qc_oers_10",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "sps_oers_10",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance"
+      ]
+    },
+    {
+      "set": "cuny_rt",
+      "document": "sps_oers_17",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance"
+      ]
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "bb_pubs_348",
+      "before": "complete",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "bb_pubs_360",
+      "before": "complete",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "bb_pubs_361",
+      "before": "manual_remediation",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "bb_pubs_363",
+      "before": "manual_remediation",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "bb_pubs_492",
+      "before": "complete",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "bx_arch_minutes_1392",
+      "before": "complete",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "cc_oers_365",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance"
+      ]
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "ccny_business_communications_syllabus",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "table_headers"
+      ]
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "citytech_buf_2246_syllabus",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "table_headers"
+      ]
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "citytech_cst_1101_syllabus",
+      "before": "complete",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "cuny_elo_badging_in_stem_slides",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "table_headers",
+        "figure_descriptions"
+      ]
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "gc_cs_tr_403",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "table_headers",
+        "figure_descriptions"
+      ]
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "gc_political_science_newsletter_2016",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "table_headers",
+        "figure_descriptions"
+      ]
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "gc_sociology_newsletter_2020_02",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "figure_descriptions"
+      ]
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "jj_pubs_384",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "table_headers"
+      ]
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "nc_pubs_23",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "figure_descriptions"
+      ]
+    },
+    {
+      "set": "cuny_untagged",
+      "document": "wsq_236",
+      "before": "manual_remediation",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "gold_rt",
+      "document": "fish_tables",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "table_headers",
+        "figure_descriptions"
+      ]
+    },
+    {
+      "set": "gold_rt",
+      "document": "matterhorn_protocol",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "table_headers"
+      ]
+    },
+    {
+      "set": "gold_rt",
+      "document": "moore_pdfua_paper",
+      "before": "manual_remediation",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "gold_rt",
+      "document": "noaa_spring_mt_2023",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "table_headers"
+      ]
+    },
+    {
+      "set": "gold_rt",
+      "document": "ref_academic_abstract",
+      "before": "complete",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "gold_rt",
+      "document": "ref_book_chapter",
+      "before": "manual_remediation",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "gold_rt",
+      "document": "ref_book_chapter_de",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "table_headers"
+      ]
+    },
+    {
+      "set": "gold_rt",
+      "document": "ref_brochure",
+      "before": "manual_remediation",
+      "after": "complete",
+      "hold_reasons": []
+    },
+    {
+      "set": "gold_rt",
+      "document": "ref_invoice",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "figure_descriptions"
+      ]
+    },
+    {
+      "set": "gold_rt",
+      "document": "ref_magazine_da",
+      "before": "manual_remediation",
+      "after": "manual_remediation",
+      "hold_reasons": [
+        "compliance",
+        "table_headers",
+        "figure_descriptions"
+      ]
+    },
+    {
+      "set": "gold_rt",
+      "document": "ref_presentation",
+      "before": "manual_remediation",
+      "after": "complete",
+      "hold_reasons": []
+    }
+  ]
+}

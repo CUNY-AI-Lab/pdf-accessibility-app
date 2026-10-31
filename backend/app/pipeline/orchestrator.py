@@ -215,6 +215,7 @@ from app.services.llm_client import (
     track_llm_usage,
 )
 from app.services.page_intelligence import collect_grounded_text_candidates
+from app.services.release_policy import apply_release_policy
 from app.services.review_surface import (
     filter_user_visible_review_tasks,
     is_user_visible_applied_change_type,
@@ -686,8 +687,10 @@ def _grounded_text_retry_improved(
 def _prepare_user_review_surface(
     review_tasks: list[dict[str, object]],
     fidelity_report: dict[str, object],
+    *,
+    compliant: bool = True,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
-    # Fidelity and terminal status stay tied to the full pipeline backlog.
+    apply_release_policy(fidelity_report, review_tasks, compliant=compliant)
     updated_fidelity_report = _recalculate_fidelity_summary(fidelity_report, review_tasks)
     user_visible_review_tasks = filter_user_visible_review_tasks(review_tasks)
     return user_visible_review_tasks, updated_fidelity_report
@@ -2537,6 +2540,9 @@ async def _assess_candidate_fidelity(
             review_tasks=candidate.review_tasks,
             fidelity_report=candidate.fidelity_report,
         )
+    apply_release_policy(
+        candidate.fidelity_report, candidate.review_tasks, compliant=candidate.validation.compliant
+    )
 
 
 async def evaluate_candidate(
@@ -2696,6 +2702,9 @@ async def _retry_grounded_candidate(
         settings=settings,
         review_tasks=retry.review_tasks,
         fidelity_report=retry.fidelity_report,
+    )
+    apply_release_policy(
+        retry.fidelity_report, retry.review_tasks, compliant=retry.validation.compliant
     )
     return retry if _candidate_is_acceptable(retry, candidate, grounded_text=True) else candidate
 
@@ -3141,6 +3150,7 @@ async def _store_candidate_result(
     user_visible_review_tasks, fidelity_report = _prepare_user_review_surface(
         review_tasks,
         fidelity_report,
+        compliant=candidate.validation.compliant,
     )
     validation_payload["fidelity"] = fidelity_report
     job.validation_json = json.dumps(validation_payload)
