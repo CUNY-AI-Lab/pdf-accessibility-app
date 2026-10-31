@@ -203,7 +203,7 @@ def test_synthesize_missing_visual_figures_appends_structure_and_figure(monkeypa
     assert updated_structure["figures_count"] == 1
 
 
-def test_assess_fidelity_flags_visual_meaning_gap(tmp_path):
+def test_assess_fidelity_keeps_visual_meaning_gap_advisory(tmp_path):
     pdf_path = tmp_path / "chart.pdf"
     _build_dominant_image_pdf(pdf_path)
 
@@ -221,21 +221,22 @@ def test_assess_fidelity_flags_visual_meaning_gap(tmp_path):
         comparison_source_pdf=None,
         structure_json=structure_json,
         alt_entries=[],
-        validation_report={"violations": [], "summary": {"errors": 0}},
+        validation_report={"compliant": True, "violations": [], "summary": {"errors": 0}},
         raw_validation_report=None,
         tagging_metrics={},
         classification="digital",
     )
 
+    assert fidelity_report["passed"] is True
     assert any(
         isinstance(check, dict)
         and str(check.get("check") or "") == "visual_meaning_gap"
-        and str(check.get("status") or "") == "fail"
+        and str(check.get("status") or "") == "warning"
         for check in fidelity_report.get("checks", [])
     )
     assert any(
         isinstance(task, dict)
-        and bool(task.get("blocking"))
+        and not bool(task.get("blocking"))
         and isinstance(task.get("metadata"), dict)
         and bool(task["metadata"].get("visual_meaning_gap"))
         for task in review_tasks

@@ -214,7 +214,7 @@ def _assess(output: Path, alt_entries: list[dict]):
         output_pdf=output,
         structure_json=FIGURE_STRUCTURE,
         alt_entries=alt_entries,
-        validation_report={"violations": [], "summary": {}, "remediation": {}},
+        validation_report={"compliant": True, "violations": [], "summary": {}, "remediation": {}},
         tagging_metrics={"figures_tagged": 1},
         classification="digital",
     )
