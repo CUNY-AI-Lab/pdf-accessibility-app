@@ -11,6 +11,7 @@ import pikepdf
 from docling_parse.pdf_parser import DoclingPdfParser
 from PIL import Image
 
+from app.pipeline.author_structure import apply_author_structure, read_author_structure
 from app.pipeline.element_text import accounts_for as accounts_for
 from app.pipeline.element_text import readable as readable
 from app.pipeline.fonts.resources import TAGGER_RESOURCES as TAGGER_RESOURCES
@@ -316,6 +317,7 @@ class TaggingResult:
     unowned_words_by_page: list[dict[str, int]] = field(default_factory=list)
     table_intelligence_audit: list[dict[str, Any]] = field(default_factory=list)
     table_readability: list[dict[str, Any]] = field(default_factory=list)
+    author_structure_audit: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _render_page_ink_ratio(pdf_path: Path, page_number: int) -> float | None:
@@ -450,8 +452,19 @@ async def tag_pdf(
             pikepdf.open(str(input_path)) as pdf,
         ):
             frames = [PageFrame.of(page) for page in pdfium_text.document]
-            elements = _elements_in_user_space(structure_json.get("elements", []), frames)
-            source_figure_alt_lookup = _source_figure_alt_lookup(pdf, elements)
+            try:
+                author_evidence = read_author_structure(input_path)
+            except Exception:
+                logger.warning("Could not read source semantics before tagging", exc_info=True)
+                author_evidence = {}
+            enriched = apply_author_structure(structure_json, author_evidence) if author_evidence else structure_json
+            elements = _elements_in_user_space(enriched.get("elements", []), frames)
+            source_figure_alt_lookup = {
+                e["figure_index"]: e.get("author_alt") or e.get("author_actual_text")
+                for e in elements if e.get("type") == "figure"
+                and isinstance(e.get("figure_index"), int)
+                and (e.get("author_alt") or e.get("author_actual_text"))
+            }
 
             # 1. Mark PDF as tagged
             if "/MarkInfo" not in pdf.Root:
@@ -503,9 +516,7 @@ async def tag_pdf(
             for fig_idx, source_alt in source_figure_alt_lookup.items():
                 if _is_weak_figure_alt_text(source_alt):
                     continue
-                if fig_idx in decorative_figures or _is_weak_figure_alt_text(
-                    alt_lookup.get(fig_idx)
-                ):
+                if source_alt:
                     decorative_figures.discard(fig_idx)
                     alt_lookup[fig_idx] = source_alt
 
@@ -793,6 +804,34 @@ async def tag_pdf(
             )
             _sanitize_outline_leaf_counts(pdf)
 
+            # Count actual emitted nodes, separately from proposed evidence matches.
+            author_structure_audit = []
+            for elem in elements:
+                if elem.get("type") == "table":
+                    emitted = builder._fragmented_table_cache.get(id(elem), {})
+                    for cell in elem.get("cells", []):
+                        node = emitted.get((cell.get("row", 0), cell.get("col", 0)))
+                        if cell.get("author_header") and node is not None and node.get("/S") == "/TH":
+                            author_structure_audit.append({
+                                "kind": "TH", "page": elem["page"], "row": cell.get("row"),
+                                "col": cell.get("col"), "scope": str(node.A.Scope), "text": cell.get("text"),
+                            })
+                elif elem.get("type") == "figure":
+                    node = builder.source_element_struct(elem)
+                    if node is not None and node.get("/S") == "/Figure":
+                        for field, pdf_key in (("author_alt", "/Alt"), ("author_actual_text", "/ActualText")):
+                            if elem.get(field) and str(node.get(pdf_key) or "") == elem[field]:
+                                author_structure_audit.append({"kind": field, "page": elem["page"],
+                                                               "figure_index": elem.get("figure_index"), "value": elem[field]})
+                elif elem.get("author_heading_level"):
+                    node = builder.source_element_struct(elem)
+                    if node is not None and node.get("/S") == f"/H{elem['author_heading_level']}":
+                        author_structure_audit.append({"kind": "heading_level", "page": elem["page"], "level": elem["level"]})
+            for entry in enriched.get("author_structure_audit", []):
+                if entry["kind"] == "title" and str(pdf.docinfo.get("/Title")) == entry["value"]:
+                    author_structure_audit.append(entry)
+                elif entry["kind"] == "language" and str(pdf.Root.get("/Lang")) == entry["value"]:
+                    author_structure_audit.append(entry)
             _save_pdf_for_viewer_compatibility(pdf, output_path)
 
         total_tags = tags_added + builder.struct_elems_created
@@ -823,6 +862,7 @@ async def tag_pdf(
             unowned_words_by_page=unowned_words_by_page,
             table_intelligence_audit=table_intelligence_audit,
             table_readability=table_readability,
+            author_structure_audit=author_structure_audit,
         )
 
     def _tag_with_forms():

@@ -49,7 +49,7 @@ def _normalize_heading_hierarchy(elements: list[dict]) -> None:
         level = _as_positive_int(heading.get("level", 1), default=1)
         while open_sections and open_sections[-1][0] >= level:
             open_sections.pop()
-        assigned = min(6, open_sections[-1][1] + 1 if open_sections else 1)
+        assigned = min(6, level if heading.get("author_heading_level") else (open_sections[-1][1] + 1 if open_sections else 1))
         open_sections.append((level, assigned))
         heading["level"] = assigned
 

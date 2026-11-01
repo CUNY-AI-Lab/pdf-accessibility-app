@@ -43,6 +43,7 @@ class StructTreeBuilder:
         self._struct_parents_counter = 0
         self._object_parent_entries: list[tuple[pikepdf.Object, pikepdf.Object]] = []
         self._source_element_structs: dict[Any, pikepdf.Object] = {}
+        self._author_heading_levels: dict[tuple[int, int], int] = {}
         self._headings: list[dict] = []
         self._heading_entries: dict[tuple[int, int], dict] = {}
         self._struct_elems_created = 0
@@ -222,6 +223,8 @@ class StructTreeBuilder:
         elem = self._struct_elem_for_mcid(owner, mcid)
         if elem is not None:
             self._source_element_structs[_source_key(source_element)] = elem
+            if source_element.get("author_heading_level"):
+                self._author_heading_levels[elem.objgen] = int(source_element["author_heading_level"])
 
     def source_element_struct(self, source_element: dict[str, Any] | None) -> pikepdf.Object | None:
         if source_element is None:
@@ -587,6 +590,8 @@ class StructTreeBuilder:
                         scope = "/Column"
                     elif col_idx == 0:
                         scope = "/Row"
+                    if cell.get("author_scope") in {"Row", "Column", "Both"}:
+                        scope = "/" + cell["author_scope"]
                     attrs["/Scope"] = pikepdf.Name(scope)
                     cell_id = f"t{table_n}-r{row_idx}-c{col_idx}"
                     cell_elem_dict["/ID"] = pikepdf.String(cell_id)
@@ -616,9 +621,9 @@ class StructTreeBuilder:
                         next_group = min((r for r, _, _, _, _, _, p in th_info if p and r > th_row), default=num_rows)
                         if th_row < td_row < next_group:
                             header_ids.append(th_id)
-                    elif scope == "/Column" and th_col <= td_col < th_col + th_cspan and th_row + th_rspan <= td_row:
+                    elif scope in {"/Column", "/Both"} and th_col <= td_col < th_col + th_cspan and th_row + th_rspan <= td_row:
                         header_ids.append(th_id)
-                    elif scope == "/Row" and th_row <= td_row < th_row + th_rspan and th_col + th_cspan <= td_col:
+                    elif scope in {"/Row", "/Both"} and th_row <= td_row < th_row + th_rspan and th_col + th_cspan <= td_col:
                         header_ids.append(th_id)
                 if header_ids:
                     td_attrs = td_elem.get("/A")
@@ -928,7 +933,8 @@ class StructTreeBuilder:
             elif isinstance(node, pikepdf.Dictionary):
                 role = str(node.get("/S"))
                 if re.fullmatch(r"/H[1-6]", role):
-                    emitted.append({"type": "heading", "level": int(role[2:]), "node": node})
+                    emitted.append({"type": "heading", "level": int(role[2:]), "node": node,
+                                    "author_heading_level": self._author_heading_levels.get(node.objgen)})
                 headings(node.get("/K"))
 
         headings(self.doc_elem)

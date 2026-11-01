@@ -197,7 +197,7 @@ def _allocate_fragment_mcid(
             alt_text=alt,
             stream_owner=stream_owner,
         )
-        actual_text = None
+        actual_text = elem.get("author_actual_text")
     elif elem_type == "list_item":
         mcid = builder.add_list_item(
             page_index,

@@ -339,10 +339,12 @@ def _build_source_alt_figure_pdf(path: Path) -> None:
     page["/Contents"] = pdf.make_stream(
         pikepdf.unparse_content_stream(
             [
+                pikepdf.ContentStreamInstruction([pikepdf.Name("/Figure"), pikepdf.Dictionary(MCID=0)], pikepdf.Operator("BDC")),
                 pikepdf.ContentStreamInstruction([], pikepdf.Operator("q")),
                 pikepdf.ContentStreamInstruction([50, 0, 0, 50, 20, 20], pikepdf.Operator("cm")),
                 pikepdf.ContentStreamInstruction([pikepdf.Name("/Im0")], pikepdf.Operator("Do")),
                 pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q")),
+                pikepdf.ContentStreamInstruction([], pikepdf.Operator("EMC")),
             ]
         )
     )
