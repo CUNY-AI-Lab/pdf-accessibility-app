@@ -6,6 +6,7 @@ import pikepdf
 from fontTools.ttLib import TTFont
 
 from app.pipeline.fonts.encoding import _parse_tounicode_map, _render_tounicode_cmap
+from app.pipeline.fonts.invisible import INVISIBLE, _render_mode
 from app.pipeline.fonts.resources import TOUNICODE_RESOURCES, _iter_pdf_resource_roots
 from app.pipeline.fonts.widths import _truetype_code_glyphs
 
@@ -36,6 +37,8 @@ def repair_notdef_content(pdf) -> dict[str, int]:
 
     Plans are compared before writing shared streams: differing inherited
     text states must never make the first invocation change the later ones.
+    Codes shown in rendering mode 3 are never removed: an invisible OCR layer
+    is the page's recognized text.
     """
     stats = {"notdef_glyphs_removed": 0, "notdef_codes_remapped": 0}
     actions, font_info, plans = {}, {}, {}
@@ -126,7 +129,7 @@ def repair_notdef_content(pdf) -> dict[str, int]:
         actions[key, code] = result
         return result
 
-    def rewrite(owner, resources, state=(None, 0.0, 0.0, 0.0), ancestors=frozenset()):
+    def rewrite(owner, resources, state=(None, 0.0, 0.0, 0.0, 0), ancestors=frozenset()):
         key = owner.objgen
         if key in ancestors:
             return
@@ -134,15 +137,15 @@ def repair_notdef_content(pdf) -> dict[str, int]:
             instructions = list(pikepdf.parse_content_stream(owner))
         except (pikepdf.PdfError, ValueError, TypeError):
             return
-        font, size, spacing, word_space = state
+        font, size, spacing, word_space, render = state
         stack, output = [], []
         removed = remapped = 0
         for instruction in instructions:
             op, args = str(instruction.operator), list(instruction.operands)
             if op == "q":
-                stack.append((font, size, spacing, word_space))
+                stack.append((font, size, spacing, word_space, render))
             elif op == "Q" and stack:
-                font, size, spacing, word_space = stack.pop()
+                font, size, spacing, word_space, render = stack.pop()
             elif op == "Tf":
                 font = resources.get("/Font", {}).get(str(args[0]))
                 size = float(args[1])
@@ -150,13 +153,15 @@ def repair_notdef_content(pdf) -> dict[str, int]:
                 spacing = float(args[0])
             elif op == "Tw":
                 word_space = float(args[0])
+            elif op == "Tr" and args:
+                render = _render_mode(args[0])
             elif op == "Do":
                 child = resources.get("/XObject", {}).get(str(args[0]))
                 if child is not None and child.get("/Subtype") == "/Form":
                     rewrite(
                         child,
                         child.get("/Resources", resources),
-                        (font, size, spacing, word_space),
+                        (font, size, spacing, word_space, render),
                         ancestors | {key},
                     )
             if op not in {"Tj", "TJ", "'", '"'} or font is None:
@@ -183,7 +188,9 @@ def repair_notdef_content(pdf) -> dict[str, int]:
                     extra = next_spacing + (
                         next_word_space if code == 32 and code_bytes == 1 else 0
                     )
-                    if decision is None or (decision[0] == "remove" and not size and extra):
+                    if decision is None or (
+                        decision[0] == "remove" and (render == INVISIBLE or (not size and extra))
+                    ):
                         chunk.extend(token)
                         continue
                     changed = True

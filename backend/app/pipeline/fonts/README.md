@@ -78,3 +78,20 @@ content operators remain unchanged. Conflicting aliases (one glyph assigned
 two PDF widths) are counted and left unresolved. A shared descriptor/program
 is copied for the font use being repaired. Local TrueType embedding performs
 the same alignment before installing the program.
+
+### Invisible OCR fonts
+
+`invisible.repair_invisible_fonts()` runs in the dictionary-repair lane before
+`repair_notdef_content`. It handles a Type0 font with `/Identity-H` that shows
+text only in rendering mode 3, such as Acrobat's `HiddenHorzOCR`, when a used
+code selects .notdef in its embedded program. Rule 7.21.8 applies in every
+rendering mode. The descendant becomes a CIDFontType2 with a TrueType built at
+runtime (glyph 0 .notdef, glyph 1 empty) and a `/CIDToGIDMap` that sends CIDs 1
+through the highest used code to glyph 1, the structure of Tesseract's
+`GlyphLessFont`. CID 0 stays .notdef. The Type0 dictionary, ToUnicode, `/W` and
+`/DW` stay, and the content is unchanged. veraPDF's 7.21.5 width check exempts
+rendering mode 3, so one advance (`/DW`) serves every width. Pages, nested
+Forms, appearances, tiling patterns, Type 3 glyphs and soft masks are walked
+with `Tr` tracked through q/Q; a font painted in any of them, or listed in the
+AcroForm `/DR`, is left alone. `repair_notdef_content` never removes codes
+shown in rendering mode 3: they are the document's recognized text.
