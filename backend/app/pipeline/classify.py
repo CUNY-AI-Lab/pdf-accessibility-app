@@ -13,6 +13,7 @@ import pypdfium2.raw as pdfium_c
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTChar, LTContainer, LTImage
 
+from app.pipeline.fonts.ocr import unmapped_type3_pages
 from app.pipeline.language import detect_language
 from app.pipeline.pdf_repair import pdfminer_readable
 from app.services.pdf_preflight import (
@@ -53,6 +54,10 @@ _IMAGE_TEXT_PAGE_COVERAGE = 0.25
 _IMAGE_TEXT_PAGE_MAX_CHARS = 1500
 # Pages with less image data than this are not inspected for image text.
 _IMAGE_TEXT_PAGE_MIN_PIXELS = 250_000
+# Outlined letters contain many painted paths/segments. A border, blank page,
+# or a handful of diagram strokes is insufficient evidence for OCR.
+_OUTLINE_PAGE_MIN_PATHS = 100
+_OUTLINE_PAGE_MIN_SEGMENTS = 1000
 _OCR_SCAN_IMAGE_HEAVY_RATIO = 0.75
 _OCR_SCAN_TEXT_RATIO = 0.9
 _OCR_SCAN_PREFLIGHT_SETTINGS = SimpleNamespace(
@@ -75,23 +80,59 @@ class ClassificationResult:
     # with --redo-ocr: those and the pages without text. Empty: OCR every page
     # without text.
     ocr_pages: list[int] = field(default_factory=list)
+    # Vector-only pages need rasterization; skip/redo OCR ignores their ink.
+    force_ocr_pages: list[int] = field(default_factory=list)
+
+
+def _vector_outline_pages(pdf_path: Path) -> list[int]:
+    found = []
+    with pdfium.PdfDocument(pdf_path) as document:
+        for index, page in enumerate(document):
+            text = page.get_textpage()
+            try:
+                if text.get_text_range().strip():
+                    continue
+            finally:
+                text.close()
+            paths = segments = 0
+            large_image = False
+            width, height = page.get_size()
+            for obj in page.get_objects(max_depth=15):
+                kind = pdfium_c.FPDFPageObj_GetType(obj.raw)
+                if kind == pdfium_c.FPDF_PAGEOBJ_PATH:
+                    paths += 1
+                    segments += max(0, pdfium_c.FPDFPath_CountSegments(obj.raw))
+                elif kind == pdfium_c.FPDF_PAGEOBJ_IMAGE:
+                    left, bottom, right, top = obj.get_bounds()
+                    if (right - left) * (top - bottom) >= width * height * _IMAGE_TEXT_PAGE_COVERAGE:
+                        large_image = True
+            if (not large_image and paths >= _OUTLINE_PAGE_MIN_PATHS
+                    and segments >= _OUTLINE_PAGE_MIN_SEGMENTS):
+                found.append(index)
+    return found
 
 
 def _page_has_text(page: pikepdf.Page) -> bool:
-    """Check if a page has extractable text content streams."""
-    try:
-        if "/Contents" not in page:
-            return False
-        contents = page.get("/Contents")
-        if contents is None:
-            return False
-        if isinstance(contents, pikepdf.Array):
-            raw = b"".join(c.read_bytes() for c in contents)
-        else:
-            raw = contents.read_bytes()
-        import re
+    """Look through invoked Forms too; a page's text need not be in its own stream."""
+    from app.pipeline.fonts.encoding import _raw_text_bytes
 
-        return bool(re.search(rb"(?:Tj|TJ)\b", raw))
+    def has_text(content, resources, seen):
+        if content.objgen in seen:
+            return False
+        seen = seen | {content.objgen}
+        for instruction in pikepdf.parse_content_stream(content):
+            op, args = str(instruction.operator), instruction.operands
+            if op in {"Tj", "TJ", "'", '"'} and _raw_text_bytes(op, args).strip():
+                return True
+            if op == "Do" and args:
+                child = resources.get("/XObject", {}).get(str(args[0]))
+                if child is not None and child.get("/Subtype") == pikepdf.Name.Form:
+                    if has_text(child, child.get("/Resources", resources), seen):
+                        return True
+        return False
+
+    try:
+        return has_text(page, page.get("/Resources", {}), set())
     except Exception as exc:
         logger.debug("Could not inspect page contents: %s", exc)
         return False
@@ -270,6 +311,7 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
             ratio = pages_with_text / total
             workload = _inspect_workload(pdf_path)
             no_text_pages = sorted(set(range(total)) - set(text_pages))
+            force_pages = sorted(set(_vector_outline_pages(pdf_path)) | set(unmapped_type3_pages(pdf_path)))
             # Pages that are pictures with no text at all (a scanned insert in
             # a born-digital document); the OCR step is the only one that
             # recognizes text, so the document is OCR'd there.
@@ -290,7 +332,7 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
             if ratio < 0.1:
                 classification = "scanned"
                 confidence = 1 - ratio
-            elif _is_ocr_scan_with_text(
+            elif not force_pages and _is_ocr_scan_with_text(
                 workload,
                 pages_with_text=pages_with_text,
                 total_pages=total,
@@ -300,7 +342,7 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
                     workload.image_heavy_pages / max(workload.page_count, 1) if workload else 0.0
                 )
                 confidence = min(1.0, max(0.75, (ratio + image_heavy_ratio) / 2))
-            elif ratio > 0.9 and not image_text_pages and not image_only_pages:
+            elif ratio > 0.9 and not image_text_pages and not image_only_pages and not force_pages:
                 classification = "digital"
                 confidence = ratio
             else:
@@ -316,10 +358,11 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
                 total_image_pixels=workload.total_image_pixels if workload else 0,
                 ocr_scan_like=bool(workload and workload.is_ocr_scan_like),
                 ocr_pages=(
-                    sorted(set(no_text_pages) | set(image_text_pages))
-                    if classification == "mixed" and image_text_pages
+                    sorted(set(no_text_pages) | set(image_text_pages) | set(force_pages))
+                    if (classification == "mixed" and image_text_pages) or force_pages
                     else []
                 ),
+                force_ocr_pages=force_pages,
             )
 
     result = await to_thread(_classify_structure)

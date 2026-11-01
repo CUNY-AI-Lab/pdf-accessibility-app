@@ -158,7 +158,11 @@ from app.pipeline.llm_operations import (
 from app.pipeline.ocr import run_ocr
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.pdfium_text import PdfiumText
-from app.pipeline.structure import docling_table_cell_matching, extract_structure
+from app.pipeline.structure import (
+    docling_table_cell_matching,
+    ensure_figure_images,
+    extract_structure,
+)
 from app.pipeline.tagger import TaggingResult, tag_pdf
 from app.pipeline.validator import ValidationResult, validate_pdf
 from app.services.alt_text_cache import usable_description
@@ -304,7 +308,6 @@ SEMANTIC_COVERAGE_INTERESTING_TAGS = (
     "Quote",
     "BlockQuote",
 )
-FIGURE_RECLASSIFY_KINDS = {"table", "form_region", "artifact"}
 
 
 def _accumulate_llm_usage(
@@ -808,7 +811,8 @@ def _reclassified_figure_cover(
     """
     page = figure.get("page")
     bbox = figure.get("bbox")
-    if working_pdf is None or not isinstance(page, int) or not isinstance(bbox, dict):
+    if (kind not in {"table", "form_region"} or working_pdf is None
+            or not isinstance(page, int) or not isinstance(bbox, dict)):
         return None
     tables = [
         element
@@ -890,11 +894,9 @@ def _apply_figure_reclassification(
     for item in alt_texts:
         figure_index = getattr(item, "figure_index", None)
         status = str(getattr(item, "status", "") or "").strip()
-        resolved_kind = str(getattr(item, "resolved_kind", "") or "").strip()
         if (
             isinstance(figure_index, int)
             and status == "reclassified"
-            and resolved_kind in FIGURE_RECLASSIFY_KINDS
         ):
             reclassified[figure_index] = item
 
@@ -1996,6 +1998,7 @@ async def _run_pipeline(
                     timeout_seconds=settings.subprocess_timeout_ocr,
                     engine=settings.ocr_engine,
                     pages=classification.ocr_pages or None,
+                    **({"force_pages": classification.force_ocr_pages} if classification.force_ocr_pages else {}),
                 )
 
                 if ocr_result.success:
@@ -2251,6 +2254,10 @@ async def _run_pipeline(
                 finally:
                     await llm_client.close()
 
+            structure.figures = await to_thread(
+                ensure_figure_images, working_pdf, structure.document_json,
+                structure.figures, job_dir / "figures",
+            )
             structure.document_json, structure.figures, synthetic_figure_rationalization = (
                 synthesize_missing_visual_figures(
                     working_pdf=working_pdf,
@@ -2395,13 +2402,14 @@ async def _run_pipeline(
                 approved_count = 0
                 rejected_count = 0
                 reclassified_count = 0
+                figures_by_index = {figure.index: figure for figure in structure.figures}
                 for alt in alt_texts:
-                    if alt.figure_index < 0 or alt.figure_index >= len(structure.figures):
+                    fig = figures_by_index.get(alt.figure_index)
+                    if fig is None:
                         continue
                     if alt.status == "reclassified":
                         reclassified_count += 1
                         continue
-                    fig = structure.figures[alt.figure_index]
                     status, generated_text = _alt_text_entry_state(
                         alt,
                         caption=fig.caption,
