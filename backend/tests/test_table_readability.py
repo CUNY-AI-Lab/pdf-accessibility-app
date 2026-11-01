@@ -118,7 +118,7 @@ async def test_cell_order_disagreement_blocks_deterministic_and_model_headers(tm
     text = "alpha beta gamma delta\nepsilon zeta eta theta"
     structure = _fixture(
         source,
-        [[text, "Kind", "Value"], ["One", "Two", "Three"], ["Four", "Five", "Six"]],
+        [[text, "Kind"], ["One", "Two"], ["Four", "Five"]],
         style="bold",
         row_height=90,
     )
@@ -135,7 +135,7 @@ async def test_cell_order_disagreement_blocks_deterministic_and_model_headers(tm
     if scrambled:
         assert result.table_readability[0]["cause"] == "cell_text_order"
         assert result.table_readability[0]["disordered_cells"] == [
-            dict(row=0, col=0, matched_unique_words=8, inversion_fraction=1.0)
+            dict(row=0, col=0, matched_words=8, matched_unique_words=8, inversion_fraction=1.0)
         ]
         assert result.table_intelligence_audit[0]["status"] == "blocked_unreadable_table"
     assert ("<th>" in screen_reader_text(after, markdown=True)) is not scrambled
@@ -156,9 +156,9 @@ async def test_scrambled_drawing_order_is_detected_even_with_correct_cell_text(t
     structure = _fixture(
         source,
         [
-            ["alpha beta gamma delta\nepsilon zeta eta theta", "Value", "Other"],
-            ["One", "Two", "Three"],
-            ["Four", "Five", "Six"],
+            ["alpha beta gamma delta\nepsilon zeta eta theta", "Value"],
+            ["One", "Two"],
+            ["Four", "Five"],
         ],
         style="bold",
         row_height=90,
@@ -182,3 +182,75 @@ def test_rotation_requires_strict_majority_of_table_glyphs(tmp_path, rotated):
     assert len(glyphs) == 24
     glyphs = [replace(g, turn=2 if i < rotated else 0) for i, g in enumerate(glyphs)]
     assert bool(_mark_unreadable_tables(structure["elements"], glyphs)) is (rotated > 12)
+
+
+@pytest.mark.parametrize("matched_other_words, held", [(7, True), (8, True), (9, False)])
+def test_disorder_requires_at_least_half_the_tables_matched_words(
+    tmp_path, matched_other_words, held
+):
+    source = tmp_path / "input.pdf"
+    text = "alpha beta gamma delta\nepsilon zeta eta theta"
+    structure = _fixture(source, [[text, " ".join(["one"] * matched_other_words)]], row_height=90)
+    structure["elements"][0]["cells"][0]["text"] = "theta eta zeta epsilon delta gamma beta alpha"
+    with PdfGlyphReader(source) as reader:
+        glyphs = [g for ops in reader.page(0).ops.values() for op in ops for g in op.glyphs]
+    diagnostics = _mark_unreadable_tables(structure["elements"], glyphs)
+    assert bool(diagnostics) is held
+    if held:
+        assert diagnostics[0]["matched_words"] == 8 + matched_other_words
+        assert diagnostics[0]["disordered_words"] == 8
+
+
+@pytest.mark.parametrize(
+    "order, held",
+    [
+        # Moving the last word ahead of the first inverts 7/28 pairs.
+        ("theta alpha beta gamma delta epsilon zeta eta", False),
+        # A half-cell reversal inverts 16/28 pairs.
+        ("epsilon zeta eta theta alpha beta gamma delta", True),
+    ],
+)
+async def test_only_severe_disorder_blocks_headers_and_release(tmp_path, order, held):
+    source, after = tmp_path / "input.pdf", tmp_path / "after.pdf"
+    text = "alpha beta gamma delta\nepsilon zeta eta theta"
+    structure = _fixture(source, [[text, "Kind"], ["One", "Two"]], style="bold", row_height=90)
+    table = structure["elements"][0]
+    table["review_id"] = "review-0"
+    table["cells"][0]["text"] = order
+    proposed, _ = queue_table_decisions(
+        structure,
+        [dict(table_review_id="review-0", page=1, action="set_table_headers", header_rows=[0])],
+    )
+    result = await tagger.tag_pdf(source, after, proposed, [], language="en")
+    assert bool(result.table_readability) is held
+    assert ("<th>" in screen_reader_text(after, markdown=True)) is not held
+    report, _ = assess_fidelity(
+        input_pdf=source, output_pdf=after, structure_json=proposed, alt_entries=[],
+        validation_report={"compliant": True, "violations": []},
+        tagging_metrics={"tables_tagged": 1, "table_readability": result.table_readability},
+        classification="digital",
+    )
+    assert ("table_readability" in release_hold_reasons(compliant=True, checks=report["checks"])) is held
+
+
+async def test_isolated_severe_disorder_does_not_block_model_or_deterministic_headers(tmp_path):
+    source = tmp_path / "input.pdf"
+    text = "alpha beta gamma delta\nepsilon zeta eta theta"
+    structure = _fixture(
+        source, [["Name", "Kind", "Value"], [text, "Two", "Three"], ["Four extra", "Five", "Six"]],
+        style="bold", row_height=90, rule="60 690 m 580 690 l S",
+    )
+    table = structure["elements"][0]
+    table["review_id"] = "review-0"
+    table["cells"][3]["text"] = "theta eta zeta epsilon delta gamma beta alpha"
+    for model in (False, True):
+        proposed = structure
+        if model:
+            proposed, _ = queue_table_decisions(
+                structure,
+                [dict(table_review_id="review-0", page=1, action="set_table_headers", header_rows=[0])],
+            )
+        after = tmp_path / f"after-{model}.pdf"
+        result = await tagger.tag_pdf(source, after, proposed, [], language="en")
+        assert not result.table_readability
+        assert "<th>" in screen_reader_text(after, markdown=True)

@@ -22,24 +22,29 @@ def _geometric_text(glyphs: list[MeasuredGlyph]) -> str:
     return " ".join(join_glyphs(line) for line in lines)
 
 
-def _order_disagreement(text: str, geometry: str) -> dict | None:
+def _order_disagreement(text: str, geometry: str) -> tuple[int, dict | None]:
     # Require the same words, so OCR substitutions, equations, sparse labels,
     # repeated words and punctuation alone cannot supply evidence of disorder.
     source, drawn = [re.findall(r"[a-z]+", t.casefold()) for t in (text, geometry)]
     a, b = Counter(source), Counter(drawn)
     common = a & b
-    if not source or not drawn or sum(common.values()) < 0.8 * max(len(source), len(drawn)):
-        return None
+    matched = sum(common.values())
+    if not source or not drawn or matched < 0.8 * max(len(source), len(drawn)):
+        return matched, None
     unique = {word for word in common if a[word] == b[word] == 1}
     if len(unique) < 8:
-        return None
+        return matched, None
     positions = {word: i for i, word in enumerate(drawn) if word in unique}
     order = [positions[word] for word in source if word in unique]
     pairs = len(order) * (len(order) - 1) // 2
     inversions = sum(x > y for i, x in enumerate(order) for y in order[i + 1 :])
-    if inversions / pairs < 0.25:
-        return None
-    return {"matched_unique_words": len(unique), "inversion_fraction": round(inversions / pairs, 4)}
+    if inversions / pairs < 0.4:
+        return matched, None
+    return matched, {
+        "matched_words": matched,
+        "matched_unique_words": len(unique),
+        "inversion_fraction": round(inversions / pairs, 4),
+    }
 
 
 def _mark_unreadable_tables(elements: list[dict], glyphs: list[MeasuredGlyph]) -> list[dict]:
@@ -48,6 +53,9 @@ def _mark_unreadable_tables(elements: list[dict], glyphs: list[MeasuredGlyph]) -
     Rotation counts non-space glyphs owned by table cells, including Forms.
     Order evidence compares both captured cell text and what its glyphs draw
     against geometry; a header cannot repair either kind of contradiction.
+    Disorder must affect at least half the table's matched words, with at
+    least 40% of unique-word pairs inverted in each disordered cell. Short
+    and orderly cells still contribute to the table-wide word denominator.
     Absence of sufficient evidence is not a readability failure.
     """
     targets = _content_targets(elements)
@@ -64,6 +72,8 @@ def _mark_unreadable_tables(elements: list[dict], glyphs: list[MeasuredGlyph]) -
         drawn = [g for (i, _), gs in cells.items() if i == index for g in gs]
         rotated = sum(bool(g.turn) for g in drawn)
         disorder = []
+        matched_words = 0
+        disordered_words = 0
         if drawn and rotated <= len(drawn) / 2:
             for cell in table.get("cells", []):
                 key = (cell.get("row", 0), cell.get("col", 0))
@@ -71,14 +81,21 @@ def _mark_unreadable_tables(elements: list[dict], glyphs: list[MeasuredGlyph]) -
                 if not gs or any(g.turn for g in gs):
                     continue
                 geometry = _geometric_text(gs)
+                cell_matched = 0
+                cell_evidence = None
                 for text in (
                     str(cell.get("actual_text") or cell.get("text") or ""),
                     join_glyphs(gs),
                 ):
-                    if evidence := _order_disagreement(text, geometry):
-                        disorder.append({"row": key[0], "col": key[1], **evidence})
-                        break
-        if rotated > len(drawn) / 2 or disorder:
+                    matched, evidence = _order_disagreement(text, geometry)
+                    cell_matched = max(cell_matched, matched)
+                    if evidence is not None:
+                        cell_evidence = evidence
+                matched_words += cell_matched
+                if cell_evidence is not None:
+                    disorder.append({"row": key[0], "col": key[1], **cell_evidence})
+                    disordered_words += cell_evidence["matched_words"]
+        if rotated > len(drawn) / 2 or (disorder and disordered_words >= matched_words / 2):
             diagnostic = {
                 "table_review_id": table.get(
                     "review_id", f"review-{table.get('_docling_order', index)}"
@@ -88,6 +105,8 @@ def _mark_unreadable_tables(elements: list[dict], glyphs: list[MeasuredGlyph]) -
                 "cause": "rotated_glyphs" if rotated > len(drawn) / 2 else "cell_text_order",
                 "glyphs": len(drawn),
                 "rotated_glyphs": rotated,
+                "matched_words": matched_words,
+                "disordered_words": disordered_words,
                 "disordered_cells": disorder,
             }
             table["_table_readability"] = diagnostic

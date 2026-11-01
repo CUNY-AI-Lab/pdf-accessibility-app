@@ -124,7 +124,7 @@ async def test_cross_page_rows_keep_mcrs_and_header_associations(
 
 
 @pytest.mark.parametrize(
-    "change", ["recover", "plain", "far", "misaligned", "missing", "extractor", "unreadable"]
+    "change", ["recover", "plain", "far", "misaligned", "missing", "extractor", "unreadable", "isolated"]
 )
 @pytest.mark.parametrize("form", [False, True])
 async def test_bold_headings_outside_grid_become_column_headers(
@@ -135,13 +135,17 @@ async def test_bold_headings_outside_grid_become_column_headers(
         ["Learning first topic", "Discussion first topic"],
         ["Learning other topic", "Discussion other topic"],
     ]
-    if change == "unreadable":
+    if change in {"unreadable", "isolated"}:
         rows[0][0] = "a b c d e f g h"
+    if change == "unreadable":
+        rows[0][1] = "i j k l m n o p"
     structure = _fixture(
         source, rows, form=form, headers={(0, 0): "Row"} if change == "extractor" else {}
     )
-    if change == "unreadable":
+    if change in {"unreadable", "isolated"}:
         structure["elements"][0]["cells"][0]["text"] = "h g f e d c b a"
+    if change == "unreadable":
+        structure["elements"][0]["cells"][1]["text"] = "p o n m l k j i"
     headings = ["Learning outcomes", "Assessment"]
     with pikepdf.open(source, allow_overwriting_input=True) as pdf:
         pg = pdf.pages[0]
@@ -174,17 +178,17 @@ async def test_bold_headings_outside_grid_become_column_headers(
     _, after = await paired(tmp_path, source, structure, monkeypatch)
     with pikepdf.open(after) as pdf:
         (table,) = _tables(pdf.Root.StructTreeRoot)
-        assert len(table.K) == (3 if change == "recover" else 2)
-        if change == "recover":
+        assert len(table.K) == (3 if change in {"recover", "isolated"} else 2)
+        if change in {"recover", "isolated"}:
             with pdf.open_outline() as outline:
                 assert not any(str(item.title) in headings for item in outline.root)
-        if change == "recover":
+        if change in {"recover", "isolated"}:
             for cell in table.K[0].K:
                 assert cell.S == "/TH"
                 assert cell.A.Scope == "/Column"
             for col, cell in enumerate(table.K[1].K):
                 assert table.K[0].K[col].ID in cell.A.Headers
-    if change == "recover":
+    if change in {"recover", "isolated"}:
         heard = screen_reader_text(after, markdown=True)
         assert "<th>Learning outcomes</th>" in heard
         assert "<th>Assessment</th>" in heard
