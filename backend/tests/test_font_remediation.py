@@ -1851,7 +1851,7 @@ def test_local_embed_support_includes_standard_type1_fonts():
     assert _local_embed_support_kind(font_dict) == "type1_standard14"
 
 
-def test_local_font_program_uses_type1_fontfile_for_standard14(monkeypatch):
+def test_local_font_program_falls_back_to_type1_fontfile_without_liberation(monkeypatch):
     font_dict = pikepdf.Dictionary(
         {
             "/Subtype": pikepdf.Name("/Type1"),
@@ -1859,6 +1859,8 @@ def test_local_font_program_uses_type1_fontfile_for_standard14(monkeypatch):
         }
     )
 
+    # Without a Liberation substitute on the host, Ghostscript's Type 1 program is used.
+    monkeypatch.setattr(programs, "_system_font_program", lambda name: (None, None))
     monkeypatch.setattr(
         programs,
         "_ghostscript_type1_font_program",
