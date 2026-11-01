@@ -235,6 +235,26 @@ The same docling-serve and model were used. The cassette answered 877 model requ
   - **A data table without header cells: 11.** Seven are held for this alone.
   - **Other veraPDF failures only: 2.**
 
+### Held-out tests (2026-10-31 and 2026-11-01)
+
+The 47 documents above were used to find and fix problems, so their completion rate overstates what an unseen PDF gets. Two held-out sets measure that instead. Each was drawn from public CUNY PDFs by fixed search queries, in rank order, before any run. Each takes several kinds of document and keeps tagged and untagged files as found. The protocol, queries and manifests (URLs and sha256) are kept outside the repository with the evaluation data.
+
+| Set | Documents | Code | Complete | Failed outright |
+|---|---:|---|---:|---:|
+| 1 | 39 (25 already tagged) | production `b0d9b79` | 9 | 2 |
+| 1 | 39 | `main` + #49 + #50 | 20 | 2 |
+| 2 | 40 (33 already tagged) | released `ee76934` | 30 | 0 |
+
+**Set 1** exposed:
+- the tagger discarding authors' table headers on tagged uploads (#54);
+- OCRmyPDF exit 4 failing the whole job (#51);
+- a font-embedding regression from #48 (#53);
+- an over-eager table-readability guard (#50).
+
+Once fixes were made from it, set 1 stopped being a held-out measure.
+
+**Set 2** found one cause behind 7 of its 10 holds: standard-14 Type 1 fonts (Times-Roman, Helvetica) were left unembedded in the Linux image (#55). Replayed through tagging and font repair in the production image, all seven pass veraPDF after #55, and none passed before. The full pipeline has not been re-run on set 2. Set 2 has now informed a fix, so the next honest measure needs a third sample.
+
 ### Untagged CUNY documents
 
 | Document | Kind | Pages | Classified | Status | Held by | veraPDF | Figures with alt text | Seconds | Cost (USD) |
