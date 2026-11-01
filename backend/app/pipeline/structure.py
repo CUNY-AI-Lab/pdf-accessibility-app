@@ -14,6 +14,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.config import get_settings
+from app.pipeline.docling_io import (
+    DoclingConversion,
+    LocalDoclingConversion,
+)
+from app.pipeline.docling_io import (
+    _docling_serve_request as _docling_serve_request,
+)
+from app.pipeline.docling_io import (
+    _is_retryable_docling_serve_error as _is_retryable_docling_serve_error,
+)
 from app.pipeline.document_title import select_document_title
 from app.pipeline.language import (
     detect_language as _detect_language,
@@ -42,9 +52,6 @@ TOC_GROUP_HEADING_EXCLUDE = {
     "page",
     "lists",
 }
-DOCLING_SERVE_REQUEST_ATTEMPTS = 3
-DOCLING_SERVE_RETRY_DELAY_SECONDS = 2.0
-DOCLING_SERVE_RETRY_STATUS_CODES = {502, 503, 504}
 
 
 @dataclass
@@ -66,64 +73,6 @@ class StructureResult:
     headings_count: int = 0
     tables_count: int = 0
     figures_count: int = 0
-
-
-def _is_retryable_docling_serve_error(exc: Exception) -> bool:
-    import httpx
-
-    return isinstance(
-        exc,
-        (
-            httpx.ConnectError,
-            httpx.ConnectTimeout,
-            httpx.PoolTimeout,
-            httpx.ReadTimeout,
-            httpx.RemoteProtocolError,
-        ),
-    )
-
-
-async def _docling_serve_request(
-    client: Any,
-    method: str,
-    url: str,
-    *,
-    attempts: int = DOCLING_SERVE_REQUEST_ATTEMPTS,
-    retry_delay: float = DOCLING_SERVE_RETRY_DELAY_SECONDS,
-    **kwargs: Any,
-):
-    for attempt in range(1, attempts + 1):
-        try:
-            response = await client.request(method, url, **kwargs)
-        except Exception as exc:
-            if attempt >= attempts or not _is_retryable_docling_serve_error(exc):
-                raise
-            logger.warning(
-                "docling-serve %s request failed on attempt %d/%d: %s; retrying",
-                method.upper(),
-                attempt,
-                attempts,
-                exc,
-            )
-            await asyncio.sleep(retry_delay)
-            continue
-
-        if (
-            response.status_code in DOCLING_SERVE_RETRY_STATUS_CODES
-            and attempt < attempts
-        ):
-            logger.warning(
-                "docling-serve %s request returned HTTP %d on attempt %d/%d; retrying",
-                method.upper(),
-                response.status_code,
-                attempt,
-                attempts,
-            )
-            await asyncio.sleep(retry_delay)
-            continue
-        return response
-
-    raise RuntimeError("docling-serve request retries were exhausted")
 
 
 def _normalize_native_toc(node: Any) -> dict[str, Any] | None:
@@ -1402,16 +1351,13 @@ async def _convert_via_docling_serve(
     the same Docling ``export_to_dict()`` structure as the local converter.
     Figure images are cropped from embedded page renders using bbox data.
     """
-    import time
-
     import httpx
 
     base_url = base_url.rstrip("/")
-    submit_url = f"{base_url}/v1/convert/file/async"
 
     auth_headers = {"Authorization": f"Bearer {token}"} if token else {}
 
-    # Per-request timeout: generous but bounded; total timeout enforced by the polling loop
+    # The conversion owns one deadline across submission, polling, and fetch.
     per_request_timeout = httpx.Timeout(min(timeout, 120.0), connect=30.0)
     async with httpx.AsyncClient(timeout=per_request_timeout) as client:
         pdf_bytes = pdf_path.read_bytes()
@@ -1435,59 +1381,12 @@ async def _convert_via_docling_serve(
                 "include_images": "true",
                 "images_scale": "2.0",
             })
-        resp = await _docling_serve_request(
-            client,
-            "POST",
-            submit_url,
+        result_data = await DoclingConversion().run(
+            client, base_url, timeout,
             headers=auth_headers,
             files={"files": (pdf_path.name, pdf_bytes, "application/pdf")},
             data=data,
         )
-        resp.raise_for_status()
-        task_id = resp.json()["task_id"]
-        logger.info("docling-serve task submitted: %s", task_id)
-
-        # Poll for completion
-        poll_url = f"{base_url}/v1/status/poll/{task_id}"
-        start = time.monotonic()
-        while True:
-            elapsed = time.monotonic() - start
-            if elapsed > timeout:
-                raise TimeoutError(
-                    f"docling-serve task {task_id} did not complete within {timeout}s"
-                )
-            await asyncio.sleep(2)
-            poll_resp = await _docling_serve_request(
-                client,
-                "GET",
-                poll_url,
-                headers=auth_headers,
-            )
-            poll_resp.raise_for_status()
-            poll_data = poll_resp.json()
-            status = poll_data.get("task_status")
-            if status == "success":
-                logger.info(
-                    "docling-serve task %s completed in %.1fs",
-                    task_id,
-                    time.monotonic() - start,
-                )
-                break
-            if status == "failure":
-                raise RuntimeError(
-                    f"docling-serve task {task_id} failed: "
-                    f"{poll_data.get('error_message', 'unknown')}"
-                )
-
-        # Fetch result
-        result_resp = await _docling_serve_request(
-            client,
-            "GET",
-            f"{base_url}/v1/result/{task_id}",
-            headers=auth_headers,
-        )
-        result_resp.raise_for_status()
-        result_data = result_resp.json()
 
     doc_dict = result_data["document"]["json_content"]
     processing_time = result_data.get("processing_time")
@@ -1508,7 +1407,7 @@ async def extract_structure(
 ) -> StructureResult:
     """Extract document structure using Docling.
 
-    Priority: docling-serve → local Docling.
+    Use docling-serve when configured, otherwise local Docling.
     """
     settings = get_settings()
     use_docling_serve = bool(settings.docling_serve_url)
@@ -1559,21 +1458,9 @@ async def extract_structure(
                 )
                 return converter.convert(str(path))
 
-            source_pdf = pdf_path
-            result_processed_pdf_path = source_pdf
-            repaired_pdf = job_dir / "repaired_input.pdf"
-            try:
-                conv_result = _convert_one(source_pdf)
-            except Exception:
-                if _repair_pdf_with_ghostscript(source_pdf, repaired_pdf):
-                    logger.warning(
-                        "Docling failed on %s; retrying structure extraction with Ghostscript-repaired file",
-                        source_pdf.name,
-                    )
-                    conv_result = _convert_one(repaired_pdf)
-                    result_processed_pdf_path = repaired_pdf
-                else:
-                    raise
+            conv_result, result_processed_pdf_path = LocalDoclingConversion().run(
+                _convert_one, _repair_pdf_with_ghostscript, pdf_path, job_dir / "repaired_input.pdf",
+            )
 
             doc = conv_result.document
             doc_dict = doc.export_to_dict()

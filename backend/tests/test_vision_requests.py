@@ -177,7 +177,6 @@ async def test_other_vision_transports_use_the_same_total_body_limit(
 
         monkeypatch.setattr(httpx, "post", post)
         monkeypatch.setenv("CAIL_OCR_MAX_REQUEST_BYTES", str(LIMIT))
-        monkeypatch.setattr(ocr_vlm_plugin, "_credential_refused", False)
         ocr_vlm_plugin._complete(
             "https://vision.test/v1",
             {},
@@ -239,7 +238,7 @@ def test_request_limit_setting_defaults_and_validation():
 async def test_local_size_failure_does_not_change_model_format_capabilities(monkeypatch):
     from app.services import intelligence_llm_utils
 
-    monkeypatch.setattr(intelligence_llm_utils, "JSON_SCHEMA_REFUSED_MODELS", set())
+    monkeypatch.setattr(intelligence_llm_utils, "FORMAT_CAPABILITIES", intelligence_llm_utils.FormatCapabilityCache())
     client = LlmClient("https://vision.test/v1", "", "vision", max_request_bytes=LIMIT)
 
     async def forbidden(*args, **kwargs):
@@ -254,6 +253,6 @@ async def test_local_size_failure_does_not_change_model_format_capabilities(monk
                 schema_name="vision",
                 response_schema={"type": "object"},
             )
-        assert not intelligence_llm_utils.JSON_SCHEMA_REFUSED_MODELS
+        assert not intelligence_llm_utils.FORMAT_CAPABILITIES.entries
     finally:
         await client.close()

@@ -1,4 +1,14 @@
-"""Bounded, process-local SQLite access for reusable crop descriptions only."""
+"""Bounded, process-local SQLite access for reusable crop descriptions only.
+
+Entry transitions, guarded by _write_entry::
+    absent -> fresh (store description)
+    fresh -> fresh (access/store) | absent (eviction)
+    expired -> fresh (replace description) | absent (prune)
+    fresh -> expired (derived after 48h; reads never extend storage lifetime)
+
+Malformed legacy storage times are expired misses. Exact-input identity, the
+entry/text/file bounds and the disable switch apply to every cache operation.
+"""
 
 import hashlib
 import json
@@ -7,6 +17,7 @@ import sqlite3
 import threading
 import time
 from contextlib import closing
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +26,33 @@ _CACHE_LOCK = threading.RLock()
 MAX_ENTRIES = 2000
 MAX_TEXT_BYTES = 4096
 MAX_AGE_NS = 48 * 60 * 60 * 1_000_000_000
+
+
+class CacheEntryState(Enum):
+    ABSENT = "absent"
+    FRESH = "fresh"
+    EXPIRED = "expired"
+
+
+def cache_entry_state(stored_at: Any, now: int, *, present: bool = True) -> CacheEntryState:
+    if not present:
+        return CacheEntryState.ABSENT
+    # A legacy/malformed storage time is a cache miss, never a failed read.
+    if not isinstance(stored_at, int) or stored_at <= now - MAX_AGE_NS:
+        return CacheEntryState.EXPIRED
+    return CacheEntryState.FRESH
+
+
+_CACHE_TRANSITIONS = {
+    CacheEntryState.ABSENT: {CacheEntryState.FRESH},
+    CacheEntryState.FRESH: {CacheEntryState.FRESH, CacheEntryState.ABSENT},
+    CacheEntryState.EXPIRED: {CacheEntryState.FRESH, CacheEntryState.ABSENT},
+}
+
+
+def guard_cache_transition(current: CacheEntryState, target: CacheEntryState) -> None:
+    if target not in _CACHE_TRANSITIONS[current]:
+        raise ValueError(f"Illegal alt-text cache transition: {current.value} -> {target.value}")
 
 
 def usable_description(text: str) -> bool:
@@ -90,8 +128,40 @@ class AltTextCache:
             raise
 
     @staticmethod
-    def _prune_expired(connection: sqlite3.Connection, now: int) -> None:
-        connection.execute("DELETE FROM descriptions WHERE stored_at <= ?", (now - MAX_AGE_NS,))
+    def _write_entry(
+        connection: sqlite3.Connection, key: tuple[str, str, str, str],
+        target: CacheEntryState, now: int, *, text: str | None = None,
+    ) -> None:
+        row = connection.execute(
+            "SELECT stored_at FROM descriptions WHERE image_hash = ? AND model = ? "
+            "AND prompt_version = ? AND input_hash = ?", key,
+        ).fetchone()
+        current = cache_entry_state(row[0] if row else None, now, present=row is not None)
+        guard_cache_transition(current, target)
+        if target is CacheEntryState.ABSENT:
+            connection.execute(
+                "DELETE FROM descriptions WHERE image_hash = ? AND model = ? "
+                "AND prompt_version = ? AND input_hash = ?", key,
+            )
+        elif text is not None:
+            connection.execute("INSERT OR REPLACE INTO descriptions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                               (*key, text, now, now))
+        elif current is CacheEntryState.FRESH:
+            connection.execute(
+                "UPDATE descriptions SET accessed = ? WHERE image_hash = ? AND model = ? "
+                "AND prompt_version = ? AND input_hash = ?", (now, *key),
+            )
+        else:
+            raise ValueError("A cache insertion requires a description")
+
+    @classmethod
+    def _prune_expired(cls, connection: sqlite3.Connection, now: int) -> None:
+        keys = connection.execute(
+            "SELECT image_hash, model, prompt_version, input_hash FROM descriptions "
+            "WHERE stored_at <= ? OR typeof(stored_at) != 'integer'", (now - MAX_AGE_NS,),
+        ).fetchall()
+        for key in keys:
+            cls._write_entry(connection, tuple(key), CacheEntryState.ABSENT, now)
 
     def get(self, image_hash: str, model: str, prompt_version: str, input_hash: str) -> str | None:
         try:
@@ -104,11 +174,7 @@ class AltTextCache:
                     "WHERE image_hash = ? AND model = ? AND prompt_version = ? AND input_hash = ?", key,
                 ).fetchone()
                 if row and usable_description(row[0]):
-                    connection.execute(
-                        "UPDATE descriptions SET accessed = ? "
-                        "WHERE image_hash = ? AND model = ? AND prompt_version = ? AND input_hash = ?",
-                        (now, *key),
-                    )
+                    self._write_entry(connection, key, CacheEntryState.FRESH, now)
                     return row[0]
         except (OSError, sqlite3.Error):
             logger.warning("Alt-text cache read unavailable", exc_info=True)
@@ -122,14 +188,14 @@ class AltTextCache:
             with _CACHE_LOCK, closing(self._connect()) as connection, connection:
                 now = time.time_ns()
                 self._prune_expired(connection, now)
-                connection.execute(
-                    "INSERT OR REPLACE INTO descriptions VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (image_hash, model, prompt_version, input_hash, text, now, now),
-                )
-                connection.execute(
-                    "DELETE FROM descriptions WHERE rowid IN "
-                    "(SELECT rowid FROM descriptions ORDER BY accessed DESC, rowid DESC "
-                    "LIMIT -1 OFFSET ?)", (self.max_entries,),
-                )
+                key = (image_hash, model, prompt_version, input_hash)
+                self._write_entry(connection, key, CacheEntryState.FRESH, now, text=text)
+                evicted = connection.execute(
+                    "SELECT image_hash, model, prompt_version, input_hash FROM descriptions "
+                    "ORDER BY accessed DESC, rowid DESC LIMIT -1 OFFSET ?", (self.max_entries,),
+                ).fetchall()
+                for old_key in evicted:
+                    self._write_entry(connection, tuple(old_key), CacheEntryState.ABSENT, now)
+
         except (OSError, sqlite3.Error):
             logger.warning("Alt-text cache write unavailable", exc_info=True)

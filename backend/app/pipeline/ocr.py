@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,7 +17,12 @@ from app.pipeline.subprocess_utils import (
     communicate_with_timeout,
     subprocess_process_group_kwargs,
 )
-from app.services.llm_client import current_model_endpoint
+from app.services.llm_client import (
+    current_model_endpoint,
+    raise_if_model_access_refused,
+    refuse_model_access,
+)
+from app.services.ocr_access import OcrJobAccess
 from app.services.runtime_paths import enriched_subprocess_env
 
 logger = logging.getLogger(__name__)
@@ -149,9 +155,24 @@ async def run_ocr(
         engine=engine,
         pages=pages,
     )
+    if engine == "gateway":
+        raise_if_model_access_refused()
+    # The directory lasts through both OCRmyPDF attempts, is shared by every
+    # page process, and is never reused by a later job.
+    with tempfile.TemporaryDirectory(prefix="ocr-access-") as access_dir:
+        return await _run_ocr_process(
+            args, input_path, output_path, engine, mode, jobs, timeout_seconds, Path(access_dir),
+        )
+
+
+async def _run_ocr_process(
+    args: list[str], input_path: Path, output_path: Path, engine: str, mode: str,
+    jobs: int | None, timeout_seconds: int | None, access_dir: Path,
+) -> OcrResult:
     env = enriched_subprocess_env()
     if engine == "gateway":
         settings = get_settings()
+        env["CAIL_OCR_ACCESS_DIR"] = str(access_dir)
         endpoint = current_model_endpoint(settings)
         env["CAIL_OCR_BASE_URL"] = endpoint.base_url
         env["CAIL_OCR_HEADERS"] = json.dumps(endpoint.headers)
@@ -177,10 +198,16 @@ async def run_ocr(
         try:
             stdout, stderr = await communicate_with_timeout(proc, timeout_seconds)
         except SubprocessTimeout:
+            if refusal := OcrJobAccess(access_dir).refusal:
+                raise refuse_model_access(refusal)
             msg = f"OCR timed out after {timeout_seconds}s"
             logger.error(msg)
             return OcrResult(success=False, output_path=input_path, message=msg)
 
+        if refusal := OcrJobAccess(access_dir).refusal:
+            raise refuse_model_access(refusal)
+        if engine == "gateway":
+            raise_if_model_access_refused()
         stderr_text = stderr.decode("utf-8", errors="replace")
         stdout_text = stdout.decode("utf-8", errors="replace")
 

@@ -38,6 +38,13 @@ On a scan, the optional text correction lets a cell read the model's text,
 as /ActualText, only where every difference from the OCR text is a known
 OCR confusion (0 and O, 1 and l and I, 5 and S, 8 and B, a rule read as a
 pipe, a dropped decimal point) and everything else matches.
+
+The optional runner service circuit has one transition::
+    available -> unavailable_for_document (transport failure or HTTP 429/500/502/503/504)
+    unavailable_for_document -> terminal (skip remaining requests)
+
+A new document creates a new circuit. Malformed answers affect one table only.
+The optional AnswerCache is enabled by benchmark tooling, not the orchestrator.
 """
 
 from __future__ import annotations
@@ -54,6 +61,7 @@ import time
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
@@ -93,6 +101,26 @@ class ModelAnswer:
 class TableModelUnavailable(Exception):
     """The model cannot answer now (down, busy, or too slow): the remaining
     tables of the document keep Docling's grids without asking."""
+
+
+class TableServiceState(Enum):
+    AVAILABLE = "available"
+    UNAVAILABLE_FOR_DOCUMENT = "unavailable_for_document"
+
+
+@dataclass
+class TableServiceCircuit:
+    state: TableServiceState = TableServiceState.AVAILABLE
+    reason: str | None = None
+
+    def transition(self, target: TableServiceState, reason: str | None = None) -> None:
+        if (self.state, target) != (TableServiceState.AVAILABLE, TableServiceState.UNAVAILABLE_FOR_DOCUMENT) or not reason:
+            raise ValueError(f"Illegal table service transition: {self.state.value} -> {target.value}")
+        self.reason = reason
+        self.state = target
+
+
+TABLE_SERVICE_UNAVAILABLE_STATUSES = {429, 500, 502, 503, 504}
 
 
 class TableReader(Protocol):
@@ -192,7 +220,7 @@ class HttpReader:
                 response = await client.post(self.url, json=body)
         except httpx.HTTPError as exc:
             raise TableModelUnavailable(repr(exc)) from exc
-        if response.status_code in (429, 503):
+        if response.status_code in TABLE_SERVICE_UNAVAILABLE_STATUSES:
             raise TableModelUnavailable(f"busy ({response.status_code})")
         if response.status_code != 200:
             logger.warning("table model answered %s", response.status_code)
@@ -1169,18 +1197,18 @@ async def rewrite_tables(
     elements = list(structure_json.get("elements") or [])
     prepared = await asyncio.to_thread(prepare_tables, pdf_path, elements)
     answers: list[ModelAnswer | None] = []
-    unavailable: str | None = None
+    circuit = TableServiceCircuit()
     for prep in prepared:
-        if unavailable is not None:
+        if circuit.state is TableServiceState.UNAVAILABLE_FOR_DOCUMENT:
             answers.append(None)
             continue
         try:
             answers.append(await reader.read(prep.png))
         except TableModelUnavailable as exc:
-            unavailable = str(exc)
-            logger.warning("table model unavailable: %s", unavailable)
+            circuit.transition(TableServiceState.UNAVAILABLE_FOR_DOCUMENT, str(exc))
+            logger.warning("table model unavailable: %s", circuit.reason)
             answers.append(None)
-        except (ValueError, KeyError) as exc:
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
             logger.warning("table model failed for table %s: %r", prep.element_index, exc)
             answers.append(None)
     updated, reports = await asyncio.to_thread(
@@ -1194,7 +1222,7 @@ async def rewrite_tables(
         "tables": len(prepared),
         "replaced": sum(r.get("result") == "replaced" for r in reports),
         "seconds": round(time.monotonic() - started, 3),
-        "unavailable": unavailable,
+        "unavailable": circuit.reason,
         "table_reports": reports,
     }
     return structure, audit

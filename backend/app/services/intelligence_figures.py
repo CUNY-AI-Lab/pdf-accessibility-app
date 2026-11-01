@@ -209,6 +209,7 @@ class _CachedFigureRequest:
     ):
         self.client = client
         self.model = client.model
+        self.base_url = getattr(client, "base_url", "")
         self.cache = cache
         self.figure_index = figure.index
         with figure.path.open("rb") as image:
