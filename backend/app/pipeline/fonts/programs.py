@@ -92,14 +92,38 @@ def _local_embed_support_kind(font_dict, descendant_subtype=None) -> str:
     subtype = font_dict.get("/Subtype")
     if subtype == pikepdf.Name("/TrueType"):
         return "truetype"
+    substitutes = _metric_compatible_names(_base_font_name(font_dict))
     if (
         subtype in (pikepdf.Name("/Type1"), pikepdf.Name("/MMType1"))
-        and _normalize_font_name(_base_font_name(font_dict)) in GHOSTSCRIPT_TYPE1_SUBSTITUTES
+        and (
+            _normalize_font_name(_base_font_name(font_dict)) in GHOSTSCRIPT_TYPE1_SUBSTITUTES
+            or substitutes is not None
+        )
     ):
         return "type1_standard14"
     if subtype == pikepdf.Name("/Type0") and descendant_subtype == pikepdf.Name("/CIDFontType2"):
         return "cidfonttype2"
     return ""
+
+
+def _truetype_descriptor(font_bytes: bytes) -> dict[str, object]:
+    """Read descriptor metrics from the actual program, without requiring AFMs."""
+    from fontTools.ttLib import TTFont
+
+    with TTFont(BytesIO(font_bytes), recalcTimestamp=False) as font:
+        head, hhea, os2 = font["head"], font["hhea"], font["OS/2"]
+        scale = 1000 / int(getattr(head, "unitsPerEm"))
+        italic = float(getattr(font["post"], "italicAngle"))
+        return {
+            "Flags": 32 | (1 if getattr(font["post"], "isFixedPitch") else 0) | (64 if italic else 0),
+            "ItalicAngle": italic,
+            "Ascent": round(hhea.ascent * scale),
+            "Descent": round(hhea.descent * scale),
+            "CapHeight": round(getattr(os2, "sCapHeight", hhea.ascent) * scale),
+            "StemV": 120 if getattr(os2, "usWeightClass") >= 700 else 80,
+            "FontBBox": [round(value * scale) for value in
+                         (head.xMin, head.yMin, head.xMax, head.yMax)],
+        }
 
 
 def _coerce_metric_int(value, default: int = 0) -> int:
@@ -480,7 +504,31 @@ def _local_font_program(
         )
 
     if support_kind == "type1_standard14":
-        font_bytes, matched_name, lengths = _ghostscript_type1_font_program(font_name)
+        substitutes = _metric_compatible_names(font_name)
+        standard = font_name
+        if substitutes is not None:
+            liberation, standard = substitutes
+            encoding = font_dict.get("/Encoding")
+            if isinstance(encoding, pikepdf.Dictionary):
+                encoding = encoding.get("/BaseEncoding")
+            descriptor = font_dict.get("/FontDescriptor", {})
+            symbolic = int(descriptor.get("/Flags") or 0) & 4
+            # Standard 14 Type 1 fonts have a deterministic built-in encoding.
+            # Do not guess the implicit encoding of other simple fonts.
+            implicit_standard = (
+                encoding is None
+                and _normalize_font_name(font_name) in GHOSTSCRIPT_TYPE1_SUBSTITUTES
+            )
+            safe_encoding = not symbolic and (implicit_standard or str(encoding) in {
+                "/WinAnsiEncoding", "/MacRomanEncoding", "/StandardEncoding",
+            })
+            if safe_encoding:
+                font_bytes, matched_name = _system_font_program(liberation)
+                if font_bytes:
+                    return font_bytes, matched_name, "/FontFile2", {"Length1": len(font_bytes)}
+            elif _normalize_font_name(font_name) not in GHOSTSCRIPT_TYPE1_SUBSTITUTES:
+                return None, None, None, None
+        font_bytes, matched_name, lengths = _ghostscript_type1_font_program(standard)
         if not font_bytes or not lengths:
             return None, None, None, None
         return font_bytes, matched_name, str(pikepdf.Name("/FontFile")), lengths
