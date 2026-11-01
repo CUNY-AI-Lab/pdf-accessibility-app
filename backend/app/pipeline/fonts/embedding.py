@@ -10,6 +10,7 @@ from app.pipeline.fonts.programs import (
     _ghostscript_type1_descriptor,
     _local_embed_support_kind,
     _local_font_program,
+    _truetype_descriptor,
 )
 from app.pipeline.fonts.resources import (
     _has_embedded_font,
@@ -17,7 +18,7 @@ from app.pipeline.fonts.resources import (
     _obj_key,
     _resolve_dictionary,
 )
-from app.pipeline.fonts.widths import _align_truetype_advances
+from app.pipeline.fonts.widths import _align_truetype_advances, _derive_truetype_widths
 from app.pipeline.subprocess_utils import (
     SubprocessTimeout,
     communicate_with_timeout,
@@ -62,13 +63,16 @@ def _embed_system_fonts_sync(
     }
     seen_fonts: set[tuple[int, int]] = set()
 
-    def _ensure_type1_descriptor(font_dict, descriptor, font_name: str):
+    def _ensure_type1_descriptor(font_dict, descriptor, font_name: str, font_bytes, fontfile_key):
         if isinstance(descriptor, pikepdf.Dictionary):
             return descriptor
         if _local_embed_support_kind(font_dict) != "type1_standard14":
             return descriptor
 
-        descriptor_data = _ghostscript_type1_descriptor(font_name)
+        descriptor_data = (
+            _truetype_descriptor(font_bytes) if fontfile_key == "/FontFile2"
+            else _ghostscript_type1_descriptor(font_name)
+        )
         if not descriptor_data:
             return descriptor
 
@@ -77,7 +81,7 @@ def _embed_system_fonts_sync(
                 "/Type": pikepdf.Name("/FontDescriptor"),
                 "/FontName": pikepdf.Name(f"/{_strip_subset_prefix(font_name)}"),
                 "/Flags": int(descriptor_data["Flags"]),
-                "/ItalicAngle": int(descriptor_data["ItalicAngle"]),
+                "/ItalicAngle": float(descriptor_data["ItalicAngle"]),
                 "/Ascent": int(descriptor_data["Ascent"]),
                 "/Descent": int(descriptor_data["Descent"]),
                 "/CapHeight": int(descriptor_data["CapHeight"]),
@@ -85,7 +89,6 @@ def _embed_system_fonts_sync(
                 "/FontBBox": pikepdf.Array(descriptor_data["FontBBox"]),
             }
         )
-        font_dict[pikepdf.Name("/FontDescriptor")] = descriptor
         return descriptor
 
     def _apply_type1_width_metrics(font_dict, descriptor, font_name: str) -> None:
@@ -129,10 +132,6 @@ def _embed_system_fonts_sync(
     def _embed_descriptor_font(
         font_dict, descriptor, font_name: str, *, descendant_subtype=None, descriptor_owner=None
     ) -> bool:
-        descriptor = _ensure_type1_descriptor(font_dict, descriptor, font_name)
-        if not isinstance(descriptor, pikepdf.Dictionary):
-            stats["fonts_unsupported"] += 1
-            return False
         if _has_embedded_font(descriptor):
             stats["fonts_already_embedded"] += 1
             return False
@@ -146,7 +145,27 @@ def _embed_system_fonts_sync(
             stats["fonts_missing"] += 1
             return False
 
+        descriptor = _ensure_type1_descriptor(
+            font_dict, descriptor, font_name, font_bytes, fontfile_key,
+        )
+        if not isinstance(descriptor, pikepdf.Dictionary):
+            stats["fonts_unsupported"] += 1
+            return False
+        if fontfile_key == "/FontFile2" and font_dict.get("/Subtype") in (
+            pikepdf.Name("/Type1"), pikepdf.Name("/MMType1"),
+        ):
+            # A TrueType program requires a TrueType dictionary. Make Type 1's
+            # implicit StandardEncoding explicit before changing the subtype.
+            encoding = font_dict.get("/Encoding")
+            if encoding is None:
+                font_dict["/Encoding"] = pikepdf.Name("/StandardEncoding")
+            elif isinstance(encoding, pikepdf.Dictionary) and "/BaseEncoding" not in encoding:
+                encoding = pikepdf.Dictionary(encoding)
+                encoding["/BaseEncoding"] = pikepdf.Name("/StandardEncoding")
+                font_dict["/Encoding"] = encoding
+            font_dict["/Subtype"] = pikepdf.Name("/TrueType")
         if fontfile_key == "/FontFile2" and font_dict.get("/Subtype") == pikepdf.Name("/TrueType"):
+            _derive_truetype_widths(font_dict, font_bytes)
             font_bytes, _, _ = _align_truetype_advances(font_dict, font_bytes)
             length_info = {**length_info, "Length1": len(font_bytes)}
         stream = pdf.make_stream(font_bytes)

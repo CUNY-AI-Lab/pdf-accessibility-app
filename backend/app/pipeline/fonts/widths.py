@@ -7,6 +7,30 @@ import pikepdf
 from app.pipeline.fonts.encoding import _simple_font_unicode_map
 
 
+def _derive_truetype_widths(font_dict, font_bytes: bytes) -> None:
+    """Supply absent simple-font widths using its encoding and embedded program.
+
+    Existing author widths remain authoritative; alignment handles those instead.
+    """
+    from fontTools.ttLib import TTFont
+
+    if "/Widths" in font_dict:
+        return
+    with TTFont(BytesIO(font_bytes), recalcTimestamp=False) as font:
+        glyphs = _truetype_code_glyphs(font_dict, font)
+        if not glyphs:
+            return
+        scale = 1000 / int(getattr(font["head"], "unitsPerEm"))
+        metrics = font["hmtx"].metrics
+        missing = metrics[".notdef"][0] * scale
+        font_dict["/FirstChar"] = 0
+        font_dict["/LastChar"] = 255
+        font_dict["/Widths"] = pikepdf.Array(
+            round(metrics[glyphs[code]][0] * scale, 6) if code in glyphs else round(missing, 6)
+            for code in range(256)
+        )
+
+
 def _truetype_code_glyphs(font_dict, font) -> dict[int, str]:
     """Resolve simple PDF character codes to the program's glyphs.
 

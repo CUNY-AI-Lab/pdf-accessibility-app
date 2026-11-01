@@ -110,23 +110,31 @@ def _text_contract(path):
 @pytest.mark.parametrize(("source", "family", "style"), [
     ("ABCDEF+ArialMT", "LiberationSans", "Regular"),
     ("Arial,Bold", "LiberationSans", "Bold"),
+    ("Helvetica,Bold", "LiberationSans", "Bold"),
+    ("Helvetica,Italic", "LiberationSans", "Italic"),
+    ("Times-Roman", "LiberationSerif", "Regular"),
     ("Arial-ItalicMT", "LiberationSans", "Italic"),
     ("Helvetica-BoldOblique", "LiberationSans", "BoldItalic"),
     ("Times New Roman", "LiberationSerif", "Regular"),
     ("TimesNewRomanPS-BoldMT", "LiberationSerif", "Bold"),
     ("TimesNewRomanPS-ItalicMT", "LiberationSerif", "Italic"),
+    ("TimesNewRomanPS-BoldItalicMT", "LiberationSerif", "BoldItalic"),
     ("Times-BoldItalic", "LiberationSerif", "BoldItalic"),
     ("CourierNewPSMT", "LiberationMono", "Regular"),
     ("Courier-Bold", "LiberationMono", "Bold"),
     ("Courier-Oblique", "LiberationMono", "Italic"),
     ("CourierNewPS-BoldItalicMT", "LiberationMono", "BoldItalic"),
 ])
+@pytest.mark.parametrize("subtype", ["/TrueType", "/Type1"])
 def test_substitute_embedding_preserves_unicode_widths_and_tagged_text(
-    tmp_path, monkeypatch, source, family, style,
+    tmp_path, monkeypatch, source, family, style, subtype,
 ):
     _install_test_font(tmp_path, monkeypatch, family, style)
     before, after = tmp_path / "before.pdf", tmp_path / "after.pdf"
     _unembedded_pdf(before, source)
+    with pikepdf.open(before, allow_overwriting_input=True) as pdf:
+        pdf.pages[0].Resources.Font.F1.Subtype = pikepdf.Name(subtype)
+        pdf.save(before)
     text = screen_reader_text(before)
     assert "Aβ A" in text
     diagnostics = _inspect_font_diagnostics(before, include_used_code_analysis=False)
@@ -205,6 +213,18 @@ def test_substitution_does_not_reuse_cid_glyph_ids_or_symbolic_encoding(tmp_path
     assert programs._local_font_program(symbolic, "ArialMT")[0] is None
 
 
+def test_type1_alias_does_not_guess_an_implicit_or_symbolic_encoding(tmp_path, monkeypatch):
+    _install_test_font(tmp_path, monkeypatch)
+    for encoding, flags in ((None, 32), (pikepdf.Name.WinAnsiEncoding, 4)):
+        font = pikepdf.Dictionary(
+            Subtype=pikepdf.Name.Type1, BaseFont=pikepdf.Name.ArialMT,
+            FontDescriptor=pikepdf.Dictionary(Flags=flags),
+        )
+        if encoding is not None:
+            font.Encoding = encoding
+        assert programs._local_font_program(font, "ArialMT")[0] is None
+
+
 def test_debian_urw_programs_and_afm_are_discovered(tmp_path, monkeypatch):
     prefix = tmp_path / "usr"
     gs = prefix / "bin/gs"
@@ -242,3 +262,84 @@ def test_urw_fallback_uses_type1_and_preserves_text_contract(tmp_path, monkeypat
         font = pdf.pages[0].Resources.Font.F1
         assert font.Subtype == pikepdf.Name.Type1
         assert font.FontDescriptor.FontFile.read_bytes().startswith(b"%!")
+
+
+@pytest.mark.parametrize("encoding", ["/WinAnsiEncoding", None, "differences"])
+@pytest.mark.parametrize(("name", "family", "style"), [
+    ("Times-Roman", "LiberationSerif", "Regular"),
+    ("Helvetica-Bold", "LiberationSans", "Bold"),
+    ("Courier-Oblique", "LiberationMono", "Italic"),
+])
+def test_standard14_without_widths_or_descriptor_embeds_without_afm(
+    tmp_path, monkeypatch, encoding, name, family, style,
+):
+    from fontTools.ttLib import TTFont
+
+    _install_test_font(tmp_path, monkeypatch, family, style)
+    font_path = tmp_path / "fonts" / f"{family}-{style}.ttf"
+    with TTFont(font_path) as program:
+        program["hmtx"].metrics["space"] = (250, 0)
+        program["hmtx"].metrics["B"] = (700, 0)
+        program.save(font_path)
+    monkeypatch.setattr(embedding, "_ghostscript_type1_descriptor", lambda _: None)
+    monkeypatch.setattr(programs, "_ghostscript_type1_font_program", lambda _: (None, None, None))
+    before, after = tmp_path / "before.pdf", tmp_path / "after.pdf"
+    _unembedded_pdf(before, name)
+    with pikepdf.open(before, allow_overwriting_input=True) as pdf:
+        f = pdf.pages[0].Resources.Font.F1
+        f.Subtype = pikepdf.Name.Type1
+        for key in ("/Widths", "/FirstChar", "/LastChar", "/FontDescriptor"):
+            del f[key]
+        if encoding is None:
+            del f["/Encoding"]
+        elif encoding == "differences":
+            f.Encoding = pikepdf.Dictionary(Differences=[65, pikepdf.Name.B])
+        pdf.save(before)
+    text = screen_reader_text(before)
+    ok, message, stats = embedding._embed_system_fonts_sync(before, after)
+    assert ok, message
+    assert stats["fonts_embedded"] == 1
+    assert screen_reader_text(after) == text
+    with pikepdf.open(before) as old, pikepdf.open(after) as pdf:
+        f = pdf.pages[0].Resources.Font.F1
+        assert f.Subtype == pikepdf.Name.TrueType
+        assert f.FirstChar == 0 and f.LastChar == 255 and len(f.Widths) == 256
+        assert pdf.pages[0].Contents.read_bytes() == old.pages[0].Contents.read_bytes()
+        assert f.ToUnicode.read_bytes() == old.pages[0].Resources.Font.F1.ToUnicode.read_bytes()
+        with TTFont(BytesIO(f.FontDescriptor.FontFile2.read_bytes())) as program:
+            assert program["name"].getDebugName(6) == f"{family}-{style}"
+            glyph = "B" if encoding == "differences" else "A"
+            assert float(f.Widths[65]) == program["hmtx"].metrics[glyph][0]
+            assert float(f.Widths[66]) == program["hmtx"].metrics["B"][0] == 700
+            assert float(f.Widths[32]) == program["hmtx"].metrics["space"][0] == 250
+        if encoding == "differences":
+            assert f.Encoding.BaseEncoding == pikepdf.Name.StandardEncoding
+            assert list(f.Encoding.Differences) == [65, pikepdf.Name.B]
+        else:
+            assert f.Encoding == pikepdf.Name(encoding or "/StandardEncoding")
+
+
+async def test_arial_embeds_after_tagging_and_in_author_repairs(tmp_path, monkeypatch):
+    from app.pipeline.author_repairs import repair_author_pdf
+    from app.pipeline.tagger import tag_pdf
+
+    _install_test_font(tmp_path, monkeypatch)
+    source, tagged, repaired = [tmp_path / f"{name}.pdf" for name in ("input", "tagged", "repaired")]
+    _unembedded_pdf(source)
+    # This fixture's intentionally conflicting ToUnicode belongs to the
+    # substitution tests above; author repairs also run the Unicode repair.
+    with pikepdf.open(source, allow_overwriting_input=True) as pdf:
+        f = pdf.pages[0].Resources.Font.F1
+        f.ToUnicode = pdf.make_stream(f.ToUnicode.read_bytes().replace(b"<03B2>", b"<0042>"))
+        pdf.save(source)
+    result = await tag_pdf(source, tagged, {"elements": [{
+        "type": "paragraph", "page": 0, "bbox": [60, 60, 200, 90], "text": "AB A",
+    }]})
+    assert result.output_path == tagged
+    text = screen_reader_text(tagged)
+    audit = repair_author_pdf(tagged, repaired, {})
+    assert audit[0]["applied"] and audit[0]["stats"]["fonts_embedded"] == 1
+    assert screen_reader_text(repaired) == text
+    assert _text_contract(tagged) == _text_contract(tmp_path / "author-embed_fonts.pdf")
+    with pikepdf.open(repaired) as pdf:
+        assert pdf.pages[0].Resources.Font.F1.FontDescriptor.FontFile2.read_bytes()
