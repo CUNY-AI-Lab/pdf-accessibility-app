@@ -78,6 +78,8 @@ def _artifact_properties_for_element(elem: dict | None) -> pikepdf.Dictionary | 
         properties["/Type"] = pikepdf.Name("/Pagination")
         properties["/Subtype"] = pikepdf.Name("/Footer")
         properties["/Attached"] = pikepdf.Array([pikepdf.Name("/Bottom")])
+    elif artifact_type == "pagination":
+        properties["/Type"] = pikepdf.Name("/Pagination")
     elif artifact_type in {"layout", "decorative", "decoration"}:
         properties["/Type"] = pikepdf.Name("/Layout")
     elif artifact_type == "background":
