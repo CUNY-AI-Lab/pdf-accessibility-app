@@ -94,7 +94,7 @@ mkdir -p "$bench/logs" "$cache"
 [ -n "$snapshot" ] && trap 'rm -rf "$snapshot"' EXIT
 
 for i in $(seq 0 $((shards - 1))); do
-  docker run --rm --name "pipe-$candidate-$subset-$i" --user 0 "${env[@]}" "${mounts[@]}" \
+  docker run --rm --no-healthcheck --name "pipe-$candidate-$subset-$i" --user 0 "${env[@]}" "${mounts[@]}" \
     -e PYTHONPATH=/app/backend "$image" \
     python /app/backend/scripts/pipeline_bench.py "${bench_args[@]}" --shard "$i/$shards" \
     >> "$bench/logs/$candidate.$subset.$i.log" 2>&1 &

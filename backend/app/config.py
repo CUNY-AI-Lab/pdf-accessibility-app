@@ -23,9 +23,6 @@ LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1", "::1"}
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=BASE_DIR / ".env", extra="ignore")
 
-    # Database
-    database_url: str = f"sqlite+aiosqlite:///{BASE_DIR / 'data' / 'pdf_accessibility.db'}"
-
     # File storage
     upload_dir: Path = BASE_DIR / "data" / "uploads"
     processing_dir: Path = BASE_DIR / "data" / "processing"
@@ -104,27 +101,8 @@ class Settings(BaseSettings):
     max_upload_ocr_scan_total_image_pixels: int = 150_000_000
     max_upload_ocr_scan_image_heavy_pages: int = 25
     upload_image_heavy_page_min_pixels: int = 4_000_000
-    max_files_per_upload: int = 5
-    max_active_jobs_per_session: int = 3
-    max_active_jobs_global: int = 12
-    max_concurrent_jobs: int = 2
     ocrmypdf_jobs: int = 1
     ocrmypdf_max_image_mpixels: int = 75
-
-    # Job lifecycle
-    job_ttl_hours: int = 12
-
-    # Anonymous browser session
-    anonymous_session_cookie_name: str = "anon_session"
-    anonymous_session_csrf_cookie_name: str = "anon_session_csrf"
-    anonymous_session_cookie_max_age_hours: int = 24 * 30
-    anonymous_session_cookie_secure: bool = False
-    csrf_protection_enabled: bool = True
-
-    # CORS
-    cors_allow_origins: str = (
-        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080"
-    )
 
     # LLM retry
     llm_max_retries: int = 3
@@ -163,11 +141,8 @@ class Settings(BaseSettings):
     runner_slots: int = 2
     runner_poll_seconds: float = 2.0
     runner_heartbeat_seconds: float = 30.0
-    # Touched on every claim loop, for the container's health check.
+    # Touched every 30 seconds while the runner is running, for its health check.
     runner_alive_file: str = ""
-
-    # Dev
-    debug: bool = False
 
     @model_validator(mode="after")
     def validate_llm_settings(self):

@@ -47,10 +47,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.pipeline.orchestrator as orchestrator
-from app.api.jobs import PIPELINE_STEPS
 from app.config import get_settings
 from app.models import AltTextEntry, Base, Job, JobStep, ReviewTask
-from app.services.job_manager import JobManager
+from app.pipeline.steps import PIPELINE_STEPS
+from app.services.pipeline_progress import NullProgress
 
 BACKEND = Path(__file__).resolve().parent.parent
 
@@ -245,7 +245,7 @@ async def main() -> None:
     shard, shards = (int(part) for part in options.shard.split("/"))
 
     settings = get_settings()
-    job_manager = JobManager()
+    job_manager = NullProgress()
     if options.docling_cache:
         bench_caches.install_docling_cache(options.docling_cache)
     bench_caches.install_llm_cassette(options.cassette, options.cassette_mode)

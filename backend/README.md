@@ -1,6 +1,7 @@
 # Backend
 
-The backend is a FastAPI application that owns:
+The backend is a Python pipeline imported in-process by the v2 runner and
+evaluation scripts. It owns:
 
 - the remediation pipeline
 - semantic adjudication and grounding
@@ -14,7 +15,7 @@ The backend is a FastAPI application that owns:
 ```text
 backend/
   app/
-    api/         REST endpoints for jobs, documents, and review
+    runner/      Worker task claims, per-task databases, and view publication
     pipeline/    classify, ocr, structure, tag, validate, fidelity
     services/    LLM client, semantic units, previews, form helpers, storage
     models.py    SQLAlchemy models
@@ -49,8 +50,10 @@ Wrappers over the shared engine:
 ## LLM transport
 
 Every AI step sends rendered page images to one chat-completions lane: the
-CAIL Gateway at `LLM_BASE_URL`, with an open-weight vision `LLM_MODEL`
-(default `qwen3-vl-235b-a22b-instruct`) and a Gateway key in `LLM_API_KEY`.
+CAIL Gateway with an open-weight vision `LLM_MODEL`
+(default `qwen3-vl-235b-a22b-instruct`). The runner uses the Worker relay and
+a task lease; it never holds a Gateway key. Standalone benchmark scripts use
+`LLM_BASE_URL` and a personal key in `LLM_API_KEY`.
 
 Important behaviors:
 - `json_schema` structured output, falling back to `json_object` for models
@@ -105,27 +108,26 @@ Resolution order is:
 
 ## Development
 
-Run the API:
+Use the Worker/runner harness in [../worker/README.md](../worker/README.md)
+(`worker/dev/e2e.mjs`) for the v2 app locally. To run a configured runner:
 
 ```bash
 cd backend
-uv run uvicorn app.main:app --reload --port 8001
+uv run --frozen python -m app.runner
 ```
 
-The backend scopes jobs to an anonymous browser session using an HTTP-only cookie.
-There is no login flow, but job APIs only return documents created by the current
-browser session. Uploaded files and job state expire after `JOB_TTL_HOURS`
-(`12` by default).
-This protects jobs inside the app's API surface; semantic LLM calls still go to
-the configured provider. Anonymous sessions apply only to local runs; people
-using the deployed v2 app sign in through Doorway (see `docs/architecture.md`).
+It needs `RUNNER_WORKER_URL` and `RUNNER_TOKEN`, claims work over outbound
+HTTP, and renders the views the Worker serves. The Worker owns sign-in, API
+routes, job scheduling, storage, and retention. Each runner task opens its own
+SQLite database; `app.database.prepare_schema` is shared schema preparation.
 
-For HTTPS deployments, set `ANONYMOUS_SESSION_COOKIE_SECURE=true` so the cookie
-is only sent over secure transport. If the app is served through a reverse proxy
-or subpath, include every public origin in `CORS_ALLOW_ORIGINS` (for example
-`https://tools.ailab.gc.cuny.edu`). The CSRF origin check also accepts
-same-origin requests when the proxy forwards the public `Host` and
-`X-Forwarded-Proto` headers.
+Use the pinned uv shim for dependency changes, ignoring workstation-wide uv
+configuration. For example:
+
+```bash
+cd backend
+UV_NO_CONFIG=1 uvx uv@0.13.4 sync --locked --extra dev
+```
 
 ## Tests
 

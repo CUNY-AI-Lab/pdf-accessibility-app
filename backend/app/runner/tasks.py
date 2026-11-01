@@ -2,7 +2,7 @@
 
 A ``process`` task runs the whole pipeline on an uploaded PDF. A ``review``
 task restores the job's saved state, applies one review action (undo,
-revise, or edit), and re-runs tagging, as v1's review routes do. A ``sync``
+revise, or edit), and re-runs tagging, using the shared review operations. A ``sync``
 task restores the state, records the statuses a person changed with keep or
 resolve, and re-renders the views and report. Every task ends by uploading
 what the Worker serves and calling ``complete`` (or ``fail``); nothing stays
@@ -19,14 +19,12 @@ from enum import Enum
 from typing import Any
 
 import httpx
-from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.api.jobs import PIPELINE_STEPS
-from app.api.review import apply_review_action
 from app.config import Settings, task_settings
 from app.models import AppliedChange, Job, JobStep, ReviewTask
 from app.pipeline.orchestrator import run_pipeline, run_tagging_and_validation
+from app.pipeline.steps import PIPELINE_STEPS
 from app.runner.client import LeaseLost, Task, WorkerClient
 from app.runner.state import (
     attempt_workspace,
@@ -40,6 +38,8 @@ from app.runner.views import OUTPUT_READY_STATUSES, RenderedViews, render_views
 from app.services.job_state import clear_terminal_artifacts, reset_rerun_steps
 from app.services.llm_client import job_model_access
 from app.services.pdf_preflight import PdfUploadPreflightError, preflight_pdf_upload
+from app.services.review_actions import apply_review_action
+from app.services.review_errors import ReviewRefusal
 from app.services.review_revisions import (
     RevisionPhase,
     advance_revision,
@@ -60,7 +60,7 @@ INTERNAL_ERROR = "The PDF could not be processed because of an internal error."
 
 
 class ProgressSink:
-    """The pipeline's job manager on the runner: queues step events for the Worker."""
+    """Queues pipeline step events for forwarding to the Worker."""
 
     def __init__(self) -> None:
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -281,7 +281,7 @@ async def _revisit(
                         feedback=action.get("feedback"),
                         text=action.get("text"),
                     )
-                except HTTPException as exc:
+                except ReviewRefusal as exc:
                     await db.rollback()
                     return Outcome(review_refused=str(exc.detail))
                 await start_review(db, job, revision)

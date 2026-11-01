@@ -6,11 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api.review import apply_review_action
 from app.models import AltTextEntry, AppliedChange, Base, Job, JobStep, ReviewRevision, ReviewTask
 from app.services.applied_changes import list_figure_changes
 from app.services.candidate_state import (
@@ -28,6 +26,8 @@ from app.services.job_transitions import (
     guard_transition,
     set_step_status,
 )
+from app.services.review_actions import apply_review_action
+from app.services.review_errors import ReviewRefusal
 from app.services.review_revisions import (
     fail_review,
     finish_review,
@@ -229,9 +229,9 @@ async def test_stale_review_writer_cannot_overwrite_winner(sessions, tmp_path):
         loser = await stale.get(AppliedChange, 1)
         await transition_review(first, winner, "kept")
         await first.commit()
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(ReviewRefusal) as exc:
             await transition_review(stale, loser, "undone")
-        assert exc.value.status_code == 409
+        assert exc.value.code == 409
 
 
 async def test_override_replay_cannot_reopen_terminal_review(sessions, tmp_path):
@@ -240,7 +240,7 @@ async def test_override_replay_cannot_reopen_terminal_review(sessions, tmp_path)
         change = await db.get(AppliedChange, 1)
         await transition_review(db, change, "kept", replay=True)
         await transition_review(db, change, "kept", replay=True)
-        with pytest.raises(HTTPException):
+        with pytest.raises(ReviewRefusal):
             await transition_review(db, change, "pending_review", replay=True)
 
 
@@ -296,7 +296,7 @@ async def test_change_disposition_edges(sessions, tmp_path, current, target):
         }:
             await transition_review(db, row, target, replay=True)
         else:
-            with pytest.raises(HTTPException):
+            with pytest.raises(ReviewRefusal):
                 await transition_review(db, row, target, replay=True)
 
 
@@ -314,7 +314,7 @@ async def test_acknowledgement_edges(sessions, tmp_path, current, target):
         if current == target or (current, target) == ("pending_review", "resolved"):
             await transition_review(db, row, target, replay=True)
         else:
-            with pytest.raises(HTTPException):
+            with pytest.raises(ReviewRefusal):
                 await transition_review(db, row, target, replay=True)
 
 
@@ -358,7 +358,7 @@ async def test_duplicate_command_cannot_apply_twice(sessions, tmp_path):
         await start_review(db, job, revision)
         job.status = "complete"
         await finish_review(db, job, revision)
-        with pytest.raises(HTTPException):
+        with pytest.raises(ReviewRefusal):
             await prepare_review(db, job, command)
 
 
@@ -507,7 +507,7 @@ async def test_stale_rerun_reservation_cannot_reopen_processing_job(sessions, tm
         await start_review(winner, first_job, first)
         await winner.commit()
         second = await prepare_review(stale, stale_job, {"type": "edit", "change_id": 2})
-        with pytest.raises(HTTPException):
+        with pytest.raises(ReviewRefusal):
             await start_review(stale, stale_job, second)
         await stale.rollback()
         assert (await stale.get(Job, "j")).status == "processing"
@@ -796,10 +796,10 @@ async def test_stale_legacy_undo_cannot_overwrite_a_new_figure_decision(sessions
         current = await winner.get(AltTextEntry, 1)
         set_figure_status(current, "rejected")
         await winner.commit()
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(ReviewRefusal) as exc:
             await restore_stored_figure(
                 stale, old, {"status": "accepted", "generated_text": "Old caption"}
             )
-        assert exc.value.status_code == 409
+        assert exc.value.code == 409
         await stale.rollback()
         assert (await stale.get(AltTextEntry, 1)).status == "rejected"

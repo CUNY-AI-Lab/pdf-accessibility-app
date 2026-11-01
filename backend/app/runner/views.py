@@ -1,4 +1,4 @@
-"""What the Worker serves for a job, rendered by v1's own response code.
+"""What the Worker serves for a job, rendered by the shared response code.
 
 The Worker applies review statuses changed since the last task (keep and
 resolve) on top of these views; it does not re-implement them.
@@ -15,13 +15,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.api.documents import visible_review_tasks
-from app.api.jobs import job_to_response
 from app.models import AltTextEntry, AppliedChange, Job, ReviewTask
 from app.schemas import ValidationReportResponse
 from app.services.applied_changes import change_to_response_payload, list_figure_changes
 from app.services.html_export import export_html
 from app.services.html_report import render_batch_parts, render_html_report
+from app.services.job_views import job_to_response, visible_review_tasks
 from app.services.pdf_preview import render_page_png_bytes
 from app.services.thread_work import to_thread
 

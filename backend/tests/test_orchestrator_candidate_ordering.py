@@ -168,7 +168,7 @@ async def _run_ordering_flow(
                 db.add(JobStep(job_id=job.id, step_name=name))
             await db.commit()
             if review_edit:
-                from app.api.review import apply_review_action
+                from app.services.review_actions import apply_review_action
                 for index in range(2):
                     db.add(AltTextEntry(job_id=job.id, figure_index=index, image_path="/tmp/figure.png",
                                         status="approved", generated_text=f"Description {index}"))

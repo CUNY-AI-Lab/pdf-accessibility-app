@@ -12,6 +12,11 @@ The fleet rules in the CAIL workspace AGENTS.md apply.
   replaced.
 - The runner never holds a Gateway key. Its model calls go through the
   Worker's relay with the task's lease; do not add a direct Gateway path.
+- The backend is an in-process pipeline, with no HTTP server. Local app
+  development uses `worker/dev/e2e.mjs` (see `worker/README.md`). Keep shared
+  response mapping in `services/job_views.py`, review operations in
+  `services/review_actions.py`, and progress interfaces in
+  `services/pipeline_progress.py`.
 - Views the Worker serves are rendered by the runner with the backend's own
   response code. Do not re-implement pipeline or report logic in the Worker.
 - The Worker releases only through `.github/workflows/worker-release.yml`;

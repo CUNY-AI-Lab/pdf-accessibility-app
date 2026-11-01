@@ -50,15 +50,9 @@ The runner on actual-dell runs each job's pipeline, and its model calls go
 through the Worker with the signed-in person's Gateway credential (see
 [Version 2](#version-2)). There are no anonymous sessions in the deployed app.
 
-Run locally (Quick Start or Docker), the FastAPI app has no sign-in, and jobs
-belong to anonymous browser sessions:
-
-- middleware assigns an HTTP-only cookie to each browser
-- every job row is owned by a hash of that session token
-- list, detail, download, preview, SSE progress, and review routes are all scoped to the current browser session
-- jobs and their files expire after `JOB_TTL_HOURS`, which defaults to `12`
-
-Model calls in a local run use the `LLM_API_KEY` from `.env`.
+Local development uses the same Worker and runner through
+`worker/dev/e2e.mjs`, with temporary signed identities and a dev Gateway
+using a personal key. Docker runs the runner only; it serves no HTTP routes.
 
 ## Version 2
 

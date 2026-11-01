@@ -158,7 +158,6 @@ try {
         UPLOAD_DIR: join(data, "uploads"),
         PROCESSING_DIR: join(data, "processing"),
         OUTPUT_DIR: join(data, "output"),
-        DATABASE_URL: `sqlite+aiosqlite:///${join(data, "unused.db")}`,
         LLM_API_KEY: "",
       },
     },

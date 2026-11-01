@@ -16,11 +16,11 @@ All live writes use compare-and-set; snapshot restoration is historical SQL.
 
 from enum import StrEnum
 
-from fastapi import HTTPException
 from sqlalchemy import update
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.services.job_transitions import guard_transition
+from app.services.review_errors import ReviewRefusal
 
 
 class ChangeStatus(StrEnum):
@@ -55,9 +55,9 @@ async def transition_review(db, row, target: str, *, replay=False) -> None:
     try:
         guard_transition(current, target, table, entity="review")
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise ReviewRefusal(code=409, detail=str(exc)) from exc
     if current == target and not replay:
-        raise HTTPException(status_code=409, detail="Review action was already applied")
+        raise ReviewRefusal(code=409, detail="Review action was already applied")
     model = type(row)
     result = await db.execute(
         update(model)
@@ -66,5 +66,5 @@ async def transition_review(db, row, target: str, *, replay=False) -> None:
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:
-        raise HTTPException(status_code=409, detail="Review revision changed; refresh and retry")
+        raise ReviewRefusal(code=409, detail="Review revision changed; refresh and retry")
     set_committed_value(row, field, target)

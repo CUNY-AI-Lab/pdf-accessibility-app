@@ -151,7 +151,7 @@ metadata. Another owner receives the same 404 as a PDF request. Missing,
 unlisted, or not-yet-ready HTML returns 404. A new revision replaces the
 manifest, so a failed subsequent export cannot expose stale HTML. The
 frontend's plain Accessible HTML link appears beside PDF on job and review
-pages only when `has_html` is true. Local FastAPI responses without this
+pages only when `has_html` is true. Older saved job views without this
 optional capability field continue to hide the control.
 
 Additional runner tests in `backend/tests/test_runner.py`:

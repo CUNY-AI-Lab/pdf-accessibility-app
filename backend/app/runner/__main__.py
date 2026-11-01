@@ -2,7 +2,7 @@
 
 The runner makes only outbound calls. It needs RUNNER_WORKER_URL (the
 Worker's runner API, reached through Doorway) and RUNNER_TOKEN; Docling,
-OCR, and validation use the same settings as v1.
+OCR, and validation use the shared pipeline settings.
 """
 
 import asyncio
