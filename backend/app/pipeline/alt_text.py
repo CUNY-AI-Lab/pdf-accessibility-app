@@ -9,6 +9,7 @@ from typing import Any
 from app.config import Settings, get_settings
 from app.pipeline.figure_rules import decorative_reasons, model_decoration_allowed
 from app.pipeline.structure import FigureInfo
+from app.pipeline.tagger_semantics import is_placeholder_alt_text
 from app.services.alt_text_cache import AltTextCache, usable_description
 from app.services.intelligence_figures import (
     generate_figure_intelligence,
@@ -88,7 +89,10 @@ def figure_applied_change_specs(
         if figure is None:
             continue
 
-        if result.status == "rejected":
+        if (result.remediation_intelligence or {}).get("source") == "author":
+            title = f"Kept author description for figure {result.figure_index + 1}"
+            detail = "Kept the author's description for the matching figure."
+        elif result.status == "rejected":
             title = f"Hid figure {result.figure_index + 1}"
             detail = result.summary or "The model hid this figure from assistive technology."
         elif result.status == NEEDS_DESCRIPTION:
@@ -182,7 +186,20 @@ async def generate_alt_text(
         if settings.alt_text_cache_enabled:
             cache = AltTextCache(settings.processing_dir.parent / "alt_text_cache.sqlite3")
 
+    author_descriptions = {
+        e.get("figure_index"): e.get("author_alt") or e.get("author_actual_text")
+        for e in structure.get("elements", []) if e.get("type") == "figure"
+        and not is_placeholder_alt_text(e.get("author_alt") or e.get("author_actual_text"))
+    }
     for fig in figures:
+        if fig.index in author_descriptions:
+            existing[fig.index] = AltTextResult(
+                figure_index=fig.index, generated_text=author_descriptions[fig.index],
+                status="approved", confidence="high", reviewable=False,
+                summary="Kept the author description for the matching figure.",
+                reason="Matched author description", remediation_intelligence={"source": "author"},
+            )
+            continue
         if fig.index in rules:
             reason = rules[fig.index]
             existing[fig.index] = AltTextResult(

@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import re
+import shutil
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
@@ -24,6 +25,8 @@ from app.pipeline.alt_text import (
     figure_applied_change_specs,
     generate_alt_text,
 )
+from app.pipeline.author_repairs import author_table_readability, repair_author_pdf
+from app.pipeline.author_structure import apply_author_structure, read_author_structure
 from app.pipeline.classify import classify_pdf
 from app.pipeline.fidelity import _table_semantics_risk, assess_fidelity
 
@@ -253,6 +256,7 @@ from app.services.semantic_pretag_policy import (
 from app.services.semantic_pretag_policy import (
     widget_targets_for_rationalization as _widget_targets_for_rationalization,
 )
+from app.services.structure_text import screen_reader_text
 from app.services.table_decisions import queue_table_decision, queue_table_decisions
 from app.services.title_intelligence import enhance_document_title_with_intelligence
 from app.services.toc_intelligence import enhance_toc_structure_with_intelligence
@@ -1948,6 +1952,28 @@ async def _run_pipeline(
                 result={"type": classification.type},
             )
 
+            try:
+                author_evidence = await asyncio.to_thread(read_author_structure, input_path)
+            except Exception as exc:
+                logger.warning("Could not recover author evidence", exc_info=True)
+                author_evidence = {"elements": [], "author_read_error": type(exc).__name__}
+            if author_evidence and not author_evidence.get("author_read_error"):
+                preserved = await _preserve_author_candidate(
+                    job=job, settings=settings, evidence=author_evidence,
+                    output_path=get_output_path(job_id, f"accessible_{job.original_filename}"),
+                )
+                if preserved is not None:
+                    for step in ("ocr", "structure", "alt_text", "tagging"):
+                        await _update_step(db, job_id, step, "skipped", result={"reason": "author_pdf_passes"})
+                        job_manager.emit_progress(job_id, step=step, status="skipped")
+                    await _update_step(db, job_id, "validation", "complete",
+                                       result={"compliant": True, "candidate": preserved.produced_by})
+                    await _store_candidate_result(
+                        db=db, job=job, job_manager=job_manager, candidate=preserved,
+                        alt_entries=[], review_task_metadata_overrides={},
+                    )
+                    return
+
             # ── Step 2: OCR (conditional) ──
             current_step = "ocr"
             working_pdf = input_path
@@ -2028,6 +2054,7 @@ async def _run_pipeline(
                 job_dir,
                 table_cell_matching=docling_table_cell_matching(classification.type),
             )
+            structure.document_json = apply_author_structure(structure.document_json, author_evidence)
             if structure.processed_pdf_path:
                 working_pdf = structure.processed_pdf_path
             docling_escalation_plan = docling_structure_escalation_plan(structure.document_json)
@@ -2236,6 +2263,9 @@ async def _run_pipeline(
                 working_pdf, structure.document_json, settings
             )
 
+            structure.document_json = apply_author_structure(structure.document_json, author_evidence)
+            if author_evidence.get("author_candidate_audit"):
+                structure.document_json["author_candidate_audit"] = author_evidence["author_candidate_audit"]
             elements = structure.document_json.get("elements", [])
             headings_count = sum(1 for el in elements if el.get("type") == "heading")
             tables_count = sum(1 for el in elements if el.get("type") == "table")
@@ -2264,6 +2294,7 @@ async def _run_pipeline(
                     "docling_escalation_plan": docling_escalation_plan,
                     "synthetic_figure_rationalization": synthetic_figure_rationalization,
                     "table_model": table_model_audit,
+                    "author_structure": structure.document_json.get("author_structure_audit", []),
                 },
             )
             job_manager.emit_progress(
@@ -2671,6 +2702,103 @@ async def evaluate_candidate(
     return candidate
 
 
+async def _evaluate_author_candidate(
+    *, job: Job, settings: Settings, path: Path, evidence: dict,
+    baseline_validation: ValidationResult | None = None, produced_by: str = "author_original",
+) -> Candidate:
+    """Evaluate existing bytes through the same Candidate release checks, without tagging."""
+    validation = await validate_pdf(
+        pdf_path=path, verapdf_path=settings.verapdf_path,
+        flavour=settings.verapdf_flavour,
+        timeout_seconds=settings.subprocess_timeout_validation,
+    )
+    readability_error = None
+    try:
+        readability = await asyncio.to_thread(author_table_readability, path, evidence)
+    except Exception as exc:
+        readability = []
+        readability_error = type(exc).__name__
+    elements = evidence.get("elements", [])
+    tagging = TaggingResult(
+        output_path=path,
+        figures_tagged=sum(e["type"] == "figure" for e in elements),
+        tables_tagged=sum(e["type"] == "table" for e in elements),
+        headings_tagged=sum(e["type"] == "heading" for e in elements),
+        table_readability=readability,
+    )
+    candidate = await evaluate_candidate(
+        job=job, settings=settings, input_path=path, output_path=path,
+        structure_json=evidence, reviewed_alts=[], alt_entries=[],
+        baseline_validation=baseline_validation or validation,
+        font_remediation=FontRemediation(), llm_font_map_auto={},
+        produced_by=produced_by, fidelity_source_pdf=Path(job.input_path),
+        applied_change_specs=[], tagging_result=tagging, validation=validation,
+        adjudicate=False,
+    )
+    if readability_error:
+        candidate.fidelity_report["checks"] = [*candidate.fidelity_report.get("checks", []), {
+            "check": "table_readability", "status": "error", "message": readability_error,
+        }]
+        apply_release_policy(candidate.fidelity_report, candidate.review_tasks, compliant=validation.compliant)
+    return candidate
+
+
+def _prefer_author_candidate(original: Candidate | None, retagged: Candidate | None) -> Candidate | None:
+    # Both pass is an intentional tie: preserve the author's structure and words.
+    if original is not None and original.validation.compliant and original.fidelity_report.get("passed"):
+        return original
+    return retagged
+
+
+async def _preserve_author_candidate(
+    *, job: Job, settings: Settings, evidence: dict, output_path: Path,
+) -> Candidate | None:
+    if not evidence:
+        return None
+    original = await _evaluate_author_candidate(
+        job=job, settings=settings, path=Path(job.input_path), evidence=evidence,
+    )
+    selection = {
+        "original_passed": bool(original.fidelity_report.get("passed")),
+        "original_checks": original.fidelity_report.get("checks", []),
+    }
+    evidence["author_candidate_audit"] = selection
+    if _prefer_author_candidate(original, None) is None:
+        return None
+    # Repair only a passing original. Re-evaluate the exact repaired file;
+    # failure or an exception can never displace the passing source bytes.
+    try:
+        repairs = await asyncio.to_thread(repair_author_pdf, original.output_path, output_path, evidence)
+        repaired_evidence = await asyncio.to_thread(read_author_structure, output_path)
+        repaired = await _evaluate_author_candidate(
+            job=job, settings=settings, path=output_path, evidence=repaired_evidence,
+            baseline_validation=original.validation, produced_by="author_repaired",
+        )
+        selection["repairs"] = repairs
+        selection["repaired_checks"] = repaired.fidelity_report.get("checks", [])
+        # A passing release threshold alone must not license changing an
+        # already-good screen-reader reading, including headings/tables/figures.
+        def same_reading():
+            return screen_reader_text(original.output_path, figure_text=True, markdown=True) == screen_reader_text(
+                repaired.output_path, figure_text=True, markdown=True,
+            )
+        reading_preserved = await asyncio.to_thread(same_reading)
+        selection["repair_reading_preserved"] = reading_preserved
+        if repaired.validation.compliant and repaired.fidelity_report.get("passed") and reading_preserved:
+            repaired.structure_json["author_candidate_audit"] = selection
+            return repaired
+    except Exception as exc:
+        logger.warning("Author-only repairs failed; retaining passing original", exc_info=True)
+        selection["repair_error"] = type(exc).__name__
+    # Copy without serialization: fallback is the unrepaired original, byte for byte.
+    fallback = output_path.with_name("author-original.pdf")
+    await asyncio.to_thread(shutil.copyfile, original.output_path, fallback)
+    original.output_path = fallback
+    original.tagging_result.output_path = fallback
+    original.structure_json["author_candidate_audit"] = selection
+    return original
+
+
 def _candidate_is_acceptable(
     candidate: Candidate,
     current: Candidate,
@@ -2836,6 +2964,12 @@ async def _prepare_tagging_inputs(
     structure_json: dict,
 ):
     """Apply the existing pretag policies and collect figure decisions once."""
+    evidence = {}
+    try:
+        evidence = await asyncio.to_thread(read_author_structure, Path(job.input_path))
+        structure_json = apply_author_structure(structure_json, evidence)
+    except Exception:
+        logger.warning("Could not recover author evidence for re-tagging", exc_info=True)
     # Approved and rejected figure decisions go to the tagger; fidelity also
     # sees the figures still waiting for a description.
     result = await db.execute(select(AltTextEntry).where(AltTextEntry.job_id == job.id))
@@ -2907,6 +3041,9 @@ async def _prepare_tagging_inputs(
         "pretag_widget_rationalization": pretag_widget_rationalization,
         "pretag_form_intelligence": pretag_form_intelligence,
     }
+    if evidence:
+        structure_json = apply_author_structure(structure_json, evidence)
+    pretag_details["author_structure"] = structure_json.get("author_structure_audit", [])
     return working_pdf, structure_json, alt_entries, reviewed_alts, pretag_details
 
 
@@ -2935,6 +3072,8 @@ def _tagging_step_result(tagging_result, pretag_details):
         "layout_count": sum(d.get("status") == "applied_layout" for d in actual),
     }
     return {
+        "author_structure": getattr(tagging_result, "author_structure_audit", []),
+        "matched_author_evidence": pretag_details.get("author_structure", []),
         "tags_added": tagging_result.tags_added,
         "lang_set": tagging_result.lang_set,
         "struct_elems": tagging_result.struct_elems_created,
@@ -3212,6 +3351,12 @@ async def _store_candidate_result(
         fidelity_report,
         compliant=candidate.validation.compliant,
     )
+    validation_payload["candidate_selection"] = {
+        "chosen": candidate.produced_by,
+        "author_candidate": candidate.structure_json.get("author_candidate_audit", {}),
+        "author_structure": getattr(candidate.tagging_result, "author_structure_audit", []),
+        "matched_author_evidence": candidate.structure_json.get("author_structure_audit", []),
+    }
     validation_payload["fidelity"] = fidelity_report
     job.validation_json = json.dumps(validation_payload)
     job.fidelity_json = json.dumps(fidelity_report)
