@@ -35,7 +35,7 @@ export async function handleRunner(request: Request, env: Env, path: string): Pr
     if (!body.success) return detail(422, "Invalid claim");
     const task = await board.claim(now);
     if (task === null) return noContent();
-    console.log(JSON.stringify({ event: "task_claimed", job: task.job_id, kind: task.kind, attempt: task.attempt, runner: body.data.runner }));
+    console.log(JSON.stringify({ event: "task_claimed", job: task.job_id, kind: task.kind, attempt: task.attempt, attempt_id: task.attempt_id, runner: body.data.runner }));
     return new Response(JSON.stringify({ task }), {
       headers: { "content-type": "application/json", "cache-control": "no-store" },
     });
@@ -68,7 +68,8 @@ export async function handleRunner(request: Request, env: Env, path: string): Pr
   if (action === "progress" && request.method === "POST") {
     const event = progressEventSchema.safeParse(await request.json().catch(() => null));
     if (!event.success) return detail(422, "Invalid progress event");
-    return (await board.progress(jobId, lease, JSON.stringify(event.data), now)) ? json({ ok: true }) : leaseLost();
+    const progress = await board.progress(jobId, lease, JSON.stringify(event.data), now);
+    return progress.ok ? json({ ok: true }) : detail(progress.status, progress.detail);
   }
 
   if (action === "complete" && request.method === "POST") {
@@ -106,9 +107,18 @@ export async function handleRunner(request: Request, env: Env, path: string): Pr
     if (!Number.isInteger(length) || length < 1 || length > MAX_RUNNER_FILE_BYTES) {
       return detail(413, "File empty or too large");
     }
-    await env.FILES.put(`jobs/${jobId}/r${held.nextRev}/${name}`, request.body, {
-      httpMetadata: { contentType: request.headers.get("content-type") ?? "application/octet-stream" },
-    });
+    const write = await board.beginArtifactUpload(jobId, lease, Date.now());
+    if (write === null) return leaseLost();
+    try {
+      // First successful PUT wins. Retrying a partly successful publication
+      // cannot replace a file that completion has already verified.
+      await env.FILES.put(`jobs/${jobId}/r${held.nextRev}/${name}`, request.body, {
+        onlyIf: { etagDoesNotMatch: "*" },
+        httpMetadata: { contentType: request.headers.get("content-type") ?? "application/octet-stream" },
+      });
+    } finally {
+      await board.endArtifactUpload(write, jobId, lease, Date.now());
+    }
     return noContent();
   }
   return detail(404, "Not Found");

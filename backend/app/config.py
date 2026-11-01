@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -49,6 +51,7 @@ class Settings(BaseSettings):
     alt_text_max_concurrency: int = 8
     alt_text_global_max_concurrency: int = 12
     alt_text_cache_enabled: bool = True
+    alt_text_cache_dir: Path | None = None
     auto_apply_llm_font_map: bool = True
     auto_apply_grounded_text: bool = True
     auto_apply_table_intelligence: bool = True
@@ -120,10 +123,7 @@ class Settings(BaseSettings):
 
     # CORS
     cors_allow_origins: str = (
-        "http://localhost:5173,"
-        "http://127.0.0.1:5173,"
-        "http://localhost:8080,"
-        "http://127.0.0.1:8080"
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080"
     )
 
     # LLM retry
@@ -154,7 +154,6 @@ class Settings(BaseSettings):
     # On scans, read a cell as the model's text where it differs from the OCR
     # text only by known OCR confusions (as /ActualText).
     table_model_scan_text: bool = False
-
 
     # Runner (v2): pulls work from the Worker at runner_worker_url, which
     # relays each job's model calls with that person's Gateway credential.
@@ -199,9 +198,22 @@ class Settings(BaseSettings):
 
 
 _settings: Settings | None = None
+_task_settings: ContextVar[Settings | None] = ContextVar("runner_settings", default=None)
+
+
+@contextmanager
+def task_settings(settings: Settings):
+    token = _task_settings.set(settings)
+    try:
+        yield
+    finally:
+        _task_settings.reset(token)
 
 
 def get_settings() -> Settings:
+    scoped = _task_settings.get()
+    if scoped is not None:
+        return scoped
     global _settings
     if _settings is None:
         _settings = Settings()

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from app.pipeline import structure
+from app.pipeline import docling_io
 from app.pipeline.structure import (
     _docling_serve_request,
     _expand_toc_item_tables,
@@ -25,7 +25,7 @@ async def test_docling_serve_request_retries_transient_connect_timeout(monkeypat
     async def fake_sleep(delay):
         sleep_delays.append(delay)
 
-    monkeypatch.setattr(structure.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(docling_io.asyncio, "sleep", fake_sleep)
 
     class Client:
         attempts = 0

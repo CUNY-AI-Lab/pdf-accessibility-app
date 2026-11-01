@@ -214,38 +214,58 @@ async function upload(request: Request, env: Env, person: Person, now: number): 
 
   const id = crypto.randomUUID();
   const key = `jobs/${id}/input.pdf`;
+  await board.reserveUpload(id, Date.now());
   const stream = new FixedLengthStream(length);
   const writer = stream.writable.getWriter();
   const pump = (async () => {
-    await writer.write(head);
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      await writer.write(value);
+    try {
+      await writer.write(head);
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        await writer.write(value);
+      }
+      await writer.close();
+    } catch (error) {
+      await Promise.allSettled([writer.abort(error)]);
+      throw error;
     }
-    await writer.close();
   })();
-  try {
-    await Promise.all([env.FILES.put(key, stream.readable, { httpMetadata: { contentType: "application/pdf" } }), pump]);
-  } catch {
-    await env.FILES.delete(key);
+  const store = env.FILES.put(key, stream.readable, { httpMetadata: { contentType: "application/pdf" } }).catch(async (error) => {
+    await Promise.allSettled([reader.cancel(error), writer.abort(error)]);
+    throw error;
+  });
+  // Do not release the durable in-flight locator until both sides have stopped.
+  const transfers = await Promise.allSettled([store, pump]);
+  if (transfers.some((result) => result.status === "rejected")) {
+    await board.abandonUpload(id, Date.now());
     return detail(400, "The upload did not finish. Try again.");
   }
 
-  const created = await board.createJob({
-    id,
-    owner: person.subject,
-    originalFilename: filename,
-    fileSizeBytes: length,
-    gatewayJwt: person.gatewayJwt,
-    gatewayExpiresAt: person.gatewayExpiresAt,
-    now,
-  });
-  if (!created.admission.ok || created.record === null) {
-    await env.FILES.delete(key);
-    return refused(created.admission.ok ? "global" : created.admission.reason);
+  try {
+    const stored = await board.markUploadStored(id);
+    if (!stored.ok) {
+      await board.abandonUpload(id, Date.now());
+      return detail(stored.status, stored.detail);
+    }
+    const created = await board.createJob({
+      id,
+      owner: person.subject,
+      originalFilename: filename,
+      fileSizeBytes: length,
+      gatewayJwt: person.gatewayJwt,
+      gatewayExpiresAt: person.gatewayExpiresAt,
+      now: Date.now(),
+    });
+    if (!created.admission.ok || created.record === null) {
+      await board.abandonUpload(id, Date.now());
+      return refused(created.admission.ok ? "global" : created.admission.reason);
+    }
+    return json({ jobs: [jobResponse(created.record, true)] }, 201);
+  } catch {
+    await board.abandonUpload(id, Date.now());
+    return detail(503, "The upload could not be saved. Try again.");
   }
-  return json({ jobs: [jobResponse(created.record, true)] }, 201);
 }
 
 function refused(reason: "per_person" | "global" | "sign_in_ending"): Response {

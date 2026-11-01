@@ -24,21 +24,23 @@ from sqlalchemy import update
 
 from app.api.jobs import PIPELINE_STEPS
 from app.api.review import apply_review_action
-from app.config import Settings
+from app.config import Settings, task_settings
 from app.models import AppliedChange, Job, JobStep, ReviewTask
 from app.pipeline.orchestrator import run_pipeline, run_tagging_and_validation
 from app.runner.client import LeaseLost, Task, WorkerClient
 from app.runner.state import (
+    attempt_workspace,
+    data_root,
     input_path,
     open_job_database,
     pack_state,
-    remove_job_files,
     unpack_state,
 )
 from app.runner.views import OUTPUT_READY_STATUSES, RenderedViews, render_views
 from app.services.job_state import clear_terminal_artifacts, reset_rerun_steps
 from app.services.llm_client import job_model_access
 from app.services.pdf_preflight import PdfUploadPreflightError, preflight_pdf_upload
+from app.services.thread_work import owned_thread_work, to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -59,11 +61,15 @@ class ProgressSink:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class Outcome:
     views: RenderedViews | None = None
     failed: str | None = None
     review_refused: str | None = None
+
+    def __post_init__(self) -> None:
+        if sum(value is not None for value in (self.views, self.failed, self.review_refused)) != 1:
+            raise ValueError("Task outcome requires exactly one of views, failed, review_refused")
 
 
 class TaskPhase(Enum):
@@ -91,6 +97,7 @@ class ClaimedTaskExecution:
         self.task = task
         self.settings = settings
         self.phase = TaskPhase.CLAIMED
+        self.archive_root = data_root(settings)
 
     def transition(self, phase: TaskPhase) -> None:
         if phase not in _PHASE_TRANSITIONS[self.phase]:
@@ -110,7 +117,8 @@ class ClaimedTaskExecution:
                 )
                 self.transition(TaskPhase.PUBLISHING)
                 await self.while_held(
-                    _finish(self.client, self.task, self.settings, outcome), forward
+                    _finish(self.client, self.task, self.settings, outcome, self.archive_root),
+                    forward,
                 )
                 self.transition(TaskPhase.FAILED if outcome.failed is not None else TaskPhase.DONE)
                 return
@@ -169,11 +177,13 @@ class ClaimedTaskExecution:
 
 
 async def run_task(client: WorkerClient, task: Task, settings: Settings) -> None:
-    remove_job_files(settings, task.job_id)
-    try:
-        await ClaimedTaskExecution(client, task, settings).run()
-    finally:
-        remove_job_files(settings, task.job_id)
+    # The OS lock lets startup distinguish crashed attempts from another live
+    # runner using the same volume. Hold it until all owned work has joined.
+    with attempt_workspace(settings, task.lease) as isolated, task_settings(isolated):
+        execution = ClaimedTaskExecution(client, task, isolated)
+        execution.archive_root = data_root(settings)
+        async with owned_thread_work():
+            await execution.run()
 
 
 async def _forward_progress(
@@ -208,7 +218,7 @@ async def _process(
     path = input_path(settings, task.job_id)
     await client.download(task, "input", path)
     try:
-        await asyncio.to_thread(preflight_pdf_upload, path, settings=settings)
+        await to_thread(preflight_pdf_upload, path, settings=settings)
     except PdfUploadPreflightError as exc:
         return Outcome(failed=exc.detail)
 
@@ -294,7 +304,9 @@ async def apply_overrides(db, job_id: str, overrides: dict[str, dict[str, str]])
             )
 
 
-async def _finish(client: WorkerClient, task: Task, settings: Settings, outcome: Outcome) -> None:
+async def _finish(
+    client: WorkerClient, task: Task, settings: Settings, outcome: Outcome, archive_root=None
+) -> None:
     if outcome.failed is not None:
         await client.fail(task, outcome.failed)
         return
@@ -314,7 +326,7 @@ async def _finish(client: WorkerClient, task: Task, settings: Settings, outcome:
     has_state = views.job["status"] in OUTPUT_READY_STATUSES
     if has_state:
         archive = input_path(settings, task.job_id).with_suffix(".state.tar.gz")
-        await asyncio.to_thread(pack_state, settings, task.job_id, archive)
+        await to_thread(pack_state, settings, task.job_id, archive, canonical_root=archive_root)
         await client.upload(task, "state.tar.gz", archive, "application/gzip")
     await client.complete(
         task,

@@ -17,6 +17,7 @@ from app.services.intelligence_figures import (
 )
 from app.services.intelligence_normalize import confidence_label
 from app.services.llm_client import LlmClient
+from app.services.thread_work import to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +175,7 @@ async def generate_alt_text(
     existing: dict[int, AltTextResult] = {}
     figures_for_intelligence: list[FigureInfo] = []
     structure = structure or {}
-    rules = await asyncio.to_thread(
+    rules = await to_thread(
         decorative_reasons, figures, structure=structure, pdf_path=pdf_path,
     )
     model = getattr(llm_client, "model", None)
@@ -184,7 +185,7 @@ async def generate_alt_text(
         # Both v1 and the runner keep processing/ beside uploads/ and output/.
         # This file is outside per-job directories and the runner's state tar.
         if settings.alt_text_cache_enabled:
-            cache = AltTextCache(settings.processing_dir.parent / "alt_text_cache.sqlite3")
+            cache = AltTextCache((settings.alt_text_cache_dir or settings.processing_dir.parent) / "alt_text_cache.sqlite3")
 
     author_descriptions = {
         e.get("figure_index"): e.get("author_alt") or e.get("author_actual_text")

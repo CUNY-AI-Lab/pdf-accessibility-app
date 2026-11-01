@@ -25,6 +25,7 @@ from app.pipeline.subprocess_utils import (
     subprocess_process_group_kwargs,
 )
 from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
+from app.services.thread_work import to_thread
 
 logger = logging.getLogger("app.pipeline.orchestrator")
 
@@ -285,7 +286,7 @@ async def _embed_system_fonts(
     input_path: Path,
     output_path: Path,
 ) -> tuple[bool, str, dict[str, int]]:
-    return await asyncio.to_thread(_embed_system_fonts_sync, input_path, output_path)
+    return await to_thread(_embed_system_fonts_sync, input_path, output_path)
 
 
 def _ghostscript_embed_command(gs: str, input_path: Path, output_path: Path) -> tuple[str, ...]:

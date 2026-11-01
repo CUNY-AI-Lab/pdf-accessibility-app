@@ -3,7 +3,7 @@ import { runInDurableObject, SELF } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { LIMITS, MESSAGES } from "../src/board";
+import { JobBoard, LIMITS, MESSAGES } from "../src/board";
 import { jobBoard } from "../src/env";
 import {
   alice,
@@ -29,7 +29,9 @@ const relayedSchema = z.object({
 
 beforeEach(async () => {
   await runInDurableObject(jobBoard(env), (_board, state) => {
-    state.storage.sql.exec("DELETE FROM jobs");
+    for (const table of ["jobs", "completions", "artifact_attempts", "cleanup", "uploads", "upload_writes"]) {
+      state.storage.sql.exec(`DELETE FROM ${table}`);
+    }
   });
   const stored = await env.FILES.list({ prefix: "jobs/" });
   if (stored.objects.length > 0) await env.FILES.delete(stored.objects.map((object) => object.key));
@@ -303,6 +305,8 @@ describe("accessible HTML downloads", () => {
     expect((await job(id)).has_html).toBe(false);
     expect((await api(`/jobs/${id}/download/document.html`)).status).toBe(404);
     expect((await api(`/jobs/${id}/download`)).status).toBe(200);
+    expect(await env.FILES.get(`jobs/${id}/r1/document.html`)).not.toBeNull();
+    await jobBoard(env).sweep(Date.now() + 5 * 60_000 + 1);
     expect(await env.FILES.get(`jobs/${id}/r1/document.html`)).toBeNull();
   });
 });
@@ -472,6 +476,7 @@ describe("guarded task transitions", () => {
     const id = await createdJobId(await upload());
     const task = await claim();
     if (task === null) throw new Error("no process task");
+    await putFile(task, "state.tar.gz", "saved", "application/gzip");
     return { id, task };
   }
 
@@ -482,6 +487,7 @@ describe("guarded task transitions", () => {
     const sync = await claim();
     if (sync === null) throw new Error("no sync task");
     expect(sync.kind).toBe("sync");
+    await putFile(sync, "state.tar.gz", "saved", "application/gzip");
     return { id, task: sync };
   }
 
@@ -542,6 +548,7 @@ describe("guarded task transitions", () => {
     expect(tasks).toHaveLength(1);
     const task = tasks[0];
     if (task === undefined) throw new Error("no task");
+    await putFile(task, "state.tar.gz", "saved", "application/gzip");
     const finishes = await Promise.all([1, 2].map(() => runner(`/tasks/${task.job_id}/complete`, { method: "POST", lease: task.lease, body: completion() })));
     expect(finishes.map((response) => response.status)).toEqual([204, 204]);
     expect((await jobBoard(env).getJob(alice, task.job_id))?.rev).toBe(1);
@@ -570,7 +577,7 @@ describe("guarded task transitions", () => {
     const { id, task } = await start();
     const board = jobBoard(env);
     const now = Date.now();
-    expect(await board.progress(id, task.lease, "{}", now + LIMITS.leaseMs - 10)).toBe(true);
+    expect(await board.progress(id, task.lease, "{}", now + LIMITS.leaseMs - 10)).toEqual({ ok: true });
     expect(await board.checkLease(id, task.lease, now + LIMITS.leaseMs + 10, false)).not.toBeNull();
     expect(await board.checkLease(id, task.lease, now + 2 * LIMITS.leaseMs - 10, false)).toBeNull();
   });
@@ -621,4 +628,215 @@ describe("guarded task transitions", () => {
     expect((await refuse()).status).toBe(204);
     expect(await claim()).toBeNull();
   });
+});
+
+describe("attempt artifacts and durable deletion", () => {
+  async function start() {
+    const id = await createdJobId(await upload());
+    const task = await claim();
+    if (task === null) throw new Error("no task");
+    return { id, task };
+  }
+
+  it("allocates a fresh revision on retry and isolates a late old upload", async () => {
+    const { id, task } = await start();
+    const board = jobBoard(env);
+    const write = await board.beginArtifactUpload(id, task.lease, Date.now());
+    if (write === null) throw new Error("no write");
+    await putFile(task, "output.pdf", "old", "application/pdf");
+    await board.sweep(Date.now() + LIMITS.leaseMs + 1);
+    const retry = await claim();
+    if (retry === null) throw new Error("no retry");
+    const held = await board.checkLease(id, retry.lease, Date.now(), false);
+    expect(held?.nextRev).toBe(2);
+    expect((await finishProcess(retry)).status).toBe(204);
+    // Simulate the old PUT finishing after the retry has published.
+    await env.FILES.put(`jobs/${id}/r1/output.pdf`, "late old bytes");
+    await board.endArtifactUpload(write, id, task.lease, Date.now());
+    expect(await (await api(`/jobs/${id}/download`)).text()).toContain("%PDF-");
+    await board.sweep(Date.now() + LIMITS.leaseMs + 5 * 60_000 + 1);
+    expect(await env.FILES.get(`jobs/${id}/r1/output.pdf`)).toBeNull();
+    expect(await env.FILES.get(`jobs/${id}/r2/output.pdf`)).not.toBeNull();
+  });
+
+  it("makes repeated PUTs immutable before and after publication", async () => {
+    const { id, task } = await start();
+    expect((await putFile(task, "output.pdf", "first", "application/pdf")).status).toBe(204);
+    expect((await putFile(task, "output.pdf", "replacement", "application/pdf")).status).toBe(204);
+    expect(await (await env.FILES.get(`jobs/${id}/r1/output.pdf`))?.text()).toBe("first");
+    expect((await finishProcess(task)).status).toBe(204);
+    expect((await putFile(task, "output.pdf", "after", "application/pdf")).status).toBe(409);
+    expect(await (await api(`/jobs/${id}/download`)).text()).toBe("first");
+  });
+
+  it("rejects an incomplete manifest without publishing any revision", async () => {
+    const { id, task } = await start();
+    const body = JSON.stringify({ job: finishedJob("complete"), figures: [], previews: [], files: ["output.pdf"], has_state: true, overrides_version: 0 });
+    const finish = () => runner(`/tasks/${id}/complete`, { method: "POST", lease: task.lease, body });
+    expect((await finish()).status).toBe(422);
+    await putFile(task, "output.pdf", "pdf", "application/pdf");
+    expect((await finish()).status).toBe(422);
+    expect((await jobBoard(env).getJob(alice, id))?.rev).toBe(0);
+    await putFile(task, "state.tar.gz", "state", "application/gzip");
+    expect((await finish()).status).toBe(204);
+  });
+
+  it("keeps a deletion locator while a pre-deletion PUT is in flight", async () => {
+    const { id, task } = await start();
+    const board = jobBoard(env);
+    const write = await board.beginArtifactUpload(id, task.lease, Date.now());
+    if (write === null) throw new Error("no write");
+    expect(await board.deleteJob(alice, id)).toBe(true);
+    await runInDurableObject(board, (_board, state) => {
+      expect(state.storage.sql.exec("SELECT prefix FROM cleanup").toArray()).toHaveLength(1);
+    });
+    await env.FILES.put(`jobs/${id}/r1/output.pdf`, "late");
+    await board.endArtifactUpload(write, id, task.lease, Date.now());
+    await board.sweep(Date.now());
+    expect((await env.FILES.list({ prefix: `jobs/${id}/` })).objects).toHaveLength(0);
+    await runInDurableObject(board, (_board, state) => {
+      expect(state.storage.sql.exec("SELECT prefix FROM cleanup").toArray()).toHaveLength(0);
+    });
+  });
+
+  it("resumes a persisted failed deletion", async () => {
+    const { id } = await start();
+    // A persisted failed cleanup is the crash/retry boundary; no mock of R2 is needed.
+    await runInDurableObject(jobBoard(env), (_board, state) => {
+      state.storage.sql.exec("INSERT INTO cleanup VALUES (?, 'delete_failed', 0)", `jobs/${id}/`);
+      state.storage.sql.exec("DELETE FROM jobs WHERE id = ?", id);
+    });
+    await jobBoard(env).sweep(Date.now());
+    expect((await env.FILES.list({ prefix: `jobs/${id}/` })).objects).toHaveLength(0);
+  });
+
+  it("reconciles a reservation whose request died after PUT", async () => {
+    const board = jobBoard(env);
+    await board.reserveUpload("interrupted-upload", Date.now());
+    await env.FILES.put("jobs/interrupted-upload/input.pdf", PDF);
+    await board.sweep(Date.now() + LIMITS.leaseMs);
+    expect(await env.FILES.get("jobs/interrupted-upload/input.pdf")).toBeNull();
+    expect((await board.markUploadStored("interrupted-upload")).ok).toBe(false);
+    await board.abandonUpload("interrupted-upload", Date.now());
+  });
+
+  it("rechecks credential lifetime after upload and never admits an expired reservation", async () => {
+    const board = jobBoard(env);
+    const now = Date.now();
+    await board.reserveUpload("slow", now);
+    await board.markUploadStored("slow");
+    const data = { id: "slow", owner: alice, originalFilename: "x.pdf", fileSizeBytes: 1, gatewayJwt: "token", gatewayExpiresAt: now + LIMITS.queueMinimumMs, now: now + 1 };
+    expect((await board.createJob(data)).admission.ok).toBe(false);
+    expect((await board.createJob({ ...data, gatewayExpiresAt: now + 24 * 3600_000, now: now + LIMITS.leaseMs })).admission.ok).toBe(false);
+  });
+
+  it("rejects illegal step progress with a clear response and resets review retry steps", async () => {
+    const { id, task } = await start();
+    const progress = (step: string, status: string, lease = task.lease) => runner(`/tasks/${id}/progress`, { method: "POST", lease, body: JSON.stringify({ step, status }) });
+    expect((await progress("classify", "complete")).status).toBe(200);
+    const illegal = await progress("classify", "running");
+    expect(illegal.status).toBe(422);
+    expect(await illegal.text()).toContain("Illegal step transition");
+    expect((await finishProcess(task)).status).toBe(204);
+    await jobBoard(env).queueReview(alice, id, { type: "undo", change_id: 1 }, "gateway", Date.now() + 24 * 3600_000, Date.now());
+    const review = await claim();
+    if (review === null) throw new Error("no review");
+    expect((await progress("tagging", "complete", review.lease)).status).toBe(200);
+    await jobBoard(env).sweep(Date.now() + LIMITS.leaseMs + 1);
+    const retry = await claim();
+    if (retry === null) throw new Error("no retry");
+    expect((await job(id)).steps.find((step) => step.step_name === "tagging")?.status).toBe("pending");
+    expect((await progress("tagging", "running", retry.lease)).status).toBe(200);
+  });
+});
+
+
+describe("stored contract compatibility", () => {
+  it("keeps legacy rows readable and retires unknown writable status and task kinds", async () => {
+    const id = await createdJobId(await upload());
+    await runInDurableObject(jobBoard(env), (_board, state) => {
+      state.storage.sql.exec("UPDATE jobs SET status = 'legacy-status', task_kind = 'sync' WHERE id = ?", id);
+    });
+    expect((await jobBoard(env).getJob(alice, id))?.status).toBe("legacy-status");
+    expect(await claim()).toBeNull();
+    expect((await job(id)).status).toBe("failed");
+    const second = await createdJobId(await upload());
+    await runInDurableObject(jobBoard(env), (_board, state) => {
+      state.storage.sql.exec("UPDATE jobs SET task_kind = 'legacy-kind' WHERE id = ?", second);
+    });
+    expect(await claim()).toBeNull();
+    expect((await job(second)).status).toBe("failed");
+  });
+
+  it("preserves an upgraded lease and allocates beyond abandoned legacy revisions", async () => {
+    const id = await createdJobId(await upload());
+    const task = await claim();
+    if (task === null) throw new Error("no task");
+    const baseline = Date.now();
+    await runInDurableObject(jobBoard(env), (_board, state) => {
+      state.storage.sql.exec("DROP TABLE artifact_attempts");
+      new JobBoard(state, env);
+    });
+    expect((await jobBoard(env).checkLease(id, task.lease, Date.now(), false))?.nextRev).toBe(1);
+    await jobBoard(env).sweep(Date.now() + LIMITS.leaseMs + 1);
+    const retry = await claim();
+    if (retry === null) throw new Error("no retry");
+    expect((await jobBoard(env).checkLease(id, retry.lease, Date.now(), false))?.nextRev).toBeGreaterThan(baseline);
+    expect((await finishProcess(retry)).status).toBe(204);
+    expect((await job(id)).status).toBe("manual_remediation");
+  });
+});
+
+
+it("joins a failed initial transfer before deleting its reservation and files", async () => {
+  const response = await api("/jobs?filename=partial.pdf", {
+    method: "POST", body: PDF,
+    headers: { "content-type": "application/pdf", "content-length": String(PDF.length + 1), origin: ORIGIN },
+  });
+  expect(response.status).toBe(400);
+  expect((await env.FILES.list({ prefix: "jobs/" })).objects).toHaveLength(0);
+  await runInDurableObject(jobBoard(env), (_board, state) => {
+    expect(state.storage.sql.exec("SELECT id FROM jobs").toArray()).toHaveLength(0);
+    expect(state.storage.sql.exec("SELECT id FROM uploads").toArray()).toHaveLength(0);
+    expect(state.storage.sql.exec("SELECT id FROM upload_writes").toArray()).toHaveLength(0);
+  });
+});
+
+
+it("keeps completion receipts and failure acknowledgements when outcome logging throws", async () => {
+  const id = await createdJobId(await upload());
+  const task = await claim();
+  if (task === null) throw new Error("no task");
+  const completed = JSON.stringify({ job: finishedJob("failed"), figures: [], previews: [], files: [], has_state: false, overrides_version: 0 });
+  await runInDurableObject(jobBoard(env), async (board) => {
+    const log = console.log;
+    console.log = () => { throw new Error("synthetic log failure"); };
+    try {
+      expect(await board.complete(id, task.lease, completed, Date.now())).toEqual({ ok: true });
+      expect(await board.complete(id, task.lease, completed, Date.now())).toEqual({ ok: true });
+    } finally { console.log = log; }
+  });
+  const second = await createdJobId(await upload());
+  const failed = await claim();
+  if (failed === null) throw new Error("no task");
+  await runInDurableObject(jobBoard(env), async (board) => {
+    const log = console.log;
+    console.log = () => { throw new Error("synthetic log failure"); };
+    try { expect(await board.fail(second, failed.lease, "failure", Date.now())).toBe(true); }
+    finally { console.log = log; }
+  });
+  expect((await job(id)).status).toBe("failed");
+  expect((await job(second)).status).toBe("failed");
+});
+
+
+it("preserves an admitted input when the creation acknowledgement is uncertain", async () => {
+  const id = await createdJobId(await upload());
+  await jobBoard(env).abandonUpload(id, Date.now());
+  expect(await env.FILES.get(`jobs/${id}/input.pdf`)).not.toBeNull();
+  const task = await claim();
+  if (task === null) throw new Error("no task");
+  const input = await runner(`/tasks/${id}/input`, { lease: task.lease });
+  expect(input.status).toBe(200);
+  expect(new Uint8Array(await input.arrayBuffer())).toEqual(PDF);
 });

@@ -4,7 +4,6 @@ The Worker applies review statuses changed since the last task (keep and
 resolve) on top of these views; it does not re-implement them.
 """
 
-import asyncio
 import json
 import logging
 import mimetypes
@@ -24,6 +23,7 @@ from app.services.applied_changes import change_to_response_payload, list_figure
 from app.services.html_export import export_html
 from app.services.html_report import render_batch_parts, render_html_report
 from app.services.pdf_preview import render_page_png_bytes
+from app.services.thread_work import to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +156,7 @@ async def render_views(db: AsyncSession, job_id: str) -> RenderedViews:
     if job.output_path and Path(job.output_path).exists():
         rendered.files.append(RenderedFile("output.pdf", Path(job.output_path), "application/pdf"))
         try:
-            document = await asyncio.to_thread(export_html, Path(job.output_path))
+            document = await to_thread(export_html, Path(job.output_path))
             rendered.files.append(
                 RenderedFile(DOCUMENT_HTML_FILE, document.encode("utf-8"), "text/html; charset=utf-8")
             )
@@ -185,7 +185,7 @@ async def render_views(db: AsyncSession, job_id: str) -> RenderedViews:
         if job.page_count and page > job.page_count:
             continue
         try:
-            png = await asyncio.to_thread(render_page_png_bytes, preview_source, page)
+            png = await to_thread(render_page_png_bytes, preview_source, page)
         except Exception:
             logger.exception("Could not render page %s of job %s for review", page, job_id)
             continue

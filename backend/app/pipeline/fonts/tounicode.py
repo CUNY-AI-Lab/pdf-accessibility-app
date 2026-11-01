@@ -1,6 +1,5 @@
 """Rebuild ToUnicode maps and remove eligible zero-byte text residue."""
 
-import asyncio
 from pathlib import Path
 
 from app.pipeline.fonts.encoding import (
@@ -27,6 +26,7 @@ from app.pipeline.fonts.resources import (
 )
 from app.pipeline.fonts.symbols import _symbol_family
 from app.services.pdf_objects import pdf_named_resource
+from app.services.thread_work import to_thread
 
 
 def _repair_pdf_tounicode_sync(
@@ -531,4 +531,4 @@ async def _repair_pdf_tounicode(
     input_path: Path,
     output_path: Path,
 ) -> tuple[bool, str, dict[str, int]]:
-    return await asyncio.to_thread(_repair_pdf_tounicode_sync, input_path, output_path)
+    return await to_thread(_repair_pdf_tounicode_sync, input_path, output_path)

@@ -4,6 +4,7 @@ import json
 import tarfile
 import threading
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -12,7 +13,7 @@ from app.config import Settings
 from app.models import AltTextEntry, AppliedChange, Job, ReviewTask
 from app.runner import tasks as runner_tasks
 from app.runner import views as runner_views
-from app.runner.client import JOB_TOKEN_HEADER, RUNNER_TOKEN_HEADER, Task, WorkerClient
+from app.runner.client import JOB_TOKEN_HEADER, RUNNER_TOKEN_HEADER, Task, UploadPhase, WorkerClient
 from app.runner.state import (
     database_path,
     input_path,
@@ -174,7 +175,9 @@ def quiet_previews(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_process_task_runs_through_the_relay_and_uploads_views(tmp_path, monkeypatch, quiet_previews):
+async def test_process_task_runs_through_the_relay_and_uploads_views(
+    tmp_path, monkeypatch, quiet_previews
+):
     settings = _settings(tmp_path)
     worker = FakeWorker()
     client = worker.client()
@@ -240,7 +243,9 @@ async def test_preflight_refusal_fails_the_task_with_its_reason(tmp_path, monkey
 
 
 @pytest.mark.parametrize("status", ["complete", "manual_remediation"])
-async def test_process_uploads_accessible_html_from_final_pdf(tmp_path, monkeypatch, quiet_previews, status):
+async def test_process_uploads_accessible_html_from_final_pdf(
+    tmp_path, monkeypatch, quiet_previews, status
+):
     settings = _settings(tmp_path)
     worker = FakeWorker()
     client = worker.client()
@@ -253,7 +258,8 @@ async def test_process_uploads_accessible_html_from_final_pdf(tmp_path, monkeypa
             job = await db.get(Job, job_id)
             tagged_text_pages(
                 settings_arg.output_dir / job_id / "accessible_syllabus.pdf",
-                actual_text="Final reviewed text & fixes", running_head=True,
+                actual_text="Final reviewed text & fixes",
+                running_head=True,
             )
             final_pdf = (settings_arg.output_dir / job_id / "accessible_syllabus.pdf").read_bytes()
             job.status = status
@@ -276,7 +282,11 @@ async def test_process_uploads_accessible_html_from_final_pdf(tmp_path, monkeypa
 
 @pytest.mark.parametrize("status", ["complete", "manual_remediation"])
 async def test_html_export_failure_still_completes_pdf_with_safe_diagnostic(
-    tmp_path, monkeypatch, quiet_previews, caplog, status,
+    tmp_path,
+    monkeypatch,
+    quiet_previews,
+    caplog,
+    status,
 ):
     settings = _settings(tmp_path)
     worker = FakeWorker()
@@ -306,7 +316,9 @@ async def test_html_export_failure_still_completes_pdf_with_safe_diagnostic(
     records = [record for record in caplog.records if record.name == runner_views.__name__]
     assert len(records) == 1
     assert json.loads(records[0].getMessage()) == {
-        "event": "html_export_failed", "job_id": JOB_ID, "error_type": "RuntimeError",
+        "event": "html_export_failed",
+        "job_id": JOB_ID,
+        "error_type": "RuntimeError",
     }
     assert records[0].exc_info is None
     assert "DOCUMENT_SECRET" not in caplog.text
@@ -332,7 +344,8 @@ async def _saved_state(settings, *, actual_text=None) -> bytes:
     await _finish_as_reviewed(session_maker, settings, JOB_ID)
     if actual_text is not None:
         tagged_text_pages(
-            settings.output_dir / JOB_ID / "accessible_syllabus.pdf", actual_text=actual_text,
+            settings.output_dir / JOB_ID / "accessible_syllabus.pdf",
+            actual_text=actual_text,
         )
     await engine.dispose()
     archive = pack_state(settings, JOB_ID, settings.upload_dir.parent / "saved.tar.gz")
@@ -345,7 +358,9 @@ async def _saved_state(settings, *, actual_text=None) -> bytes:
 @pytest.mark.parametrize("kind", ["review", "sync"])
 async def test_later_tasks_regenerate_accessible_html(tmp_path, monkeypatch, quiet_previews, kind):
     settings = _settings(tmp_path)
-    worker = FakeWorker(state=await _saved_state(settings, actual_text="Previously reviewed content"))
+    worker = FakeWorker(
+        state=await _saved_state(settings, actual_text="Previously reviewed content")
+    )
     client = worker.client()
 
     async def fake_rerun(job_id, db, settings_arg, sink):
@@ -371,7 +386,9 @@ async def test_later_tasks_regenerate_accessible_html(tmp_path, monkeypatch, qui
         assert b"Previously reviewed content" not in document
     else:
         assert b"Previously reviewed content" in document
-    with tarfile.open(fileobj=io.BytesIO(worker.uploads["state.tar.gz"][1]), mode="r:gz") as archive:
+    with tarfile.open(
+        fileobj=io.BytesIO(worker.uploads["state.tar.gz"][1]), mode="r:gz"
+    ) as archive:
         assert not any(member.name.endswith(".html") for member in archive.getmembers())
 
 
@@ -412,7 +429,9 @@ async def test_review_edit_restores_state_and_reruns_tagging(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_refused_review_action_keeps_the_previous_result(tmp_path, monkeypatch, quiet_previews):
+async def test_refused_review_action_keeps_the_previous_result(
+    tmp_path, monkeypatch, quiet_previews
+):
     settings = _settings(tmp_path)
     worker = FakeWorker(state=await _saved_state(settings))
     client = worker.client()
@@ -421,15 +440,16 @@ async def test_refused_review_action_keeps_the_previous_result(tmp_path, monkeyp
         raise AssertionError("a refused action must not re-run tagging")
 
     monkeypatch.setattr(runner_tasks, "run_tagging_and_validation", fake_rerun)
-    task = _task("review", action={"type": "undo", "change_id": 1}, overrides={"changes": {"1": "kept"}})
+    task = _task(
+        "review", action={"type": "undo", "change_id": 1}, overrides={"changes": {"1": "kept"}}
+    )
     await runner_tasks.run_task(client, task, settings)
     await client.close()
 
     assert worker.uploads == {}
     assert worker.completed == {
         "review_refused": (
-            "This figure decision is no longer pending review. "
-            "Refresh to see the latest job state."
+            "This figure decision is no longer pending review. Refresh to see the latest job state."
         ),
         "overrides_version": 0,
     }
@@ -512,7 +532,9 @@ def _publication_outcome():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("blocked_path", ["/files/report.html", "/complete"])
-async def test_lease_is_renewed_until_publication_is_acknowledged(tmp_path, monkeypatch, blocked_path):
+async def test_lease_is_renewed_until_publication_is_acknowledged(
+    tmp_path, monkeypatch, blocked_path
+):
     worker = FakeWorker()
     publishing = asyncio.Event()
     renewed = asyncio.Event()
@@ -535,15 +557,21 @@ async def test_lease_is_renewed_until_publication_is_acknowledged(tmp_path, monk
     await client.close()
     assert renewed.is_set()
     assert worker.completed == {
-        "job": {"status": "failed"}, "figures": [], "previews": [],
-        "files": ["report.html"], "has_state": False, "overrides_version": 0,
+        "job": {"status": "failed"},
+        "figures": [],
+        "previews": [],
+        "files": ["report.html"],
+        "has_state": False,
+        "overrides_version": 0,
     }
     assert execution.phase is runner_tasks.TaskPhase.DONE
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("loss_source", ["heartbeat", "upload"])
-async def test_lease_loss_during_publication_stops_without_completion(tmp_path, monkeypatch, loss_source):
+async def test_lease_loss_during_publication_stops_without_completion(
+    tmp_path, monkeypatch, loss_source
+):
     worker = FakeWorker()
     uploading = asyncio.Event()
     cancelled = asyncio.Event()
@@ -579,7 +607,9 @@ async def test_lease_loss_during_publication_stops_without_completion(tmp_path, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_source", ["work", "publication", "outcome"])
-async def test_failure_reporting_keeps_renewing_until_acknowledged(tmp_path, monkeypatch, failure_source):
+async def test_failure_reporting_keeps_renewing_until_acknowledged(
+    tmp_path, monkeypatch, failure_source
+):
     worker = FakeWorker()
     reporting = asyncio.Event()
     renewed = asyncio.Event()
@@ -607,7 +637,9 @@ async def test_failure_reporting_keeps_renewing_until_acknowledged(tmp_path, mon
     await asyncio.wait_for(execution.run(), 2)
     await client.close()
     assert renewed.is_set()
-    assert worker.failed == ("Preflight refused" if failure_source == "outcome" else runner_tasks.INTERNAL_ERROR)
+    assert worker.failed == (
+        "Preflight refused" if failure_source == "outcome" else runner_tasks.INTERNAL_ERROR
+    )
     assert worker.completed is None
     assert execution.phase is runner_tasks.TaskPhase.FAILED
 
@@ -670,7 +702,7 @@ async def test_lease_loss_while_packing_prevents_state_upload(tmp_path, monkeypa
     pack_done = threading.Event()
     loop = asyncio.get_running_loop()
 
-    def pack(*_args):
+    def pack(*_args, **_kwargs):
         loop.call_soon_threadsafe(packing.set)
         try:
             assert release.wait(2)
@@ -679,6 +711,7 @@ async def test_lease_loss_while_packing_prevents_state_upload(tmp_path, monkeypa
 
     async def handler(request):
         if request.url.path.endswith("/progress") and packing.is_set():
+            release.set()
             return httpx.Response(409)
         return worker.handler(request)
 
@@ -723,3 +756,366 @@ async def test_lease_loss_during_failure_reporting_does_not_report_again(tmp_pat
     assert failures == 1
     assert worker.completed is None
     assert worker.uploads == {}
+
+
+@pytest.mark.parametrize("current", list(UploadPhase))
+def test_upload_guard_all_transitions(current):
+    from app.runner.client import UploadPhase, upload_transition
+
+    expected = {
+        "sending": {"backoff", "acknowledged", "failed", "lease_lost"},
+        "backoff": {"sending", "failed"},
+        "acknowledged": set(),
+        "failed": set(),
+        "lease_lost": set(),
+    }
+    for target in UploadPhase:
+        if target.value in expected[current.value]:
+            assert upload_transition(current, target) is target
+        else:
+            with pytest.raises(ValueError, match="Illegal upload transition"):
+                upload_transition(current, target)
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 409, 410, 411, 413, 422])
+async def test_upload_does_not_retry_permanent_errors(tmp_path, status):
+    from app.runner.client import LeaseLost
+
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(status)
+
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    with pytest.raises(LeaseLost if status in {404, 409, 410} else httpx.HTTPStatusError):
+        await client.upload(_task(), "output.pdf", b"pdf", "application/pdf")
+    await client.close()
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("failure", [408, 425, 429, 500, 502, 503, 504, "transport"])
+async def test_upload_retries_transient_errors_with_identical_bytes(tmp_path, monkeypatch, failure):
+    from app.runner import client as runner_client
+
+    requests = []
+    sleeps = []
+    source = tmp_path / "output.pdf"
+    source.write_bytes(b"original")
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    def handler(request):
+        requests.append(request.content)
+        source.write_bytes(b"changed while retrying")
+        if len(requests) == 3:
+            return httpx.Response(204)
+        if failure == "transport":
+            raise httpx.ReadError("uncertain accepted PUT")
+        return httpx.Response(failure)
+
+    monkeypatch.setattr(runner_client.asyncio, "sleep", sleep)
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    await client.upload(_task(), "output.pdf", source, "application/pdf")
+    await client.close()
+    assert requests == [b"original"] * 3
+    assert sleeps == [2, 4]
+
+
+async def test_upload_retry_limit_and_deadline(tmp_path, monkeypatch):
+    from app.runner import client as runner_client
+
+    requests = []
+
+    async def sleep(_seconds):
+        pass
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503)
+
+    monkeypatch.setattr(runner_client.asyncio, "sleep", sleep)
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.upload(_task(), "output.pdf", b"pdf", "application/pdf")
+    assert len(requests) == 3
+    requests.clear()
+    with pytest.raises(TimeoutError):
+        await client.upload(
+            _task(deadline=int((time.time() + 1) * 1000)), "output.pdf", b"pdf", "application/pdf"
+        )
+    assert len(requests) == 1
+    requests.clear()
+    with pytest.raises(TimeoutError):
+        await client.upload(
+            _task(deadline=int((time.time() - 1) * 1000)), "output.pdf", b"pdf", "application/pdf"
+        )
+    assert requests == []
+    await client.close()
+
+
+async def test_upload_deadline_cancels_sending():
+    cancelled = asyncio.Event()
+
+    async def handler(_request):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    with pytest.raises(TimeoutError):
+        await client.upload(
+            _task(deadline=int((time.time() + 0.05) * 1000)),
+            "output.pdf",
+            b"pdf",
+            "application/pdf",
+        )
+    await client.close()
+    assert cancelled.is_set()
+
+
+def test_outcome_rejects_empty_or_contradictory_results():
+    with pytest.raises(ValueError):
+        runner_tasks.Outcome()
+    with pytest.raises(ValueError):
+        runner_tasks.Outcome(failed="failed", review_refused="refused")
+
+
+@pytest.mark.parametrize("current", ["accepting", "stopping", "stopped"])
+def test_claim_loop_guard_all_transitions(current):
+    from app.runner.__main__ import RunnerControl, RunnerMode
+
+    for target in RunnerMode:
+        control = RunnerControl()
+        control.mode = RunnerMode(current)
+        if (current, target.value) in {("accepting", "stopping"), ("stopping", "stopped")}:
+            control.transition(target)
+            assert control.mode is target
+        else:
+            with pytest.raises(ValueError):
+                control.transition(target)
+
+
+@pytest.mark.parametrize("slot_available", [True, False])
+async def test_stop_while_waiting_for_slot_never_acquires_work(slot_available):
+    from app.runner.__main__ import acquire_slot
+
+    slots = asyncio.Semaphore(1 if slot_available else 0)
+    stop = asyncio.Event()
+    pending = asyncio.create_task(acquire_slot(slots, stop))
+    stop.set()
+    assert not await asyncio.wait_for(pending, 1)
+    assert slots.locked() is not slot_available
+
+
+async def test_claim_loop_recovers_malformed_claim_and_does_not_dispatch_after_stop(
+    tmp_path, monkeypatch
+):
+    from app.runner import __main__ as runner_main
+
+    signals = []
+    dispatched = []
+    settings = _settings(tmp_path)
+
+    class Client:
+        base_url = WORKER
+        calls = 0
+        closed = False
+
+        async def claim(self, _runner):
+            self.calls += 1
+            if self.calls == 1:
+                raise ValueError("malformed claim")
+            signals[0]()
+            return _task()
+
+        async def close(self):
+            self.closed = True
+
+    async def sleep(*_args):
+        pass
+
+    async def dispatch(*args):
+        dispatched.append(args)
+
+    client = Client()
+    monkeypatch.setattr(runner_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(runner_main, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(runner_main, "WorkerClient", lambda *_args: client)
+    monkeypatch.setattr(runner_main, "_sleep_unless", sleep)
+    monkeypatch.setattr(runner_main, "run_task", dispatch)
+    monkeypatch.setattr(
+        asyncio.get_running_loop(),
+        "add_signal_handler",
+        lambda _signal, callback: signals.append(callback),
+    )
+    await asyncio.wait_for(runner_main.main(), 1)
+    assert client.calls == 2
+    assert client.closed
+    assert dispatched == []
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("lease", None), ("job_id", ""), ("attempt", 0), ("deadline", "123"), ("kind", "unknown")],
+)
+def test_claim_protocol_rejects_malformed_fields(field, value):
+    data = {
+        "job_id": JOB_ID,
+        "kind": "process",
+        "lease": "lease",
+        "attempt": 1,
+        "deadline": 1000,
+        "original_filename": "x.pdf",
+    }
+    with pytest.raises(ValueError):
+        Task.from_json({**data, field: value})
+
+
+async def test_attempt_paths_and_archives_work_in_both_runner_layouts(tmp_path):
+    import sqlite3
+
+    from app.config import get_settings, task_settings
+    from app.runner.state import attempt_settings, data_root
+
+    base = _settings(tmp_path)
+    legacy = await _saved_state(base)
+    first = attempt_settings(base, "old-lease")
+    second = attempt_settings(base, "new-lease")
+    archive = tmp_path / "legacy.tar.gz"
+    archive.write_bytes(legacy)
+    unpack_state(first, JOB_ID, archive)
+    unpack_state(second, JOB_ID, archive)
+    with task_settings(first):
+        assert get_settings().processing_dir == first.processing_dir
+        assert (
+            await asyncio.to_thread(lambda: get_settings().processing_dir) == first.processing_dir
+        )
+    assert database_path(first, JOB_ID) != database_path(second, JOB_ID)
+    with sqlite3.connect(database_path(second, JOB_ID)) as db:
+        row = db.execute("SELECT input_path, output_path FROM jobs").fetchone()
+        assert all(str(data_root(second)) in path for path in row)
+        assert all(Path(path).exists() for path in row)
+    modern = pack_state(second, JOB_ID, tmp_path / "modern.tar.gz", canonical_root=data_root(base))
+    # The deployed unpacker only checks member names and extracts; it does no rebasing.
+    with tarfile.open(modern) as tar:
+        tar.extractall(data_root(base), filter="data")
+    with sqlite3.connect(database_path(base, JOB_ID)) as db:
+        row = db.execute("SELECT input_path, output_path FROM jobs").fetchone()
+        assert all(str(data_root(base)) in path for path in row)
+        assert all(Path(path).exists() for path in row)
+    remove_job_files(first, JOB_ID)
+    assert input_path(second, JOB_ID).exists()
+
+
+@pytest.mark.parametrize("cancel_again", [False, True])
+async def test_cancelled_attempt_joins_thread_before_removing_its_files(
+    tmp_path, monkeypatch, cancel_again
+):
+    from app.runner.state import attempt_settings
+    from app.services.thread_work import to_thread
+
+    settings = _settings(tmp_path)
+    task = _task()
+    scoped = attempt_settings(settings, task.lease)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def work():
+        path = input_path(scoped, JOB_ID)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"owned")
+        started.set()
+        assert release.wait(3)
+        assert path.read_bytes() == b"owned"
+        path.write_bytes(b"finished")
+        finished.set()
+
+    async def perform(*_args):
+        await to_thread(work)
+        raise AssertionError("cancelled work must not publish")
+
+    monkeypatch.setattr(runner_tasks, "_perform", perform)
+    client = FakeWorker().client()
+    running = asyncio.create_task(runner_tasks.run_task(client, task, settings))
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        running.cancel()
+        await asyncio.sleep(0.02)
+        assert not running.done()
+        assert input_path(scoped, JOB_ID).exists()
+        if cancel_again:
+            running.cancel()
+            await asyncio.sleep(0.02)
+            assert not running.done()
+            assert input_path(scoped, JOB_ID).exists()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        assert finished.is_set()
+        assert not input_path(scoped, JOB_ID).exists()
+    finally:
+        release.set()
+        await client.close()
+
+
+@pytest.mark.parametrize("current", list(runner_tasks.TaskPhase))
+def test_execution_phase_all_transitions(tmp_path, current):
+    allowed = {
+        "claimed": {"working", "failed"},
+        "working": {"publishing", "failed"},
+        "publishing": {"done", "failed"},
+        "done": set(),
+        "failed": set(),
+    }
+    for target in runner_tasks.TaskPhase:
+        execution = runner_tasks.ClaimedTaskExecution(None, _task(), _settings(tmp_path))
+        execution.phase = current
+        if target.value in allowed[current.value]:
+            execution.transition(target)
+            assert execution.phase is target
+        else:
+            with pytest.raises(ValueError):
+                execution.transition(target)
+
+
+@pytest.mark.parametrize("body", [[], {"task": None}, {"task": []}, {"task": "bad"}, {}])
+async def test_claim_rejects_malformed_envelopes_without_attribute_errors(body):
+    client = WorkerClient(
+        WORKER,
+        "host-token",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=body)),
+    )
+    try:
+        with pytest.raises(ValueError):
+            await client.claim("runner")
+    finally:
+        await client.close()
+
+
+def test_startup_removes_crashed_attempts_but_preserves_a_live_file_owner(tmp_path):
+    from app.runner.state import (
+        attempt_settings,
+        attempt_workspace,
+        cleanup_abandoned_attempts,
+        data_root,
+    )
+
+    settings = _settings(tmp_path)
+    crashed = data_root(attempt_settings(settings, "crashed"))
+    crashed.mkdir(parents=True)
+    (crashed / "orphan.pdf").write_bytes(PDF)
+    with attempt_workspace(settings, "live") as live:
+        path = input_path(live, JOB_ID)
+        path.parent.mkdir(parents=True)
+        path.write_bytes(PDF)
+        cleanup_abandoned_attempts(settings)
+        assert not crashed.exists()
+        assert path.exists()
+        with pytest.raises(RuntimeError):
+            with attempt_workspace(settings, "live"):
+                raise AssertionError("duplicate file owner")
+    assert not data_root(live).exists()

@@ -21,6 +21,7 @@ from app.services.pdf_preflight import (
     inspect_pdf_upload,
     page_image_pixels_of,
 )
+from app.services.thread_work import to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -230,7 +231,7 @@ async def _probe_ocr_detect(pdf_path: Path) -> str | None:
                     probe_pdf.save(str(probe_input))
                     return True
 
-            if not await asyncio.to_thread(_extract_page1):
+            if not await to_thread(_extract_page1):
                 return None
 
             ocr_result = await run_ocr(
@@ -247,7 +248,7 @@ async def _probe_ocr_detect(pdf_path: Path) -> str | None:
                 text = pdfminer_extract(str(ocr_result.output_path), maxpages=1)
                 return detect_language(text[:3000]) if text else None
 
-            return await asyncio.to_thread(_extract_and_detect)
+            return await to_thread(_extract_and_detect)
     except Exception as exc:
         logger.debug("Probe OCR language detection failed: %s", exc)
         return None
@@ -321,14 +322,14 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
                 ),
             )
 
-    result = await asyncio.to_thread(_classify_structure)
+    result = await to_thread(_classify_structure)
 
     # Try detecting language from existing text (digital/mixed) with a timeout.
     # pdfminer has no internal timeout and can stall on malformed streams.
     if result.pages_with_text > 0:
         try:
             detected = await asyncio.wait_for(
-                asyncio.to_thread(_detect_language_from_text, pdf_path),
+                to_thread(_detect_language_from_text, pdf_path),
                 timeout=_TEXT_DETECT_TIMEOUT_SECONDS,
             )
         except TimeoutError:
