@@ -103,6 +103,20 @@ def build_ocrmypdf_args(
     return args
 
 
+def _ocr_output_error(input_path: Path, output_path: Path) -> str:
+    """Check the output against the whole input, even for page-limited OCR."""
+    try:
+        with pikepdf.open(input_path) as source:
+            expected_pages = len(source.pages)
+        with pikepdf.open(output_path) as output:
+            actual_pages = len(output.pages)
+        if actual_pages != expected_pages:
+            return f"Output has {actual_pages} pages; expected {expected_pages}"
+    except (OSError, pikepdf.PdfError) as exc:
+        return f"Cannot open OCR output or source: {exc}"
+    return ""
+
+
 async def run_ocr(
     input_path: Path,
     output_path: Path,
@@ -141,6 +155,7 @@ async def run_ocr(
         endpoint = current_model_endpoint(settings)
         env["CAIL_OCR_BASE_URL"] = endpoint.base_url
         env["CAIL_OCR_HEADERS"] = json.dumps(endpoint.headers)
+        env["CAIL_OCR_MAX_REQUEST_BYTES"] = str(settings.llm_max_request_bytes)
         env["CAIL_OCR_MODEL"] = settings.ocr_model
         env["CAIL_OCR_PAGE_SECONDS"] = str(settings.ocr_gateway_page_seconds)
         # Pages run in rounds of --jobs, each round within the page limit, so
@@ -150,36 +165,71 @@ async def run_ocr(
         needed = rounds * (settings.ocr_gateway_page_seconds + GATEWAY_PAGE_FALLBACK_SECONDS)
         timeout_seconds = max(timeout_seconds or 0, needed)
 
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-        **subprocess_process_group_kwargs(),
-    )
-    try:
-        stdout, stderr = await communicate_with_timeout(proc, timeout_seconds)
-    except SubprocessTimeout:
-        msg = f"OCR timed out after {timeout_seconds}s"
-        logger.error(msg)
-        return OcrResult(success=False, output_path=input_path, message=msg)
-
-    stderr_text = stderr.decode("utf-8", errors="replace")
-    stdout_text = stdout.decode("utf-8", errors="replace")
-
-    if proc.returncode == 0:
-        logger.info(f"OCR complete: {output_path.name}")
-        return OcrResult(success=True, output_path=output_path)
-    elif proc.returncode == 6 and mode == "skip":
-        # Exit code 6 = "file already has text" — not an error
-        logger.info(f"OCR skipped (already has text): {input_path.name}")
-        return OcrResult(
-            success=True,
-            output_path=input_path,  # Use original
-            skipped=True,
-            message="File already contains text",
+    warnings: list[str] = []
+    for attempt in range(2):
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            **subprocess_process_group_kwargs(),
         )
-    else:
-        msg = f"OCR failed (exit {proc.returncode}): {stderr_text or stdout_text}"
-        logger.error(msg)
-        return OcrResult(success=False, output_path=input_path, message=msg)
+        try:
+            stdout, stderr = await communicate_with_timeout(proc, timeout_seconds)
+        except SubprocessTimeout:
+            msg = f"OCR timed out after {timeout_seconds}s"
+            logger.error(msg)
+            return OcrResult(success=False, output_path=input_path, message=msg)
+
+        stderr_text = stderr.decode("utf-8", errors="replace")
+        stdout_text = stdout.decode("utf-8", errors="replace")
+
+        if proc.returncode == 4 or (attempt == 1 and proc.returncode == 0):
+            output_error = _ocr_output_error(input_path, output_path)
+            if not output_error:
+                if proc.returncode == 4:
+                    warning = (
+                        "OCRmyPDF exited with code 4 (invalid output PDF), but the output "
+                        "opens with pikepdf and has the expected page count; continuing"
+                    )
+                    logger.warning(warning)
+                    warnings.append(warning)
+                return OcrResult(
+                    success=True, output_path=output_path, message="; ".join(warnings)
+                )
+            if attempt == 0:
+                warning = (
+                    f"OCRmyPDF exited with code 4 and the output is unusable: {output_error}; "
+                    "retrying once with --output-type pdf -O0 (optimization disabled)"
+                )
+                logger.warning(warning)
+                warnings.append(warning)
+                # Do not let the retry mistake the first attempt's file for new output.
+                output_path.unlink(missing_ok=True)
+                args[-2:-2] = ["-O0"]
+                continue
+            msg = (
+                f"OCR failed after retry (exit {proc.returncode}): {output_error}; "
+                f"{stderr_text or stdout_text}"
+            )
+            logger.error(msg)
+            return OcrResult(success=False, output_path=input_path, message=msg)
+
+        if proc.returncode == 0:
+            logger.info(f"OCR complete: {output_path.name}")
+            return OcrResult(success=True, output_path=output_path)
+        elif proc.returncode == 6 and mode == "skip":
+            # Exit code 6 = "file already has text" — not an error
+            logger.info(f"OCR skipped (already has text): {input_path.name}")
+            return OcrResult(
+                success=True,
+                output_path=input_path,  # Use original
+                skipped=True,
+                message="File already contains text",
+            )
+        else:
+            msg = f"OCR failed (exit {proc.returncode}): {stderr_text or stdout_text}"
+            logger.error(msg)
+            return OcrResult(success=False, output_path=input_path, message=msg)
+
+    raise AssertionError("OCR retry loop must return a result")

@@ -143,6 +143,11 @@ def _allocate_fragment_mcid(
     stream_owner: pikepdf.Object | None = None,
 ) -> tuple[str, int, str | None] | None:
     """Allocate an MCID for one fragmented content run."""
+    if elem.get("type") == "figure":
+        if elem.get("figure_index") in decorative_figures:
+            return None
+        if paragraph := elem.get("_figure_text_box"):
+            elem = paragraph
     tag = _fragment_tag_for_element(elem)
     if tag is None:
         return None
@@ -659,6 +664,55 @@ def _page_reading_order(
     return {"page": page_index, **diagnostics}
 
 
+@dataclass
+class _DeferredFigureText:
+    """Append recovered glyph MCIDs after the page's original allocations.
+
+    Keeping the instructions until the page is complete avoids renumbering
+    any existing page or Form-stream MCID when previously untagged text is
+    recovered earlier in paint order.
+    """
+
+    fragments: list[
+        tuple[dict, ContentTarget, pikepdf.ContentStreamInstruction, pikepdf.Object | None]
+    ] = dataclasses.field(default_factory=list)
+    streams: list[tuple[Any, list]] = dataclasses.field(default_factory=list)
+
+    def mark(
+        self, elem: dict, target: ContentTarget, stream_owner: pikepdf.Object | None,
+    ) -> pikepdf.ContentStreamInstruction:
+        instruction = _make_bdc("P", -1)
+        self.fragments.append((elem, target, instruction, stream_owner))
+        return instruction
+
+    def finish(
+        self, pdf: pikepdf.Pdf, builder: StructTreeBuilder, page_index: int,
+        page_ref: pikepdf.Object,
+    ) -> None:
+        replacements: dict[int, pikepdf.ContentStreamInstruction] = {}
+        for elem, target, instruction, stream_owner in self.fragments:
+            with builder.at_reading_order(elem.get("reading_order")):
+                allocated = _allocate_fragment_mcid(
+                    builder, elem, page_index, page_ref, {}, set(), stream_owner=stream_owner,
+                )
+                assert allocated is not None
+                tag, mcid, actual_text = allocated
+                if target.annotation is not None:
+                    builder.put_mcid_in_link(
+                        stream_owner or page_ref, mcid, page_ref, target.annotation,
+                    )
+                    tag, actual_text = "Link", None
+                replacements[id(instruction)] = _make_bdc(tag, mcid, actual_text=actual_text)
+        for owner, instructions in self.streams:
+            data = pikepdf.unparse_content_stream([
+                replacements.get(id(instruction), instruction) for instruction in instructions
+            ])
+            if isinstance(owner, pikepdf.Page):
+                owner["/Contents"] = pdf.make_stream(data)
+            else:
+                owner.write(data)
+
+
 def _rewrite_content_stream(
     pdf: pikepdf.Pdf,
     content_owner,
@@ -674,6 +728,7 @@ def _rewrite_content_stream(
     passthrough_regions: list[ContentRegion] | None = None,
     measured_ops: list[MeasuredTextOp] | None = None,
     word_owners: dict[tuple, ContentTarget | None] | None = None,
+    deferred_figure_text: _DeferredFigureText | None = None,
 ) -> set[int]:
     """Mark a content stream's content for the elements it belongs to.
 
@@ -710,6 +765,7 @@ def _rewrite_content_stream(
     new_instructions: list = []
     active: ContentTarget | int | Literal["artifact"] | None = None
     pending_path: list = []
+    has_deferred = False
 
     def close_active() -> None:
         nonlocal active
@@ -720,13 +776,19 @@ def _rewrite_content_stream(
     def open_mark(mark: ContentTarget | int | Literal["artifact"]) -> None:
         """Open the marked content for a mark, or an artifact if no
         structure element can hold it."""
-        nonlocal active
+        nonlocal active, has_deferred
         if mark == _ARTIFACT_MARK:
             new_instructions.append(_make_bmc_artifact())
             active = mark
             return
         elem_idx = mark if isinstance(mark, int) else mark.elem_idx
         elem = elements[elem_idx]
+        if elem.get("_figure_text") and isinstance(mark, ContentTarget) and deferred_figure_text:
+            new_instructions.append(deferred_figure_text.mark(elem, mark, stream_owner))
+            has_deferred = True
+            tagged.add(elem_idx)
+            active = mark
+            return
         with builder.at_reading_order(elem.get("reading_order")):
             if elem.get("type") == "artifact":
                 new_instructions.append(_make_bmc_artifact(elem))
@@ -814,6 +876,11 @@ def _rewrite_content_stream(
         if overlay:
             new_instructions.extend(overlay)
             tagged.add(elem_idx)
+
+    if has_deferred:
+        assert deferred_figure_text is not None
+        deferred_figure_text.streams.append((content_owner, new_instructions))
+        return tagged
 
     try:
         new_stream = pikepdf.unparse_content_stream(new_instructions)

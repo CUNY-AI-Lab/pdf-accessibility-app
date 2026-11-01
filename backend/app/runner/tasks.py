@@ -13,7 +13,9 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Coroutine
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 import httpx
@@ -64,49 +66,114 @@ class Outcome:
     review_refused: str | None = None
 
 
+class TaskPhase(Enum):
+    CLAIMED = "claimed"
+    WORKING = "working"
+    PUBLISHING = "publishing"
+    DONE = "done"
+    FAILED = "failed"
+
+
+_PHASE_TRANSITIONS = {
+    TaskPhase.CLAIMED: {TaskPhase.WORKING, TaskPhase.FAILED},
+    TaskPhase.WORKING: {TaskPhase.PUBLISHING, TaskPhase.FAILED},
+    TaskPhase.PUBLISHING: {TaskPhase.DONE, TaskPhase.FAILED},
+    TaskPhase.DONE: set(),
+    TaskPhase.FAILED: set(),
+}
+
+
+class ClaimedTaskExecution:
+    """Own work and publication under one lease supervisor and deadline."""
+
+    def __init__(self, client: WorkerClient, task: Task, settings: Settings):
+        self.client = client
+        self.task = task
+        self.settings = settings
+        self.phase = TaskPhase.CLAIMED
+
+    def transition(self, phase: TaskPhase) -> None:
+        if phase not in _PHASE_TRANSITIONS[self.phase]:
+            raise ValueError(f"Illegal runner transition: {self.phase.value} -> {phase.value}")
+        self.phase = phase
+
+    async def run(self) -> None:
+        sink = ProgressSink()
+        forward = asyncio.create_task(
+            _forward_progress(self.client, self.task, sink, self.settings.runner_heartbeat_seconds)
+        )
+        try:
+            self.transition(TaskPhase.WORKING)
+            try:
+                outcome = await self.while_held(
+                    _perform(self.client, self.task, self.settings, sink), forward
+                )
+                self.transition(TaskPhase.PUBLISHING)
+                await self.while_held(
+                    _finish(self.client, self.task, self.settings, outcome), forward
+                )
+                self.transition(TaskPhase.FAILED if outcome.failed is not None else TaskPhase.DONE)
+                return
+            except LeaseLost:
+                raise
+            except TimeoutError:
+                error = DEADLINE_ERROR
+            except Exception:
+                logger.exception("Task %s for job %s failed", self.task.kind, self.task.job_id)
+                error = INTERNAL_ERROR
+            # Failure reporting is also publication: keep renewing until its acknowledgement.
+            if self.phase is TaskPhase.WORKING:
+                self.transition(TaskPhase.PUBLISHING)
+            try:
+                await self.while_held(self.client.fail(self.task, error), forward, deadline=False)
+            except httpx.HTTPError:
+                logger.exception("Could not report the failure of job %s", self.task.job_id)
+            self.transition(TaskPhase.FAILED)
+        except LeaseLost as exc:
+            self.transition(TaskPhase.FAILED)
+            logger.warning("Job %s is no longer this runner's: %s", self.task.job_id, exc)
+        except asyncio.CancelledError:
+            self.transition(TaskPhase.FAILED)
+            raise
+        finally:
+            forward.cancel()
+            await asyncio.gather(forward, return_exceptions=True)
+
+    async def while_held[T](
+        self, operation: Coroutine[Any, Any, T], forward: asyncio.Task, *, deadline: bool = True
+    ) -> T:
+        remaining = max(self.task.deadline_ms / 1000 - time.time(), 0) if deadline else None
+        if forward.done() or remaining == 0:
+            operation.close()
+            if forward.done():
+                forward.result()
+                raise LeaseLost("Lease renewal stopped")
+            raise TimeoutError
+        pending = asyncio.create_task(operation)
+        try:
+            done, _ = await asyncio.wait(
+                {pending, forward}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+            # A terminal acknowledgement wins over a heartbeat rejected after that commit.
+            if pending in done and self.phase is TaskPhase.PUBLISHING:
+                return pending.result()
+            if forward in done:
+                forward.result()
+                raise LeaseLost("Lease renewal stopped")
+            if pending in done:
+                return pending.result()
+            raise TimeoutError
+        finally:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+
+
 async def run_task(client: WorkerClient, task: Task, settings: Settings) -> None:
     remove_job_files(settings, task.job_id)
-    sink = ProgressSink()
-    work = asyncio.create_task(_perform(client, task, settings, sink))
-    forward = asyncio.create_task(
-        _forward_progress(client, task, sink, settings.runner_heartbeat_seconds)
-    )
     try:
-        remaining = task.deadline_ms / 1000 - time.time()
-        done, _ = await asyncio.wait(
-            {work, forward}, timeout=max(remaining, 0), return_when=asyncio.FIRST_COMPLETED
-        )
-        if work not in done:
-            work.cancel()
-            await asyncio.gather(work, return_exceptions=True)
-            if forward in done:
-                logger.warning("Stopped job %s: %s", task.job_id, forward.exception())
-                return
-            logger.warning("Job %s reached its deadline", task.job_id)
-            await _report_failure(client, task, DEADLINE_ERROR)
-            return
-        forward.cancel()
-        await asyncio.gather(forward, return_exceptions=True)
-        await _finish(client, task, settings, work.result())
-    except LeaseLost as exc:
-        logger.warning("Job %s is no longer this runner's: %s", task.job_id, exc)
-    except Exception:
-        logger.exception("Task %s for job %s failed", task.kind, task.job_id)
-        await _report_failure(client, task, INTERNAL_ERROR)
+        await ClaimedTaskExecution(client, task, settings).run()
     finally:
-        for pending in (work, forward):
-            pending.cancel()
-        await asyncio.gather(work, forward, return_exceptions=True)
         remove_job_files(settings, task.job_id)
-
-
-async def _report_failure(client: WorkerClient, task: Task, error: str) -> None:
-    try:
-        await client.fail(task, error)
-    except LeaseLost:
-        pass
-    except httpx.HTTPError:
-        logger.exception("Could not report the failure of job %s", task.job_id)
 
 
 async def _forward_progress(
@@ -240,6 +307,8 @@ async def _finish(client: WorkerClient, task: Task, settings: Settings, outcome:
 
     views = outcome.views
     assert views is not None
+    if views.job["status"] not in OUTPUT_READY_STATUSES | {"failed"}:
+        raise ValueError(f"Completion requires a terminal job status: {views.job['status']}")
     for rendered in views.files:
         await client.upload(task, rendered.name, rendered.body, rendered.content_type)
     has_state = views.job["status"] in OUTPUT_READY_STATUSES

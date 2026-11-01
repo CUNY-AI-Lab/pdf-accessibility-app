@@ -11,6 +11,7 @@ from app.models import Job
 from app.services.llm_client import LlmClient, is_retryable_llm_exception, make_llm_client
 from app.services.path_safety import validate_path_within_allowed_roots
 from app.services.pdf_preview import render_page_jpeg_data_url
+from app.services.vision_requests import VisionRequestTooLarge
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ JSON_SCHEMA_REFUSED_MODELS: set[str] = set()
 
 def _should_try_alternate_response_format(exc: BaseException) -> bool:
     """Fallback formats help with capability/validation issues, not flaky endpoints."""
-    return not is_retryable_llm_exception(exc)
+    return not isinstance(exc, VisionRequestTooLarge) and not is_retryable_llm_exception(exc)
 
 
 def job_pdf_path(job: Job) -> Path:

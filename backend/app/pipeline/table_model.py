@@ -62,9 +62,11 @@ import pikepdf
 import pypdfium2 as pdfium
 from rapidfuzz.distance import Levenshtein
 
+from app.config import DEFAULT_LLM_MAX_REQUEST_BYTES
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.page_glyphs import MeasuredGlyph, PdfGlyphReader, union_bbox
 from app.pipeline.tagger_ownership import _measured_words, _page_has_hidden_text
+from app.services.vision_requests import bound_vision_request
 
 logger = logging.getLogger(__name__)
 
@@ -162,11 +164,13 @@ class HttpReader:
         *,
         timeout: float = 60.0,
         cache: AnswerCache | None = None,
+        max_request_bytes: int = DEFAULT_LLM_MAX_REQUEST_BYTES,
     ) -> None:
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model = model
         self.timeout = timeout
         self.cache = cache
+        self.max_request_bytes = max_request_bytes
 
     async def read(self, png: bytes) -> ModelAnswer | None:
         if self.cache is not None and (answer := self.cache.get(png)) is not None:
@@ -181,6 +185,7 @@ class HttpReader:
                 {"type": "text", "text": PROMPT},
             ]}],
         }
+        body = await asyncio.to_thread(bound_vision_request, body, self.max_request_bytes)
         started = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
