@@ -263,7 +263,7 @@ def test_partial_embedding_improvement_is_kept_with_same_failed_rule():
 
 
 @pytest.mark.asyncio
-async def test_pipeline_keeps_partial_local_embedding_while_century_gothic_remains(
+async def test_pipeline_keeps_partial_local_embedding_while_unsupported_font_remains(
     tmp_path, monkeypatch
 ):
     from types import SimpleNamespace
@@ -280,9 +280,9 @@ async def test_pipeline_keeps_partial_local_embedding_while_century_gothic_remai
         with pikepdf.open(source, allow_overwriting_input=True) as pdf:
             pdf.pages[0].Resources.Font.F1.Encoding = pikepdf.Name.MacRomanEncoding
             font = pikepdf.Dictionary(pdf.pages[0].Resources.Font.F1)
-            font.BaseFont = pikepdf.Name.CenturyGothic
+            font.BaseFont = pikepdf.Name.UnsubstitutableFixture
             font.FontDescriptor = pikepdf.Dictionary(font.FontDescriptor)
-            font.FontDescriptor.FontName = pikepdf.Name.CenturyGothic
+            font.FontDescriptor.FontName = pikepdf.Name.UnsubstitutableFixture
             pdf.pages[0].Resources.Font.F2 = pdf.make_indirect(font)
             pdf.pages[0].Contents = pdf.make_stream(
                 b"/P << /MCID 0 >> BDC BT /F1 12 Tf 72 720 Td (AB) Tj /F2 12 Tf (A) Tj ET EMC"
@@ -296,7 +296,7 @@ async def test_pipeline_keeps_partial_local_embedding_while_century_gothic_remai
             False,
             [
                 Violation(
-                    "ISO 14289-1:2014-7.21.4.1-1", "Century Gothic not embedded", "error", count=1
+                    "ISO 14289-1:2014-7.21.4.1-1", "Unsupported font not embedded", "error", count=1
                 )
             ],
         )

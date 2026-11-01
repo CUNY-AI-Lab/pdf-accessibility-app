@@ -343,3 +343,26 @@ async def test_arial_embeds_after_tagging_and_in_author_repairs(tmp_path, monkey
     assert _text_contract(tagged) == _text_contract(tmp_path / "author-embed_fonts.pdf")
     with pikepdf.open(repaired) as pdf:
         assert pdf.pages[0].Resources.Font.F1.FontDescriptor.FontFile2.read_bytes()
+
+
+def test_partial_ghostscript_directories_do_not_hide_urw_font_files(tmp_path, monkeypatch):
+    prefix = tmp_path / "usr"
+    gs = prefix / "bin/gs"
+    gs.parent.mkdir(parents=True)
+    gs.touch()
+    # Both directories exist on split installations, even when the target
+    # font and its AFM live elsewhere.
+    (prefix / "share/ghostscript/10.00.0/Resource/Font").mkdir(parents=True)
+    (prefix / "share/ghostscript/fonts").mkdir(parents=True)
+    fonts = prefix / "share/fonts/type1/urw-base35"
+    fonts.mkdir(parents=True)
+    program = b"%!PS-AdobeFont-1.0: D050000L 1.0\n/FontName /D050000L def\n"
+    (fonts / "D050000L.t1").write_bytes(program)
+    (fonts / "D050000L.afm").write_text(
+        "StartFontMetrics 4.1\nFontName D050000L\nFontBBox -100 -200 1000 800\n"
+        "Ascender 800\nDescender -200\nStartCharMetrics 1\n"
+        "C 65 ; WX 600 ; N a10 ; B 0 0 600 700 ;\nEndCharMetrics\nEndFontMetrics\n"
+    )
+    monkeypatch.setattr(programs, "resolve_binary", lambda *args, **kwargs: str(gs))
+    assert programs._ghostscript_type1_font_program("ZapfDingbats")[0] == program
+    assert programs._ghostscript_type1_descriptor("ZapfDingbats")["Widths"][65] == 600

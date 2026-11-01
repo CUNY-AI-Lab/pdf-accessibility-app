@@ -110,6 +110,7 @@ def _repair_pdf_tounicode_sync(
                     pikepdf.Name("/Type1"),
                     pikepdf.Name("/MMType1"),
                     pikepdf.Name("/TrueType"),
+                    pikepdf.Name("/Type3"),
                 ):
                     continue
                 font_key = _obj_key(current_font)
@@ -318,8 +319,8 @@ def _repair_pdf_tounicode_sync(
         used_codes = used_simple_codes.get(font_key or (-1, -1), set())
         existing_stream = _resolve_dictionary(font_dict.get("/ToUnicode"))
         existing_map, invalid_entries = _parse_tounicode_map_details(existing_stream)
-        if not used_codes:
-            return False, len(existing_map), 0, invalid_entries, 0, 0
+        if not used_codes and not invalid_entries:
+            return False, len(existing_map), 0, 0, 0, 0
 
         missing_used_codes = {
             code
@@ -332,21 +333,22 @@ def _repair_pdf_tounicode_sync(
 
         descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
         font_bytes = _font_stream_bytes(descriptor)
-        if _simple_font_auto_unicode_policy(font_dict, font_bytes=font_bytes) == "blocked":
-            return False, 0, 0, invalid_entries, 0, 0
-        generated = _simple_font_unicode_map(font_dict, font_bytes)
-        if not generated:
-            return False, 0, 0, invalid_entries, 0, 0
+        generated = (
+            _simple_font_unicode_map(font_dict, font_bytes)
+            if _simple_font_auto_unicode_policy(font_dict, font_bytes=font_bytes) != "blocked"
+            else {}
+        )
+        if not generated and not invalid_entries:
+            return False, 0, 0, 0, 0, 0
 
         target_map = {
             code: text for code, text in generated.items() if not used_codes or code in used_codes
         }
-        if _symbol_family(font_dict):
-            # Standard symbol correspondences only fill holes. In particular,
-            # preserve author mappings and entries for codes not used here.
+        if _symbol_family(font_dict) or font_dict.get("/Subtype") == pikepdf.Name("/Type3"):
+            # Preserve valid author semantics, including opaque Type3 glyph names.
             target_map = {**target_map, **existing_map}
-        if not target_map:
-            return False, 0, len(generated), invalid_entries, 0, 0
+        if not target_map and not invalid_entries:
+            return False, 0, len(generated), 0, 0, 0
 
         overwritten = sum(
             1
@@ -386,6 +388,7 @@ def _repair_pdf_tounicode_sync(
                 pikepdf.Name("/Type1"),
                 pikepdf.Name("/MMType1"),
                 pikepdf.Name("/TrueType"),
+                pikepdf.Name("/Type3"),
             ):
                 (
                     changed,

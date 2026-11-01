@@ -181,7 +181,7 @@ from app.pipeline.tagger_geometry import _resolve_dictionary as _resolve_diction
 from app.pipeline.tagger_geometry import _safe_float as _safe_float
 from app.pipeline.tagger_geometry import _table_cell_bbox as _table_cell_bbox
 from app.pipeline.tagger_geometry import _transform_point as _transform_point
-from app.pipeline.tagger_layout_tables import _layout_table_plan
+from app.pipeline.tagger_layout_tables import CONTENTS, _layout_table_plan
 from app.pipeline.tagger_link_labels import (
     _best_annotation_source_element as _best_annotation_source_element,
 )
@@ -405,6 +405,14 @@ def _should_artifact_nonsemantic_page_content(
         if ink_ratio is not None and ink_ratio <= BLANK_PAGE_MAX_INK_RATIO:
             return True
 
+    # A page can paint an opaque white background with arbitrary path
+    # operators. Exact zero ink is positive evidence even outside OCR's
+    # usual operator pattern; nonblank pages retain their Figure hold.
+    if ink_ratio is None and meaningful_ops:
+        ink_ratio = _render_page_ink_ratio(input_path, page_index + 1)
+        if ink_ratio == 0.0:
+            return True
+
     return (
         bool(meaningful_ops)
         and all(op in OCR_NOISE_ONLY_OPERATORS for op in meaningful_ops)
@@ -552,7 +560,20 @@ async def tag_pdf(
                         elem["_layout_table"] = (
                             None
                             if elem.get("_table_readability")
-                            else (_model_table_layout(elem) or _layout_table_plan(elem, page_elems))
+                            else (
+                                _model_table_layout(elem)
+                                or _layout_table_plan(
+                                    elem,
+                                    page_elems,
+                                    contents_context=any(
+                                        CONTENTS.fullmatch(
+                                            " ".join(str(e.get("text") or "").split())
+                                        )
+                                        for e in pages_elements.get(page_index - 1, [])
+                                        if e.get("type") in {"heading", "paragraph", "toc_caption"}
+                                    ),
+                                )
+                            )
                         )
                 _plan_external_table_headers(
                     page_elems, [g for op in eligible_ops for g in op.glyphs]
@@ -629,6 +650,7 @@ async def tag_pdf(
                     ),
                     frames[page_index],
                 )
+                _ensure_annotation_baseline(page)
                 page["/Tabs"] = pikepdf.Name("/S")
                 page_tagged_elements: list[dict] = []
                 first_page_kid = len(builder.doc_elem.get("/K") or [])
@@ -647,7 +669,7 @@ async def tag_pdf(
                         stream_starts.add(len(measured_ops))
                         measured_ops.extend(ops)
                     measured = dict(enumerate(measured_ops))
-                    recovered = _figure_text_elements(page_elems, measured, decorative_figures)
+                    recovered = _figure_text_elements(page_elems, measured, decorative_figures, set(alt_lookup))
                     _prepare_link_targets(page, builder, recovered)
                     page_elems.extend(recovered)
                     recovered_indices = set(range(len(page_elems) - len(recovered), len(page_elems)))

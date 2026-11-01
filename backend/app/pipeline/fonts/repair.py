@@ -4,6 +4,7 @@ from io import BytesIO
 from pathlib import Path
 
 from app.pipeline.fonts.names import FONT_SUBSET_RE
+from app.pipeline.fonts.notdef import repair_cid_notdef
 from app.pipeline.fonts.resources import (
     _has_embedded_font,
     _iter_pdf_fonts,
@@ -143,6 +144,7 @@ def _repair_pdf_font_dicts_sync(
         "cidset_removed": 0,
         "truetype_widths_aligned": 0,
         "truetype_width_conflicts": 0,
+        "notdef_mappings_repaired": 0,
     }
     seen_fonts: set[tuple[int, int]] = set()
 
@@ -199,7 +201,9 @@ def _repair_pdf_font_dicts_sync(
             if not isinstance(program, pikepdf.Stream):
                 return
             try:
-                aligned, count, conflicts = _align_truetype_advances(font_dict, program.read_bytes())
+                aligned, count, conflicts = _align_truetype_advances(
+                    font_dict, program.read_bytes()
+                )
             except Exception:
                 # One malformed/unsupported font must not prevent repairs of
                 # other fonts. Validation retains its unresolved failure.
@@ -220,7 +224,13 @@ def _repair_pdf_font_dicts_sync(
             if not isinstance(descendants, pikepdf.Array):
                 return
             for descendant in descendants:
-                _repair_cid_font_dict(_resolve_dictionary(descendant))
+                cid_font = _resolve_dictionary(descendant)
+                _repair_cid_font_dict(cid_font)
+                if isinstance(cid_font, pikepdf.Dictionary):
+                    count = repair_cid_notdef(pdf, font_dict, cid_font)
+                    stats["notdef_mappings_repaired"] += count
+                    if count:
+                        stats["fonts_touched"] += 1
         elif subtype == pikepdf.Name("/CIDFontType2"):
             _repair_cid_font_dict(font_dict)
 
@@ -229,7 +239,11 @@ def _repair_pdf_font_dicts_sync(
             for font_dict in _iter_pdf_fonts(pdf):
                 _process_font(font_dict)
 
-            if stats["fonts_touched"] <= 0:
+            from app.pipeline.fonts.notdef_content import repair_notdef_content
+
+            content_stats = repair_notdef_content(pdf)
+            stats.update(content_stats)
+            if stats["fonts_touched"] <= 0 and not any(content_stats.values()):
                 return False, "No eligible font dictionary or TrueType width repairs found", stats
 
             pdf.save(str(output_path))

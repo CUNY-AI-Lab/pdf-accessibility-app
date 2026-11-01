@@ -152,7 +152,7 @@ def _unicode_repair_gate_from_diagnostics(
                 profile["safe_type0_candidates"] = int(profile["safe_type0_candidates"]) + 1
             continue
 
-        if subtype not in ("/Type1", "/MMType1", "/TrueType"):
+        if subtype not in ("/Type1", "/MMType1", "/TrueType", "/Type3"):
             continue
 
         needs_repair = (
@@ -294,6 +294,7 @@ def _inspect_font_diagnostics(
                         pikepdf.Name("/Type1"),
                         pikepdf.Name("/MMType1"),
                         pikepdf.Name("/TrueType"),
+                        pikepdf.Name("/Type3"),
                     ):
                         continue
                     font_key = _obj_key(current_font)
@@ -330,7 +331,7 @@ def _inspect_font_diagnostics(
                 )
                 font_bytes = _font_stream_bytes(descriptor)
                 auto_unicode_policy = ""
-                if subtype in ("/Type1", "/MMType1", "/TrueType"):
+                if subtype in ("/Type1", "/MMType1", "/TrueType", "/Type3"):
                     auto_unicode_policy = _simple_font_auto_unicode_policy(
                         font_dict, font_bytes=font_bytes
                     )
@@ -375,7 +376,7 @@ def _inspect_font_diagnostics(
             existing_map, invalid_entries = _parse_tounicode_map_details(existing_stream)
             profile["invalid_tounicode_entries"] = invalid_entries
             profile["existing_tounicode_entries"] = len(existing_map)
-            if font_key and profile["subtype"] in ("/Type1", "/MMType1", "/TrueType"):
+            if font_key and profile["subtype"] in ("/Type1", "/MMType1", "/TrueType", "/Type3"):
                 simple_font_candidates[font_key] = {
                     "profile": profile,
                     "font_dict": font_dict,
@@ -538,7 +539,7 @@ def _inspect_font_diagnostics(
         summary["simple_fonts"] = sum(
             1
             for profile in profiles
-            if str(profile["subtype"]) in {"/Type1", "/MMType1", "/TrueType"}
+            if str(profile["subtype"]) in {"/Type1", "/MMType1", "/TrueType", "/Type3"}
         )
         summary["type0_fonts"] = sum(
             1 for profile in profiles if str(profile["subtype"]) == "/Type0"

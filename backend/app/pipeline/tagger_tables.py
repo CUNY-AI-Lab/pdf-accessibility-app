@@ -268,6 +268,31 @@ def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page
         def mark(cell, scope):
             cell.update(is_header=True, column_header=scope == "Column", row_header=scope == "Row")
 
+        # Room directories repeat name/location pairs horizontally. Each name
+        # labels its adjacent room code, rather than heading a data column.
+        ordered_rows = [sorted(cs, key=lambda c: c.get("col", 0)) for cs in rows.values()]
+        room_code = re.compile(r"[A-Z]{1,4}-\d+[A-Z]+\d+", re.I)
+        if (
+            len(ordered_rows) >= 3
+            and table["num_cols"] % 2 == 0
+            and all(
+                len(cs) == table["num_cols"]
+                and [c.get("col", 0) for c in cs] == list(range(table["num_cols"]))
+                and all(c.get("row_span", 1) == c.get("col_span", 1) == 1 for c in cs)
+                and all(
+                    any(ch.isalpha() for ch in text(cs[col]))
+                    and not room_code.fullmatch(text(cs[col]))
+                    and room_code.fullmatch(text(cs[col + 1]))
+                    for col in range(0, len(cs), 2)
+                )
+                for cs in ordered_rows
+            )
+        ):
+            for cs in ordered_rows:
+                for col in range(0, len(cs), 2):
+                    mark(cs[col], "Row")
+            continue
+
         # Definition pairs can have row headers, but their first entry is
         # not a column-heading row merely because it is bold or underlined.
         paired = [cs for cs in rows.values() if len(cs) == 2]

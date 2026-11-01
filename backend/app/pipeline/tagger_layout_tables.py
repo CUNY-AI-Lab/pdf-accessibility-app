@@ -13,7 +13,9 @@ LEADER = re.compile(r"(?:\.\s*){3,}\s*(?:\d+|[ivxlcdm]+)\s*$", re.I)
 CONTENTS = re.compile(r"^(?:table of contents|contents|list of (?:tables|figures)|inhalt|inhaltsverzeichnis|indhold)$", re.I)
 
 
-def _layout_table_plan(table: dict, page_elements: list[dict]) -> dict | None:
+def _layout_table_plan(
+    table: dict, page_elements: list[dict], *, contents_context: bool = False,
+) -> dict | None:
     """Return a structure-only plan; uncertain grids remain data tables.
 
     All boxes are already in PDF user space (bottom-up). Row order is the
@@ -25,7 +27,7 @@ def _layout_table_plan(table: dict, page_elements: list[dict]) -> dict | None:
     if any(c.get(f) for c in cells for f in ("is_header", "column_header", "row_header")):
         return None
     populated = [c for c in cells if str(c.get("text") or "").strip()]
-    if len(populated) < 3 or any(not c.get("bbox") for c in populated):
+    if len(populated) < 2 or any(not c.get("bbox") for c in populated):
         return None
     rows: dict[int, list[dict]] = defaultdict(list)
     for cell in populated:
@@ -60,6 +62,26 @@ def _layout_table_plan(table: dict, page_elements: list[dict]) -> dict | None:
         and b["l"] < box["r"] and b["r"] > box["l"]
         for e in page_elements
     )
+    # Some extractors collapse whole TOC columns into cells. Require the
+    # contents heading here or on the preceding page AND repeated numbered
+    # sections with printed destinations; a numeric data column is insufficient.
+    sections = []
+    for cell in populated:
+        value = text(cell)
+        starts = list(re.finditer(r"\b\d+\.\d+(?:\.\d+)*\s+(?=[A-Za-z])", value))
+        sections.extend(
+            value[m.end() : starts[i + 1].start() if i + 1 < len(starts) else len(value)]
+            for i, m in enumerate(starts)
+        )
+    if (
+        (nearby_contents or contents_context)
+        and len(sections) >= 6
+        and sum(bool(re.search(r"\b\d+\s*$", section)) for section in sections)
+        >= 0.8 * len(sections)
+    ):
+        groups = [[c] for c in sorted(populated, key=lambda c: (c["bbox"]["l"], -c["bbox"]["t"]))]
+        return plan("contents sections and printed destinations", [block("P", groups)], "column")
+
     destinations = [text(row[-1]) for row in ordered if len(row) == 2]
     numbers = [int(n) for value in destinations for n in value.split() if n.isdigit()]
     if (nearby_contents and len(destinations) >= 0.8 * len(ordered)

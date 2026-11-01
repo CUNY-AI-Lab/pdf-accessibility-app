@@ -2,6 +2,7 @@
 
 import re
 from collections.abc import Iterable
+from enum import StrEnum
 from io import BytesIO
 
 import pikepdf
@@ -31,6 +32,32 @@ HEX_STR_RE = re.compile(r"<([0-9A-Fa-f]+)>")
 
 
 MAX_TOUNICODE_BFRANGE_SPAN = 65536
+
+
+class ToUnicodeMode(StrEnum):
+    OUTSIDE = "outside"
+    BFCHAR = "bfchar"
+    BFRANGE = "bfrange"
+
+
+# CMaps are read tolerantly: a new begin replaces an unfinished block, any
+# end closes it, and EOF retains the entries already read. Writers of the
+# parser state still use only these named events.
+TOUNICODE_TRANSITIONS = {
+    mode: {
+        "beginbfchar": ToUnicodeMode.BFCHAR,
+        "beginbfrange": ToUnicodeMode.BFRANGE,
+        "end": ToUnicodeMode.OUTSIDE,
+    }
+    for mode in ToUnicodeMode
+}
+
+
+def _tounicode_transition(mode: ToUnicodeMode, event: str) -> ToUnicodeMode:
+    target = TOUNICODE_TRANSITIONS.get(mode, {}).get(event)
+    if target is None:
+        raise ValueError(f"Illegal ToUnicode parser transition: {mode!r} via {event!r}")
+    return target
 
 
 def _simple_font_auto_unicode_policy(font_dict, font_bytes: bytes | None = None) -> str:
@@ -182,7 +209,11 @@ def _simple_font_unicode_map(font_dict, font_bytes: bytes | None) -> dict[int, s
     import pikepdf
 
     if _symbol_family(font_dict):
-        return _symbol_font_unicode_map(font_dict, font_bytes)
+        return {
+            code: text
+            for code, text in _symbol_font_unicode_map(font_dict, font_bytes).items()
+            if _is_valid_unicode_text(text)
+        }
     mapping: dict[int, str] = {}
 
     subtype = font_dict.get("/Subtype")
@@ -190,6 +221,17 @@ def _simple_font_unicode_map(font_dict, font_bytes: bytes | None) -> dict[int, s
     if isinstance(encoding, pikepdf.Dictionary):
         mapping.update(_named_simple_encoding_map(encoding.get("/BaseEncoding")))
         mapping.update(_encoding_differences_map(encoding.get("/Differences")))
+        if subtype == pikepdf.Name("/Type3"):
+            # An opaque CharProc name replaces the base encoding too. It is
+            # not evidence for the Latin character at the same byte code.
+            code = 0
+            for item in encoding.get("/Differences") or ():
+                if isinstance(item, int):
+                    code = item
+                else:
+                    if _glyph_name_to_unicode(str(item).lstrip("/")) is None:
+                        mapping.pop(code, None)
+                    code += 1
     else:
         mapping.update(_named_simple_encoding_map(encoding))
 
@@ -222,7 +264,8 @@ def _raw_text_bytes(op: str, operands) -> bytes:
             try:
                 for item in arr:
                     try:
-                        parts.append(bytes(item))
+                        if isinstance(item, pikepdf.String):
+                            parts.append(bytes(item))
                     except Exception:
                         continue
             except Exception:
@@ -260,7 +303,8 @@ def _simple_font_zero_byte_repair_candidate(
 
 
 def _sanitize_text_showing_zero_bytes(
-    op: str, operands: Iterable[pikepdf.Object | int | float],
+    op: str,
+    operands: Iterable[pikepdf.Object | int | float],
 ) -> tuple[list[pikepdf.Object | int | float], int]:
     removed = 0
     new_operands = list(operands)
@@ -269,10 +313,9 @@ def _sanitize_text_showing_zero_bytes(
         value: pikepdf.Object | int | float,
     ) -> pikepdf.Object | int | float:
         nonlocal removed
-        try:
-            raw = bytes(value)
-        except Exception:
+        if not isinstance(value, pikepdf.String):
             return value
+        raw = bytes(value)
         removed_here = raw.count(0)
         if removed_here <= 0:
             return value
@@ -308,7 +351,11 @@ def _parse_tounicode_map(stream_obj) -> dict[int, str]:
     return mapping
 
 
-def _parse_tounicode_map_details(stream_obj) -> tuple[dict[int, str], int]:
+def _parse_tounicode_map_details(
+    stream_obj,
+    *,
+    invalid_codes: set[int] | None = None,
+) -> tuple[dict[int, str], int]:
     if stream_obj is None:
         return {}, 0
     try:
@@ -323,7 +370,7 @@ def _parse_tounicode_map_details(stream_obj) -> tuple[dict[int, str], int]:
 
     mapping: dict[int, str] = {}
     invalid_entries = 0
-    mode = ""
+    mode = ToUnicodeMode.OUTSIDE
 
     def _bounded_span(start: int, end: int) -> int | None:
         if end < start:
@@ -339,19 +386,19 @@ def _parse_tounicode_map_details(stream_obj) -> tuple[dict[int, str], int]:
             continue
         lower = line.lower()
         if lower.endswith("beginbfchar"):
-            mode = "bfchar"
+            mode = _tounicode_transition(mode, "beginbfchar")
             continue
         if lower.endswith("beginbfrange"):
-            mode = "bfrange"
+            mode = _tounicode_transition(mode, "beginbfrange")
             continue
         if lower.endswith("endbfchar") or lower.endswith("endbfrange"):
-            mode = ""
+            mode = _tounicode_transition(mode, "end")
             continue
-        if not mode:
+        if mode == ToUnicodeMode.OUTSIDE:
             continue
 
         hex_groups = HEX_STR_RE.findall(line)
-        if mode == "bfchar":
+        if mode == ToUnicodeMode.BFCHAR:
             if len(hex_groups) < 2:
                 continue
             try:
@@ -363,6 +410,8 @@ def _parse_tounicode_map_details(stream_obj) -> tuple[dict[int, str], int]:
                 mapping[code] = decoded
             else:
                 invalid_entries += 1
+                if invalid_codes is not None:
+                    invalid_codes.add(code)
             continue
 
         # bfrange
@@ -385,6 +434,8 @@ def _parse_tounicode_map_details(stream_obj) -> tuple[dict[int, str], int]:
                     mapping[start + offset] = decoded
                 else:
                     invalid_entries += 1
+                    if invalid_codes is not None:
+                        invalid_codes.add(start + offset)
             continue
 
         if len(hex_groups) < 3:
@@ -411,6 +462,8 @@ def _parse_tounicode_map_details(stream_obj) -> tuple[dict[int, str], int]:
             cp = seed_cp + offset
             if cp > 0x10FFFF or cp in (0x0000, 0xFFFE, 0xFEFF) or (0xD800 <= cp <= 0xDFFF):
                 invalid_entries += 1
+                if invalid_codes is not None:
+                    invalid_codes.add(start + offset)
                 continue
             mapping[start + offset] = chr(cp)
 
