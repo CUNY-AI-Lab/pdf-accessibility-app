@@ -95,3 +95,13 @@ Forms, appearances, tiling patterns, Type 3 glyphs and soft masks are walked
 with `Tr` tracked through q/Q; a font painted in any of them, or listed in the
 AcroForm `/DR`, is left alone. `repair_notdef_content` never removes codes
 shown in rendering mode 3: they are the document's recognized text.
+
+### Writing ToUnicode CMaps
+
+`encoding._render_tounicode_cmap()` writes runs of consecutive codes whose
+destinations are consecutive single BMP code points as `bfrange` entries, and
+everything else as `bfchar`, at most 100 entries per block. A range stays
+within one 256-code block on both sides: only the last source byte may vary
+(Adobe Technical Note #5014), and the last destination byte must not pass 255
+(ISO 32000-1, 9.10.3). `_parse_tounicode_map_details` reads the result back
+exactly.

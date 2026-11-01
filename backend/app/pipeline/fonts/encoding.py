@@ -493,12 +493,49 @@ def _render_tounicode_cmap(mapping: dict[int, str], code_bytes: int) -> bytes:
         "endcodespacerange",
     ]
 
-    for i in range(0, len(entries), 100):
-        chunk = entries[i : i + 100]
+    chars: list[tuple[int, str]] = []
+    ranges: list[tuple[int, int, str]] = []
+    index = 0
+    while index < len(entries):
+        code, value = entries[index]
+        last = index
+        if len(value) == 1 and ord(value) <= 0xFFFF:
+            while last + 1 < len(entries):
+                (code_a, value_a), (code_b, value_b) = entries[last], entries[last + 1]
+                if (
+                    code_b != code_a + 1
+                    or code_b >> 8 != code >> 8
+                    or len(value_b) != 1
+                    or ord(value_b) != ord(value_a) + 1
+                    or ord(value_b) >> 8 != ord(value) >> 8
+                ):
+                    break
+                last += 1
+        if last > index:
+            ranges.append((code, entries[last][0], value))
+        else:
+            chars.append((code, value))
+        index = last + 1
+
+    def _hex(value: str) -> str:
+        return value.encode("utf-16-be").hex().upper()
+
+    # A bfrange may vary only the last byte of its source codes (Adobe
+    # Technical Note #5014) and must not carry the last destination byte
+    # past 255 (ISO 32000-1, 9.10.3); the checks above keep both within one
+    # 256-code block. Supplementary-plane destinations, whose increment some
+    # readers apply to the UTF-16 pair differently, stay in bfchar.
+    for i in range(0, len(ranges), 100):
+        chunk = ranges[i : i + 100]
+        lines.append(f"{len(chunk)} beginbfrange")
+        for low, high, value in chunk:
+            lines.append(f"<{low:0{width}X}> <{high:0{width}X}> <{_hex(value)}>")
+        lines.append("endbfrange")
+    for i in range(0, len(chars), 100):
+        chunk = chars[i : i + 100]
         lines.append(f"{len(chunk)} beginbfchar")
         for code, value in chunk:
-            dest_hex = value.encode("utf-16-be").hex().upper()
-            lines.append(f"<{code:0{width}X}> <{dest_hex}>")
+            lines.append(f"<{code:0{width}X}> <{_hex(value)}>")
         lines.append("endbfchar")
 
     lines.extend(
