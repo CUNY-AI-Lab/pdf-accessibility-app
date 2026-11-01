@@ -10,6 +10,7 @@ import pikepdf
 from app.pipeline.tagger_geometry import _as_positive_int, _obj_key
 from app.pipeline.tagger_layout_tables import BULLET, MARKER
 from app.pipeline.tagger_link_labels import _infer_link_contents
+from app.pipeline.tagger_normalization import _normalize_heading_hierarchy
 from app.pipeline.tagger_tables import (
     _complete_table_grid_cells,
     _set_list_numbering_attr,
@@ -43,6 +44,7 @@ class StructTreeBuilder:
         self._object_parent_entries: list[tuple[pikepdf.Object, pikepdf.Object]] = []
         self._source_element_structs: dict[Any, pikepdf.Object] = {}
         self._headings: list[dict] = []
+        self._heading_entries: dict[tuple[int, int], dict] = {}
         self._struct_elems_created = 0
         # The chosen reading-order position (see _page_reading_order) of the
         # element whose content is being tagged, and that of each element
@@ -321,7 +323,9 @@ class StructTreeBuilder:
             lang=lang,
             stream_owner=stream_owner,
         )
-        self._headings.append({"level": level, "text": text, "page_index": page_index})
+        entry = {"level": level, "text": text, "page_index": page_index}
+        self._headings.append(entry)
+        self._heading_entries[self.doc_elem.K[-1].objgen] = entry
         return mcid
 
     def add_paragraph(
@@ -912,6 +916,31 @@ class StructTreeBuilder:
 
     def finalize(self):
         """Build the ParentTree NumberTree and set StructParents on content owners."""
+        # Layout headings with no owned content never reach the tree. Normalize
+        # the headings that actually survived, in final structure order, so a
+        # discarded heading cannot leave a gap. Keep bookmarks in that order too.
+        emitted = []
+
+        def headings(node):
+            if isinstance(node, pikepdf.Array):
+                for kid in node:
+                    headings(kid)
+            elif isinstance(node, pikepdf.Dictionary):
+                role = str(node.get("/S"))
+                if re.fullmatch(r"/H[1-6]", role):
+                    emitted.append({"type": "heading", "level": int(role[2:]), "node": node})
+                headings(node.get("/K"))
+
+        headings(self.doc_elem)
+        _normalize_heading_hierarchy(emitted)
+        self._headings = []
+        for heading in emitted:
+            node, level = heading["node"], heading["level"]
+            node["/S"] = pikepdf.Name(f"/H{level}")
+            entry = self._heading_entries.get(node.objgen)
+            if entry is not None:
+                entry["level"] = level
+                self._headings.append(entry)
         parent_tree_nums = pikepdf.Array([])
 
         owner_entries = sorted(

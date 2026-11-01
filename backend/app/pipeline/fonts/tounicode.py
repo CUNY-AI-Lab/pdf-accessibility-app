@@ -25,6 +25,7 @@ from app.pipeline.fonts.resources import (
     _obj_key,
     _resolve_dictionary,
 )
+from app.pipeline.fonts.symbols import _symbol_family
 from app.services.pdf_objects import pdf_named_resource
 
 
@@ -340,6 +341,10 @@ def _repair_pdf_tounicode_sync(
         target_map = {
             code: text for code, text in generated.items() if not used_codes or code in used_codes
         }
+        if _symbol_family(font_dict):
+            # Standard symbol correspondences only fill holes. In particular,
+            # preserve author mappings and entries for codes not used here.
+            target_map = {**target_map, **existing_map}
         if not target_map:
             return False, 0, len(generated), invalid_entries, 0, 0
 

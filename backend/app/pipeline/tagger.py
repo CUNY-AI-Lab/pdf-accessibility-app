@@ -592,7 +592,13 @@ async def tag_pdf(
                 first_page_kid = len(builder.doc_elem.get("/K") or [])
                 nonsemantic_page = page_index in nonsemantic_pages
                 has_words = any(op.glyphs for ops in page_glyphs.ops.values() for op in ops)
-                if not nonsemantic_page and (page_elems or has_words):
+                has_semantics = any(
+                    elem.get("type") in {"figure", "artifact"}
+                    or elem.get("text")
+                    or any(cell.get("text") for cell in elem.get("cells") or [])
+                    for elem in page_elems
+                )
+                if not nonsemantic_page and (has_semantics or has_words):
                     page_word_owners = page_owners[page_index]
                     def rewrite(owner, path=(), initial_ctm=IDENTITY, ancestors=frozenset()):
                         try:
@@ -675,6 +681,21 @@ async def tag_pdf(
                             decorative_figures=decorative_figures,
                             measured_ops=page_glyphs.ops.get(()),
                         )
+                    else:
+                        # A nonblank page with no extracted text/layout can be
+                        # outlined text. Preserve it as an undescribed Figure,
+                        # rather than falsely declaring meaningful ink an
+                        # Artifact. Validation keeps the description/OCR review
+                        # requirement visible while all its paint is marked.
+                        instructions = _strip_existing_markers(
+                            list(pikepdf.parse_content_stream(page)), page.get("/Resources")
+                        )
+                        if any(_instruction_paints_content(op) for op in instructions):
+                            mcid = builder.add_figure(page_index, page.obj, alt_text=None)
+                            page["/Contents"] = pdf.make_stream(pikepdf.unparse_content_stream([
+                                _make_bdc("Figure", mcid), *instructions, _make_emc(),
+                            ]))
+                            figures_tagged += 1
 
                 # Widgets participate in page order; links and other OBJRs
                 # are attached after ordering. Finalize before adding bookmarks.
