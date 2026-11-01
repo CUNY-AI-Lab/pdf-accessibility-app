@@ -19,8 +19,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 (
   cd "$repo_root/frontend"
-  bun run lint
-  bun run build
+  bun run check
 )
 
 # The v2 Worker: lint, types, its build (with the app at /pdf-accessibility/),

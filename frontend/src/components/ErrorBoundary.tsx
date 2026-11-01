@@ -1,3 +1,4 @@
+import { boundaryTransition, type BoundaryState } from "../state/errorBoundary";
 import { Component } from "react";
 import type { ErrorInfo, ReactNode } from "react";
 
@@ -5,18 +6,14 @@ interface Props {
   children: ReactNode;
 }
 
-interface State {
-  hasError: boolean;
-}
-
-class ErrorBoundary extends Component<Props, State> {
+class ErrorBoundary extends Component<Props, BoundaryState> {
   constructor(props: Props) {
     super(props);
-    this.state = { hasError: false };
+    this.state = { status: "ready" };
   }
 
-  static getDerivedStateFromError(): State {
-    return { hasError: true };
+  static getDerivedStateFromError(): BoundaryState {
+    return boundaryTransition({ status: "ready" }, "crash");
   }
 
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
@@ -24,7 +21,7 @@ class ErrorBoundary extends Component<Props, State> {
   }
 
   render() {
-    if (this.state.hasError) {
+    if (this.state.status === "crashed") {
       return (
         <div className="flex flex-col items-center justify-center min-h-screen bg-surface text-ink">
           <h1 className="text-2xl font-semibold mb-2">Something went wrong</h1>

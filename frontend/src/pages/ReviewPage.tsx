@@ -1,17 +1,18 @@
-import { useState } from "react";
+import { editorTransition, type EditorState } from "../state/editor";
+import { showToastGlobal } from "../hooks/useToast";
+import { useMachine } from "../hooks/useMachine";
+import { actionLeavesReview, reviewActionTransition, type ReviewAction, type ReviewOperation } from "../state/reviewAction";
+import { downloadCapabilities, jobRevision, outputReady, projectJobView } from "../state/jobView";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { apiUrl } from "../api/client";
 import {
-  useAppliedChanges,
   useEditAppliedChange,
-  useFigureChanges,
   useJob,
+  useReviewContext,
   useKeepAppliedChange,
   useResolveReviewTask,
   useReviseAppliedChange,
-  useReviewTasks,
   useUndoAppliedChange,
-  useValidation,
 } from "../api/jobs";
 import AppliedChangeCard from "../components/AppliedChangeCard";
 import DownloadButton from "../components/DownloadButton";
@@ -27,10 +28,6 @@ const FIDELITY_TASK_TYPES = new Set([
   "form_semantics",
   "font_text_fidelity",
 ]);
-
-function actionSubject(change: AppliedChange): string {
-  return change.change_type === "figure_semantics" ? "image description" : "change";
-}
 
 const CATEGORY_LABELS: Record<string, string> = {
   fonts: "Font issues",
@@ -95,46 +92,45 @@ function UnremediatedViolations({ violations }: { violations: ValidationViolatio
 
 export default function ReviewPage() {
   const { id } = useParams<{ id: string }>();
+  return <ReviewJob key={id} id={id!} />;
+}
+
+function ReviewJob({ id }: { id: string }) {
   const navigate = useNavigate();
   const {
     data: job,
     isLoading: jobLoading,
     error: jobError,
   } = useJob(id!);
-  const canInspectOutput = job?.status === "complete" || job?.status === "manual_remediation";
-  const {
-    data: reviewTasks,
-    isLoading: tasksLoading,
-    error: reviewTasksError,
-  } = useReviewTasks(id!, canInspectOutput);
-  const {
-    data: appliedChanges,
-    isLoading: appliedChangesLoading,
-    error: appliedChangesError,
-  } = useAppliedChanges(id!, canInspectOutput);
-  const {
-    data: figureChanges,
-    isLoading: figureChangesLoading,
-    error: figureChangesError,
-  } = useFigureChanges(id!, canInspectOutput);
-  const { data: validationReport } = useValidation(id!, canInspectOutput);
+  const canInspectOutput = outputReady(job);
+  const capabilities = downloadCapabilities(job);
+  const view = projectJobView(job, jobLoading, jobError);
+  const context = useReviewContext(job);
+  const reviewTasks = context.status === "ready" ? context.data.tasks : undefined;
+  const appliedChanges = context.status === "ready" ? context.data.changes : undefined;
+  const figureChanges = context.status === "ready" ? context.data.figures : undefined;
+  const validationReport = context.status === "ready" ? context.data.validation : undefined;
   const keepAppliedChange = useKeepAppliedChange(id!);
   const undoAppliedChange = useUndoAppliedChange(id!);
   const reviseAppliedChange = useReviseAppliedChange(id!);
   const editAppliedChange = useEditAppliedChange(id!);
   const resolveReviewTask = useResolveReviewTask(id!);
 
-  const [keepingChangeId, setKeepingChangeId] = useState<number | null>(null);
-  const [resolvingTaskId, setResolvingTaskId] = useState<number | null>(null);
-  const [undoingChangeId, setUndoingChangeId] = useState<number | null>(null);
-  const [revisingChangeId, setRevisingChangeId] = useState<number | null>(null);
-  const [editingChangeId, setEditingChangeId] = useState<number | null>(null);
-  const [changeActionErrorId, setChangeActionErrorId] = useState<number | null>(null);
-  const [changeActionError, setChangeActionError] = useState<Error | null>(null);
-
-  const isLoading = jobLoading || (canInspectOutput && (tasksLoading || appliedChangesLoading || figureChangesLoading));
+  const actions = useMachine<ReviewAction, Parameters<typeof reviewActionTransition>[1]>({ status: "idle" }, reviewActionTransition);
+  const editor = useMachine<EditorState, Parameters<typeof editorTransition>[1]>({ status: "viewing" }, editorTransition);
+  const draftOwner = editor.state.status === "viewing" ? null : editor.state.target;
+  const busy = actions.state.status === "pending";
+  const isLoading = view.status === "loading" || context.status === "loading";
   const isManualRemediation = job?.status === "manual_remediation";
-  const reviewContextError = reviewTasksError || appliedChangesError || figureChangesError;
+  const reviewContextError = context.status === "unavailable" ? context.error : null;
+  const busyId = (operation: ReviewOperation) => actions.state.status === "pending" && actions.state.operation === operation ? actions.state.target : null;
+  const keepingChangeId = busyId("keep");
+  const undoingChangeId = busyId("undo");
+  const revisingChangeId = busyId("revise");
+  const editingChangeId = busyId("edit");
+  const resolvingTaskId = busyId("resolve");
+  const changeActionErrorId = actions.state.status === "failed" && actions.state.operation !== "resolve" ? actions.state.target : null;
+  const changeActionError = actions.state.status === "failed" ? actions.state.error : null;
   const pendingAppliedChanges = appliedChanges?.filter((change) => change.review_status === "pending_review") ?? [];
   const pendingIds = new Set(pendingAppliedChanges.map((c) => c.id));
   const keptFigureChanges = figureChanges?.filter((c) => !pendingIds.has(c.id) && c.review_status === "kept") ?? [];
@@ -155,93 +151,36 @@ export default function ReviewPage() {
   ) ?? [];
   const hasReviewItems = pendingAppliedChanges.length > 0 || allOpenTasks.length > 0 || unremediatedViolations.length > 0;
 
-  const handleKeepAppliedChange = async (change: AppliedChange) => {
-    setChangeActionErrorId(null);
-    setChangeActionError(null);
-    setKeepingChangeId(change.id);
+  const runAction = async (
+    operation: ReviewOperation, target: number, permitted: boolean,
+    request: () => Promise<{ job_status: string }>,
+  ) => {
+    const requestId = crypto.randomUUID();
+    const draft = editor.read();
+    const owner = draft.status === "viewing" ? null : draft.target;
     try {
-      await keepAppliedChange.mutateAsync({ changeId: change.id });
+      actions.send({ type: "start", requestId, operation, target, revision: job ? jobRevision(job) : "", permitted: permitted && context.status === "ready" && (owner === null || (operation === "edit" && owner === target)) });
     } catch (error) {
-      setChangeActionErrorId(change.id);
-      setChangeActionError(
-        error instanceof Error ? error : new Error(`Failed to keep this ${actionSubject(change)}`),
-      );
-    } finally {
-      setKeepingChangeId(null);
+      if (operation === "edit") throw error;
+      showToastGlobal(error instanceof Error ? error.message : "Review action unavailable");
+      return;
     }
-  };
-
-  const handleUndoAppliedChange = async (change: AppliedChange) => {
-    setChangeActionErrorId(null);
-    setChangeActionError(null);
-    setUndoingChangeId(change.id);
+    let result: { job_status: string };
     try {
-      const result = await undoAppliedChange.mutateAsync({ changeId: change.id });
-      if (result.job_status === "processing" || result.job_status === "failed") {
-        navigate(`/jobs/${id}`);
-      }
+      result = await request();
     } catch (error) {
-      setChangeActionErrorId(change.id);
-      setChangeActionError(
-        error instanceof Error ? error : new Error(`Failed to undo this ${actionSubject(change)}`),
-      );
-    } finally {
-      setUndoingChangeId(null);
+      actions.send({ type: "failed", requestId, error: error instanceof Error ? error : new Error("Review action failed") });
+      if (operation === "edit") throw error;
+      return;
     }
+    const completed = actions.send({ type: "done", requestId });
+    if (completed.status === "done" && completed.requestId === requestId && actionLeavesReview(result.job_status)) navigate(`/jobs/${id}`);
   };
-
-  const handleReviseAppliedChange = async (change: AppliedChange, feedback?: string) => {
-    setChangeActionErrorId(null);
-    setChangeActionError(null);
-    setRevisingChangeId(change.id);
-    try {
-      await reviseAppliedChange.mutateAsync({ changeId: change.id, feedback });
-    } catch (error) {
-      setChangeActionErrorId(change.id);
-      setChangeActionError(
-        error instanceof Error
-          ? error
-          : new Error(
-              change.change_type === "figure_semantics"
-                ? "Failed to retry this image description"
-                : `Failed to revise this ${actionSubject(change)}`,
-            ),
-      );
-    } finally {
-      setRevisingChangeId(null);
-    }
-  };
-
-  const handleEditAppliedChange = async (change: AppliedChange, text: string) => {
-    setChangeActionErrorId(null);
-    setChangeActionError(null);
-    setEditingChangeId(change.id);
-    try {
-      const result = await editAppliedChange.mutateAsync({ changeId: change.id, text });
-      if (result.job_status === "processing" || result.job_status === "failed") {
-        navigate(`/jobs/${id}`);
-      }
-    } catch (error) {
-      setChangeActionErrorId(change.id);
-      setChangeActionError(
-        error instanceof Error ? error : new Error("Failed to save the edited description"),
-      );
-      throw error; // Re-throw so AppliedChangeCard keeps the edit form open
-    } finally {
-      setEditingChangeId(null);
-    }
-  };
-
-  const handleResolveTask = async (taskId: number) => {
-    setResolvingTaskId(taskId);
-    try {
-      await resolveReviewTask.mutateAsync({ taskId });
-    } catch {
-      // error handled by mutation state
-    } finally {
-      setResolvingTaskId(null);
-    }
-  };
+  const handleKeepAppliedChange = (change: AppliedChange) => runAction("keep", change.id, change.reviewable, () => keepAppliedChange.mutateAsync({ changeId: change.id }));
+  const handleUndoAppliedChange = (change: AppliedChange) => runAction("undo", change.id, change.reviewable, () => undoAppliedChange.mutateAsync({ changeId: change.id }));
+  const handleReviseAppliedChange = (change: AppliedChange, feedback?: string) => runAction("revise", change.id, change.reviewable, () => reviseAppliedChange.mutateAsync({ changeId: change.id, feedback }));
+  const handleEditAppliedChange = (change: AppliedChange, text: string) => runAction("edit", change.id, change.reviewable, () => editAppliedChange.mutateAsync({ changeId: change.id, text }));
+  const handleResolveTask = (taskId: number) => runAction("resolve", taskId, canInspectOutput, () => resolveReviewTask.mutateAsync({ taskId }));
 
   if (isLoading) {
     return (
@@ -256,7 +195,7 @@ export default function ReviewPage() {
     );
   }
 
-  if (jobError || !job) {
+  if (view.status === "unavailable" || !job) {
     return (
       <div className="text-center py-20">
         <h2 className="text-xl font-display text-ink mb-2">Review unavailable</h2>
@@ -311,6 +250,11 @@ export default function ReviewPage() {
         </div>
       </div>
 
+      {editor.state.status !== "viewing" && <div className="mb-4 rounded-lg border border-ink/10 p-3 text-sm">
+        A description draft is open. Finish or cancel it before another review action.
+        <button type="button" className="ml-3 text-accent" disabled={editor.state.status === "saving"} onClick={() => editor.send({ type: "cancel" })}>Cancel draft</button>
+      </div>}
+      {actions.state.status === "failed" && actions.state.operation === "resolve" && <p role="alert" className="mb-4 text-error">{actions.state.error.message}</p>}
       {reviewContextError && (
         <div className="mb-8 rounded-xl border border-warning/30 bg-warning-light/20 p-5">
           <p className="text-sm text-ink-muted">
@@ -339,7 +283,7 @@ export default function ReviewPage() {
               >
                 Download Accessible PDF
               </a>
-              {job?.has_html && <DownloadButton jobId={job.id} filename={job.original_filename} type="html" />}
+              {capabilities.html && <DownloadButton jobId={job.id} filename={job.original_filename} type="html" />}
               <a
                 href={apiUrl(`/jobs/${id}/download/report.html`)}
                 download={job ? `report_${job.original_filename.replace(/\.pdf$/i, "")}.html` : undefined}
@@ -357,6 +301,7 @@ export default function ReviewPage() {
               task={task}
               onResolve={handleResolveTask}
               resolving={resolvingTaskId === task.id}
+              disabled={busy || draftOwner !== null}
             />
           ))}
         </section>
@@ -380,7 +325,7 @@ export default function ReviewPage() {
             >
               Download Accessible PDF
             </a>
-            {job?.has_html && <DownloadButton jobId={job.id} filename={job.original_filename} type="html" />}
+            {capabilities.html && <DownloadButton jobId={job.id} filename={job.original_filename} type="html" />}
             <a
               href={apiUrl(`/jobs/${id}/download/report.html`)}
               download={job ? `report_${job.original_filename.replace(/\.pdf$/i, "")}.html` : undefined}
@@ -408,6 +353,9 @@ export default function ReviewPage() {
               key={change.id}
               jobId={id!}
               change={change}
+              revision={jobRevision(job)}
+              disabled={busy || (draftOwner !== null && draftOwner !== change.id)}
+              editor={editor}
               onKeep={handleKeepAppliedChange}
               onUndo={handleUndoAppliedChange}
               onRevise={handleReviseAppliedChange}
@@ -437,6 +385,9 @@ export default function ReviewPage() {
               key={change.id}
               jobId={id!}
               change={change}
+              revision={jobRevision(job)}
+              disabled={busy || (draftOwner !== null && draftOwner !== change.id)}
+              editor={editor}
               onKeep={handleKeepAppliedChange}
               onUndo={handleUndoAppliedChange}
               onRevise={handleReviseAppliedChange}
@@ -468,6 +419,7 @@ export default function ReviewPage() {
                   task={task}
                   onResolve={handleResolveTask}
                   resolving={resolvingTaskId === task.id}
+                  disabled={busy || draftOwner !== null}
                 />
               ) : (
                 <ReviewTaskCard key={task.id} jobId={id!} task={task} />
@@ -477,7 +429,7 @@ export default function ReviewPage() {
         </section>
       )}
 
-      {!hasReviewItems && !isManualRemediation && !reviewContextError && (
+      {!hasReviewItems && !isManualRemediation && context.status === "ready" && validationReport?.compliant === true && job.validation_compliant === true && (
         <div className="rounded-xl border border-success/25 bg-success-light/20 p-6">
           <h2 className="text-2xl text-ink tracking-tight mb-2">
             Nothing to review

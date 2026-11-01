@@ -1,3 +1,5 @@
+import { responseOutcome } from "../state/request";
+
 function normalizeBasePath(basePath: string): string {
   if (!basePath || basePath === "/") {
     return "";
@@ -93,7 +95,7 @@ async function isCsrfFailure(response: Response): Promise<boolean> {
   }
 }
 
-class ApiError extends Error {
+export class ApiError extends Error {
   status: number;
   detail: string;
 
@@ -121,21 +123,20 @@ export async function apiFetch<T>(
     }
   }
 
+  let detail = `Request failed with status ${response.status}`;
+  let launch: unknown;
   if (!response.ok) {
-    let detail = `Request failed with status ${response.status}`;
     try {
       const errorBody = await response.json();
       detail = errorBody.detail || errorBody.error?.message || detail;
-      // Doorway's sign-in has ended: its envelope names where to sign in again.
-      const launch = errorBody.error?.launch;
-      if (response.status === 401 && typeof launch === "string" && launch.startsWith("/launch/")) {
-        window.location.assign(launch);
-      }
+      launch = errorBody.error?.launch;
     } catch {
       // ignore parse errors
     }
-    throw new ApiError(response.status, detail);
   }
+  const outcome = responseOutcome(response.status, detail, launch);
+  if (outcome.status === "redirect") window.location.assign(outcome.launch);
+  if (outcome.status !== "success") throw new ApiError(response.status, detail);
 
   if (response.status === 204) {
     return undefined as T;

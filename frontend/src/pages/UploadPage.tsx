@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useMachine } from "../hooks/useMachine";
+import { emptyUpload, retryableUploads, runUploadBatch, uploadTransition } from "../state/upload";
 import { useNavigate } from "react-router-dom";
 import { useCreateJobs } from "../api/jobs";
 import { formatBytes } from "../utils/format";
@@ -18,33 +19,21 @@ const PIPELINE_STEPS = [
 export default function UploadPage() {
   const navigate = useNavigate();
   const createJobs = useCreateJobs();
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
-
+  const { state, send, read } = useMachine(emptyUpload, uploadTransition);
+  const busy = state.requestId !== null;
   const handleFiles = (files: File[]) => {
-    setSelectedFiles((prev) => {
-      const existingKeys = new Set(prev.map((f) => `${f.name}:${f.size}`));
-      const newFiles = files.filter((f) => !existingKeys.has(`${f.name}:${f.size}`));
-      return newFiles.length > 0 ? [...prev, ...newFiles] : prev;
-    });
+    if (read().requestId === null) send({ type: "add", files });
   };
-
   const handleUpload = async () => {
-    if (selectedFiles.length === 0) return;
-    try {
-      const result = await createJobs.mutateAsync(selectedFiles);
-      setSelectedFiles([]);
-      if (result.jobs.length === 1) {
-        navigate(`/jobs/${result.jobs[0].id}`);
-      } else {
-        navigate("/dashboard");
-      }
-    } catch {
-      // error handled by mutation state
+    if (read().requestId !== null || retryableUploads(read()).length === 0) return;
+    const result = await runUploadBatch(read, send, (file) => createJobs.mutateAsync(file), crypto.randomUUID());
+    if (result.items.every((item) => item.outcome.status === "accepted")) {
+      const jobs = result.items.flatMap((item) => item.outcome.status === "accepted" ? item.outcome.jobs : []);
+      navigate(jobs.length === 1 ? `/jobs/${jobs[0].id}` : "/dashboard");
     }
   };
-
-  const removeFile = (index: number) => {
-    setSelectedFiles((prev) => prev.filter((_, i) => i !== index));
+  const removeFile = (id: string) => {
+    if (read().requestId === null) send({ type: "remove", id });
   };
 
   return (
@@ -64,18 +53,18 @@ export default function UploadPage() {
       <div className="max-w-2xl mx-auto">
         <FileDropzone
           onFiles={handleFiles}
-          disabled={createJobs.isPending}
+          disabled={busy}
         />
 
         {/* Selected files list */}
-        {selectedFiles.length > 0 && (
+        {state.items.length > 0 && (
           <div className="mt-6 space-y-2 animate-slide-up">
             <h3 className="text-sm font-semibold text-ink-light mb-3">
-              Selected files ({selectedFiles.length})
+              Selected files ({state.items.length})
             </h3>
-            {selectedFiles.map((file, i) => (
+            {state.items.map(({ id, file, outcome }) => (
               <div
-                key={`${file.name}-${i}`}
+                key={id}
                 className="
                   flex items-center justify-between gap-3
                   px-4 py-3 rounded-xl bg-cream border border-ink/6
@@ -93,13 +82,15 @@ export default function UploadPage() {
                       {file.name}
                     </p>
                     <p className="text-xs text-ink-muted">
-                      {formatBytes(file.size)}
+                      {formatBytes(file.size)} · {outcome.status}
+                      {outcome.status === "failed" && <span role="alert">: {outcome.error}</span>}
                     </p>
                   </div>
                 </div>
                 <button
                   type="button"
-                  onClick={() => removeFile(i)}
+                  onClick={() => removeFile(id)}
+                  disabled={busy}
                   className="text-ink-muted hover:text-error transition-colors p-1"
                   aria-label={`Remove ${file.name}`}
                 >
@@ -113,7 +104,7 @@ export default function UploadPage() {
               <button
                 type="button"
                 onClick={handleUpload}
-                disabled={createJobs.isPending}
+                disabled={busy}
                 className="
                   w-full py-3.5 rounded-xl
                   bg-accent text-white font-semibold text-sm
@@ -124,7 +115,7 @@ export default function UploadPage() {
                   flex items-center justify-center gap-2
                 "
               >
-                {createJobs.isPending ? (
+                {busy ? (
                   <>
                     <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
@@ -140,11 +131,7 @@ export default function UploadPage() {
               </button>
             </div>
 
-            {createJobs.isError && (
-              <p className="text-sm text-error bg-error-light rounded-lg px-4 py-3 mt-2">
-                {createJobs.error?.message || "Upload failed. Please try again."}
-              </p>
-            )}
+
           </div>
         )}
       </div>

@@ -1,6 +1,9 @@
-import { useState } from "react";
+import { useMachine } from "../hooks/useMachine";
+import { disclosureTransition, type DisclosureState } from "../state/modes";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { useAppliedChanges, useDeleteJob, useJob, useReviewTasks, useValidation } from "../api/jobs";
+import { useJob, useReviewContext } from "../api/jobs";
+import { useDeleteConfirmation } from "../hooks/useDeleteConfirmation";
+import { downloadCapabilities, projectJobView } from "../state/jobView";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { ChevronLeftIcon, ChevronRightIcon } from "../components/Icons";
 import OutcomeHero from "../components/OutcomeHero";
@@ -13,43 +16,24 @@ import { asNumber } from "../utils/typeGuards";
 
 export default function JobDetailPage() {
   const { id } = useParams<{ id: string }>();
+  return <JobDetail key={id} id={id!} />;
+}
+
+function JobDetail({ id }: { id: string }) {
   const navigate = useNavigate();
   const { data: job, isLoading, error } = useJob(id!);
-  const deleteJob = useDeleteJob();
-  const [showConfirmDialog, setShowConfirmDialog] = useState(false);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
-  const canInspectOutput = job?.status === "complete" || job?.status === "manual_remediation";
-  const hasFinalOutput = job?.status === "complete" || job?.status === "manual_remediation";
-  const {
-    data: validationReport,
-    error: validationError,
-  } = useValidation(id!, hasFinalOutput);
-  const {
-    data: reviewTasks,
-    error: reviewTasksError,
-    isLoading: reviewTasksLoading,
-  } = useReviewTasks(id!, canInspectOutput);
-  const {
-    data: appliedChanges,
-    error: appliedChangesError,
-    isLoading: appliedChangesLoading,
-  } = useAppliedChanges(id!, canInspectOutput);
-  const openReviewTasks = reviewTasks?.filter((task) => task.status === "pending_review") ?? [];
-  const pendingAppliedChanges = appliedChanges?.filter((change) => change.review_status === "pending_review") ?? [];
-  const followUpCount = openReviewTasks.length;
-  const appliedChangeCount = pendingAppliedChanges.length;
-  const [showDetails, setShowDetails] = useState(false);
-  const reviewContextLoading =
-    canInspectOutput && (reviewTasksLoading || appliedChangesLoading);
-  const reviewContextError = reviewTasksError || appliedChangesError;
-  const reviewContextStatus =
-    !canInspectOutput
-      ? "ready"
-      : reviewContextLoading
-        ? "loading"
-        : reviewContextError
-          ? "unavailable"
-          : "ready";
+  const deletion = useDeleteConfirmation(id!, () => navigate("/dashboard"));
+  const view = projectJobView(job, isLoading, error);
+  const capabilities = downloadCapabilities(job);
+  const hasFinalOutput = capabilities.pdf;
+  const context = useReviewContext(job);
+  const validationReport = context.status === "ready" ? context.data.validation : undefined;
+  const validationError = context.status === "unavailable" ? context.error : null;
+  const followUpCount = context.status === "ready" ? context.data.tasks.filter((task) => task.status === "pending_review").length : 0;
+  const appliedChangeCount = context.status === "ready" ? context.data.changes.filter((change) => change.review_status === "pending_review").length : 0;
+  const { state: details, send: toggleDetails } = useMachine<DisclosureState, "toggle">("collapsed", disclosureTransition);
+  const showDetails = details === "expanded";
+  const reviewContextStatus = context.status;
   const fidelity =
     validationReport?.fidelity && typeof validationReport.fidelity === "object"
       ? (validationReport.fidelity as Record<string, unknown>)
@@ -65,7 +49,7 @@ export default function JobDetailPage() {
   const displaySteps = pipelineSteps(job?.steps);
   const taggingResult = displaySteps.find((s) => s.step_name === "tagging")?.result;
 
-  if (isLoading) {
+  if (view.status === "loading") {
     return (
       <div className="max-w-2xl mx-auto animate-pulse-soft">
         <div className="h-6 bg-paper-warm rounded w-48 mb-2" />
@@ -85,10 +69,10 @@ export default function JobDetailPage() {
     );
   }
 
-  if (error || !job) {
+  if (view.status === "unavailable" || !job) {
     return (
       <div className="text-center py-20">
-        <h2 className="text-xl font-display text-ink mb-2">Job not found</h2>
+        <h2 className="text-xl font-display text-ink mb-2">{view.status === "unavailable" && view.reason === "request" ? "Job temporarily unavailable" : "Job not found"}</h2>
         <p className="text-sm text-ink-muted mb-6">
           This job may have been deleted or doesn't exist.
         </p>
@@ -147,6 +131,8 @@ export default function JobDetailPage() {
         </div>
       )}
 
+      {view.status === "unknown" && <p role="status" className="mb-6 text-ink-muted">This job has an unrecognized status. Its status will be checked again.</p>}
+
       {/* Pipeline progress */}
       <div className="rounded-xl border border-ink/6 bg-cream p-6 mb-6">
         <h2 className="text-lg font-display text-ink mb-5">
@@ -161,8 +147,9 @@ export default function JobDetailPage() {
           <OutcomeHero
             jobId={job.id}
             filename={job.original_filename}
-            hasHtml={job.has_html === true}
-            status={job.status as "complete" | "manual_remediation" | "failed"}
+            hasHtml={capabilities.html}
+            validationCompliant={job.validation_compliant === true && validationReport?.compliant === true}
+            status={job.status === "complete" ? "complete" : "manual_remediation"}
             appliedChangeCount={appliedChangeCount}
             reviewTaskCount={followUpCount}
             blockingIssueCount={job.status === "manual_remediation" ? blockingIssueCount : null}
@@ -205,7 +192,7 @@ export default function JobDetailPage() {
             <div>
               <button
                 type="button"
-                onClick={() => setShowDetails((prev) => !prev)}
+                onClick={() => toggleDetails("toggle")}
                 className="
                   flex items-center gap-2 text-sm text-ink-muted
                   hover:text-ink transition-colors py-2
@@ -292,8 +279,7 @@ export default function JobDetailPage() {
           <button
             type="button"
             onClick={() => {
-              setDeleteError(null);
-              setShowConfirmDialog(true);
+              deletion.show();
             }}
             className="
               px-4 py-2 rounded-lg text-sm font-medium
@@ -304,31 +290,15 @@ export default function JobDetailPage() {
             Delete Job
           </button>
           <ConfirmDialog
-            open={showConfirmDialog}
+            open={deletion.open}
             title="Delete Job"
             message="Delete this failed job? This action cannot be undone."
             confirmLabel="Delete"
             cancelLabel="Cancel"
-            confirmPending={deleteJob.isPending}
-            errorMessage={deleteError}
-            onConfirm={() => {
-              setDeleteError(null);
-              deleteJob.mutate(job.id, {
-                onSuccess: () => {
-                  setShowConfirmDialog(false);
-                  navigate("/dashboard");
-                },
-                onError: (error) => {
-                  setDeleteError(
-                    error instanceof Error ? error.message : "Failed to delete this job. Please try again.",
-                  );
-                },
-              });
-            }}
-            onCancel={() => {
-              if (deleteJob.isPending) return;
-              setShowConfirmDialog(false);
-            }}
+            confirmPending={deletion.pending}
+            errorMessage={deletion.error}
+            onConfirm={deletion.confirm}
+            onCancel={deletion.cancel}
           />
         </div>
       )}
