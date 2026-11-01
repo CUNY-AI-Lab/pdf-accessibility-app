@@ -1137,18 +1137,14 @@ async def test_pretag_table_intelligence_applies_high_confidence_header_fix(monk
     )
 
     table = updated["elements"][0]
-    assert audit["applied"] is True
-    assert audit["applied_count"] == 1
+    assert audit["applied"] is False
+    assert audit["queued_count"] == 1
     assert audit["page_batch_count"] == 1
     assert audit["page_batch_resolved_count"] == 1
     assert audit["individual_fallback_count"] == 0
-    assert audit["set_headers_count"] == 1
-    assert table["table_llm_confirmed"] is True
-    assert table["table_llm_action"] == "set_table_headers"
-    assert table["cells"][0]["column_header"] is True
-    assert table["cells"][0]["row_header"] is True
-    assert table["cells"][1]["column_header"] is True
-    assert table["cells"][2]["row_header"] is True
+    assert table["table_llm_confirmed"] is False
+    assert table["table_llm_decisions"][0]["header_rows"] == [0]
+    assert not any(c.get("is_header") for c in table["cells"])
 
 
 @pytest.mark.asyncio
@@ -1488,10 +1484,12 @@ async def test_pretag_table_intelligence_retries_manual_only_aggressively(monkey
     assert calls == [False, True]
     assert audit["page_batch_count"] == 1
     assert audit["individual_fallback_count"] == 1
-    assert audit["applied"] is True
+    assert audit["applied"] is False
     assert audit["aggressive_retry_count"] == 1
-    assert table["table_llm_confirmed"] is True
-    assert table["table_llm_action"] == "set_table_headers"
+    assert "table_llm_decisions" not in table
+    assert table["cells"][0]["column_header"] is True
+    assert table["cells"][1]["column_header"] is True
+    assert table["cells"][2]["row_header"] is True
 
 
 @pytest.mark.asyncio

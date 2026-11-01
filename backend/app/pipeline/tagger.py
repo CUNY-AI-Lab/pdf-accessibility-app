@@ -275,6 +275,8 @@ from app.pipeline.tagger_semantics import _spoken_formula_exponent as _spoken_fo
 from app.pipeline.tagger_semantics import is_placeholder_alt_text as is_placeholder_alt_text
 from app.pipeline.tagger_structure import StructTreeBuilder as StructTreeBuilder
 from app.pipeline.tagger_structure import _source_key as _source_key
+from app.pipeline.tagger_table_intelligence import _apply_model_table_headers, _model_table_layout
+from app.pipeline.tagger_table_readability import _mark_unreadable_tables
 from app.pipeline.tagger_table_structure import (
     _finish_table_structure,
     _plan_external_table_headers,
@@ -312,6 +314,8 @@ class TaggingResult:
     # Zero-based page index and unclaimed word counts (including words
     # deliberately left hidden); exact Artifact owners are already claimed.
     unowned_words_by_page: list[dict[str, int]] = field(default_factory=list)
+    table_intelligence_audit: list[dict[str, Any]] = field(default_factory=list)
+    table_readability: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _render_page_ink_ratio(pdf_path: Path, page_number: int) -> float | None:
@@ -413,6 +417,7 @@ def _should_artifact_nonsemantic_page_content(
 # Main entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 async def tag_pdf(
     input_path: Path,
     output_path: Path,
@@ -512,6 +517,7 @@ async def tag_pdf(
                     pages_elements[pg] = []
                 pages_elements[pg].append(elem)
             _attach_glyph_text(pages_elements, pdfium_text)
+            table_readability = []
             reading_order_diagnostics = []
             unowned_words_by_page = []
             page_owners = {}
@@ -528,19 +534,33 @@ async def tag_pdf(
                 for ops in glyph_reader.page(page_index).ops.values():
                     stream_starts.add(len(eligible_ops))
                     eligible_ops.extend(ops)
+                glyphs = [g for op in eligible_ops for g in op.glyphs]
+                table_readability.extend(_mark_unreadable_tables(page_elems, glyphs))
                 for elem in page_elems:
                     if elem.get("type") == "table":
-                        elem["_layout_table"] = _layout_table_plan(elem, page_elems)
-                _plan_external_table_headers(page_elems, [g for op in eligible_ops for g in op.glyphs])
+                        elem["_layout_table"] = (
+                            None
+                            if elem.get("_table_readability")
+                            else (_model_table_layout(elem) or _layout_table_plan(elem, page_elems))
+                        )
+                _plan_external_table_headers(
+                    page_elems, [g for op in eligible_ops for g in op.glyphs]
+                )
                 _infer_table_headers(
-                    page_elems, [g for op in eligible_ops for g in op.glyphs], page,
+                    page_elems,
+                    [g for op in eligible_ops for g in op.glyphs],
+                    page,
                 )
                 diagnostic = {"page": page_index, "before": 0, "after": 0}
                 owners = _word_owners(
-                    dict(enumerate(eligible_ops)), _content_targets(page_elems),
-                    elements=None if nonsemantic else page_elems, frame=frames[page_index],
-                    scanned=_page_has_hidden_text(page), diagnostic=diagnostic,
-                    stream_starts=stream_starts, vertical_rules=_page_vertical_rules(page),
+                    dict(enumerate(eligible_ops)),
+                    _content_targets(page_elems),
+                    elements=None if nonsemantic else page_elems,
+                    frame=frames[page_index],
+                    scanned=_page_has_hidden_text(page),
+                    diagnostic=diagnostic,
+                    stream_starts=stream_starts,
+                    vertical_rules=_page_vertical_rules(page),
                 )
                 for index, elem in enumerate(page_elems):
                     if elem.get("fallback"):
@@ -551,14 +571,23 @@ async def tag_pdf(
                 before = list(page_elems)
                 page_elems.sort(key=lambda elem: elem["reading_order"])
                 _remap_word_owners(owners, before, page_elems)
-                reading_order_diagnostics.append(_page_reading_order(
-                    page, page_index, page_elems, glyph_reader.page(page_index).ops,
-                    frames[page_index], decorative_figures, word_owners=owners,
-                ))
+                reading_order_diagnostics.append(
+                    _page_reading_order(
+                        page,
+                        page_index,
+                        page_elems,
+                        glyph_reader.page(page_index).ops,
+                        frames[page_index],
+                        decorative_figures,
+                        word_owners=owners,
+                    )
+                )
                 page_owners[page_index] = owners
                 unowned_words_by_page.append(diagnostic)
             elements = [elem for pg in sorted(pages_elements) for elem in pages_elements[pg]]
-            _normalize_heading_hierarchy([elem for elem in elements if not elem.get("continuation")])
+            _normalize_heading_hierarchy(
+                [elem for elem in elements if not elem.get("continuation")]
+            )
 
             figures_tagged = 0
             headings_tagged = 0
@@ -624,7 +653,9 @@ async def tag_pdf(
                                 list(pikepdf.parse_content_stream(owner)), owner.get("/Resources")
                             )
                         except pikepdf.PdfError as exc:
-                            logger.warning("Could not parse content on page %s: %s", page_index, exc)
+                            logger.warning(
+                                "Could not parse content on page %s: %s", page_index, exc
+                            )
                             return set()
                         forms = _extract_form_invocations(owner, instructions)
                         passthrough = [
@@ -638,8 +669,13 @@ async def tag_pdf(
                             for form in forms
                         ]
                         matched = _rewrite_content_stream(
-                            pdf, owner, page_index, page_elems,
-                            builder, page.obj, alt_lookup,
+                            pdf,
+                            owner,
+                            page_index,
+                            page_elems,
+                            builder,
+                            page.obj,
+                            alt_lookup,
                             decorative_figures=decorative_figures,
                             initial_ctm=initial_ctm,
                             stream_owner=None if not path else owner,
@@ -651,12 +687,14 @@ async def tag_pdf(
                         for form in forms:
                             if form.stream.objgen in ancestors:
                                 continue
-                            matched.update(rewrite(
-                                form.stream,
-                                (*path, form.xobject_name.lstrip("/")),
-                                _mat_multiply(form.initial_ctm, initial_ctm),
-                                ancestors | {form.stream.objgen},
-                            ))
+                            matched.update(
+                                rewrite(
+                                    form.stream,
+                                    (*path, form.xobject_name.lstrip("/")),
+                                    _mat_multiply(form.initial_ctm, initial_ctm),
+                                    ancestors | {form.stream.objgen},
+                                )
+                            )
                         return matched
 
                     matched_page_indices = rewrite(page)
@@ -737,14 +775,18 @@ async def tag_pdf(
                 e.get("type") == "heading" and bool(e.get("_table_header_recovered"))
                 for e in elements
             )
+            table_intelligence_audit = _apply_model_table_headers(builder, pages_elements)
             builder.finalize()
 
             # 6. Add bookmarks from headings
             bookmarks_added = _add_bookmarks(
                 pdf,
                 builder.headings,
-                [elem for elem in elements
-                 if not elem.get("continuation") and not elem.get("_table_header_recovered")],
+                [
+                    elem
+                    for elem in elements
+                    if not elem.get("continuation") and not elem.get("_table_header_recovered")
+                ],
                 structure_json.get("bookmark_plan"),
                 structure_json.get("native_toc"),
                 structure_json.get("title"),
@@ -779,6 +821,8 @@ async def tag_pdf(
             title_set=title_set,
             reading_order_diagnostics=reading_order_diagnostics,
             unowned_words_by_page=unowned_words_by_page,
+            table_intelligence_audit=table_intelligence_audit,
+            table_readability=table_readability,
         )
 
     def _tag_with_forms():

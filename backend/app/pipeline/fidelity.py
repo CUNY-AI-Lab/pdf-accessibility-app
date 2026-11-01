@@ -2281,6 +2281,30 @@ def _check_table_coverage(inputs: _FidelityInputs, out: _FidelityCollector) -> N
         )
 
 
+def _check_table_readability(tagging_metrics: dict[str, Any], out: _FidelityCollector) -> None:
+    from app.pipeline.tagger_table_readability import TABLE_READABILITY_REASON
+
+    unreadable = tagging_metrics.get("table_readability") or []
+    for index, table in enumerate(unreadable):
+        out.add_task(
+            f"review:table_readability:{index}",
+            task_type="table_semantics",
+            title=TABLE_READABILITY_REASON,
+            detail=f"Page {table['page']}: {TABLE_READABILITY_REASON}. Adding headers cannot repair its cell text.",
+            severity="high",
+            blocking=True,
+            metadata={"check": "table_readability", **table, "pages_to_check": [table["page"]]},
+        )
+    out.checks.append(
+        {
+            "check": "table_readability",
+            "status": "fail" if unreadable else "pass",
+            "message": "Checked table glyph rotation and cell text order before semantic repairs.",
+            "metrics": {"unreadable_tables": unreadable},
+        }
+    )
+
+
 def _check_table_headers(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     try:
         missing = _output_tables_without_headers(inputs.output_pdf)
@@ -2944,6 +2968,7 @@ def assess_fidelity(
     _check_reading_order(inputs, out)
     _check_figure_coverage(inputs, out)
     _check_table_coverage(inputs, out)
+    _check_table_readability(tagging_metrics, out)
     _check_table_headers(inputs, out)
     _check_table_risk(inputs, out)
     _check_form_semantics(inputs, out)
