@@ -2,9 +2,9 @@
 
 The pipeline records absolute paths (input, figures, output) in the job's
 database. Each lease has an isolated data root. Archives retain the deployed
-runner's relative layout and canonical file references; unpacking rebases only
-file-reference columns to the receiving attempt. Job files are removed after
-owned work, including cancelled threads, has joined.
+runner's relative layout and canonical file references; unpacking rebases
+file-reference columns and revision snapshot paths to the receiving attempt.
+Job files are removed after owned work, including cancelled threads, has joined.
 
 A shared cache keeps generated figure descriptions keyed by hashes of the
 image and exact model request, model ID, and prompt version. It stores no
@@ -20,6 +20,7 @@ writes. It defaults to true. Disabling it leaves any existing file untouched.
 
 import fcntl
 import hashlib
+import json
 import shutil
 import sqlite3
 import tarfile
@@ -135,25 +136,80 @@ def attempt_settings(settings: Settings, lease: str) -> Settings:
     )
 
 
+_FILE_REFERENCE_COLUMNS = (
+    ("jobs", "input_path"),
+    ("jobs", "output_path"),
+    ("alt_texts", "image_path"),
+)
+_REVISION_SNAPSHOTS = ("before_json", "edits_json", "published_json")
+
+
+def _relocate_revision_snapshot(raw: str | None, job_id: str, root: Path) -> str | None:
+    """Rebase only file fields; each snapshot may come from an older attempt."""
+    if raw is None:
+        return raw
+    try:
+        state = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(state, dict) or not isinstance(state.get("jobs"), list):
+        return raw
+    saved_job = next(
+        (row for row in state["jobs"] if isinstance(row, dict) and row.get("id") == job_id), None
+    )
+    if saved_job is None or not isinstance(saved_job.get("input_path"), str):
+        return raw
+    old_root = str(Path(saved_job["input_path"]).parent.parent) + "/"
+    new_root = str(root) + "/"
+    changed = False
+    for table, column in _FILE_REFERENCE_COLUMNS:
+        records = state.get(table, [])
+        if not isinstance(records, list):
+            continue
+        for row in records:
+            identity = "id" if table == "jobs" else "job_id"
+            if not isinstance(row, dict) or row.get(identity) != job_id:
+                continue
+            value = row.get(column)
+            if isinstance(value, str) and value.startswith(old_root):
+                relocated = new_root + value[len(old_root) :]
+                if relocated != value:
+                    row[column] = relocated
+                    changed = True
+    return json.dumps(state) if changed else raw
+
+
 def relocate_database(path: Path, job_id: str, root: Path) -> None:
-    """Rebase the file-reference columns without changing document or review text."""
+    """Rebase live and revision file references, preserving text and digests."""
     with sqlite3.connect(path) as db:
         row = db.execute("SELECT input_path FROM jobs WHERE id = ?", (job_id,)).fetchone()
         if row is None:
             raise ValueError("Saved state has no job")
         old_root = str(Path(row[0]).parent.parent) + "/"
         new_root = str(root) + "/"
-        # Only file-reference columns are rebased. Document text and review JSON
-        # can contain literal paths and must remain byte-for-byte unchanged.
-        for table, column in (
-            ("jobs", "input_path"),
-            ("jobs", "output_path"),
-            ("alt_texts", "image_path"),
-        ):
+        # Only known file fields are rebased; literal paths in document text,
+        # commands, metadata and digest records must remain unchanged.
+        for table, column in _FILE_REFERENCE_COLUMNS:
             db.execute(
                 f'UPDATE "{table}" SET "{column}" = replace("{column}", ?, ?)',
                 (old_root, new_root),
             )
+        # Deployed/pre-journal archives do not have this optional table.
+        if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'review_revisions'"
+        ).fetchone():
+            revisions = db.execute(
+                "SELECT revision, before_json, edits_json, published_json FROM review_revisions WHERE job_id = ?",
+                (job_id,),
+            ).fetchall()
+            for revision, *snapshots in revisions:
+                for field, raw in zip(_REVISION_SNAPSHOTS, snapshots, strict=True):
+                    relocated = _relocate_revision_snapshot(raw, job_id, root)
+                    if relocated != raw:
+                        db.execute(
+                            f'UPDATE review_revisions SET "{field}" = ? WHERE job_id = ? AND revision = ?',
+                            (relocated, job_id, revision),
+                        )
 
 
 @contextmanager
