@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.models import Job
 from app.pipeline.structure import FigureInfo
 from app.services.alt_text_cache import AltTextCache, request_input_hash, usable_description
+from app.services.figure_decisions import normalize_figure_decision
 from app.services.intelligence_llm_utils import (
     context_json_part,
     page_preview_parts,
@@ -154,6 +155,7 @@ def _image_data_url(path: Path) -> str:
 
 
 def _normalize_figure_result(*, figure_index: int, raw: dict[str, Any]) -> dict[str, object]:
+    raw = normalize_figure_decision(raw)
     confidence = confidence_label(raw.get("confidence"))
     suggested_action = str(raw.get("suggested_action") or "manual_only").strip() or "manual_only"
     resolved_kind = str(raw.get("resolved_kind") or "").strip() or None
@@ -218,7 +220,9 @@ class _CachedFigureRequest:
 
     async def chat_completion(self, messages: list[dict], **kwargs) -> dict:
         self.request_count += 1
-        self.input_hash = request_input_hash({"messages": messages, **kwargs})
+        request = await self.client.prepare_request(messages, **kwargs)
+        request.pop("model")
+        self.input_hash = request_input_hash(request)
         description = self.cache.get(
             self.image_hash, self.model, self.prompt_version, self.input_hash,
         ) if self.input_hash else None
@@ -234,7 +238,7 @@ class _CachedFigureRequest:
             return {"choices": [{"message": {
                 "content": json.dumps({"decisions": [decision]}),
             }}]}
-        return await self.client.chat_completion(messages=messages, **kwargs)
+        return await self.client.chat_completion(**request)
 
     def store(self, decision: dict[str, object]) -> None:
         text = str(decision.get("alt_text") or "").strip()
@@ -319,6 +323,7 @@ def _finalize_figure_result(
     raw: dict[str, Any],
     figure_context: dict[str, Any] | None = None,
 ) -> dict[str, object]:
+    raw = normalize_figure_decision(raw)
     if _should_suppress_child_ui_alt(raw=raw, figure_context=figure_context):
         raw = {
             **raw,
@@ -341,7 +346,7 @@ def _requires_single_figure_followup(result: dict[str, object]) -> bool:
         return True
     if suggested_action == "manual_only":
         return True
-    if suggested_action == "set_alt_text" and not alt_text:
+    if suggested_action == "set_alt_text" and not usable_description(alt_text):
         return True
     return False
 
@@ -546,7 +551,13 @@ async def generate_figures_intelligence(
 
                 chunk_index_set = {figure.index for figure in chunk}
                 seen: set[int] = set()
-                for item in (parsed or {}).get("decisions") or []:
+                provisional: dict[int, dict[str, object]] = {}
+                items = (parsed or {}).get("decisions") or []
+                # Some providers return a single decision despite the array schema.
+                # Accept it only when it names a candidate in this request.
+                if not items and isinstance((parsed or {}).get("figure_index"), int):
+                    items = [parsed]
+                for item in items:
                     if not isinstance(item, dict):
                         continue
                     figure_index = item.get("figure_index")
@@ -558,6 +569,7 @@ async def generate_figures_intelligence(
                         raw=item,
                     )
                     if _requires_single_figure_followup(finalized):
+                        provisional[figure_index] = finalized
                         continue
                     if cached_request is not None and cached_request.cached:
                         finalized.update({
@@ -571,13 +583,33 @@ async def generate_figures_intelligence(
                 for figure in chunk:
                     if figure.index in seen:
                         continue
-                    page_results[figure.index] = await generate_figure_intelligence(
+                    followup = await generate_figure_intelligence(
                         figure=figure,
                         llm_client=llm_client,
                         job=job,
                         original_filename=original_filename,
                         figure_context=page_context.get(figure.index),
                     )
+                    previous = provisional.get(figure.index)
+                    if (
+                        previous is not None
+                        and usable_description(str(previous.get("alt_text") or ""))
+                        and followup.get("suggested_action") in {"set_alt_text", "manual_only"}
+                        and not usable_description(str(followup.get("alt_text") or ""))
+                    ):
+                        followup = previous
+                    if (
+                        previous is not None
+                        and usable_description(str(previous.get("alt_text") or ""))
+                        and followup.get("suggested_action") == "reclassify_region"
+                        and followup.get("resolved_kind") in {"table", "form_region"}
+                        and not usable_description(str(followup.get("alt_text") or ""))
+                    ):
+                        # Coverage is checked later. Keep the crop description in
+                        # case the proposed replacement carries no actual content.
+                        followup = {**followup, "alt_text": previous["alt_text"],
+                                    "description_source": "batch"}
+                    page_results[figure.index] = followup
             return page_results
 
     results: dict[int, dict[str, object]] = {}

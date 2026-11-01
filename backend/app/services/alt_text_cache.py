@@ -19,7 +19,11 @@ MAX_AGE_NS = 48 * 60 * 60 * 1_000_000_000
 
 def usable_description(text: str) -> bool:
     text = text.strip()
-    return bool(text) and not text.startswith("[") and text.lower() != "decorative"
+    return bool(text) and not text.startswith("[") and text.lower().rstrip(".") not in {
+        "decorative", "n/a", "none", "null", "unknown", "no description",
+        "no description available", "no alt text", "no alt text available",
+        "unable to describe", "could not determine figure semantics",
+    }
 
 
 def request_input_hash(payload: dict[str, Any]) -> str | None:

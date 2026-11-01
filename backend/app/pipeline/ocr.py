@@ -141,6 +141,7 @@ async def run_ocr(
         endpoint = current_model_endpoint(settings)
         env["CAIL_OCR_BASE_URL"] = endpoint.base_url
         env["CAIL_OCR_HEADERS"] = json.dumps(endpoint.headers)
+        env["CAIL_OCR_MAX_REQUEST_BYTES"] = str(settings.llm_max_request_bytes)
         env["CAIL_OCR_MODEL"] = settings.ocr_model
         env["CAIL_OCR_PAGE_SECONDS"] = str(settings.ocr_gateway_page_seconds)
         # Pages run in rounds of --jobs, each round within the page limit, so

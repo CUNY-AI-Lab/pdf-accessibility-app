@@ -2,8 +2,10 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DEFAULT_LLM_MAX_REQUEST_BYTES = 2 * 1024 * 1024
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent  # pdf-accessibility-app/
 PLACEHOLDER_LLM_KEYS = {
@@ -36,6 +38,8 @@ class Settings(BaseSettings):
     # sample of page images.
     llm_page_candidate_batch_size: int = 12
     llm_bookmark_preview_pages: int = 4
+    # Includes base64 images, all prompt text, history and the response schema.
+    llm_max_request_bytes: int = Field(default=DEFAULT_LLM_MAX_REQUEST_BYTES, ge=64 * 1024)
     llm_timeout: int = 120
     llm_pretag_timeout: int = 45
     llm_pretag_fallback_timeout: int = 15

@@ -24,6 +24,7 @@ environment:
     CAIL_OCR_API_KEY        Gateway credential
     CAIL_OCR_MODEL          vision model
     CAIL_OCR_PAGE_SECONDS   time for all of a page's Gateway calls
+    CAIL_OCR_MAX_REQUEST_BYTES   maximum encoded JSON request bytes
 """
 
 from __future__ import annotations
@@ -45,6 +46,9 @@ from ocrmypdf.builtin_plugins.tesseract_ocr import TesseractOcrEngine
 from ocrmypdf.hocrtransform import BoundingBox, HocrParser, OcrClass, OcrElement
 from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
 from PIL import Image
+
+from app.config import DEFAULT_LLM_MAX_REQUEST_BYTES
+from app.services.vision_requests import bound_vision_request
 
 if TYPE_CHECKING:
     from ocrmypdf._options import OcrOptions
@@ -109,6 +113,9 @@ def _complete(base_url: str, headers: dict[str, str], body: dict, deadline: floa
     global _credential_refused
     if _credential_refused:
         raise GatewayOcrError("the Gateway refused this job's credential")
+    body = bound_vision_request(
+        body, int(os.environ.get("CAIL_OCR_MAX_REQUEST_BYTES", DEFAULT_LLM_MAX_REQUEST_BYTES)),
+    )
     retry_delays = iter(RETRY_DELAYS_SECONDS)
     while True:
         remaining = deadline - time.monotonic()

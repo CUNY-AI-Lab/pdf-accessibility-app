@@ -31,6 +31,13 @@ class FakeLlmClient:
         self.fail = fail
         self.text = text
 
+    async def prepare_request(self, messages, **kwargs):
+        from app.config import DEFAULT_LLM_MAX_REQUEST_BYTES
+        from app.services.vision_requests import bound_vision_request
+
+        return bound_vision_request({"model": self.model, "messages": messages, **kwargs},
+                                    DEFAULT_LLM_MAX_REQUEST_BYTES)
+
     async def chat_completion(self, messages, **kwargs):
         self.calls.append(messages)
         if self.fail:
@@ -47,6 +54,14 @@ class FakeLlmClient:
             for candidate in context["candidates"]
         ]
         return {"choices": [{"message": {"content": json.dumps({"decisions": decisions})}}]}
+
+
+@pytest.fixture(autouse=True)
+def isolated_model_capabilities(monkeypatch):
+    # Each fake provider starts with its own capability negotiation.
+    from app.services import intelligence_llm_utils
+
+    monkeypatch.setattr(intelligence_llm_utils, "JSON_SCHEMA_REFUSED_MODELS", set())
 
 
 @pytest.fixture
