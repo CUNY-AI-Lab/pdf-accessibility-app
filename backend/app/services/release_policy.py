@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
+from app.services.candidate_state import set_check_verdict
 from app.services.review_surface import is_user_visible_review_task_type
 
 FIDELITY_HOLD_CHECKS = {
@@ -43,6 +46,22 @@ def release_hold_reasons(*, compliant: bool, checks: list[dict[str, Any]]) -> li
     return reasons
 
 
+class ReleaseStatus(StrEnum):
+    RELEASE = "release"
+    HOLD = "hold"
+
+
+@dataclass(frozen=True)
+class ReleaseDecision:
+    status: ReleaseStatus
+    reasons: tuple[str, ...]
+
+
+def release_decision(*, compliant: bool, checks: list[dict[str, Any]]) -> ReleaseDecision:
+    reasons = tuple(release_hold_reasons(compliant=compliant, checks=checks))
+    return ReleaseDecision(ReleaseStatus.HOLD if reasons else ReleaseStatus.RELEASE, reasons)
+
+
 def apply_release_policy(
     fidelity_report: dict[str, Any],
     review_tasks: list[dict[str, Any]],
@@ -55,10 +74,11 @@ def apply_release_policy(
     flag, severity or type is not evidence of a release failure.
     """
     checks = fidelity_report.get("checks", [])
-    reasons = release_hold_reasons(compliant=compliant, checks=checks)
+    decision = release_decision(compliant=compliant, checks=checks)
+    reasons = decision.reasons
     for check in checks:
         if check.get("status") == "fail" and check.get("check") not in reasons:
-            check["status"] = "warning"
+            set_check_verdict(check, "warning")
 
     descriptions = {
         **FIDELITY_HOLD_CHECKS,
@@ -108,7 +128,7 @@ def apply_release_policy(
         })
 
     blocking = sum(bool(task.get("blocking")) for task in review_tasks)
-    fidelity_report["passed"] = not reasons
+    fidelity_report["passed"] = decision.status == ReleaseStatus.RELEASE
     fidelity_report["summary"] = {
         "blocking_tasks": blocking,
         "advisory_tasks": len(review_tasks) - blocking,

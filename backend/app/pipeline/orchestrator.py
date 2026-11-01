@@ -14,11 +14,11 @@ from pathlib import Path
 from typing import Any
 
 import pikepdf
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.models import AltTextEntry, AppliedChange, Job, JobStep, ReviewTask
+from app.models import AltTextEntry, Job, JobStep
 from app.pipeline.alt_text import (
     AltTextResult,
     describe_unresolved_figures,
@@ -169,6 +169,14 @@ from app.services.alt_text_cache import usable_description
 from app.services.applied_changes import add_applied_change
 from app.services.auto_structure_apply import auto_apply_structure_tasks
 from app.services.bookmark_intelligence import enhance_bookmark_structure_with_intelligence
+from app.services.candidate_state import (
+    AdjudicationState,
+    CandidateDecision,
+    CandidatePhase,
+    advance_candidate,
+    candidate_decision,
+    candidate_phase,
+)
 from app.services.docling_escalation import (
     docling_pretag_ambiguity_router,
     docling_structure_escalation_plan,
@@ -176,6 +184,7 @@ from app.services.docling_escalation import (
 from app.services.early_pages_intelligence import (
     enhance_document_title_and_front_matter_with_intelligence,
 )
+from app.services.figure_state import resolve_figure_for_storage, set_figure_status
 from app.services.file_storage import create_job_dir, get_output_path
 from app.services.font_intelligence_auto import (
     attempt_auto_llm_font_map as _attempt_auto_llm_font_map,
@@ -221,6 +230,7 @@ from app.services.intelligence_widgets import (
 )
 from app.services.job_manager import JobManager
 from app.services.job_state import clear_terminal_artifacts
+from app.services.job_transitions import set_job_status, set_step_status
 from app.services.llm_client import (
     job_model_access,
     make_llm_client,
@@ -229,6 +239,7 @@ from app.services.llm_client import (
 )
 from app.services.page_intelligence import collect_grounded_text_candidates
 from app.services.release_policy import apply_release_policy
+from app.services.review_revisions import preserve_output, reconcile_review_tasks
 from app.services.review_surface import (
     filter_user_visible_review_tasks,
     is_user_visible_applied_change_type,
@@ -937,7 +948,7 @@ def _apply_figure_reclassification(
                         and bool(element.get("synthetic_figure"))
                     ):
                         artifact_pages.add(page + 1)
-                    result.status = "rejected"
+                    set_figure_status(result, "rejected", persistent=False)
                     result.generated_text = ""
                     result.suggested_action = "mark_decorative"
                     result.reviewable = True
@@ -946,9 +957,9 @@ def _apply_figure_reclassification(
                     continue
                 cover = _reclassified_figure_cover(element, resolved_kind, elements, working_pdf)
                 if cover is None:
-                    result.status = "pending_review"
+                    set_figure_status(result, "pending_review", persistent=False)
                     if usable_description(result.generated_text):
-                        result.status = "approved"
+                        set_figure_status(result, "approved", persistent=False)
                         result.suggested_action = "set_alt_text"
                     else:
                         result.generated_text = ""
@@ -1871,15 +1882,7 @@ async def _update_step(
         db.add(step)
         await db.flush()
 
-    step.status = status
-    if status == "running":
-        step.started_at = datetime.now(UTC)
-    if status in ("complete", "failed", "skipped"):
-        step.completed_at = datetime.now(UTC)
-    if result:
-        step.result_json = json.dumps(result)
-    if error:
-        step.error = error
+    set_step_status(step, status, result=result, error=error)
 
     await db.commit()
 
@@ -1912,7 +1915,7 @@ async def _run_pipeline(
         current_step = None
 
         try:
-            job.status = "processing"
+            set_job_status(job, "processing")
             await db.commit()
 
             # ── Step 1: Classify ──
@@ -2407,7 +2410,9 @@ async def _run_pipeline(
                     fig = figures_by_index.get(alt.figure_index)
                     if fig is None:
                         continue
-                    if alt.status == "reclassified":
+                    if not resolve_figure_for_storage(
+                        alt, figure_reclassification.get("removed_indexes", []),
+                    ):
                         reclassified_count += 1
                         continue
                     status, generated_text = _alt_text_entry_state(
@@ -2516,8 +2521,9 @@ async def _run_pipeline(
                 )
             job = await db.get(Job, job_id)
             if job:
-                job.status = "failed"
+                set_job_status(job, "failed")
                 job.error = user_error or f"Pipeline failed at step: {current_step}"
+                clear_terminal_artifacts(job)
                 await db.commit()
             job_manager.emit_progress(
                 job_id,
@@ -2566,6 +2572,7 @@ class Candidate:
     review_tasks: list[dict[str, object]] = dataclass_field(default_factory=list)
     applied_change_specs: list[dict[str, object]] = dataclass_field(default_factory=list)
     grounded_text_adjudication: dict[str, object] | None = None
+    phase: CandidatePhase = CandidatePhase.VALIDATED
 
 
 def _candidate_job(job: Job, candidate: Candidate) -> Job:
@@ -2582,6 +2589,7 @@ async def _assess_candidate_fidelity(
     settings: Settings,
     adjudicate: bool = True,
 ) -> None:
+    advance_candidate(candidate, CandidatePhase.ASSESSING)
     candidate.fidelity_report, candidate.review_tasks = await to_thread(
         assess_fidelity,
         input_pdf=Path(job.input_path),
@@ -2594,6 +2602,7 @@ async def _assess_candidate_fidelity(
         tagging_metrics=candidate.validation_report["tagging"],
         classification=job.classification,
     )
+    candidate.fidelity_report["adjudication_state"] = AdjudicationState.NOT_REQUESTED
     if adjudicate:
         (
             candidate.review_tasks,
@@ -2608,6 +2617,8 @@ async def _assess_candidate_fidelity(
     apply_release_policy(
         candidate.fidelity_report, candidate.review_tasks, compliant=candidate.validation.compliant
     )
+
+    advance_candidate(candidate, CandidatePhase.ASSESSED)
 
 
 async def evaluate_candidate(
@@ -2646,6 +2657,7 @@ async def evaluate_candidate(
             original_filename=job.original_filename or "",
         )
         output_path = Path(tagging_result.output_path)
+    phase = candidate_phase(CandidatePhase.INPUTS, CandidatePhase.TAGGED)
     if on_tagged is not None:
         await on_tagged(tagging_result)
     if validation is None:
@@ -2677,7 +2689,9 @@ async def evaluate_candidate(
     # A patch may preserve all tag counts while producing a different PDF.
     tagging_result = copy.copy(tagging_result)
     tagging_result.output_path = Path(output_path)
+    phase = candidate_phase(phase, CandidatePhase.VALIDATED)
     candidate = Candidate(
+        phase=phase,
         output_path=Path(output_path),
         validation=validation,
         validation_report=_build_validation_payload(
@@ -2816,17 +2830,16 @@ def _candidate_is_acceptable(
     grounded_text: bool = False,
 ) -> bool:
     """Adopt only compliant, non-regressing candidates under the existing policy."""
-    if not candidate.validation.compliant:
-        return False
-    if not _fidelity_not_worse(candidate.fidelity_report, current.fidelity_report):
-        return False
+    improvement = True
     if grounded_text:
-        return _grounded_text_retry_improved(current.review_tasks, candidate.review_tasks)
-    if require_improvement:
-        return _blocking_task_count(candidate.review_tasks) < _blocking_task_count(
-            current.review_tasks
-        )
-    return True
+        improvement = _grounded_text_retry_improved(current.review_tasks, candidate.review_tasks)
+    elif require_improvement:
+        improvement = _blocking_task_count(candidate.review_tasks) < _blocking_task_count(current.review_tasks)
+    return candidate_decision(
+        compliant=candidate.validation.compliant,
+        nonregressing=_fidelity_not_worse(candidate.fidelity_report, current.fidelity_report),
+        improvement=improvement,
+    ) == CandidateDecision.ACCEPTED
 
 
 async def _retry_grounded_candidate(
@@ -3341,8 +3354,9 @@ async def _store_candidate_result(
     review_task_metadata_overrides: dict[tuple[str, str], dict[str, object]],
 ) -> None:
     """Persist only the selected PDF and the changes carried by that candidate."""
+    advance_candidate(candidate, CandidatePhase.PUBLISHED)
     job_id = job.id
-    job.output_path = str(candidate.output_path)
+    job.output_path = preserve_output(candidate.output_path)
     job.structure_json = json.dumps(candidate.structure_json)
     validation_payload = candidate.validation_report
     fidelity_report = candidate.fidelity_report
@@ -3370,13 +3384,7 @@ async def _store_candidate_result(
     job.validation_json = json.dumps(validation_payload)
     job.fidelity_json = json.dumps(fidelity_report)
 
-    await db.execute(delete(ReviewTask).where(ReviewTask.job_id == job_id))
-    await db.execute(
-        delete(AppliedChange).where(
-            AppliedChange.job_id == job_id,
-            AppliedChange.review_status == "pending_review",
-        )
-    )
+    await reconcile_review_tasks(db, job_id, user_visible_review_tasks)
     alt_entry_by_index = {entry.figure_index: entry for entry in alt_entries}
     for change_spec in candidate.applied_change_specs:
         task_type = str(change_spec.get("task_type") or "review_change")
@@ -3429,24 +3437,6 @@ async def _store_candidate_result(
             after=after,
             undo_payload=undo_payload,
         )
-    for task in user_visible_review_tasks:
-        metadata = task.get("metadata", {})
-        if not isinstance(metadata, dict):
-            metadata = {}
-        db.add(
-            ReviewTask(
-                job_id=job_id,
-                task_type=str(task.get("task_type") or "review_task"),
-                title=str(task.get("title") or "Follow-up review required"),
-                detail=str(task.get("detail") or ""),
-                severity=str(task.get("severity") or "medium"),
-                blocking=bool(task.get("blocking", True)),
-                status=str(task.get("status") or "pending_review"),
-                source=str(task.get("source") or "fidelity"),
-                metadata_json=json.dumps(metadata),
-            )
-        )
-
     blocking_task_count = _blocking_task_count(review_tasks)
     await _update_step(
         db,
@@ -3478,7 +3468,7 @@ async def _store_candidate_result(
         if candidate.validation.compliant and bool(fidelity_report.get("passed", False))
         else "manual_remediation"
     )
-    job.status = final_status
+    set_job_status(job, final_status)
     await db.commit()
     job_manager.emit_progress(job_id, step="review", status=final_status)
     logger.info(f"Pipeline complete for job {job_id} with status={final_status}")
@@ -3511,7 +3501,7 @@ async def _run_tagging_and_validation(
 
     current_step = "validation"
     try:
-        job.status = "processing"
+        set_job_status(job, "processing")
         await db.commit()
 
         baseline_validation = await validate_pdf(
@@ -3638,7 +3628,7 @@ async def _run_tagging_and_validation(
         )
         job = await db.get(Job, job_id)
         if job:
-            job.status = "failed"
+            set_job_status(job, "failed")
             job.error = user_error or "Tagging/validation failed"
             clear_terminal_artifacts(job)
             await db.commit()

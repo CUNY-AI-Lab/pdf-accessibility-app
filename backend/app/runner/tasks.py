@@ -20,7 +20,7 @@ from typing import Any
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import update
+from sqlalchemy import select
 
 from app.api.jobs import PIPELINE_STEPS
 from app.api.review import apply_review_action
@@ -40,6 +40,16 @@ from app.runner.views import OUTPUT_READY_STATUSES, RenderedViews, render_views
 from app.services.job_state import clear_terminal_artifacts, reset_rerun_steps
 from app.services.llm_client import job_model_access
 from app.services.pdf_preflight import PdfUploadPreflightError, preflight_pdf_upload
+from app.services.review_revisions import (
+    RevisionPhase,
+    advance_revision,
+    fail_review,
+    finish_review,
+    prepare_review,
+    snapshot,
+    start_review,
+)
+from app.services.review_state import transition_review
 from app.services.thread_work import owned_thread_work, to_thread
 
 logger = logging.getLogger(__name__)
@@ -256,11 +266,13 @@ async def _revisit(
     engine, session_maker = await open_job_database(settings, task.job_id)
     try:
         async with session_maker() as db:
-            await apply_overrides(db, task.job_id, task.overrides)
             job = await db.get(Job, task.job_id)
             if task.kind == "review":
+                await apply_overrides(db, task.job_id, task.overrides)
                 action = task.action or {}
+                revision = None
                 try:
+                    revision = await prepare_review(db, job, action)
                     await apply_review_action(
                         job=job,
                         db=db,
@@ -272,14 +284,28 @@ async def _revisit(
                 except HTTPException as exc:
                     await db.rollback()
                     return Outcome(review_refused=str(exc.detail))
-                job.status = "processing"
+                await start_review(db, job, revision)
+                revision_number = revision.revision
                 job.error = None
                 clear_terminal_artifacts(job)
                 await reset_rerun_steps(db, task.job_id)
                 await db.commit()
-                await run_tagging_and_validation(task.job_id, db, settings, sink)
+                try:
+                    await run_tagging_and_validation(task.job_id, db, settings, sink)
+                    await finish_review(db, job, revision)
+                except Exception as exc:
+                    await fail_review(db, task.job_id, revision_number, str(exc))
             else:
-                await db.commit()
+                revision = await prepare_review(db, job, {
+                    "type": "sync", "overrides": task.overrides,
+                    "overrides_version": task.overrides_version,
+                }, replay=True)
+                if revision.phase != RevisionPhase.PUBLISHED:
+                    await apply_overrides(db, task.job_id, task.overrides)
+                    revision.edits_json = await snapshot(db, task.job_id)
+                    advance_revision(revision, RevisionPhase.RUNNING)
+                    await db.commit()
+                    await finish_review(db, job, revision)
         async with session_maker() as db:
             return Outcome(views=await render_views(db, task.job_id))
     finally:
@@ -288,20 +314,11 @@ async def _revisit(
 
 async def apply_overrides(db, job_id: str, overrides: dict[str, dict[str, str]]) -> None:
     """Record the review statuses a person set in the Worker since the last task."""
-    for change_id, status in (overrides.get("changes") or {}).items():
-        if status in {"kept", "undone", "pending_review"}:
-            await db.execute(
-                update(AppliedChange)
-                .where(AppliedChange.job_id == job_id, AppliedChange.id == int(change_id))
-                .values(review_status=status)
-            )
-    for task_id, status in (overrides.get("tasks") or {}).items():
-        if status in {"resolved", "pending_review"}:
-            await db.execute(
-                update(ReviewTask)
-                .where(ReviewTask.job_id == job_id, ReviewTask.id == int(task_id))
-                .values(status=status)
-            )
+    for model, key in ((AppliedChange, "changes"), (ReviewTask, "tasks")):
+        for row_id, status in (overrides.get(key) or {}).items():
+            row = await db.scalar(select(model).where(model.job_id == job_id, model.id == int(row_id)))
+            if row is not None:
+                await transition_review(db, row, status, replay=True)
 
 
 async def _finish(

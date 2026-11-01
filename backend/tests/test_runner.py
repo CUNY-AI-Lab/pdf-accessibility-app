@@ -120,6 +120,9 @@ async def _finish_as_reviewed(session_maker, settings, job_id: str) -> None:
     output.write_bytes(PDF)
     async with session_maker() as db:
         job = await db.get(Job, job_id)
+        if job.status == "queued":
+            job.status = "processing"
+            await db.flush()
         job.status = "manual_remediation"
         job.page_count = 4
         job.output_path = str(output)
@@ -262,6 +265,9 @@ async def test_process_uploads_accessible_html_from_final_pdf(
                 running_head=True,
             )
             final_pdf = (settings_arg.output_dir / job_id / "accessible_syllabus.pdf").read_bytes()
+            if job.status != "processing":
+                job.status = "processing"
+                await db.flush()
             job.status = status
             await db.commit()
 
@@ -296,6 +302,9 @@ async def test_html_export_failure_still_completes_pdf_with_safe_diagnostic(
         await _finish_as_reviewed(session_maker, settings_arg, job_id)
         async with session_maker() as db:
             job = await db.get(Job, job_id)
+            if job.status != "processing":
+                job.status = "processing"
+                await db.flush()
             job.status = status
             await db.commit()
 
@@ -1119,3 +1128,120 @@ def test_startup_removes_crashed_attempts_but_preserves_a_live_file_owner(tmp_pa
             with attempt_workspace(settings, "live"):
                 raise AssertionError("duplicate file owner")
     assert not data_root(live).exists()
+
+
+async def test_failed_review_rerun_publishes_prior_bytes_and_keeps_command_history(tmp_path, monkeypatch, quiet_previews):
+    import sqlite3
+
+    settings = _settings(tmp_path)
+    worker = FakeWorker(state=await _saved_state(settings))
+    client = worker.client()
+
+    async def fail_after_edit(job_id, db, settings_arg, sink):
+        output = settings_arg.output_dir / job_id / "accessible_syllabus.pdf"
+        output.write_bytes(b"broken candidate")
+        job = await db.get(Job, job_id)
+        job.status = "failed"
+        job.output_path = None
+        job.error = "failed candidate"
+        await db.commit()
+
+    monkeypatch.setattr(runner_tasks, "run_tagging_and_validation", fail_after_edit)
+    await runner_tasks.run_task(client, _task("review", action={"type": "edit", "change_id": 1, "text": "New description"}), settings)
+    await client.close()
+    assert worker.failed is None
+    assert worker.completed["job"]["status"] == "manual_remediation"
+    assert worker.uploads["output.pdf"][1] == PDF
+    changes = json.loads(worker.uploads["views/figure-changes.json"][1])
+    assert len(changes) == 1 and changes[0]["review_status"] == "pending_review"
+    with tarfile.open(fileobj=io.BytesIO(worker.uploads["state.tar.gz"][1]), mode="r:gz") as archive:
+        member = next(item for item in archive.getmembers() if item.name.endswith(".db"))
+        local = tmp_path / "published.db"
+        local.write_bytes(archive.extractfile(member).read())
+    with sqlite3.connect(local) as db:
+        phase, edits = db.execute("SELECT phase, edits_json FROM review_revisions").fetchone()
+        assert phase == "failed" and "New description" in edits
+
+
+async def test_sync_acknowledgements_are_versioned_and_replay_is_idempotent(tmp_path, quiet_previews):
+    import sqlite3
+
+    settings = _settings(tmp_path)
+    state = await _saved_state(settings)
+    task = _task("sync", overrides={"changes": {"1": "kept"}, "tasks": {"1": "resolved"}}, overrides_version=7)
+    for _ in range(2):
+        worker = FakeWorker(state=state)
+        client = worker.client()
+        await runner_tasks.run_task(client, task, settings)
+        await client.close()
+        assert worker.failed is None
+        state = worker.uploads["state.tar.gz"][1]
+    with tarfile.open(fileobj=io.BytesIO(state), mode="r:gz") as archive:
+        member = next(item for item in archive.getmembers() if item.name.endswith(".db"))
+        local = tmp_path / "sync.db"
+        local.write_bytes(archive.extractfile(member).read())
+    with sqlite3.connect(local) as db:
+        rows = db.execute("SELECT phase, before_json, edits_json FROM review_revisions").fetchall()
+        assert len(rows) == 1
+        phase, before, after = rows[0]
+        assert phase == "published"
+        assert json.loads(before)["applied_changes"][0]["review_status"] == "pending_review"
+        assert json.loads(after)["applied_changes"][0]["review_status"] == "kept"
+        assert json.loads(after)["review_tasks"][0]["status"] == "resolved"
+
+
+async def test_three_reviews_bound_archived_copies_and_failed_review_restores_latest_bytes(
+    tmp_path, monkeypatch, quiet_previews,
+):
+    import sqlite3
+    from pathlib import Path
+
+    from app.services.review_revisions import preserve_output
+
+    settings = _settings(tmp_path)
+    state = await _saved_state(settings)
+    reruns = 0
+
+    async def rerun(job_id, db, settings_arg, sink):
+        nonlocal reruns
+        reruns += 1
+        output = settings_arg.output_dir / job_id / "accessible_syllabus.pdf"
+        output.write_bytes(PDF + f"candidate {reruns}".encode())
+        job = await db.get(Job, job_id)
+        job.output_path = preserve_output(output)
+        assert len(list((output.parent / "published").glob("*/*.pdf"))) <= 2
+        job.status = "failed" if reruns == 4 else "manual_remediation"
+        await db.commit()
+
+    monkeypatch.setattr(runner_tasks, "run_tagging_and_validation", rerun)
+    for number in range(1, 5):
+        worker = FakeWorker(state=state)
+        client = worker.client()
+        await runner_tasks.run_task(client, _task("review", action={
+            "type": "edit", "change_id": number, "text": f"Description revision {number}",
+        }), settings)
+        await client.close()
+        assert worker.failed is None
+        assert worker.completed["job"]["status"] == "manual_remediation"
+        expected = PDF + f"candidate {min(number, 3)}".encode()
+        assert worker.uploads["output.pdf"][1] == expected
+        state = worker.uploads["state.tar.gz"][1]
+        with tarfile.open(fileobj=io.BytesIO(state), mode="r:gz") as archive:
+            files = {item.name for item in archive.getmembers() if item.isfile()}
+            copies = [name for name in files if "/published/" in name]
+            assert len(copies) == 1  # Terminal state needs only the selected PDF.
+            member = next(item for item in archive.getmembers() if item.name.endswith(".db"))
+            local = tmp_path / f"revision-{number}.db"
+            local.write_bytes(archive.extractfile(member).read())
+        with sqlite3.connect(local) as db:
+            rows = db.execute("SELECT phase, before_json, edits_json, published_json FROM review_revisions ORDER BY revision").fetchall()
+            assert len(rows) == number
+            assert rows[-1][0] == ("failed" if number == 4 else "published")
+            for _, *snapshots in rows:
+                for raw in snapshots:
+                    for saved_job in json.loads(raw or "{}").get("jobs", []):
+                        if saved_job["output_path"]:
+                            assert str(Path(saved_job["output_path"]).relative_to(settings.output_dir.parent)) in files
+            if number >= 2:
+                assert any("retired_output_sha256" in raw for row in rows for raw in row[1:] if raw)
+    assert reruns == 4

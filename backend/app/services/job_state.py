@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Job, JobStep
+from app.services.job_transitions import set_step_status
 
 ACTIVE_JOB_STATUSES = frozenset({"queued", "processing"})
 RESTART_INTERRUPTED_ERROR = (
@@ -29,11 +30,7 @@ async def reset_rerun_steps(db: AsyncSession, job_id: str) -> None:
         )
     )
     for step in result.scalars():
-        step.status = "pending"
-        step.started_at = None
-        step.completed_at = None
-        step.result_json = None
-        step.error = None
+        set_step_status(step, "pending")
 
 
 async def mark_job_failed(

@@ -11,10 +11,31 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from app.services.release_policy import release_hold_reasons
+from app.services.release_policy import FIDELITY_HOLD_CHECKS, release_hold_reasons
 
 
 def replay(root: Path) -> dict:
+    if root.is_file():
+        # The checked-in e128b6e fixture contains decisions/reasons, not raw
+        # check verdicts. Replay that saved evidence; never fabricate PDFs.
+        saved = json.loads(root.read_text())
+        documents = []
+        for row in saved["documents"]:
+            reasons = release_hold_reasons(
+                compliant="compliance" not in row["hold_reasons"],
+                checks=[{"check": reason, "status": "fail" if reason in FIDELITY_HOLD_CHECKS else "error"}
+                        for reason in row["hold_reasons"] if reason != "compliance"],
+            )
+            after = "manual_remediation" if reasons else "complete"
+            if after != row["after"] or reasons != row["hold_reasons"]:
+                raise ValueError(f"Release decision changed: {row['set']}/{row['document']}")
+            documents.append({**row, "after": after, "hold_reasons": reasons})
+    else:
+        documents = _replay_runs(root)
+    return {"summary": _summary(documents), "documents": documents}
+
+
+def _replay_runs(root: Path) -> list[dict]:
     documents = []
     for path in sorted(root.glob("*/*.run.json")):
         run = json.loads(path.read_text())
@@ -37,6 +58,10 @@ def replay(root: Path) -> dict:
     if not documents:
         raise ValueError(f"No run.json files found: {root}")
 
+    return documents
+
+
+def _summary(documents: list[dict]) -> dict:
     summary = {}
     for name in sorted({doc["set"] for doc in documents}) + ["total"]:
         rows = [doc for doc in documents if name == "total" or doc["set"] == name]
@@ -46,7 +71,7 @@ def replay(root: Path) -> dict:
             "after": dict(Counter(doc["after"] for doc in rows)),
             "hold_reasons": dict(Counter(reason for doc in rows for reason in doc["hold_reasons"])),
         }
-    return {"summary": summary, "documents": documents}
+    return summary
 
 
 if __name__ == "__main__":

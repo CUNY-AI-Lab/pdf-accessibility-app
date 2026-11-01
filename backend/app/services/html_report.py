@@ -189,7 +189,8 @@ def _review_status_label(status: str) -> str:
         "kept": "Kept",
         "pending_review": "Pending",
         "undone": "Undone",
-        "accepted": "Accepted",
+        "approved": "Described",
+        "accepted": "Described",
         "rejected": "Decorative",
     }
     return labels.get(status, _e(status))

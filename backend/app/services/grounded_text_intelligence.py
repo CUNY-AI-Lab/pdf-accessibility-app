@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from app.services.candidate_state import (
+    AdjudicationState,
+    set_adjudication_state,
+    set_check_verdict,
+)
 from app.services.intelligence_pages import generate_suspicious_text_intelligence
 from app.services.llm_client import make_llm_client
 
@@ -41,7 +46,7 @@ def update_grounded_text_check(
         fidelity_report["checks"] = checks
     for check in checks:
         if isinstance(check, dict) and str(check.get("check") or "") == "grounded_text_fidelity":
-            check["status"] = status
+            set_check_verdict(check, status)
             check["message"] = message
             check["metrics"] = {
                 "candidate_blocks": candidate_count,
@@ -89,11 +94,19 @@ def apply_grounded_text_adjudication(
     if not isinstance(candidate_blocks, list):
         candidate_blocks = []
 
+    set_adjudication_state(fidelity_report, AdjudicationState.PENDING)
     confirmed_blocks: list[dict[str, object]] = []
     if isinstance(adjudication, dict):
         for block in adjudication.get("blocks", []) if isinstance(adjudication.get("blocks"), list) else []:
             if isinstance(block, dict) and bool(block.get("should_block_accessibility", False)):
                 confirmed_blocks.append(block)
+
+    # Keep the established empty-result behavior while distinguishing no result.
+    set_adjudication_state(fidelity_report, (
+        AdjudicationState.NOT_REQUESTED if adjudication is None else
+        AdjudicationState.CONFIRMED if confirmed_blocks else AdjudicationState.CLEARED
+    ))
+    metadata.pop("grounded_text_llm_error", None)
 
     if not confirmed_blocks:
         review_tasks = [
@@ -188,6 +201,7 @@ async def adjudicate_grounded_text_candidates(
     if not isinstance(pages_to_check, list) or not isinstance(suspicious_blocks, list) or not suspicious_blocks:
         return review_tasks, fidelity_report, None
 
+    set_adjudication_state(fidelity_report, AdjudicationState.PENDING)
     llm_client = make_llm_client(settings)
     try:
         adjudication = await generate_suspicious_text_intelligence(
@@ -197,6 +211,7 @@ async def adjudicate_grounded_text_candidates(
             llm_client=llm_client,
         )
     except Exception as exc:
+        set_adjudication_state(fidelity_report, AdjudicationState.ERROR)
         candidate_task["metadata"] = {
             **metadata,
             "grounded_text_candidate": True,
