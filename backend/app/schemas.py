@@ -29,15 +29,6 @@ class JobResponse(BaseModel):
     steps: list[JobStepResponse] = Field(default_factory=list)
 
 
-class JobCreateResponse(BaseModel):
-    jobs: list[JobResponse]
-
-
-class JobListResponse(BaseModel):
-    jobs: list[JobResponse]
-    total: int
-
-
 class ReviewTaskResponse(BaseModel):
     id: int
     task_type: str
@@ -48,27 +39,6 @@ class ReviewTaskResponse(BaseModel):
     status: str
     source: str
     metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class AppliedChangeResponse(BaseModel):
-    id: int
-    change_type: str
-    title: str
-    detail: str
-    importance: Literal["high", "medium", "low"]
-    review_status: str
-    reviewable: bool
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    before: dict[str, Any] = Field(default_factory=dict)
-    after: dict[str, Any] = Field(default_factory=dict)
-
-
-class ReviewFeedbackRequest(BaseModel):
-    feedback: str | None = None
-
-
-class ReviewEditRequest(BaseModel):
-    text: str
 
 
 class AppliedChangeActionResponse(BaseModel):
@@ -115,22 +85,3 @@ class ValidationReportResponse(BaseModel):
     tagging: dict[str, Any] = Field(default_factory=dict)
     semantic_coverage: dict[str, Any] = Field(default_factory=dict)
     claims: dict[str, Any] = Field(default_factory=dict)
-
-
-class HealthResponse(BaseModel):
-    status: str = "ok"
-    version: str = "0.1.0"
-
-
-class ReadinessCheckResponse(BaseModel):
-    ok: bool
-    status: Literal["ok", "error"]
-    detail: str
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class ReadinessResponse(BaseModel):
-    status: Literal["ready", "not_ready"]
-    version: str = "0.1.0"
-    checks: dict[str, ReadinessCheckResponse] = Field(default_factory=dict)
-    diagnostics: dict[str, Any] = Field(default_factory=dict)

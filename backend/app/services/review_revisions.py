@@ -21,13 +21,13 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
-from fastapi import HTTPException
 from sqlalchemy import DateTime, delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.models import AltTextEntry, AppliedChange, Job, JobStep, ReviewRevision, ReviewTask
 from app.services.applied_changes import parse_json_dict
 from app.services.job_transitions import guard_transition, set_job_status
+from app.services.review_errors import ReviewRefusal
 
 
 class RevisionPhase(StrEnum):
@@ -170,7 +170,7 @@ async def snapshot(db, job_id: str) -> str:
 
 async def prepare_review(db, job, action: dict, *, replay: bool = False) -> ReviewRevision:
     if job.status not in {"complete", "manual_remediation"}:
-        raise HTTPException(status_code=409, detail="Review needs a published output")
+        raise ReviewRefusal(code=409, detail="Review needs a published output")
     command = json.dumps(action, sort_keys=True)
     command_id = hashlib.sha256(command.encode()).hexdigest()
     prior = await db.scalar(
@@ -185,7 +185,7 @@ async def prepare_review(db, job, action: dict, *, replay: bool = False) -> Revi
     if prior is not None and prior.phase == RevisionPhase.PUBLISHED and replay:
         return prior
     if prior is not None and prior.phase != RevisionPhase.FAILED:
-        raise HTTPException(status_code=409, detail="Review command was already recorded")
+        raise ReviewRefusal(code=409, detail="Review command was already recorded")
     # First command captures the deployed runner's output before any writer can overwrite it.
     if job.output_path:
         job.output_path = preserve_output(Path(job.output_path))
@@ -213,7 +213,7 @@ async def prepare_review(db, job, action: dict, *, replay: bool = False) -> Revi
         await db.flush()
     except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(status_code=409, detail="Review revision changed; retry") from exc
+        raise ReviewRefusal(code=409, detail="Review revision changed; retry") from exc
     return row
 
 
@@ -230,7 +230,7 @@ async def start_review(db, job, revision) -> None:
             .execution_options(synchronize_session=False)
         )
     if result.rowcount != 1:
-        raise HTTPException(status_code=409, detail="Review job changed; retry")
+        raise ReviewRefusal(code=409, detail="Review job changed; retry")
     advance_revision(revision, RevisionPhase.RUNNING)
 
 

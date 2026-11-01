@@ -59,18 +59,19 @@ jobs:
         run: docker build --tag pdf-accessibility-app:ci .
       - name: Verify container CA trust
         run: docker run --rm pdf-accessibility-app:ci python /usr/local/libexec/check_ca_trust.py
-      - name: Smoke-test container health
+      # The local dummy endpoint refuses claims; this checks runner liveness only.
+      - name: Smoke-test runner container health
         run: |
           set -euo pipefail
           container_name=pdf-accessibility-ci-smoke
-          host_port=18081
           cleanup() {
             docker rm -f "$container_name" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
 
           docker run --detach --name "$container_name" \
-            --publish "127.0.0.1:${host_port}:8001" \
+            --env RUNNER_WORKER_URL=http://127.0.0.1:9 \
+            --env RUNNER_TOKEN=check-only \
             --env LLM_API_KEY=check-only \
             --env LLM_BASE_URL=http://127.0.0.1:8000/v1 \
             --env LLM_MODEL=check-model \
@@ -79,8 +80,8 @@ jobs:
             pdf-accessibility-app:ci
 
           health_ok=false
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent --show-error "http://127.0.0.1:${host_port}/health"; then
+          for attempt in $(seq 1 150); do
+            if [[ "$(docker inspect --format '{{.State.Health.Status}}' "$container_name")" == healthy ]]; then
               health_ok=true
               break
             fi
@@ -91,9 +92,3 @@ jobs:
             docker logs "$container_name"
             exit 1
           fi
-
-          (
-            cd backend
-            uv run --frozen python ../scripts/check_frontend_runtime.py \
-              "http://127.0.0.1:${host_port}/"
-          )

@@ -9,7 +9,7 @@ export function json(body: JsonValue, status = 200): Response {
   });
 }
 
-/** FastAPI's error body, which the React app reads. */
+/** The API error body read by the React app. */
 export function detail(status: number, message: string): Response {
   return json({ detail: message }, status);
 }

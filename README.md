@@ -20,7 +20,8 @@ Upload a PDF and the app classifies it, runs OCR if needed, extracts structure, 
 
 | Layer | Technology |
 |---|---|
-| Backend | Python 3.12, FastAPI, SQLAlchemy (async SQLite) |
+| API and hosting | Cloudflare Worker, Durable Object, R2 |
+| Pipeline runner | Python 3.12, SQLAlchemy (per-task async SQLite) |
 | Frontend | React, TypeScript, Vite, Tailwind CSS 4, TanStack Query |
 | PDF Processing | pikepdf, OCRmyPDF, Ghostscript, Poppler, QPDF |
 | Structure Extraction | Docling (local or `docling-serve`) |
@@ -36,69 +37,57 @@ Upload a PDF and the app classifies it, runs OCR if needed, extracts structure, 
 - [Tesseract](https://github.com/tesseract-ocr/tesseract)
 - [Poppler](https://poppler.freedesktop.org/) (`pdftoppm`)
 - [veraPDF](https://verapdf.org/) and a Java runtime
-- A CAIL Gateway API key
+- A personal CAIL Gateway key for local evaluation; production uses the Worker relay
 
 On macOS, install system dependencies via Homebrew. On Debian/Ubuntu, install `ghostscript`, `poppler-utils`, `tesseract-ocr`, and a Java runtime.
 
 ## Quick Start
 
-```bash
-# Clone and configure
-git clone <repo-url> pdf-accessibility-app
-cd pdf-accessibility-app
-cp .env.example .env
-# Edit .env and set LLM_API_KEY (a CAIL Gateway key)
-
-# Install dependencies
-cd backend && uv sync
-cd ../frontend && bun install
-```
-
-Run the two services in separate terminals:
+Install backend, frontend, and Worker dependencies:
 
 ```bash
-# Backend
 cd backend
-uv run uvicorn app.main:app --reload --port 8001
-
-# Frontend
-cd frontend
-bun dev
+UV_NO_CONFIG=1 uvx uv@0.13.4 sync --locked --extra dev
+cd ../frontend
+bun install
+cd ../worker
+bun install
 ```
 
-Open http://localhost:5173. The frontend proxies `/api` and `/health` to the backend on port 8001.
+The v2 development harness starts the Worker and runner with temporary local
+identity keys. From `worker/`, use your personal Gateway key and a PDF:
+
+```bash
+DEV_GATEWAY_KEY="$(security find-generic-password -s cail-gateway -w)" \
+DOCLING_SERVE_URL=http://localhost:5001 \
+E2E_BROWSER=1 node dev/e2e.mjs /path/to/file.pdf
+```
+
+This processes the PDF and exercises the browser flow. See
+[worker/README.md](worker/README.md) for the harness and
+[frontend/README.md](frontend/README.md#development) for the Vite proxy.
 
 ## Docker
 
-A single-container image bundles all system dependencies and serves the built frontend from FastAPI.
+The image contains the Python runner and PDF tools. The Worker serves the
+frontend and API separately. Configure `RUNNER_WORKER_URL` and `RUNNER_TOKEN`
+for the Worker the runner should claim from; production setup is in
+[deploy/actual-dell/README.md](deploy/actual-dell/README.md).
 
 ```bash
 cp .env.example .env
-# Set LLM_API_KEY
-
+# Set the runner credentials and Docling URL in .env.
 docker compose up -d --build
 ```
 
-Open http://localhost:8080. Set `APP_PORT` in `.env` to use a different port.
+The default command is `python -m app.runner`. It makes outbound requests and
+opens no HTTP port. Docker checks the file named by `RUNNER_ALIVE_FILE`
+(default `/tmp/runner-alive`), which the runner touches every 30 seconds.
 
-To run without Compose:
-
-```bash
-docker build -t pdf-accessibility-app .
-docker run -d \
-  --name pdf-accessibility-app \
-  --env-file .env \
-  -p 8080:8001 \
-  -v pdf_accessibility_data:/app/data \
-  -v pdf_accessibility_cache:/home/app/.cache \
-  pdf-accessibility-app
-```
-
-By default, the Docker image is slim and expects `DOCLING_SERVE_URL` to point to
-a remote `docling-serve` instance. Set `WITH_LOCAL_DOCLING=true` before building
-to include local Docling and preload models into the image. For subpath
-deployments (e.g., behind a reverse proxy), set
-`VITE_APP_BASE_PATH=/pdf-accessibility/` before building.
+The image expects `DOCLING_SERVE_URL` to point to a remote `docling-serve`.
+Set `WITH_LOCAL_DOCLING=true` before building to include local Docling and
+preload its models. Evaluation containers override the command with a Python
+script and disable the runner health check.
 
 Tesseract language packs included: English, Spanish, French, German, Chinese (Simplified and Traditional), Russian, Arabic, Korean, Bengali, Polish, Hebrew, Yiddish, Haitian Creole, Hindi, Italian, Portuguese, and Japanese. Add others by extending the Dockerfile.
 
@@ -118,8 +107,7 @@ Version 1 ran on the NML host (lw4av) from `/data/pdf-accessibility-app`
 until 2026-10-28, when v2 replaced it. Its container and volumes are removed
 and the secrets in its `.env` files are blanked. The host's nginx now answers
 `/pdf-accessibility` with a permanent redirect to v2 (`debian/alt-text.conf` in
-whisper-server-nml). The FastAPI app in `backend/` still runs for local
-development (Quick Start, Docker); the runner reuses its pipeline.
+whisper-server-nml). Local development uses the Worker and runner too.
 
 ## Configuration
 
@@ -128,7 +116,7 @@ Configure the app via `.env`. Key variables:
 | Variable | Description | Default |
 |---|---|---|
 | `LLM_BASE_URL` | Chat-completions base URL (the CAIL Gateway) | `https://tools.ailab.gc.cuny.edu/v1` |
-| `LLM_API_KEY` | CAIL Gateway key (required) | — |
+| `LLM_API_KEY` | Personal Gateway key for standalone benchmark scripts; the runner uses a task lease instead | — |
 | `LLM_MODEL` | Open-weight vision model on the Gateway | `qwen3-vl-235b-a22b-instruct` |
 | `LLM_MAX_REQUEST_BYTES` | Maximum complete encoded vision request body; oversized page/crop images are recompressed or downscaled before transport | `2097152` (2 MiB) |
 | `ALT_TEXT_MAX_CONCURRENCY` | Max concurrent alt-text requests per PDF | `8` |
@@ -141,18 +129,12 @@ Configure the app via `.env`. Key variables:
 | `MAX_UPLOAD_IMAGE_HEAVY_PAGES` | Maximum pages with at least `UPLOAD_IMAGE_HEAVY_PAGE_MIN_PIXELS` image pixels | `75` |
 | `MAX_UPLOAD_OCR_SCAN_TOTAL_IMAGE_PIXELS` | Stricter embedded scan-image pixel cap for OCR/Paper Capture PDFs | `150000000` |
 | `MAX_UPLOAD_OCR_SCAN_IMAGE_HEAVY_PAGES` | Stricter image-heavy page cap for OCR/Paper Capture PDFs | `25` |
-| `MAX_FILES_PER_UPLOAD` | Maximum PDFs accepted in one upload request | `5` |
-| `MAX_ACTIVE_JOBS_PER_SESSION` | Maximum queued/processing jobs per anonymous browser session | `3` |
-| `MAX_ACTIVE_JOBS_GLOBAL` | Maximum queued/processing jobs accepted across the app | `12` |
-| `MAX_CONCURRENT_JOBS` | Maximum PDF pipeline jobs actively executing in-process | `2` |
 | `OCRMYPDF_JOBS` | OCRmyPDF worker count per PDF; keep low on shared hosts | `1` |
 | `OCRMYPDF_MAX_IMAGE_MPIXELS` | OCRmyPDF image decompression ceiling per image | `75` |
 | `WITH_LOCAL_DOCLING` | Include local Docling in Docker builds | `false` |
 | `DOCLING_SERVE_URL` | Remote `docling-serve` URL (falls back to local Docling when unset) | — |
 | `DOCLING_SERVE_TOKEN` | Bearer token for a protected `docling-serve` proxy | — |
 | `OCR_LANGUAGE` | Fallback Tesseract language code | `eng` |
-| `JOB_TTL_HOURS` | Hours before jobs expire | `12` |
-| `CSRF_PROTECTION_ENABLED` | Require CSRF header for cookie-authenticated write requests | `true` |
 | `VERAPDF_PATH` | Path to the veraPDF binary | `verapdf` |
 | `GHOSTSCRIPT_PATH` | Path to the Ghostscript binary | `gs` |
 
@@ -189,7 +171,7 @@ Each upload runs through seven steps:
 ```
 backend/
   app/
-    api/              FastAPI route handlers
+    runner/           Worker task claims, pipeline execution, and view publication
     pipeline/         Classify, OCR, structure, tag, validate, fidelity
     services/         Semantic adjudication, storage, LLM client
     models.py         SQLAlchemy ORM models
@@ -232,13 +214,9 @@ cd backend
 PYTHONPATH=. uv run python scripts/runtime_diagnostics.py
 ```
 
-When the app is running, `/health` is a lightweight liveness check and
-`/health/ready` verifies runtime dependencies needed for real PDF processing:
-database connectivity, writable storage, required PDF binaries, LLM
-configuration, and Docling/docling-serve availability.
-A remote `docling-serve` is probed at most once per 30 seconds per app process;
-readiness requests inside that window reuse the last result, so repeated calls
-to the public endpoint do not reach docling-serve.
+The Worker's `/pdf-accessibility/health` checks Worker liveness. The runner's
+container health check checks its heartbeat file; runtime diagnostics above
+inspect local PDF dependencies.
 
 ## Documentation
 
@@ -257,6 +235,6 @@ people: Doorway signs them in and checks Admission membership, and anonymous
 use ended at the cutover. Every AI step calls the CAIL Gateway with rendered
 page images, never PDF files. In v2 each call goes through the Worker's relay
 with the person's own Gateway credential, so it counts against their budget;
-the Gateway admits only open-weight models. Run locally, the FastAPI app uses
-`LLM_API_KEY` and anonymous browser sessions. See
+the Gateway admits only open-weight models. The local development harness
+uses temporary signed identities and a personal key in its dev Gateway. See
 [docs/cail-integration-plan.md](docs/cail-integration-plan.md).

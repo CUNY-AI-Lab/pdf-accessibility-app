@@ -228,7 +228,6 @@ from app.services.intelligence_widgets import (
     generate_widget_intelligence,
     generate_widget_intelligence_for_page,
 )
-from app.services.job_manager import JobManager
 from app.services.job_state import clear_terminal_artifacts
 from app.services.job_transitions import set_job_status, set_step_status
 from app.services.llm_client import (
@@ -238,6 +237,7 @@ from app.services.llm_client import (
     track_llm_usage,
 )
 from app.services.page_intelligence import collect_grounded_text_candidates
+from app.services.pipeline_progress import ProgressReporter
 from app.services.release_policy import apply_release_policy
 from app.services.review_revisions import preserve_output, reconcile_review_tasks
 from app.services.review_surface import (
@@ -1891,7 +1891,7 @@ async def run_pipeline(
     job_id: str,
     db_session_maker,
     settings: Settings,
-    job_manager: JobManager,
+    job_manager: ProgressReporter,
 ):
     """Execute the full PDF accessibility pipeline for a job."""
     with job_model_access():
@@ -1902,7 +1902,7 @@ async def _run_pipeline(
     job_id: str,
     db_session_maker,
     settings: Settings,
-    job_manager: JobManager,
+    job_manager: ProgressReporter,
 ):
     async with db_session_maker() as db:
         job = await db.get(Job, job_id)
@@ -2537,7 +2537,7 @@ async def run_tagging_and_validation(
     job_id: str,
     db: AsyncSession,
     settings: Settings,
-    job_manager: JobManager,
+    job_manager: ProgressReporter,
     working_pdf: Path | None = None,
     structure_json: dict | None = None,
     pre_applied_change_specs: list[dict[str, object]] | None = None,
@@ -3348,7 +3348,7 @@ async def _store_candidate_result(
     *,
     db: AsyncSession,
     job: Job,
-    job_manager: JobManager,
+    job_manager: ProgressReporter,
     candidate: Candidate,
     alt_entries,
     review_task_metadata_overrides: dict[tuple[str, str], dict[str, object]],
@@ -3478,7 +3478,7 @@ async def _run_tagging_and_validation(
     job_id: str,
     db: AsyncSession,
     settings: Settings,
-    job_manager: JobManager,
+    job_manager: ProgressReporter,
     working_pdf: Path | None,
     structure_json: dict | None,
     pre_applied_change_specs: list[dict[str, object]] | None,

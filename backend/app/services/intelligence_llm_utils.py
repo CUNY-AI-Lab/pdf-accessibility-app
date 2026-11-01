@@ -27,7 +27,7 @@ import httpx
 from app.config import get_settings
 from app.models import Job
 from app.services.llm_client import LlmClient, make_llm_client
-from app.services.path_safety import validate_path_within_allowed_roots
+from app.services.path_safety import PathAccessError, validate_path_within_allowed_roots
 from app.services.pdf_preview import render_page_jpeg_data_url
 
 logger = logging.getLogger(__name__)
@@ -141,8 +141,6 @@ def transition_json_attempt(current: JsonAttempt, target: JsonAttempt) -> JsonAt
 
 
 def job_pdf_path(job: Job) -> Path:
-    from fastapi import HTTPException
-
     candidates = []
     if getattr(job, "output_path", None):
         candidates.append(Path(str(job.output_path)))
@@ -152,7 +150,7 @@ def job_pdf_path(job: Job) -> Path:
         resolved = pdf_path.resolve()
         try:
             validated = validate_path_within_allowed_roots(resolved)
-        except HTTPException:
+        except PathAccessError:
             # This helper is used by internal remediation/intelligence flows, not
             # user-facing download APIs. Test fixtures and local worker temps can
             # live outside the configured data roots, so prefer any existing file.

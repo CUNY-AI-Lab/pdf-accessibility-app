@@ -46,16 +46,12 @@ In v2, Doorway signs the person in before the app loads, and the Worker's API
 returns only the signed-in person's jobs. Jobs and files are deleted 12 hours after
 their last change.
 
-Against the local FastAPI backend:
-
-- the backend assigns an anonymous HTTP-only browser session cookie
-- the dashboard and job pages only show jobs created by that browser session
-- clearing cookies or switching browser profiles means the user loses access to in-flight and completed jobs from the old session
-- backend TTL cleanup deletes old jobs and files even if the browser still has a valid cookie
-
 ## Development
 
-Run the dev server:
+The full local setup is the Worker/runner harness in
+[../worker/README.md](../worker/README.md), `worker/dev/e2e.mjs`. It starts
+the dev Worker on port 8791 and signs temporary identities for the test.
+For UI iteration against that Worker, run the Vite server:
 
 ```bash
 cd frontend
@@ -75,7 +71,12 @@ jsdom for DOM interactions. `bun run test:mutations` temporarily breaks each mai
 guard, requires its named test to fail, and restores the source in cleanup. Run
 mutation checks separately from other checks to avoid testing modified files.
 
-The frontend expects the backend at `http://127.0.0.1:8001` during local development.
+Vite proxies API and health requests to the dev Worker at
+`http://127.0.0.1:8791/pdf-accessibility`. `VITE_DEV_PROXY_TARGET` overrides
+the Worker origin. Requests with `VITE_APP_BASE_PATH=/pdf-accessibility/`
+preserve that prefix; root-path development adds the Worker prefix. The
+Worker still requires signed development identities for API access. For Vite
+write requests, set the dev Worker's `CAIL_CANONICAL_ORIGIN` to the Vite origin.
 
 ## Current review surface
 

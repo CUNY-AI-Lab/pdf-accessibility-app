@@ -61,9 +61,10 @@ async def restore_stored_figure(db, entry, state: dict) -> None:
     This is restoration, not a new semantic approval. Conditional SQL checks
     the current row; set_committed_value prevents ORM revalidation of history.
     """
-    from fastapi import HTTPException
     from sqlalchemy import update
     from sqlalchemy.orm.attributes import set_committed_value
+
+    from app.services.review_errors import ReviewRefusal
 
     values = {
         "generated_text": state.get("generated_text"),
@@ -83,6 +84,6 @@ async def restore_stored_figure(db, entry, state: dict) -> None:
             .execution_options(synchronize_session=False)
         )
     if result.rowcount != 1:
-        raise HTTPException(status_code=409, detail="Figure changed; cannot restore stale history")
+        raise ReviewRefusal(code=409, detail="Figure changed; cannot restore stale history")
     for field, value in values.items():
         set_committed_value(entry, field, value)
