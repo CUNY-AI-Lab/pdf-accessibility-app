@@ -306,6 +306,12 @@ def apply_field_accessible_names(
                 for target in entry.get("_field_entries", [])
                 if isinstance(target, pikepdf.Dictionary)
             ]
+            # A label for one of several widgets of a field, such as a radio
+            # option, names that widget only, not the group.
+            group = kid_widget_field(widget_target)
+            group_widgets = _resolve_array(group.get("/Kids")) if group is not None else None
+            if group_widgets is not None and len(group_widgets) > 1:
+                field_targets = []
             try:
                 for field_target in field_targets:
                     field_target["/TU"] = pikepdf.String(label)
