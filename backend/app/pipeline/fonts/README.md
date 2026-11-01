@@ -91,6 +91,22 @@ consults it after the AGL, with and without a `.suffix`. It was generated once
   `angbracketright` -> U+27E9 MATHEMATICAL RIGHT ANGLE BRACKET; `mapsto` ->
   U+21A6 RIGHTWARDS ARROW FROM BAR.
 
+Nine pdf.js values are corrected locally against the Unicode Character
+Database:
+
+- `intercal` -> U+22BA INTERCALATE. pdf.js has U+1D40 MODIFIER LETTER CAPITAL
+  T.
+- The sized angle brackets `angbracketleftbig`, `angbracketleftBig`,
+  `angbracketleftbigg` and `angbracketleftBigg` -> U+27E8, and the four
+  `angbracketright` sizes -> U+27E9, the same characters as the unsized
+  names. pdf.js has U+2329 and U+232A. Unicode marks those two Deprecated
+  (UCD 18.0.0 `PropList.txt`), and Unicode Technical Report #25, revision 15,
+  section 2.10 ("Deprecated Delimiters") says they "are now deprecated for use
+  with mathematics because their canonical equivalence to CJK angle brackets
+  is likely to result in unintended wide spacing problems when used in
+  mathematical formulae", and that U+27E8 and U+27E9 should be used instead.
+  Under NFC they become the CJK brackets U+3008 and U+3009.
+
 Some TeX glyphs are parts of a symbol. `negationslash` (U+0338) is set before
 the symbol it negates, and CMSY's zero-width `mapsto` bar is set before an
 arrow, so extracted text has U+0338 before `=` for `\neq`, and U+21A6 followed
@@ -100,8 +116,9 @@ hayro: Copyright (c) The Hayro Authors, licensed under the Apache License,
 Version 2.0 or the MIT license; used here under the Apache License, Version
 2.0. pdf.js: Copyright 2012 Mozilla Foundation, licensed under the Apache
 License, Version 2.0. The license text is at
-http://www.apache.org/licenses/LICENSE-2.0. Both tables were converted to JSON;
-their name-to-character pairs are unchanged.
+http://www.apache.org/licenses/LICENSE-2.0. Both tables were converted to JSON.
+hayro's pairs are unchanged; pdf.js's are unchanged except for the corrections
+above.
 
 ### Program width repair
 

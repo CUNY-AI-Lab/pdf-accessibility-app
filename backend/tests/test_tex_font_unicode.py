@@ -1,5 +1,6 @@
 """Unicode for TeX glyph names, Type 1 built-in encodings, and authored gaps."""
 
+import unicodedata
 from types import SimpleNamespace
 
 import pikepdf
@@ -10,10 +11,12 @@ from app.pipeline.fonts.diagnostics import (
     _unicode_repair_gate_from_diagnostics,
 )
 from app.pipeline.fonts.encoding import (
+    _glyph_name_to_unicode,
     _parse_tounicode_map,
     _render_tounicode_cmap,
     _simple_font_auto_unicode_policy,
     _simple_font_unicode_map,
+    _tex_glyph_names,
 )
 from app.pipeline.fonts.tounicode import _repair_pdf_tounicode_sync
 
@@ -92,6 +95,17 @@ def test_tex_glyph_names_outside_the_agl_map_to_unicode():
         57: "(",
         58: "\u03b1",
     }
+
+
+def test_every_tex_glyph_name_resolves_to_text_that_nfc_keeps():
+    # A deprecated code point such as U+2329 becomes a CJK bracket under NFC.
+    changed = {}
+    for name in _tex_glyph_names():
+        text = _glyph_name_to_unicode(name)
+        if text is None or unicodedata.normalize("NFC", text) != text:
+            changed[name] = text
+
+    assert changed == {}
 
 
 @pytest.mark.parametrize(
