@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import tarfile
+import threading
 import time
 
 import httpx
@@ -498,3 +499,227 @@ def test_preview_pages_match_the_review_screen():
         "broken_links": [{"page": 1}],
     }
     assert preview_pages_for_task(metadata) == [1, 2, 5]
+
+
+def _publication_outcome():
+    return runner_tasks.Outcome(
+        views=runner_views.RenderedViews(
+            job={"status": "failed"},
+            files=[runner_views.RenderedFile("report.html", b"report", "text/html")],
+        )
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_path", ["/files/report.html", "/complete"])
+async def test_lease_is_renewed_until_publication_is_acknowledged(tmp_path, monkeypatch, blocked_path):
+    worker = FakeWorker()
+    publishing = asyncio.Event()
+    renewed = asyncio.Event()
+
+    async def handler(request):
+        if request.url.path.endswith(blocked_path):
+            publishing.set()
+            await asyncio.wait_for(renewed.wait(), 1)
+        if request.url.path.endswith("/progress") and publishing.is_set():
+            renewed.set()
+        return worker.handler(request)
+
+    async def perform(*_args):
+        return _publication_outcome()
+
+    monkeypatch.setattr(runner_tasks, "_perform", perform)
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    execution = runner_tasks.ClaimedTaskExecution(client, _task(), _settings(tmp_path))
+    await asyncio.wait_for(execution.run(), 2)
+    await client.close()
+    assert renewed.is_set()
+    assert worker.completed == {
+        "job": {"status": "failed"}, "figures": [], "previews": [],
+        "files": ["report.html"], "has_state": False, "overrides_version": 0,
+    }
+    assert execution.phase is runner_tasks.TaskPhase.DONE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss_source", ["heartbeat", "upload"])
+async def test_lease_loss_during_publication_stops_without_completion(tmp_path, monkeypatch, loss_source):
+    worker = FakeWorker()
+    uploading = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def handler(request):
+        if "/files/" in request.url.path:
+            uploading.set()
+            if loss_source == "upload":
+                return httpx.Response(409)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        if request.url.path.endswith("/progress") and uploading.is_set():
+            return httpx.Response(409)
+        return worker.handler(request)
+
+    async def perform(*_args):
+        return _publication_outcome()
+
+    monkeypatch.setattr(runner_tasks, "_perform", perform)
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    execution = runner_tasks.ClaimedTaskExecution(client, _task(), _settings(tmp_path))
+    await asyncio.wait_for(execution.run(), 2)
+    await client.close()
+    assert execution.phase is runner_tasks.TaskPhase.FAILED
+    assert worker.completed is None
+    assert worker.failed is None
+    assert worker.uploads == {}
+    if loss_source == "heartbeat":
+        assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_source", ["work", "publication", "outcome"])
+async def test_failure_reporting_keeps_renewing_until_acknowledged(tmp_path, monkeypatch, failure_source):
+    worker = FakeWorker()
+    reporting = asyncio.Event()
+    renewed = asyncio.Event()
+
+    async def handler(request):
+        if "/files/" in request.url.path and failure_source == "publication":
+            raise RuntimeError("upload failed")
+        if request.url.path.endswith("/fail"):
+            reporting.set()
+            await asyncio.wait_for(renewed.wait(), 1)
+        if request.url.path.endswith("/progress") and reporting.is_set():
+            renewed.set()
+        return worker.handler(request)
+
+    async def perform(*_args):
+        if failure_source == "work":
+            raise RuntimeError("work failed")
+        if failure_source == "outcome":
+            return runner_tasks.Outcome(failed="Preflight refused")
+        return _publication_outcome()
+
+    monkeypatch.setattr(runner_tasks, "_perform", perform)
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    execution = runner_tasks.ClaimedTaskExecution(client, _task(), _settings(tmp_path))
+    await asyncio.wait_for(execution.run(), 2)
+    await client.close()
+    assert renewed.is_set()
+    assert worker.failed == ("Preflight refused" if failure_source == "outcome" else runner_tasks.INTERNAL_ERROR)
+    assert worker.completed is None
+    assert execution.phase is runner_tasks.TaskPhase.FAILED
+
+
+@pytest.mark.asyncio
+async def test_deadline_applies_during_publication(tmp_path, monkeypatch):
+    worker = FakeWorker()
+    cancelled = asyncio.Event()
+
+    async def handler(request):
+        if "/files/" in request.url.path:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        return worker.handler(request)
+
+    async def perform(*_args):
+        return _publication_outcome()
+
+    monkeypatch.setattr(runner_tasks, "_perform", perform)
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    task = _task(deadline=int((time.time() + 0.15) * 1000))
+    await asyncio.wait_for(runner_tasks.run_task(client, task, _settings(tmp_path)), 2)
+    await client.close()
+    assert cancelled.is_set()
+    assert worker.failed == runner_tasks.DEADLINE_ERROR
+    assert worker.completed is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_completion_status_is_failed_before_upload(tmp_path, monkeypatch):
+    worker = FakeWorker()
+    client = worker.client()
+
+    async def perform(*_args):
+        outcome = _publication_outcome()
+        outcome.views.job["status"] = "processing"
+        return outcome
+
+    monkeypatch.setattr(runner_tasks, "_perform", perform)
+    await runner_tasks.run_task(client, _task(), _settings(tmp_path))
+    await client.close()
+    assert worker.failed == runner_tasks.INTERNAL_ERROR
+    assert worker.uploads == {}
+    assert worker.completed is None
+
+
+def test_runner_rejects_illegal_lifecycle_transition(tmp_path):
+    execution = runner_tasks.ClaimedTaskExecution(None, _task(), _settings(tmp_path))
+    with pytest.raises(ValueError, match="claimed -> done"):
+        execution.transition(runner_tasks.TaskPhase.DONE)
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_while_packing_prevents_state_upload(tmp_path, monkeypatch):
+    worker = FakeWorker()
+    packing = asyncio.Event()
+    release = threading.Event()
+    pack_done = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def pack(*_args):
+        loop.call_soon_threadsafe(packing.set)
+        try:
+            assert release.wait(2)
+        finally:
+            pack_done.set()
+
+    async def handler(request):
+        if request.url.path.endswith("/progress") and packing.is_set():
+            return httpx.Response(409)
+        return worker.handler(request)
+
+    async def perform(*_args):
+        outcome = _publication_outcome()
+        outcome.views.job["status"] = "complete"
+        return outcome
+
+    monkeypatch.setattr(runner_tasks, "_perform", perform)
+    monkeypatch.setattr(runner_tasks, "pack_state", pack)
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    try:
+        await asyncio.wait_for(runner_tasks.run_task(client, _task(), _settings(tmp_path)), 1)
+    finally:
+        release.set()
+        assert await asyncio.to_thread(pack_done.wait, 2)
+        await client.close()
+    assert set(worker.uploads) == {"report.html"}
+    assert worker.completed is None
+    assert worker.failed is None
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_during_failure_reporting_does_not_report_again(tmp_path, monkeypatch):
+    worker = FakeWorker()
+    failures = 0
+
+    async def handler(request):
+        nonlocal failures
+        if request.url.path.endswith("/fail"):
+            failures += 1
+            return httpx.Response(409)
+        return worker.handler(request)
+
+    async def perform(*_args):
+        raise RuntimeError("work failed")
+
+    monkeypatch.setattr(runner_tasks, "_perform", perform)
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    await runner_tasks.run_task(client, _task(), _settings(tmp_path))
+    await client.close()
+    assert failures == 1
+    assert worker.completed is None
+    assert worker.uploads == {}
