@@ -350,8 +350,10 @@ async def test_continuation_uses_original_headers_before_model_decision(tmp_path
     elements = []
     for page in range(2):
         part = tmp_path / f"p{page}.pdf"
+        # The second page's rows do not repeat the header row.
+        rows = ROWS if page == 0 else [["Delta", "four", "fourth"], *ROWS[1:]]
         element = _fixture(
-            part, ROWS, headers={(0, c): "Column" for c in range(3)} if page == 0 else None
+            part, rows, headers={(0, c): "Column" for c in range(3)} if page == 0 else None
         )["elements"][0]
         with pikepdf.open(part) as piece:
             source = piece.pages[0]
@@ -378,7 +380,7 @@ async def test_continuation_uses_original_headers_before_model_decision(tmp_path
         assert len(table.K) == 6
         assert all(c.S == "/TH" for c in table.K[0].K)
         assert all(c.S == "/TD" for c in table.K[3].K)
-    assert result.table_intelligence_audit[0]["status"] == "preserved_existing_headers"
+    assert result.table_intelligence_audit[0]["status"] == "joined_previous_table"
 
 
 async def test_table_decision_from_page_review_is_not_lost_on_order_confirmation(
