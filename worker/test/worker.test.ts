@@ -462,3 +462,163 @@ describe("the app", () => {
     expect(await page.text()).toContain("<div id=\"root\">");
   });
 });
+
+describe("guarded task transitions", () => {
+  function completion(status = "manual_remediation", version = 0) {
+    return JSON.stringify({ job: finishedJob(status), figures: [], previews: [], files: [], has_state: true, overrides_version: version });
+  }
+
+  async function start() {
+    const id = await createdJobId(await upload());
+    const task = await claim();
+    if (task === null) throw new Error("no process task");
+    return { id, task };
+  }
+
+  async function startSync() {
+    const { id, task } = await start();
+    expect((await finishProcess(task)).status).toBe(204);
+    await jobBoard(env).setOverride(alice, id, "changes", 1, Date.now());
+    const sync = await claim();
+    if (sync === null) throw new Error("no sync task");
+    expect(sync.kind).toBe("sync");
+    return { id, task: sync };
+  }
+
+  it.each(["queued", "processing", "invented"])("rejects completion status %s without clearing the task", async (status) => {
+    const { id, task } = await start();
+    const response = await runner(`/tasks/${id}/complete`, { method: "POST", lease: task.lease, body: completion(status) });
+    expect(response.status).toBe(422);
+    expect(await response.text()).toContain("terminal job status");
+    expect((await job(id)).status).toBe("processing");
+    expect(await jobBoard(env).checkLease(id, task.lease, Date.now(), false)).not.toBeNull();
+  });
+
+  it.each(["complete", "manual_remediation", "failed"])("accepts terminal status %s and replays it idempotently", async (status) => {
+    const { id, task } = await start();
+    const finish = (body = completion(status)) => runner(`/tasks/${id}/complete`, { method: "POST", lease: task.lease, body });
+    expect((await finish()).status).toBe(204);
+    const before = await jobBoard(env).getJob(alice, id);
+    expect(before?.status).toBe(status);
+    expect(before?.rev).toBe(1);
+    expect((await finish()).status).toBe(204);
+    expect(await jobBoard(env).getJob(alice, id)).toEqual(before);
+    const conflicting = await finish(completion(status === "complete" ? "failed" : "complete"));
+    expect(conflicting.status).toBe(409);
+    expect(await conflicting.text()).toContain("Conflicting completion");
+  });
+
+  it("rejects completion, failure and renewal from a stale attempt", async () => {
+    const { id, task } = await start();
+    await jobBoard(env).sweep(Date.now() + LIMITS.leaseMs + 1);
+    const current = await claim();
+    if (current === null) throw new Error("no retry");
+    const requests: [string, string][] = [["complete", completion()], ["fail", '{"error":"late"}'], ["progress", "{}"]];
+    for (const [action, body] of requests) {
+      expect((await runner(`/tasks/${id}/${action}`, { method: "POST", lease: task.lease, body })).status).toBe(409);
+    }
+    expect((await job(id)).status).toBe("processing");
+    expect(await jobBoard(env).checkLease(id, current.lease, Date.now(), false)).not.toBeNull();
+  });
+
+  it("retires an inconsistent queued row at claim and keeps the queue moving", async () => {
+    const bad = await createdJobId(await upload());
+    const good = await createdJobId(await upload());
+    await runInDurableObject(jobBoard(env), (_board, state) => {
+      state.storage.sql.exec("UPDATE jobs SET status = 'failed', task_queued_at = 0 WHERE id = ?", bad);
+    });
+    const task = await claim();
+    expect(task?.job_id).toBe(good);
+    const retired = await job(bad);
+    expect(retired.status).toBe("failed");
+    expect(retired.error).toBe(MESSAGES.inconsistent);
+    expect(await claim()).toBeNull();
+  });
+
+  it("serializes competing claims and duplicate completions", async () => {
+    await upload();
+    const claims = await Promise.all([claim(), claim(), claim()]);
+    const tasks = claims.filter((task) => task !== null);
+    expect(tasks).toHaveLength(1);
+    const task = tasks[0];
+    if (task === undefined) throw new Error("no task");
+    const finishes = await Promise.all([1, 2].map(() => runner(`/tasks/${task.job_id}/complete`, { method: "POST", lease: task.lease, body: completion() })));
+    expect(finishes.map((response) => response.status)).toEqual([204, 204]);
+    expect((await jobBoard(env).getJob(alice, task.job_id))?.rev).toBe(1);
+  });
+
+  it("replays an old receipt without completing a newer claimed task", async () => {
+    const { id, task } = await start();
+    expect((await runner(`/tasks/${id}/complete`, { method: "POST", lease: task.lease, body: completion() })).status).toBe(204);
+    await jobBoard(env).setOverride(alice, id, "changes", 1, Date.now());
+    const sync = await claim();
+    if (sync === null) throw new Error("no sync");
+    expect((await runner(`/tasks/${id}/complete`, { method: "POST", lease: task.lease, body: completion() })).status).toBe(204);
+    expect(await jobBoard(env).checkLease(id, sync.lease, Date.now(), false)).not.toBeNull();
+    expect((await jobBoard(env).getJob(alice, id))?.rev).toBe(1);
+  });
+
+  it.each(["process", "sync"])("rejects review refusal for %s", async (kind) => {
+    const { id, task } = kind === "sync" ? await startSync() : await start();
+    const response = await runner(`/tasks/${id}/complete`, { method: "POST", lease: task.lease, body: JSON.stringify({ review_refused: "refused", overrides_version: 0 }) });
+    expect(response.status).toBe(409);
+    expect(await response.text()).toContain("Only a review task");
+    expect(await jobBoard(env).checkLease(id, task.lease, Date.now(), false)).not.toBeNull();
+  });
+
+  it("renews the current lease and rejects it exactly at expiry", async () => {
+    const { id, task } = await start();
+    const board = jobBoard(env);
+    const now = Date.now();
+    expect(await board.progress(id, task.lease, "{}", now + LIMITS.leaseMs - 10)).toBe(true);
+    expect(await board.checkLease(id, task.lease, now + LIMITS.leaseMs + 10, false)).not.toBeNull();
+    expect(await board.checkLease(id, task.lease, now + 2 * LIMITS.leaseMs - 10, false)).toBeNull();
+  });
+
+  it.each(["failure", "lease expiry"])("bounds sync retries after %s", async (cause) => {
+    const { id, task } = await startSync();
+    let current = task;
+    for (let attempt = 1; attempt <= LIMITS.attempts; attempt++) {
+      expect(current.attempt).toBe(attempt);
+      if (cause === "failure") {
+        expect((await runner(`/tasks/${id}/fail`, { method: "POST", lease: current.lease, body: '{"error":"refresh failed"}' })).status).toBe(204);
+      } else await jobBoard(env).sweep(Date.now() + LIMITS.leaseMs + 1);
+      const next = await claim();
+      if (attempt < LIMITS.attempts) {
+        if (next === null) throw new Error("missing retry");
+        current = next;
+      } else expect(next).toBeNull();
+    }
+    const result = await jobBoard(env).getJob(alice, id);
+    expect(result?.status).toBe("manual_remediation");
+    expect(result?.busy).toBe(false);
+    expect(result?.overrides.changes).toEqual({ "1": "kept" });
+    expect(result?.notice).toContain("Report refresh was interrupted");
+    await jobBoard(env).sweep(Date.now() + LIMITS.leaseMs + 1);
+    expect(await claim()).toBeNull();
+  });
+
+  it.each(["failure", "deadline"])("hands an interrupted sync to its deferred review after %s", async (cause) => {
+    const { id, task } = await startSync();
+    expect(await jobBoard(env).queueReview(alice, id, { type: "undo", change_id: 1 }, "gateway", Date.now() + 24 * 3600_000, Date.now())).toEqual({ ok: true });
+    if (cause === "failure") await jobBoard(env).fail(id, task.lease, "failed", Date.now());
+    else await jobBoard(env).sweep(task.deadline);
+    const review = await claim();
+    expect(review?.kind).toBe("review");
+    expect(review?.attempt).toBe(1);
+    expect((await job(id)).status).toBe("processing");
+  });
+
+  it("accepts a review refusal once and restores its terminal result", async () => {
+    const { id, task } = await startSync();
+    await jobBoard(env).queueReview(alice, id, { type: "undo", change_id: 1 }, "gateway", Date.now() + 24 * 3600_000, Date.now());
+    expect((await runner(`/tasks/${id}/complete`, { method: "POST", lease: task.lease, body: completion("complete", task.overrides_version) })).status).toBe(204);
+    const review = await claim();
+    if (review === null) throw new Error("missing review");
+    const refuse = () => runner(`/tasks/${id}/complete`, { method: "POST", lease: review.lease, body: JSON.stringify({ review_refused: "no longer pending", overrides_version: review.overrides_version }) });
+    expect((await refuse()).status).toBe(204);
+    expect((await job(id)).status).toBe("complete");
+    expect((await refuse()).status).toBe(204);
+    expect(await claim()).toBeNull();
+  });
+});
