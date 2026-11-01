@@ -30,12 +30,13 @@ def _figure_text_elements(
     elements: list[dict],
     measured: dict[int, MeasuredTextOp],
     decorative: set[int],
+    described: set[int] | None = None,
 ) -> list[dict]:
     """Separate a figure's live text from its image semantics.
 
     Dense glyph coverage is evidence of a text box, regardless of a model's
-    classification. Sparse text is recovered only for decorative figures;
-    described diagrams keep their existing treatment of internal labels.
+    classification. Sparse labels remain readable alongside the figure's
+    description, including text in OCR Form XObjects.
     The proxies are appended after ownership/order planning so existing
     elements and their MCIDs retain their identity.
     """
@@ -57,7 +58,11 @@ def _figure_text_elements(
         text_box = (
             sum(_bbox_area(box) for box in boxes) >= 0.5 * area and _union_area(boxes) >= 0.5 * area
         )
-        if not text_box and elem.get("figure_index") not in decorative:
+        if (
+            not text_box
+            and elem.get("figure_index") not in decorative
+            and elem.get("figure_index") not in (described or set())
+        ):
             continue
         paragraph = {
             "type": "paragraph",

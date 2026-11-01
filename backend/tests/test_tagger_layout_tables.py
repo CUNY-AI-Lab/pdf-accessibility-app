@@ -38,7 +38,7 @@ async def _compare_structure(tmp_path, monkeypatch, source, structure):
     before, after = tmp_path / 'before.pdf', tmp_path / 'after.pdf'
     original = copy.deepcopy(structure)
     with monkeypatch.context() as patch:
-        patch.setattr(tagger, '_layout_table_plan', lambda *args: None)
+        patch.setattr(tagger, '_layout_table_plan', lambda *args, **kwargs: None)
         await tagger.tag_pdf(source, before, structure)
     result = await tagger.tag_pdf(source, after, structure)
     assert structure == original

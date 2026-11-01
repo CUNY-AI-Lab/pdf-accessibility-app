@@ -23,6 +23,7 @@ RUN apt-get update \
         fontconfig \
         fonts-dejavu-core \
         fonts-liberation2 \
+        fonts-urw-base35 \
         ghostscript \
         gnupg \
         libspatialindex-dev \

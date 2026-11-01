@@ -244,9 +244,10 @@ class _FontResourceWalker:
         if self.policy.inherit_resources:
             resources = resources or fallback_resources
         yield from self._walk_resources(resources)
-        for key in ("/N", "/R", "/D"):
-            child = appearance_obj.get(key)
-            if child is not None:
+        # /AP has N/R/D children; each can be a stream or a dictionary of
+        # arbitrary appearance-state names (Off, Yes, ...).
+        if not isinstance(appearance_obj, pikepdf.Stream):
+            for _, child in appearance_obj.items():
                 yield from self._walk_appearance_object(child, resources)
 
 

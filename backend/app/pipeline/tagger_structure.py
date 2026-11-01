@@ -625,7 +625,16 @@ class StructTreeBuilder:
                     elif scope in {"/Column", "/Both"} and th_col <= td_col < th_col + th_cspan and th_row + th_rspan <= td_row:
                         header_ids.append(th_id)
                     elif scope in {"/Row", "/Both"} and th_row <= td_row < th_row + th_rspan and th_col + th_cspan <= td_col:
-                        header_ids.append(th_id)
+                        # A repeated stub/value pair ends at the next stub
+                        # on this row, rather than labelling every later pair.
+                        next_stub = min(
+                            (col for row, col, span, _, _, other_scope, _ in th_info
+                             if other_scope in {"/Row", "/Both"}
+                             and row <= td_row < row + span and col > th_col),
+                            default=num_cols,
+                        )
+                        if td_col < next_stub:
+                            header_ids.append(th_id)
                 if header_ids:
                     td_attrs = td_elem.get("/A")
                     if td_attrs is None:
