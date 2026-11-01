@@ -75,6 +75,43 @@ class StructureResult:
     figures_count: int = 0
 
 
+def ensure_figure_images(
+    pdf_path: Path, structure: dict, figures: list[FigureInfo], figures_dir: Path,
+) -> list[FigureInfo]:
+    """Keep a candidate for every extracted figure, even if Docling omitted its image.
+
+    A missing crop must not silently remove a figure from semantic analysis.
+    Render it from the source page, or retain a missing-path candidate so its
+    unresolved description remains visible to the review and release checks.
+    """
+    from app.services.pdf_preview import render_bbox_preview_png_bytes
+
+    by_index = {figure.index: figure for figure in figures}
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    for elem in structure.get("elements", []):
+        index, page = elem.get("figure_index"), elem.get("page")
+        if elem.get("type") != "figure" or not isinstance(index, int):
+            continue
+        figure = by_index.get(index)
+        if figure is None:
+            figure = FigureInfo(
+                index=index, path=figures_dir / f"figure_{index}.png",
+                page=page, bbox=elem.get("bbox"), caption=elem.get("caption"),
+            )
+            by_index[index] = figure
+        if figure.path.is_file() or not isinstance(page, int) or page < 0:
+            continue
+        if not isinstance(figure.bbox, dict):
+            continue
+        try:
+            figure.path.write_bytes(render_bbox_preview_png_bytes(
+                pdf_path, page + 1, figure.bbox, highlight=False, crop_margin_points=0,
+            ))
+        except Exception:
+            logger.warning("Could not recover figure %s crop", index, exc_info=True)
+    return sorted(by_index.values(), key=lambda figure: figure.index)
+
+
 def _normalize_native_toc(node: Any) -> dict[str, Any] | None:
     """Convert a docling-parse table-of-contents tree into plain JSON-safe dicts."""
     if node is None:

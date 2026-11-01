@@ -105,6 +105,8 @@ def build_ocrmypdf_args(
     if pages:
         # OCRmyPDF numbers pages from 1.
         args.extend(["--pages", ",".join(str(page + 1) for page in pages)])
+        # Do not optimize fonts/images on pages outside this selection.
+        args.extend(["--optimize", "0"])
     args.extend([str(input_path), str(output_path)])
     return args
 
@@ -136,11 +138,29 @@ async def run_ocr(
     max_image_mpixels: int | None = None,
     engine: str = "tesseract",
     pages: list[int] | None = None,
+    force_pages: list[int] | None = None,
 ) -> OcrResult:
     """Run OCRmyPDF as a subprocess to add text layer to scanned PDFs.
 
     OCRmyPDF is not thread-safe, so we run it as a separate process.
     """
+    if force_pages:
+        # Rasterize only outlined pages, retaining native text elsewhere.
+        # A second pass handles scanned inserts without rasterizing them again.
+        remaining = sorted(set(pages or []) - set(force_pages))
+        forced_output = output_path.with_name(f"{output_path.stem}.forced.pdf") if remaining else output_path
+        options = dict(
+            rotate_pages=rotate_pages, deskew=deskew, timeout_seconds=timeout_seconds,
+            jobs=jobs, max_image_mpixels=max_image_mpixels, engine=engine,
+        )
+        forced = await run_ocr(
+            input_path, forced_output, language, mode="force", pages=force_pages, **options,
+        )
+        if not forced.success or not remaining:
+            return forced
+        return await run_ocr(
+            forced.output_path, output_path, language, mode=mode, pages=remaining, **options,
+        )
     logger.info(f"Running OCR on {input_path.name} (language={language}, engine={engine})")
 
     args = build_ocrmypdf_args(

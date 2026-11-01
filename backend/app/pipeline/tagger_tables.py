@@ -45,6 +45,27 @@ def _complete_table_grid_cells(
 
     rows: dict[int, list[dict]] = {}
     covered_by_rowspans: dict[int, set[int]] = {row: set() for row in range(num_rows)}
+    # An extractor can report a long span across cells it also reports
+    # explicitly. The later cells are stronger evidence of a boundary than
+    # the span. Keep every cell and its ownership key; shorten only the span.
+    for cell in normalized:
+        row, col = cell["row"], cell["col"]
+        end_col = min(col + cell["col_span"], num_cols)
+        end_col = min(
+            [end_col] + [other["col"] for other in normalized
+                         if other["row"] == row and col < other["col"] < end_col]
+        )
+        cell["col_span"] = end_col - col
+    for cell in normalized:
+        row, col = cell["row"], cell["col"]
+        end_row = min(row + cell["row_span"], num_rows)
+        end_row = min(
+            [end_row] + [other["row"] for other in normalized
+                         if row < other["row"] < end_row
+                         and other["col"] < col + cell["col_span"]
+                         and other["col"] + other["col_span"] > col]
+        )
+        cell["row_span"] = end_row - row
     for cell in normalized:
         row = _as_positive_int(cell.get("row", 0), default=0)
         col = _as_positive_int(cell.get("col", 0), default=0)

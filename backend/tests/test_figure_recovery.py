@@ -326,3 +326,80 @@ def test_boilerplate_descriptions_and_captions_keep_the_hold(placeholder):
         "pending_review",
         "",
     )
+
+
+@pytest.mark.parametrize('kind', ['text_block', 'layout_grid', '', None])
+def test_unsupported_reclassification_stays_described_or_pending(kind):
+    result = alt_text.AltTextResult(
+        figure_index=7, generated_text='', status='reclassified', resolved_kind=kind,
+    )
+    structure = {'elements': [{'type':'figure','figure_index':7,'page':0}]}
+    updated, _ = _apply_figure_reclassification(structure, [result])
+    assert updated == structure
+    assert result.status == 'pending_review'
+    assert result.reviewable
+
+
+async def test_recovery_fills_missing_live_result_without_reviving_removed_figures(tmp_path, monkeypatch):
+    figures = []
+    for index in [2,7,11]:
+        path = tmp_path / f'{index}.png'
+        Image.new('RGB',(20,20),'white').save(path)
+        figures.append(FigureInfo(index=index,path=path,page=0))
+    replies = []
+    async def recover(*, figure, **kwargs):
+        replies.append(figure.index)
+        return {'suggested_action':'set_alt_text','alt_text':'Toolbar with graph controls.'}
+    monkeypatch.setattr(alt_text,'generate_figure_intelligence',recover)
+    results = [alt_text.AltTextResult(figure_index=2,generated_text='Campus map.',status='approved')]
+    structure = {'elements':[{'type':'figure','figure_index':i,'page':0} for i in [2,11]]}
+    await alt_text.describe_unresolved_figures(figures,results,None,structure=structure)
+    assert replies == [11]
+    assert {result.figure_index:result.status for result in results} == {2:'approved',11:'approved'}
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_missing_docling_crop_keeps_its_index_and_pending_candidate(tmp_path, monkeypatch, failed):
+    from app.pipeline.structure import ensure_figure_images
+    from app.services import pdf_preview
+    from tests.test_figure_descriptions import _figure_pdf
+    source = _figure_pdf(tmp_path / 'source.pdf')
+    calls = []
+    def render(*args, **kwargs):
+        calls.append(args)
+        if failed:
+            raise ValueError('unrenderable page')
+        return b'crop'
+    monkeypatch.setattr(pdf_preview, 'render_bbox_preview_png_bytes', render)
+    structure = {'elements':[{'type':'figure','figure_index':7,'page':0,
+                             'bbox':{'l':10,'b':20,'r':30,'t':40}}]}
+    [figure] = ensure_figure_images(source,structure,[],tmp_path / 'figures')
+    assert figure.index == 7
+    assert figure.path.exists() is not failed
+    assert calls[0][1] == 1
+
+
+async def test_description_recovery_excludes_reclassification_and_uses_the_crop(tmp_path, monkeypatch):
+    path = tmp_path / 'toolbar.png'
+    Image.new('RGB',(60,20),'white').save(path)
+    requests = []
+    async def request(**kwargs):
+        requests.append(kwargs)
+        return {'suggested_action':'set_alt_text','alt_text':'Graph controls in a toolbar.',
+                'confidence':'high','reason':'Visible controls'}
+    async def classify(**kwargs):
+        pytest.fail('Description recovery must not repeat the semantic classifier')
+    monkeypatch.setattr(intelligence_figures,'request_llm_json',request)
+    monkeypatch.setattr(intelligence_figures,'adjudicate_semantic_unit',classify)
+    result = alt_text.AltTextResult(figure_index=22,generated_text='',status='reclassified',resolved_kind='form_region')
+    structure = {'elements':[{'type':'figure','figure_index':22,'page':0}]}
+    structure, _ = _apply_figure_reclassification(structure,[result])
+    await alt_text.describe_unresolved_figures([FigureInfo(index=22,path=path,page=0)],
+                                             [result],None,structure=structure)
+    assert result.status == 'approved'
+    assert result.generated_text == 'Graph controls in a toolbar.'
+    [request] = requests
+    assert set(request['response_schema']['properties']['suggested_action']['enum']) == {
+        'set_alt_text','mark_decorative','manual_only',
+    }
+    assert any(part.get('image_url',{}).get('url','').startswith('data:image/') for part in request['content'])

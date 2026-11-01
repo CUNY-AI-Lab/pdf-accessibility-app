@@ -555,7 +555,8 @@ class StructTreeBuilder:
         th_info: list[tuple[int, int, int, int, str, str, bool]] = []
         td_info: list[tuple[int, int, pikepdf.Object]] = []
 
-        for row_idx in sorted(rows.keys()):
+        # A row fully covered by RowSpan still occupies a row in the grid.
+        for row_idx in range(num_rows):
             row_elem = self.pdf.make_indirect(pikepdf.Dictionary({
                 "/Type": pikepdf.Name("/StructElem"),
                 "/S": pikepdf.Name("/TR"),
@@ -565,7 +566,7 @@ class StructTreeBuilder:
             table_elem["/K"].append(row_elem)
             self._struct_elems_created += 1
 
-            for cell in sorted(rows[row_idx], key=lambda c: c.get("col", 0)):
+            for cell in sorted(rows.get(row_idx, []), key=lambda c: c.get("col", 0)):
                 col_idx = _as_positive_int(cell.get("col", 0), default=0)
                 cell_type = "TH" if any(cell.get(flag) for flag in ("is_header", "column_header", "row_header")) else "TD"
                 cell_elem_dict: dict = {

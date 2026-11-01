@@ -421,9 +421,18 @@ async def describe_unresolved_figures(
     bypasses the persistent description cache. Failure leaves the release hold.
     """
     by_index = {figure.index: figure for figure in figures}
+    live_indexes = (
+        {e.get("figure_index") for e in structure["elements"] if e.get("type") == "figure"}
+        if "elements" in structure else set(by_index)
+    )
+    present = {result.figure_index for result in alt_texts}
+    for index in sorted(set(by_index) & live_indexes - present):
+        alt_texts.append(AltTextResult(
+            figure_index=index, generated_text="", status=NEEDS_DESCRIPTION,
+        ))
 
     async def recover(result: AltTextResult) -> None:
-        if result.status != NEEDS_DESCRIPTION:
+        if result.figure_index not in live_indexes or result.status != NEEDS_DESCRIPTION:
             return
         figure = by_index.get(result.figure_index)
         if figure is None or not figure.path.is_file():
@@ -433,6 +442,7 @@ async def describe_unresolved_figures(
             original_filename=original_filename,
             reviewer_feedback=FIGURE_RECOVERY_FEEDBACK,
             previous_intelligence=result.remediation_intelligence,
+            description_only=True,
         )
         action = decision.get("suggested_action")
         text = str(decision.get("alt_text") or "").strip()

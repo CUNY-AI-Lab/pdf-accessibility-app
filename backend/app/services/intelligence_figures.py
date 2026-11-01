@@ -93,6 +93,18 @@ Rules:
 
 FIGURE_BATCH_PROMPT += "\n" + FIGURE_DESCRIPTION_RULES
 
+FIGURE_DESCRIPTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "suggested_action": {"type": "string", "enum": ["set_alt_text", "mark_decorative", "manual_only"]},
+        "alt_text": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["suggested_action", "alt_text", "confidence", "reason"],
+}
+
 
 FIGURE_BATCH_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -416,6 +428,7 @@ async def generate_figure_intelligence(
     reviewer_feedback: str | None = None,
     previous_intelligence: dict[str, Any] | None = None,
     figure_context: dict[str, Any] | None = None,
+    description_only: bool = False,
 ) -> dict[str, object]:
     unit = SemanticUnit(
         unit_id=f"figure-{figure.index}",
@@ -448,6 +461,28 @@ async def generate_figure_intelligence(
         job = SimpleNamespace(original_filename=original_filename)
     try:
         async with _alt_text_global_slot():
+            if description_only:
+                # The ordinary semantic prompt permits reclassification. That
+                # decision has already failed its coverage check; a screenshot
+                # of controls is still an image, not an interactive PDF form.
+                raw = await request_llm_json(
+                    llm_client=llm_client,
+                    content=[
+                        {"type": "text", "text": (
+                            "Describe this retained figure for a screen reader. A screenshot of "
+                            "a form, toolbar or palette is a static image. No tagged replacement "
+                            "carries its information. Return set_alt_text with a grounded "
+                            "description, mark_decorative only for decoration, or manual_only "
+                            "if you cannot read it. Do not propose reclassification.\n"
+                            + FIGURE_DESCRIPTION_RULES
+                        )},
+                        context_json_part(unit.to_prompt_dict()),
+                        {"type": "image_url", "image_url": {"url": _image_data_url(figure.path)}},
+                    ],
+                    schema_name="figure_description",
+                    response_schema=FIGURE_DESCRIPTION_SCHEMA,
+                )
+                return _normalize_figure_result(figure_index=figure.index, raw=raw)
             decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)
     except Exception as exc:
         logger.warning("Figure %s semantics failed: %s", figure.index, exc)
