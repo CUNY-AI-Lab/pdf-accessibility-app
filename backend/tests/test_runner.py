@@ -66,8 +66,10 @@ class FakeWorker:
         state: bytes | None = None,
         progress_status: int = 200,
         refuse_once: asyncio.Event | None = None,
+        lease: str = "lease-token",
     ):
         self.state = state
+        self.lease = lease
         self.progress_status = progress_status
         # When given, progress answers 200 until the event is set.
         self.refuse_once = refuse_once
@@ -78,7 +80,7 @@ class FakeWorker:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         assert request.headers[RUNNER_TOKEN_HEADER] == "host-token"
-        assert request.headers[JOB_TOKEN_HEADER] == "lease-token"
+        assert request.headers[JOB_TOKEN_HEADER] == self.lease
         path = request.url.path.removeprefix("/pdf-accessibility/runner")
         prefix = f"/tasks/{JOB_ID}"
         assert path.startswith(prefix)
@@ -120,6 +122,9 @@ async def _finish_as_reviewed(session_maker, settings, job_id: str) -> None:
     output.write_bytes(PDF)
     async with session_maker() as db:
         job = await db.get(Job, job_id)
+        if job.status == "queued":
+            job.status = "processing"
+            await db.flush()
         job.status = "manual_remediation"
         job.page_count = 4
         job.output_path = str(output)
@@ -262,6 +267,9 @@ async def test_process_uploads_accessible_html_from_final_pdf(
                 running_head=True,
             )
             final_pdf = (settings_arg.output_dir / job_id / "accessible_syllabus.pdf").read_bytes()
+            if job.status != "processing":
+                job.status = "processing"
+                await db.flush()
             job.status = status
             await db.commit()
 
@@ -296,6 +304,9 @@ async def test_html_export_failure_still_completes_pdf_with_safe_diagnostic(
         await _finish_as_reviewed(session_maker, settings_arg, job_id)
         async with session_maker() as db:
             job = await db.get(Job, job_id)
+            if job.status != "processing":
+                job.status = "processing"
+                await db.flush()
             job.status = status
             await db.commit()
 
@@ -1119,3 +1130,274 @@ def test_startup_removes_crashed_attempts_but_preserves_a_live_file_owner(tmp_pa
             with attempt_workspace(settings, "live"):
                 raise AssertionError("duplicate file owner")
     assert not data_root(live).exists()
+
+
+async def test_failed_review_rerun_publishes_prior_bytes_and_keeps_command_history(tmp_path, monkeypatch, quiet_previews):
+    import sqlite3
+
+    settings = _settings(tmp_path)
+    worker = FakeWorker(state=await _saved_state(settings))
+    client = worker.client()
+
+    async def fail_after_edit(job_id, db, settings_arg, sink):
+        output = settings_arg.output_dir / job_id / "accessible_syllabus.pdf"
+        output.write_bytes(b"broken candidate")
+        job = await db.get(Job, job_id)
+        job.status = "failed"
+        job.output_path = None
+        job.error = "failed candidate"
+        await db.commit()
+
+    monkeypatch.setattr(runner_tasks, "run_tagging_and_validation", fail_after_edit)
+    await runner_tasks.run_task(client, _task("review", action={"type": "edit", "change_id": 1, "text": "New description"}), settings)
+    await client.close()
+    assert worker.failed is None
+    assert worker.completed["job"]["status"] == "manual_remediation"
+    assert worker.uploads["output.pdf"][1] == PDF
+    changes = json.loads(worker.uploads["views/figure-changes.json"][1])
+    assert len(changes) == 1 and changes[0]["review_status"] == "pending_review"
+    with tarfile.open(fileobj=io.BytesIO(worker.uploads["state.tar.gz"][1]), mode="r:gz") as archive:
+        member = next(item for item in archive.getmembers() if item.name.endswith(".db"))
+        local = tmp_path / "published.db"
+        local.write_bytes(archive.extractfile(member).read())
+    with sqlite3.connect(local) as db:
+        phase, edits = db.execute("SELECT phase, edits_json FROM review_revisions").fetchone()
+        assert phase == "failed" and "New description" in edits
+
+
+async def test_sync_acknowledgements_are_versioned_and_replay_is_idempotent(tmp_path, quiet_previews):
+    import sqlite3
+
+    settings = _settings(tmp_path)
+    state = await _saved_state(settings)
+    task = _task("sync", overrides={"changes": {"1": "kept"}, "tasks": {"1": "resolved"}}, overrides_version=7)
+    for _ in range(2):
+        worker = FakeWorker(state=state)
+        client = worker.client()
+        await runner_tasks.run_task(client, task, settings)
+        await client.close()
+        assert worker.failed is None
+        state = worker.uploads["state.tar.gz"][1]
+    with tarfile.open(fileobj=io.BytesIO(state), mode="r:gz") as archive:
+        member = next(item for item in archive.getmembers() if item.name.endswith(".db"))
+        local = tmp_path / "sync.db"
+        local.write_bytes(archive.extractfile(member).read())
+    with sqlite3.connect(local) as db:
+        rows = db.execute("SELECT phase, before_json, edits_json FROM review_revisions").fetchall()
+        assert len(rows) == 1
+        phase, before, after = rows[0]
+        assert phase == "published"
+        assert json.loads(before)["applied_changes"][0]["review_status"] == "pending_review"
+        assert json.loads(after)["applied_changes"][0]["review_status"] == "kept"
+        assert json.loads(after)["review_tasks"][0]["status"] == "resolved"
+
+
+async def test_three_reviews_bound_archived_copies_and_failed_review_restores_latest_bytes(
+    tmp_path, monkeypatch, quiet_previews,
+):
+    import sqlite3
+    from pathlib import Path
+
+    from app.runner.state import attempt_settings, data_root
+    from app.services.review_revisions import preserve_output
+
+    settings = _settings(tmp_path)
+    state = await _saved_state(settings)
+    reruns = 0
+
+    async def rerun(job_id, db, settings_arg, sink):
+        nonlocal reruns
+        reruns += 1
+        assert data_root(settings_arg) == data_root(attempt_settings(settings, f"review-{reruns}"))
+        output = settings_arg.output_dir / job_id / "accessible_syllabus.pdf"
+        output.write_bytes(PDF + f"candidate {reruns}".encode())
+        job = await db.get(Job, job_id)
+        job.output_path = preserve_output(output)
+        assert len(list((output.parent / "published").glob("*/*.pdf"))) <= 2
+        job.status = "failed" if reruns == 4 else "manual_remediation"
+        await db.commit()
+
+    monkeypatch.setattr(runner_tasks, "run_tagging_and_validation", rerun)
+    for number in range(1, 5):
+        lease = f"review-{number}"
+        worker = FakeWorker(state=state, lease=lease)
+        client = worker.client()
+        await runner_tasks.run_task(client, _task("review", lease=lease, action={
+            "type": "edit", "change_id": number, "text": f"Description revision {number}",
+        }), settings)
+        await client.close()
+        assert worker.failed is None
+        assert worker.completed["job"]["status"] == "manual_remediation"
+        expected = PDF + f"candidate {min(number, 3)}".encode()
+        assert worker.uploads["output.pdf"][1] == expected
+        state = worker.uploads["state.tar.gz"][1]
+        with tarfile.open(fileobj=io.BytesIO(state), mode="r:gz") as archive:
+            files = {item.name for item in archive.getmembers() if item.isfile()}
+            copies = [name for name in files if "/published/" in name]
+            assert len(copies) == 1  # Terminal state needs only the selected PDF.
+            member = next(item for item in archive.getmembers() if item.name.endswith(".db"))
+            local = tmp_path / f"revision-{number}.db"
+            local.write_bytes(archive.extractfile(member).read())
+        with sqlite3.connect(local) as db:
+            rows = db.execute("SELECT phase, before_json, edits_json, published_json FROM review_revisions ORDER BY revision").fetchall()
+            assert len(rows) == number
+            assert rows[-1][0] == ("failed" if number == 4 else "published")
+            for _, *snapshots in rows:
+                for raw in snapshots:
+                    for saved_job in json.loads(raw or "{}").get("jobs", []):
+                        if saved_job["output_path"]:
+                            relative = Path(saved_job["output_path"]).relative_to(data_root(settings))
+                            assert relative.parts[0] == "output"
+                            assert str(relative) in files
+            if number >= 2:
+                assert any("retired_output_sha256" in raw for row in rows for raw in row[1:] if raw)
+    assert reruns == 4
+
+
+async def test_review_compensation_restores_prior_bytes_in_a_different_attempt(
+    tmp_path, monkeypatch, quiet_previews,
+):
+    import hashlib
+    import sqlite3
+    from pathlib import Path
+
+    from app.models import ReviewRevision
+    from app.runner.state import attempt_settings, data_root
+    from app.services.job_state import clear_terminal_artifacts
+    from app.services.review_revisions import preserve_output
+
+    settings = _settings(tmp_path)
+    first = attempt_settings(settings, "review-attempt-A")
+    second = attempt_settings(settings, "review-attempt-B")
+    expected = PDF + b"review one selected bytes"
+    literal_text = f"The document mentions {first.output_dir / JOB_ID / 'literal.pdf'}"
+    calls = []
+    written = []
+
+    async def rerun(job_id, db, scoped, sink):
+        calls.append(data_root(scoped))
+        job = await db.get(Job, job_id)
+        if data_root(scoped) == data_root(second):
+            prior = await db.get(ReviewRevision, (job_id, 1))
+            saved = json.loads(prior.published_json)
+            prior_path = Path(saved["jobs"][0]["output_path"])
+            assert prior_path.is_relative_to(data_root(second))
+            assert prior_path.read_bytes() == expected
+            assert saved["alt_texts"][0]["edited_text"] == literal_text
+            assert Path(saved["alt_texts"][0]["image_path"]).is_file()
+        output = scoped.output_dir / job_id / "accessible_syllabus.pdf"
+        output.write_bytes(expected if len(calls) == 1 else b"broken second candidate")
+        written.append(output.read_bytes())
+        job.output_path = preserve_output(output)
+        job.status = "manual_remediation" if len(calls) == 1 else "failed"
+        if len(calls) == 2:
+            clear_terminal_artifacts(job)
+        await db.commit()
+
+    monkeypatch.setattr(runner_tasks, "run_tagging_and_validation", rerun)
+    original = await _saved_state(settings)
+    worker_a = FakeWorker(state=original, lease="review-attempt-A")
+    client_a = worker_a.client()
+    await runner_tasks.run_task(client_a, _task("review", lease="review-attempt-A", action={
+        "type": "edit", "change_id": 1, "text": literal_text,
+    }), settings)
+    await client_a.close()
+    assert worker_a.failed is None
+    assert worker_a.uploads["output.pdf"][1] == expected
+    assert not data_root(first).exists()  # Compensation cannot fall back to A's files.
+
+    worker_b = FakeWorker(state=worker_a.uploads["state.tar.gz"][1], lease="review-attempt-B")
+    client_b = worker_b.client()
+    await runner_tasks.run_task(client_b, _task("review", lease="review-attempt-B", action={
+        "type": "edit", "change_id": 2, "text": "Second attempt's replacement",
+    }), settings)
+    await client_b.close()
+    assert calls == [data_root(first), data_root(second)]
+    assert written == [expected, b"broken second candidate"]
+    assert worker_b.failed is None
+    assert worker_b.completed["job"]["status"] == "manual_remediation"
+    assert worker_b.uploads["output.pdf"][1] == expected
+    assert worker_b.uploads["figures/0"][1] == b"figure-png"
+    assert not data_root(second).exists()
+
+    with tarfile.open(fileobj=io.BytesIO(worker_b.uploads["state.tar.gz"][1]), mode="r:gz") as archive:
+        files = {item.name for item in archive.getmembers() if item.isfile()}
+        assert len([name for name in files if "/published/" in name]) == 1
+        member = next(item for item in archive.getmembers() if item.name.endswith(".db"))
+        local = tmp_path / "after-compensation.db"
+        local.write_bytes(archive.extractfile(member).read())
+    with sqlite3.connect(local) as db:
+        rows = db.execute("SELECT phase, before_json, edits_json, published_json FROM review_revisions ORDER BY revision").fetchall()
+        assert [row[0] for row in rows] == ["published", "failed"]
+        assert json.loads(rows[0][1])["jobs"][0]["retired_output_sha256"] == hashlib.sha256(PDF).hexdigest()
+        for _, *snapshots in rows:
+            for raw in snapshots:
+                saved = json.loads(raw or "{}")
+                for job in saved.get("jobs", []):
+                    for field in ("input_path", "output_path"):
+                        if job[field]:
+                            assert str(Path(job[field]).relative_to(data_root(settings))) in files
+                for figure in saved.get("alt_texts", []):
+                    assert str(Path(figure["image_path"]).relative_to(data_root(settings))) in files
+        # The failed command's attempted edit remains in history; compensation
+        # restores the successful description including its literal old path.
+        assert json.loads(rows[1][1])["alt_texts"][0]["edited_text"] == literal_text
+        assert json.loads(rows[1][2])["alt_texts"][0]["edited_text"] == "Second attempt's replacement"
+
+
+async def test_revision_relocation_handles_old_snapshot_roots_without_rewriting_history(tmp_path):
+    import copy
+    import sqlite3
+
+    from app.runner.state import attempt_settings, data_root, relocate_database
+
+    base = _settings(tmp_path)
+    state = await _saved_state(base)
+    archive = tmp_path / "original.tar.gz"
+    archive.write_bytes(state)
+    first = attempt_settings(base, "attempt-A")
+    second = attempt_settings(base, "attempt-B")
+    unpack_state(first, JOB_ID, archive)
+    # Simulate the existing bug: the live job uses A while its three snapshots
+    # still refer to different, older roots. Derive each snapshot's own origin.
+    origins = [data_root(base), data_root(attempt_settings(base, "older-1")),
+               data_root(attempt_settings(base, "older-2"))]
+    snapshots = []
+    for index, origin in enumerate(origins):
+        literal = f"Keep this literal {origin / 'output' / JOB_ID / 'report.pdf'}"
+        snapshots.append({
+            "jobs": [{"id": JOB_ID, "input_path": str(origin / "uploads" / f"{JOB_ID}.pdf"),
+                      "output_path": str(origin / "output" / JOB_ID / "accessible_syllabus.pdf") if index else None,
+                      "retired_output_sha256": "a" * 64, "original_filename": literal,
+                      "structure_json": json.dumps({"text": literal})}],
+            "alt_texts": [{"job_id": JOB_ID, "image_path": str(origin / "processing" / JOB_ID / "figures" / "figure_0.png"),
+                           "edited_text": literal}],
+            "applied_changes": [{"job_id": JOB_ID, "metadata_json": json.dumps({"path": literal})}],
+        })
+    originals = copy.deepcopy(snapshots)
+    command = json.dumps({"type": "edit", "text": str(origins[0] / "literal-user-text")})
+    with sqlite3.connect(database_path(first, JOB_ID)) as db:
+        db.execute("INSERT INTO review_revisions (job_id, revision, command_id, phase, command_json, before_json, edits_json, published_json) VALUES (?, 1, 'command', 'published', ?, ?, ?, ?)",
+                   (JOB_ID, command, *(json.dumps(saved) for saved in snapshots)))
+    modern = pack_state(first, JOB_ID, tmp_path / "canonical.tar.gz", canonical_root=data_root(base))
+    # Packing canonicalizes the archived database copy, never the active attempt.
+    with sqlite3.connect(database_path(first, JOB_ID)) as db:
+        assert db.execute("SELECT before_json FROM review_revisions").fetchone()[0] == json.dumps(originals[0])
+    unpack_state(second, JOB_ID, modern)
+    with sqlite3.connect(database_path(second, JOB_ID)) as db:
+        row = db.execute("SELECT command_json, before_json, edits_json, published_json FROM review_revisions").fetchone()
+        assert row[0] == command
+        for index, raw in enumerate(row[1:]):
+            relocated = json.loads(raw)
+            expected = copy.deepcopy(originals[index])
+            expected["jobs"][0]["input_path"] = str(input_path(second, JOB_ID))
+            if expected["jobs"][0]["output_path"]:
+                expected["jobs"][0]["output_path"] = str(second.output_dir / JOB_ID / "accessible_syllabus.pdf")
+                assert Path(expected["jobs"][0]["output_path"]).is_file()
+            expected["alt_texts"][0]["image_path"] = str(second.processing_dir / JOB_ID / "figures" / "figure_0.png")
+            assert Path(expected["alt_texts"][0]["image_path"]).is_file()
+            assert relocated == expected  # Text, metadata, null pointers and digests unchanged.
+    # The deployed runner's journal-less databases still restore normally.
+    with sqlite3.connect(database_path(second, JOB_ID)) as db:
+        db.execute("DROP TABLE review_revisions")
+    relocate_database(database_path(second, JOB_ID), JOB_ID, data_root(base))

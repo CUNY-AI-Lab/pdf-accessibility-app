@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from app.schemas import (
     ReviewEditRequest,
     ReviewFeedbackRequest,
 )
+from app.services.alt_text_cache import usable_description
 from app.services.anonymous_sessions import AnonymousSession, get_anonymous_session
 from app.services.applied_changes import (
     add_applied_change,
@@ -28,6 +30,7 @@ from app.services.applied_changes import (
     list_pending_reviewable_changes,
     parse_json_dict,
 )
+from app.services.figure_state import restore_stored_figure, set_figure_status
 from app.services.intelligence_figures import generate_figure_intelligence
 from app.services.job_manager import get_job_manager
 from app.services.job_state import (
@@ -38,6 +41,7 @@ from app.services.job_state import (
 )
 from app.services.llm_client import make_llm_client
 from app.services.path_safety import validate_path_within_allowed_roots
+from app.services.review_state import transition_review
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +100,7 @@ async def _load_applied_change(
 
 
 def _ensure_change_is_pending_review(change: AppliedChange) -> None:
-    if change.review_status != "pending_review":
+    if not change.reviewable or change.review_status != "pending_review":
         raise HTTPException(status_code=409, detail=_REVIEW_ACTION_STALE_DETAIL)
 
 
@@ -379,22 +383,23 @@ async def apply_revised_figure_change(
     }
     if suggested_action == "mark_decorative" or bool(decision.get("is_decorative", False)):
         entry.edited_text = "decorative"
-        entry.status = "rejected"
+        set_figure_status(entry, "rejected")
         detail = str(decision.get("summary") or "The model marked this figure decorative.").strip()
     else:
         revised_text = str(decision.get("alt_text") or "").strip()
-        if not revised_text:
+        if not usable_description(revised_text):
             raise HTTPException(
                 status_code=502,
                 detail="The model did not return a revised figure description",
             )
         entry.edited_text = revised_text
-        entry.status = "approved"
+        set_figure_status(entry, "approved")
         detail = str(
             decision.get("summary") or "The model revised this figure description."
         ).strip()
 
-    change.review_status = "undone"
+    await transition_review(db, change, "undone")
+    change.metadata_json = json.dumps({**_parse_json(change.metadata_json), "superseded": True})
     await add_applied_change(
         db=db,
         job=job,
@@ -469,14 +474,30 @@ async def apply_undo(
                 entry = entry_result.scalar_one_or_none()
         if entry is None and not bool(undo_payload.get("delete_if_absent", False)):
             raise HTTPException(status_code=404, detail="Alt text entry not found for undo.")
+        replaced_state = {
+            "generated_text": entry.generated_text if entry else None,
+            "edited_text": entry.edited_text if entry else None,
+            "status": entry.status if entry else None,
+        }
         if bool(undo_payload.get("delete_if_absent", False)):
             if entry is not None:
                 await db.delete(entry)
         elif entry is not None:
-            entry.generated_text = undo_payload.get("generated_text")
-            entry.edited_text = undo_payload.get("edited_text")
-            entry.status = str(undo_payload.get("status") or "pending_review")
-        change.review_status = "undone"
+            await restore_stored_figure(db, entry, undo_payload)
+        await transition_review(db, change, "undone")
+        if entry is not None and not bool(undo_payload.get("delete_if_absent", False)):
+            # The restored semantics get their own revision; never reopen a superseded row.
+            await add_applied_change(
+                db=db, job=job, change_type="figure_semantics",
+                title=f"Restored figure {entry.figure_index + 1}",
+                detail="Restored the previous figure decision.", reviewable=False,
+                metadata={**_parse_json(change.metadata_json), "figure_index": entry.figure_index,
+                          "restored_by_undo_of": change.id},
+                before=replaced_state,
+                after={"generated_text": entry.generated_text, "edited_text": entry.edited_text,
+                       "status": entry.status},
+            )
+
         return AppliedChangeActionResponse(
             status="undone",
             message="Undid the applied figure decision and restarted accessibility processing.",
@@ -652,7 +673,7 @@ async def apply_edit(
     """Set a figure's description by hand. The caller re-runs tagging."""
     entry, metadata = await _load_figure_change_context(job=job, change=change, db=db)
     edited_text = text.strip()
-    if not edited_text:
+    if not usable_description(edited_text):
         raise HTTPException(status_code=400, detail="Alt text cannot be empty.")
 
     previous_state = {
@@ -662,9 +683,10 @@ async def apply_edit(
     }
 
     entry.edited_text = edited_text
-    entry.status = "approved"
+    set_figure_status(entry, "approved")
 
-    change.review_status = "undone"
+    await transition_review(db, change, "undone")
+    change.metadata_json = json.dumps({**_parse_json(change.metadata_json), "superseded": True})
     await add_applied_change(
         db=db,
         job=job,

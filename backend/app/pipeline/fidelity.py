@@ -23,6 +23,7 @@ from rapidfuzz.fuzz import partial_ratio
 
 from app.pipeline.pdfium_text import PdfiumText, pagination_artifact_indices
 from app.pipeline.tagger import is_placeholder_alt_text
+from app.services.candidate_state import CheckVerdict
 from app.services.coverage_geometry import figure_boxes_for_coverage
 from app.services.form_fields import extract_widget_fields
 from app.services.page_intelligence import (
@@ -1349,6 +1350,8 @@ class _FidelityCollector:
         blocking_tasks = [task for task in tasks if task["blocking"]]
         advisory_tasks = [task for task in tasks if not task["blocking"]]
 
+        for check in self.checks:
+            CheckVerdict(check["status"])
         report = {
             "passed": len(blocking_tasks) == 0,
             "summary": {

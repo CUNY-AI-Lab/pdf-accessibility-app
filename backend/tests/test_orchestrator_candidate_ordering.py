@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.models import AppliedChange, Base, Job, JobStep, ReviewTask
+from app.models import AltTextEntry, AppliedChange, Base, Job, JobStep, ReviewTask
 from app.pipeline import orchestrator
 from app.pipeline.tagger import TaggingResult
 from app.pipeline.validator import ValidationResult, Violation
@@ -22,7 +22,7 @@ from tests.test_orchestrator_release_decision import (
 
 
 async def _run_ordering_flow(
-    tmp_path, monkeypatch, *, font_lane=False, accept_structure=True, font_map_rejection=None,
+    tmp_path, monkeypatch, *, font_lane=False, accept_structure=True, font_map_rejection=None, review_edit=False,
 ):
     input_pdf = tmp_path / "input.pdf"
     with pikepdf.new() as pdf:
@@ -160,13 +160,24 @@ async def _run_ordering_flow(
             structure = {"elements": [{"type": "paragraph", "text": "Body", "page": 0}]}
             job = Job(
                 id="job-1", filename="stored.pdf", original_filename="sample.pdf",
-                owner_session_hash="owner", input_path=str(input_pdf), status="processing",
+                owner_session_hash="owner", input_path=str(input_pdf), status="manual_remediation" if review_edit else "processing",
                 classification="digital", structure_json=json.dumps(structure),
             )
             db.add(job)
             for name in ("tagging", "validation", "fidelity"):
                 db.add(JobStep(job_id=job.id, step_name=name))
             await db.commit()
+            if review_edit:
+                from app.api.review import apply_review_action
+                for index in range(2):
+                    db.add(AltTextEntry(job_id=job.id, figure_index=index, image_path="/tmp/figure.png",
+                                        status="approved", generated_text=f"Description {index}"))
+                    db.add(AppliedChange(job_id=job.id, change_type="figure_semantics", title="Figure",
+                                         detail="", reviewable=True,
+                                         metadata_json=json.dumps({"figure_index": index}),
+                                         undo_payload_json=json.dumps({"kind": "alt_text_entry", "figure_index": index})))
+                await db.commit()
+                await apply_review_action(job=job, db=db, action="edit", change_id=1, text="New description")
             await orchestrator.run_tagging_and_validation(
                 job.id, db, settings, _RecordingJobManager(),
                 working_pdf=input_pdf, structure_json=structure,
@@ -238,3 +249,12 @@ async def test_rejected_font_map_marks_every_task_metadata_as_not_applied(
     audit = json.loads(job.validation_json)["remediation"]["llm_font_map_auto"]
     assert audit["applied"] is False
     assert audit["reason"] == rejection_reason
+
+
+@pytest.mark.asyncio
+async def test_successful_real_tagging_rerun_preserves_edited_and_unrelated_pending_changes(tmp_path, monkeypatch):
+    job, changes, *_ = await _run_ordering_flow(tmp_path, monkeypatch, review_edit=True)
+    assert job.status == "complete"
+    figures = [change for change in changes if change.change_type == "figure_semantics"]
+    assert [row.review_status for row in figures] == ["undone", "pending_review", "pending_review"]
+    assert json.loads(figures[-1].after_json)["edited_text"] == "New description"

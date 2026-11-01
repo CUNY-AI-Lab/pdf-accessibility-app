@@ -62,8 +62,9 @@ async def list_figure_changes(
         .where(
             AppliedChange.job_id == job_id,
             AppliedChange.change_type == "figure_semantics",
+            AppliedChange.review_status != "undone",
         )
-        .order_by(AppliedChange.created_at.desc())
+        .order_by(AppliedChange.created_at.desc(), AppliedChange.id.desc())
     )
     all_changes = list(all_result.scalars().all())
     # Keep only the most recent change per figure_index
@@ -93,6 +94,15 @@ async def add_applied_change(
     after: dict[str, Any] | None = None,
     undo_payload: dict[str, Any] | None = None,
 ) -> AppliedChange:
+    existing = (await db.execute(select(AppliedChange).where(
+        AppliedChange.job_id == job.id, AppliedChange.change_type == change_type,
+        AppliedChange.review_status != "undone",
+    ))).scalars().all()
+    for prior in existing:
+        if (parse_json_dict(prior.metadata_json) == (metadata or {})
+                and parse_json_dict(prior.after_json) == (after or {})
+                and parse_json_dict(prior.undo_payload_json) == (undo_payload or {})):
+            return prior
     change = AppliedChange(
         job_id=job.id,
         change_type=change_type,

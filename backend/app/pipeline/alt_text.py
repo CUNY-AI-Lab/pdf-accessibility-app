@@ -11,6 +11,7 @@ from app.pipeline.figure_rules import decorative_reasons, model_decoration_allow
 from app.pipeline.structure import FigureInfo
 from app.pipeline.tagger_semantics import is_placeholder_alt_text
 from app.services.alt_text_cache import AltTextCache, usable_description
+from app.services.figure_state import FigureStatus, set_figure_status
 from app.services.intelligence_figures import (
     generate_figure_intelligence,
     generate_figures_intelligence,
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # A figure the app could not describe: it has no alt text and waits for a
 # person. Nothing is approved or written in its place.
-NEEDS_DESCRIPTION = "pending_review"
+NEEDS_DESCRIPTION = FigureStatus.NEEDS_DESCRIPTION
 
 # Bump whenever the crop-description instructions or type templates change.
 PROMPT_VERSION = "3-exact-request-context"
@@ -40,7 +41,7 @@ def _caption_fallback(caption: str | None) -> str:
 class AltTextResult:
     figure_index: int
     generated_text: str
-    status: str = "approved"
+    status: FigureStatus = FigureStatus.DESCRIPTION
     resolved_kind: str | None = None
     suggested_action: str = "set_alt_text"
     confidence: str = "medium"
@@ -51,6 +52,10 @@ class AltTextResult:
     reviewable: bool = False
     importance: str = "medium"
     remediation_intelligence: dict[str, Any] | None = None
+
+
+    def __post_init__(self) -> None:
+        self.status = FigureStatus(self.status)
 
 
 def _figure_reviewability(
@@ -196,7 +201,7 @@ async def generate_alt_text(
         if fig.index in author_descriptions:
             existing[fig.index] = AltTextResult(
                 figure_index=fig.index, generated_text=author_descriptions[fig.index],
-                status="approved", confidence="high", reviewable=False,
+                status=FigureStatus.DESCRIPTION, confidence="high", reviewable=False,
                 summary="Kept the author description for the matching figure.",
                 reason="Matched author description", remediation_intelligence={"source": "author"},
             )
@@ -206,7 +211,7 @@ async def generate_alt_text(
             existing[fig.index] = AltTextResult(
                 figure_index=fig.index,
                 generated_text="decorative",
-                status="rejected",
+                status=FigureStatus.DECORATIVE,
                 suggested_action="mark_decorative",
                 confidence="high",
                 summary="Local evidence identified a decorative image.",
@@ -222,7 +227,7 @@ async def generate_alt_text(
             existing[fig.index] = AltTextResult(
                 figure_index=fig.index,
                 generated_text=fallback,
-                status="approved" if fallback else NEEDS_DESCRIPTION,
+                status=FigureStatus.DESCRIPTION if fallback else NEEDS_DESCRIPTION,
                 suggested_action="manual_only",
                 confidence="low",
                 summary="The image file was missing, so the app used the best available fallback.",
@@ -279,7 +284,7 @@ async def generate_alt_text(
                 existing[fig.index] = AltTextResult(
                     figure_index=fig.index,
                     generated_text=str(adjudication.get("alt_text") or "").strip(),
-                    status="reclassified",
+                    status=FigureStatus.RECLASSIFIED,
                     resolved_kind=resolved_kind,
                     suggested_action=suggested_action,
                     confidence=confidence,
@@ -346,7 +351,7 @@ async def generate_alt_text(
             existing[fig.index] = AltTextResult(
                 figure_index=fig.index,
                 generated_text=fallback,
-                status="approved" if fallback else NEEDS_DESCRIPTION,
+                status=FigureStatus.DESCRIPTION if fallback else NEEDS_DESCRIPTION,
                 resolved_kind=None,
                 suggested_action="manual_only",
                 confidence="low",
@@ -371,7 +376,7 @@ async def generate_alt_text(
             result = AltTextResult(
                 figure_index=fig.index,
                 generated_text=fallback,
-                status="approved" if fallback else NEEDS_DESCRIPTION,
+                status=FigureStatus.DESCRIPTION if fallback else NEEDS_DESCRIPTION,
                 resolved_kind=None,
                 suggested_action="manual_only",
                 confidence="low",
@@ -448,13 +453,13 @@ async def describe_unresolved_figures(
         text = str(decision.get("alt_text") or "").strip()
         if action == "set_alt_text" and usable_description(text):
             result.generated_text = text
-            result.status = "approved"
+            set_figure_status(result, "approved", persistent=False)
             result.suggested_action = "set_alt_text"
             result.used_placeholder_fallback = False
             result.used_caption_fallback = False
         elif action == "mark_decorative" and model_decoration_allowed(figure, structure, decision):
             result.generated_text = "decorative"
-            result.status = "rejected"
+            set_figure_status(result, "rejected", persistent=False)
             result.suggested_action = "mark_decorative"
         else:
             return

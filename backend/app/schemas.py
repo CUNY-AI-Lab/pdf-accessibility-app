@@ -56,7 +56,7 @@ class AppliedChangeResponse(BaseModel):
     title: str
     detail: str
     importance: Literal["high", "medium", "low"]
-    review_status: Literal["pending_review", "kept", "undone"]
+    review_status: str
     reviewable: bool
     metadata: dict[str, Any] = Field(default_factory=dict)
     before: dict[str, Any] = Field(default_factory=dict)
