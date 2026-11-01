@@ -1,10 +1,15 @@
 import { useState } from "react";
+import type { EditorController } from "../state/editor";
+import PreviewImage from "./PreviewImage";
 import { apiUrl } from "../api/client";
 import type { AppliedChange } from "../types";
 
 interface AppliedChangeCardProps {
   jobId: string;
   change: AppliedChange;
+  revision: string;
+  disabled: boolean;
+  editor: EditorController;
   onKeep: (change: AppliedChange) => Promise<void> | void;
   onUndo: (change: AppliedChange) => Promise<void> | void;
   onRevise: (change: AppliedChange, feedback?: string) => Promise<void> | void;
@@ -29,6 +34,9 @@ function isDecorative(change: AppliedChange): boolean {
 export default function AppliedChangeCard({
   jobId,
   change,
+  revision,
+  disabled,
+  editor,
   onKeep,
   onUndo,
   onRevise,
@@ -40,13 +48,15 @@ export default function AppliedChangeCard({
   actionError,
 }: AppliedChangeCardProps) {
   const [feedback, setFeedback] = useState("");
-  const [isEditing, setIsEditing] = useState(false);
-  const [editText, setEditText] = useState("");
+  const isEditing = editor.state.status !== "viewing" && editor.state.target === change.id;
+  const editText = isEditing && editor.state.status !== "viewing" ? editor.state.draft : "";
+  const staleDraft = isEditing && editor.state.status !== "viewing" && editor.state.revision !== revision;
+  const saving = editor.state.status === "saving";
   const isFigureDecision = change.change_type === "figure_semantics";
   const figureIndex = typeof change.metadata.figure_index === "number" ? change.metadata.figure_index : null;
   const altText = getAltText(change);
   const decorative = isDecorative(change);
-  const anyBusy = keeping || undoing || revising || editing;
+  const anyBusy = disabled || !change.reviewable || keeping || undoing || revising || editing;
   const isPending = change.review_status === "pending_review";
 
   const severityClasses = {
@@ -61,23 +71,22 @@ export default function AppliedChangeCard({
   const editSaveLabel = editing ? "Saving..." : "Save";
 
   const handleStartEdit = () => {
-    setEditText(altText ?? "");
-    setIsEditing(true);
+    if (anyBusy || editor.read().status !== "viewing") return;
+    editor.send({ type: "open", target: change.id, text: altText ?? "", revision });
   };
-
   const handleCancelEdit = () => {
-    setIsEditing(false);
-    setEditText("");
+    if (editor.read().status === "saving" || editor.read().status === "viewing") return;
+    editor.send({ type: "cancel" });
   };
-
   const handleSaveEdit = async () => {
-    if (!editText.trim()) return;
+    if (editor.read().status === "saving" || anyBusy || !editText.trim() || staleDraft) return;
+    const requestId = crypto.randomUUID();
+    editor.send({ type: "save", requestId, revision });
     try {
       await onEdit(change, editText.trim());
-      // Only close on success — if it fails the user keeps their text
-      setIsEditing(false);
+      editor.send({ type: "saved", requestId });
     } catch {
-      // Error is surfaced via actionError prop; keep form open
+      editor.send({ type: "failed", requestId });
     }
   };
 
@@ -96,13 +105,11 @@ export default function AppliedChangeCard({
       {/* Figure image thumbnail */}
       {isFigureDecision && figureIndex !== null && (
         <div className="mt-4">
-          <img
+          <PreviewImage
             src={apiUrl(`/jobs/${jobId}/figures/${figureIndex}/image`)}
             alt={`Figure ${figureIndex + 1}`}
-            className="max-h-48 rounded-lg border border-ink/8 bg-white object-contain"
-            onError={(e) => {
-              (e.target as HTMLImageElement).style.display = "none";
-            }}
+            title={`Figure ${figureIndex + 1}`}
+            imageClassName="max-h-48 rounded-lg border border-ink/8 bg-white object-contain"
           />
         </div>
       )}
@@ -115,9 +122,11 @@ export default function AppliedChangeCard({
           </label>
           {isEditing ? (
             <div>
+              {staleDraft && <p role="alert" className="mb-2 text-warning">The output changed while this draft was open. Copy your text, then cancel and reopen the editor before saving.</p>}
               <textarea
                 value={editText}
-                onChange={(e) => setEditText(e.target.value)}
+                onChange={(e) => editor.send({ type: "type", text: e.target.value })}
+                disabled={saving || anyBusy}
                 rows={4}
                 className="w-full rounded-lg border border-accent/30 bg-white px-3 py-2 text-sm text-ink focus:border-accent focus:outline-none"
                 autoFocus
@@ -126,7 +135,7 @@ export default function AppliedChangeCard({
                 <button
                   type="button"
                   onClick={handleCancelEdit}
-                  disabled={editing}
+                  disabled={saving}
                   className="rounded-lg border border-ink/10 bg-white px-3 py-1.5 text-sm font-medium text-ink disabled:opacity-50"
                 >
                   Cancel
@@ -134,7 +143,7 @@ export default function AppliedChangeCard({
                 <button
                   type="button"
                   onClick={handleSaveEdit}
-                  disabled={!editText.trim() || editing}
+                  disabled={!editText.trim() || saving || anyBusy || staleDraft}
                   className="rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
                 >
                   {editSaveLabel}
@@ -152,7 +161,7 @@ export default function AppliedChangeCard({
                 <button
                   type="button"
                   onClick={handleStartEdit}
-                  disabled={anyBusy}
+                  disabled={anyBusy || isEditing}
                   className="shrink-0 rounded-lg border border-ink/10 bg-white px-2.5 py-1 text-xs font-medium text-ink-muted hover:text-ink disabled:opacity-50"
                 >
                   {altText ? "Edit" : "Add"}
@@ -178,7 +187,7 @@ export default function AppliedChangeCard({
           <button
             type="button"
             onClick={() => onKeep(change)}
-            disabled={anyBusy}
+            disabled={anyBusy || isEditing}
             className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
           >
             {keepLabel}
@@ -186,7 +195,7 @@ export default function AppliedChangeCard({
           <button
             type="button"
             onClick={() => onUndo(change)}
-            disabled={anyBusy}
+            disabled={anyBusy || isEditing}
             className="rounded-lg border border-ink/10 bg-white px-4 py-2 text-sm font-medium text-ink disabled:opacity-50"
           >
             {undoLabel}
@@ -203,6 +212,7 @@ export default function AppliedChangeCard({
             <textarea
               value={feedback}
               onChange={(event) => setFeedback(event.target.value)}
+              disabled={anyBusy || isEditing}
               rows={3}
               className="w-full rounded-lg border border-ink/10 bg-white px-3 py-2 text-sm text-ink placeholder:text-ink-muted/70"
               placeholder={
@@ -215,7 +225,7 @@ export default function AppliedChangeCard({
               <button
                 type="button"
                 onClick={() => onRevise(change, feedback)}
-                disabled={!feedback.trim() || anyBusy}
+                disabled={!feedback.trim() || anyBusy || isEditing}
                 className="rounded-lg border border-accent/20 bg-accent/10 px-4 py-2 text-sm font-medium text-accent disabled:opacity-50"
               >
                 {retryLabel}

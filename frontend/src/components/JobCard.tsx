@@ -1,6 +1,6 @@
-import { useState } from "react";
 import { Link } from "react-router-dom";
-import { useDeleteJob } from "../api/jobs";
+import { useDeleteConfirmation } from "../hooks/useDeleteConfirmation";
+import { jobProgress, knownJobStatus } from "../state/jobView";
 import { formatBytes, formatClassification, formatDate } from "../utils/format";
 import ConfirmDialog from "./ConfirmDialog";
 import type { Job, JobStatus } from "../types";
@@ -47,14 +47,10 @@ interface JobCardProps {
 }
 
 export default function JobCard({ job }: JobCardProps) {
-  const config = STATUS_CONFIG[job.status];
-  const deleteJob = useDeleteJob();
-  const [showConfirmDialog, setShowConfirmDialog] = useState(false);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
-  const completedSteps = job.steps.filter(
-    (s) => s.status === "complete" || s.status === "skipped",
-  ).length;
-  const progress = job.steps.length > 0 ? (completedSteps / job.steps.length) * 100 : 0;
+  const status = knownJobStatus(job.status);
+  const config = status === "unknown" ? { label: "Unknown status", color: "text-ink-muted", bg: "bg-paper-warm", dot: "bg-ink-muted" } : STATUS_CONFIG[status];
+  const deletion = useDeleteConfirmation(job.id);
+  const { completed: completedSteps, total, percent: progress } = jobProgress(job);
 
   const isCompliant = job.validation_compliant ?? null;
   const linkTo = `/jobs/${job.id}`;
@@ -62,8 +58,7 @@ export default function JobCard({ job }: JobCardProps) {
   const handleDelete = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    setDeleteError(null);
-    setShowConfirmDialog(true);
+    deletion.show();
   };
 
   return (
@@ -124,7 +119,7 @@ export default function JobCard({ job }: JobCardProps) {
               />
             </div>
             <p className="text-xs text-ink-muted mt-1">
-              {completedSteps} of {job.steps.length} steps complete
+              {completedSteps} of {total} steps complete
             </p>
           </div>
         )}
@@ -155,9 +150,9 @@ export default function JobCard({ job }: JobCardProps) {
           </p>
         )}
 
-        {deleteError && (
+        {deletion.error && (
           <p className="text-xs text-error bg-error-light rounded-lg px-3 py-2 mb-3">
-            {deleteError}
+            {deletion.error}
           </p>
         )}
 
@@ -188,30 +183,15 @@ export default function JobCard({ job }: JobCardProps) {
         </div>
       </Link>
       <ConfirmDialog
-        open={showConfirmDialog}
+        open={deletion.open}
         title="Delete Job"
         message={`Delete "${job.original_filename}"? This action cannot be undone.`}
         confirmLabel="Delete"
         cancelLabel="Cancel"
-        confirmPending={deleteJob.isPending}
-        errorMessage={deleteError}
-        onConfirm={() => {
-          setDeleteError(null);
-          deleteJob.mutate(job.id, {
-            onSuccess: () => {
-              setShowConfirmDialog(false);
-            },
-            onError: (error) => {
-              setDeleteError(
-                error instanceof Error ? error.message : "Failed to delete this job. Please try again.",
-              );
-            },
-          });
-        }}
-        onCancel={() => {
-          if (deleteJob.isPending) return;
-          setShowConfirmDialog(false);
-        }}
+        confirmPending={deletion.pending}
+        errorMessage={deletion.error}
+        onConfirm={deletion.confirm}
+        onCancel={deletion.cancel}
       />
     </>
   );

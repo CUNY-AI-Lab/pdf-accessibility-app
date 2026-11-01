@@ -1,4 +1,7 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef } from "react";
+
+import { useMachine } from "../hooks/useMachine";
+import { acceptPickedFiles, dropzoneMode, dropzoneTransition, type DropzoneState } from "../state/dropzone";
 
 interface FileDropzoneProps {
   onFiles: (files: File[]) => void;
@@ -6,15 +9,18 @@ interface FileDropzoneProps {
 }
 
 export default function FileDropzone({ onFiles, disabled }: FileDropzoneProps) {
-  const [isDragging, setIsDragging] = useState(false);
+  const { state: dragState, send: dragSend } = useMachine<DropzoneState, Parameters<typeof dropzoneTransition>[1]>("idle", dropzoneTransition);
+  const mode = dropzoneMode(dragState, disabled === true);
+  const isDragging = mode === "dragging";
+  const zone = useRef<HTMLButtonElement>(null);
 
-  const handleDragOver = useCallback((e: React.DragEvent) => {
+  const handleDragOver = useCallback((e: React.DragEvent<HTMLButtonElement>) => {
     e.preventDefault();
     e.stopPropagation();
-    setIsDragging(true);
-  }, []);
+    if (!e.currentTarget.disabled) dragSend("enter");
+  }, [dragSend]);
 
-  const handleDragLeave = useCallback((e: React.DragEvent) => {
+  const handleDragLeave = useCallback((e: React.DragEvent<HTMLButtonElement>) => {
     e.preventDefault();
     e.stopPropagation();
     // Only set isDragging false when actually leaving the dropzone,
@@ -23,23 +29,20 @@ export default function FileDropzone({ onFiles, disabled }: FileDropzoneProps) {
       e.currentTarget instanceof Node &&
       !e.currentTarget.contains(e.relatedTarget as Node)
     ) {
-      setIsDragging(false);
+      dragSend("leave");
     }
-  }, []);
+  }, [dragSend]);
 
   const handleDrop = useCallback(
-    (e: React.DragEvent) => {
+    (e: React.DragEvent<HTMLButtonElement>) => {
       e.preventDefault();
       e.stopPropagation();
-      setIsDragging(false);
+      dragSend("drop");
       if (disabled) return;
 
-      const files = Array.from(e.dataTransfer.files).filter((f) =>
-        f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf"),
-      );
-      if (files.length > 0) onFiles(files);
+      acceptPickedFiles(Array.from(e.dataTransfer.files), false, onFiles);
     },
-    [onFiles, disabled],
+    [onFiles, disabled, dragSend],
   );
 
   const handleClick = useCallback(() => {
@@ -49,14 +52,15 @@ export default function FileDropzone({ onFiles, disabled }: FileDropzoneProps) {
     input.accept = ".pdf,application/pdf";
     input.multiple = true;
     input.onchange = () => {
-      const files = Array.from(input.files || []);
-      if (files.length > 0) onFiles(files);
+      // The picker can finish after props changed or the component unmounted.
+      acceptPickedFiles(Array.from(input.files || []), zone.current?.disabled !== false, onFiles);
     };
     input.click();
   }, [onFiles, disabled]);
 
   return (
     <button
+      ref={zone}
       type="button"
       onClick={handleClick}
       onDragOver={handleDragOver}

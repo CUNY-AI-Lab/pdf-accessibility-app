@@ -9,6 +9,7 @@ import type {
   ReviewTask,
   ValidationReport,
 } from "../types";
+import { jobPollInterval, jobRevision, loadReviewSnapshot, outputReady, projectReviewContext } from "../state/jobView";
 import { apiFetch } from "./client";
 
 // ── Queries ──
@@ -35,19 +36,11 @@ export function useJob(id: string) {
     queryFn: () => apiFetch<Job>(`/jobs/${id}`),
     refetchInterval: (query) => {
       const job = query.state.data as Job | undefined;
-      if (!job) return false;
-      return job.status === "queued" || job.status === "processing" ? 3000 : false;
+      return jobPollInterval(job);
     },
   });
 }
 
-export function useReviewTasks(jobId: string, enabled = true) {
-  return useQuery({
-    queryKey: ["jobs", jobId, "review-tasks"],
-    queryFn: () => apiFetch<ReviewTask[]>(`/jobs/${jobId}/review-tasks`),
-    enabled,
-  });
-}
 
 export function useResolveReviewTask(jobId: string) {
   const queryClient = useQueryClient();
@@ -61,21 +54,7 @@ export function useResolveReviewTask(jobId: string) {
   });
 }
 
-export function useAppliedChanges(jobId: string, enabled = true) {
-  return useQuery({
-    queryKey: ["jobs", jobId, "applied-changes"],
-    queryFn: () => apiFetch<AppliedChange[]>(`/jobs/${jobId}/applied-changes`),
-    enabled,
-  });
-}
 
-export function useFigureChanges(jobId: string, enabled = true) {
-  return useQuery({
-    queryKey: ["jobs", jobId, "figure-changes"],
-    queryFn: () => apiFetch<AppliedChange[]>(`/jobs/${jobId}/figure-changes`),
-    enabled,
-  });
-}
 
 export function useKeepAppliedChange(jobId: string) {
   const queryClient = useQueryClient();
@@ -131,37 +110,16 @@ export function useEditAppliedChange(jobId: string) {
   });
 }
 
-export function useValidation(jobId: string, enabled = true) {
-  return useQuery({
-    queryKey: ["jobs", jobId, "validation"],
-    queryFn: () =>
-      apiFetch<ValidationReport>(`/jobs/${jobId}/download/report`),
-    enabled,
-  });
-}
 
 // ── Mutations ──
 
 export function useCreateJobs() {
   const queryClient = useQueryClient();
   return useMutation({
-    // One request per file, with the PDF as the body, so the server can
-    // stream each file to storage.
-    mutationFn: async (files: File[]) => {
-      const jobs: Job[] = [];
-      for (const file of files) {
-        const created = await apiFetch<{ jobs: Job[] }>(
-          `/jobs?filename=${encodeURIComponent(file.name)}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/pdf" },
-            body: file,
-          },
-        );
-        jobs.push(...created.jobs);
-      }
-      return { jobs };
-    },
+    mutationFn: (file: File) => apiFetch<{ jobs: Job[] }>(
+      `/jobs?filename=${encodeURIComponent(file.name)}`,
+      { method: "POST", headers: { "Content-Type": "application/pdf" }, body: file },
+    ),
     onSettled: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
   });
 }
@@ -173,4 +131,25 @@ export function useDeleteJob() {
       apiFetch<void>(`/jobs/${jobId}`, { method: "DELETE" }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
   });
+}
+
+/** One cache entry for the entire review context, scoped to observed output. */
+export function useReviewContext(job?: Job) {
+  const query = useQuery({
+    queryKey: ["jobs", job?.id, "review-context", job ? jobRevision(job) : null],
+    enabled: outputReady(job),
+    queryFn: () => {
+      if (!job) throw new Error("Review needs a job");
+      const read = <T,>(path: string) => apiFetch<T>(`/jobs/${job.id}${path}`, { cache: "no-store" });
+      return loadReviewSnapshot(job, () => read<Job>(""), async () => {
+        const [tasks, changes, figures, validation] = await Promise.all([
+          read<ReviewTask[]>("/review-tasks"), read<AppliedChange[]>("/applied-changes"),
+          read<AppliedChange[]>("/figure-changes"), read<ValidationReport>("/download/report"),
+        ]);
+        return { tasks, changes, figures, validation };
+      });
+    },
+    refetchInterval: 30000,
+  });
+  return projectReviewContext(job, query);
 }

@@ -7,6 +7,7 @@ interface FidelityIssueCardProps {
   task: ReviewTask;
   onResolve?: (taskId: number) => void;
   resolving?: boolean;
+  disabled?: boolean;
 }
 
 function num(task: ReviewTask, key: string): number {
@@ -198,7 +199,7 @@ function WhatWeFound({ task }: { task: ReviewTask }) {
   );
 }
 
-export default function FidelityIssueCard({ jobId, task, onResolve, resolving }: FidelityIssueCardProps) {
+export default function FidelityIssueCard({ jobId, task, onResolve, resolving, disabled }: FidelityIssueCardProps) {
   const previewPages = previewPagesForTask(task);
   const pagesToCheck = pages(task);
   const isResolved = task.status === "resolved";
@@ -290,7 +291,7 @@ export default function FidelityIssueCard({ jobId, task, onResolve, resolving }:
           <button
             type="button"
             onClick={() => onResolve(task.id)}
-            disabled={resolving}
+            disabled={resolving || disabled}
             className="
               inline-flex items-center gap-1.5 rounded-lg
               border border-ink/15 bg-white px-3.5 py-2

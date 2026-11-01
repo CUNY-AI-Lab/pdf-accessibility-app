@@ -213,14 +213,13 @@ data/                 Runtime storage (git-ignored)
 cd backend
 PYTHONPATH=. uv run pytest tests -q
 
-# Frontend lint and build
+# Frontend lint, state tests and build
 cd frontend
-bun run lint
-bun run build
+bun run check
 ```
 
 From the repository root, run the credential-free source gate (backend Ruff,
-Pyright and pytest; frontend lint/build; Worker checks):
+Pyright and pytest; frontend lint/tests/build; Worker checks):
 
 ```bash
 ./scripts/check.sh

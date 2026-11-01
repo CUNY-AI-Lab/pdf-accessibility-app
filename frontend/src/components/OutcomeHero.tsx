@@ -1,21 +1,21 @@
 import { Link } from "react-router-dom";
 import { apiUrl } from "../api/client";
-import type { JobStatus } from "../types";
+import { complianceOutcome, type ReviewContext } from "../state/jobView";
+import type { TerminalJobStatus } from "../types";
 import { pluralize } from "../utils/format";
 import DownloadButton from "./DownloadButton";
 import { ArrowRightIcon, CheckIcon, WarningIcon, XIcon } from "./Icons";
 
-type TerminalStatus = Extract<JobStatus, "complete" | "manual_remediation" | "failed">;
-
 interface OutcomeHeroProps {
   jobId: string;
   filename: string;
-  status: TerminalStatus;
+  status: TerminalJobStatus;
   hasHtml?: boolean;
+  validationCompliant?: boolean;
   appliedChangeCount?: number;
   reviewTaskCount?: number;
   blockingIssueCount?: number | null;
-  reviewContextStatus?: "ready" | "loading" | "unavailable";
+  reviewContextStatus?: ReviewContext<unknown>["status"];
   error?: string;
 }
 
@@ -42,12 +42,14 @@ export default function OutcomeHero({
   filename,
   status,
   hasHtml = false,
+  validationCompliant = false,
   appliedChangeCount = 0,
   reviewTaskCount = 0,
   blockingIssueCount = null,
-  reviewContextStatus = "ready",
+  reviewContextStatus = "not_applicable",
   error,
 }: OutcomeHeroProps) {
+  const outcome = complianceOutcome(status, validationCompliant, reviewContextStatus);
   const summary = reviewSummary(appliedChangeCount, reviewTaskCount);
   const reviewLabel = reviewButtonLabel(appliedChangeCount);
 
@@ -80,19 +82,21 @@ export default function OutcomeHero({
           </div>
           <div className="flex-1">
             <h2 className="font-display text-xl text-ink mb-1">
-              Your PDF is now accessible
+              {outcome === "passed" ? "Your PDF is ready" : "Processing finished"}
             </h2>
             <p className="text-sm text-ink-muted leading-relaxed">
-              {reviewContextStatus === "loading"
-                ? "All compliance checks passed. Review details are still loading."
-                : summary
-                ? `All compliance checks passed. You can optionally review ${summary}.`
-                : "All compliance checks passed and your PDF is ready for assistive technologies."}
+              {reviewContextStatus !== "ready"
+                ? "Review details and validation are not available yet."
+                : outcome !== "passed"
+                  ? "The output is available. Check the report for unresolved or unverified compliance issues."
+                  : summary
+                    ? `Automated compliance checks passed. You can review ${summary}.`
+                    : "Automated compliance checks passed. Review the PDF with assistive technologies before sharing."}
             </p>
             <div className="flex flex-wrap items-center gap-3 mt-4">
               <DownloadButton jobId={jobId} filename={filename} type="pdf" />
               {hasHtml && <DownloadButton jobId={jobId} filename={filename} type="html" />}
-              {reviewContextStatus === "ready" && summary && (
+              {(reviewContextStatus !== "ready" || summary) && (
                 <Link
                   to={`/jobs/${jobId}/review`}
                   className="
@@ -141,7 +145,7 @@ export default function OutcomeHero({
           <div className="flex flex-wrap items-center gap-3 mt-4">
             <DownloadButton jobId={jobId} filename={filename} type="pdf" />
             {hasHtml && <DownloadButton jobId={jobId} filename={filename} type="html" />}
-            {reviewContextStatus === "ready" && summary && (
+            {(reviewContextStatus !== "ready" || summary) && (
               <Link
                 to={`/jobs/${jobId}/review`}
                 className="

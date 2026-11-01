@@ -69,6 +69,12 @@ cd frontend
 bun run build
 ```
 
+Run lint, state tests and the production build with `bun run check`. Tests use
+[Vitest](https://vitest.dev/guide/environment) with pure transition tests and
+jsdom for DOM interactions. `bun run test:mutations` temporarily breaks each main
+guard, requires its named test to fail, and restores the source in cleanup. Run
+mutation checks separately from other checks to avoid testing modified files.
+
 The frontend expects the backend at `http://127.0.0.1:8001` during local development.
 
 ## Current review surface
