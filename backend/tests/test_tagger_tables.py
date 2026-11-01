@@ -222,7 +222,7 @@ async def test_caps_sql_labels_over_varied_values_infer_headers(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("signal", ["bold", "rule", "caps"])
-async def test_single_signal_never_promotes_lists_definitions_or_repeated_records(tmp_path, signal):
+async def test_single_signal_does_not_make_definition_entries_column_headers(tmp_path, signal):
     cases = [
         [["TERM", "DESCRIPTION"], ["Apple", "This is a long description of an apple in prose"],
          ["Pear", "This is another long description of a pear in prose"]],
@@ -237,7 +237,8 @@ async def test_single_signal_never_promotes_lists_definitions_or_repeated_record
         if signal != "caps":
             rows[0] = [t.title() for t in rows[0]]
         kwargs = {"style": "bold"} if signal == "bold" else {"rule": RULE} if signal == "rule" else {}
-        _assert_table(await _tag(tmp_path, rows, **kwargs), rows, {})
+        expected = {(r, 0): "Row" for r in range(len(rows))} if len(rows[0]) == 2 and rows[1][0] == "Apple" else {}
+        _assert_table(await _tag(tmp_path, rows, **kwargs), rows, expected)
 
 
 @pytest.mark.asyncio
@@ -332,14 +333,15 @@ async def test_bb9fad9e_real_header_wins_over_section_rows(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_definition_and_resolution_lists_never_infer_headers(tmp_path):
+async def test_definitions_get_row_headers_but_contents_and_resolutions_do_not(tmp_path):
     positive = [["Code", "Color"], ["A", "red"], ["B", "green"]]
     _assert_table(await _tag(tmp_path, positive, style="bold", rule=RULE), positive,
                   {(0, c): "Column" for c in range(2)})
     definitions = [["Term", "This is a long description explaining what the term means"],
                    ["Object", "This is another long description explaining an object in prose"],
                    ["Content", "This is a third long description of the content and its meaning"]]
-    _assert_table(await _tag(tmp_path, definitions, style="bold", rule=RULE), definitions, {})
+    _assert_table(await _tag(tmp_path, definitions, style="bold", rule=RULE), definitions,
+                  {(r, 0): "Row" for r in range(3)})
     contents = [["An introduction to apples", "4"], ["Growing the best pears", "8"],
                 ["How to harvest plums", "12"]]
     _assert_table(await _tag(tmp_path, contents), contents, {})
