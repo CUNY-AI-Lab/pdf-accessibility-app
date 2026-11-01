@@ -237,7 +237,7 @@ The same docling-serve and model were used. The cassette answered 877 model requ
 
 ### Held-out tests (2026-10-31 and 2026-11-01)
 
-The 47 documents above were used to find and fix problems, so their completion rate overstates what an unseen PDF gets. Two held-out sets measure that instead. Each was drawn from public CUNY PDFs by fixed search queries, in rank order, before any run. Each takes several kinds of document and keeps tagged and untagged files as found. The protocol, queries and manifests (URLs and sha256) are kept outside the repository with the evaluation data.
+We used the 47 documents above to find and fix problems, so the pipeline's completion rate on them is higher than its rate on unseen PDFs. We measure unseen PDFs with held-out sets. We drew each set from public CUNY PDFs by fixed search queries, in rank order, before any run, took several kinds of document, and kept tagged and untagged files as we found them. The protocol, queries and manifests (URLs and sha256) are kept outside the repository with the evaluation data.
 
 | Set | Documents | Code | Complete | Failed outright |
 |---|---:|---|---:|---:|
@@ -267,6 +267,21 @@ The seven still held were:
 - four on font rules: 7.21.4.1-1 (embedding), 7.21.8-1 (.notdef glyph) and 7.21.7-2 (Unicode values);
 - one fillable handbook on 7.18.1-2;
 - three long handbooks on screen-reader text coverage.
+
+We made fixes from set 3 (#63, #64), so we no longer count it as held out. On the #64 branch, 31 of its 33 documents complete, and 44 of the 47 documents above complete, all passing veraPDF.
+
+We drew **set 4** (2026-11-01) the same way, excluding sets 1 to 3, and ran it on the released code (`c867c05`, PRs #45 to #64) with AI steps on:
+
+| Set | Documents | Code | Complete | Failed outright |
+|---|---:|---|---:|---:|
+| 4 | 37 (27 already tagged) | released `c867c05` | 32 | 0 |
+
+We found one scan of the three we wanted and two of the three non-English documents. The other search results were born-digital, already used in an earlier set, over 120 pages, or on servers that returned HTTP 403. The pipeline completed 25 of the 27 tagged inputs and 7 of the 10 untagged ones. It wrote alt text for all 332 figures, and 33 documents pass veraPDF. The Gateway quota dropped by $2.56 during the run.
+
+We found three new causes among the five documents the pipeline held:
+- Acrobat added a hidden OCR layer to two documents. Its font, `HiddenHorzOCR`, is a CFF CID font that maps most codes to the .notdef glyph (7.21.8-1), and we wrote the .notdef repair in #64 for TrueType programs only. One of the two also has a form field without a tooltip (7.18.1-3); the pipeline added tooltips to 12 of the 13 fields that lacked one.
+- Two are LaTeX lecture notes. Their Computer Modern math fonts have no ToUnicode map, and their glyph names, such as `negationslash` and `summationdisplay`, are not in Adobe's glyph list (7.21.7-1).
+- One is a slide deck with a table the model classified, at low confidence, as a form layout. The pipeline left it as a table without headers, and the `table_headers` check failed.
 
 ### Untagged CUNY documents
 
