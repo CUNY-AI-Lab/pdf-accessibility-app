@@ -17,6 +17,11 @@ FIDELITY_HOLD_CHECKS = {
         "Figures have no usable description",
         "A Figure has no usable Alt or ActualText for a screen reader to announce.",
     ),
+    "table_readability": (
+        "table_semantics",
+        "This table is rotated or its text could not be read in order",
+        "Table headers cannot repair rotated or disordered cell text.",
+    ),
     "table_headers": (
         "table_semantics",
         "Data tables have no headers",

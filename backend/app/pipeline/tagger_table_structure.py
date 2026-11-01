@@ -40,6 +40,7 @@ def _plan_external_table_headers(elements: list[dict], glyphs: list[MeasuredGlyp
         for t in elements
         if t.get("type") == "table"
         and t.get("bbox")
+        and not t.get("_table_readability")
         and not t.get("_layout_table")
         and not any(c.get(f) for c in t.get("cells", []) for f in HEADER_FLAGS)
     ]
@@ -129,7 +130,11 @@ def _finish_table_structure(builder: "StructTreeBuilder", pages: dict[int, list[
     changed = {}
     for elems in pages.values():
         for table in elems:
-            if table.get("type") != "table" or table.get("_layout_table"):
+            if (
+                table.get("type") != "table"
+                or table.get("_layout_table")
+                or table.get("_table_readability")
+            ):
                 continue
             cells = builder._fragmented_table_cache.get(id(table), {})
             if cells:

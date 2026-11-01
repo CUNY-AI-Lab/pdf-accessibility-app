@@ -13,6 +13,7 @@ from app.services.intelligence_normalize import confidence_label, confidence_sco
 from app.services.intelligence_semantics import adjudicate_semantic_unit
 from app.services.llm_client import LlmClient
 from app.services.semantic_units import SemanticUnit
+from app.services.table_decisions import table_action
 
 TABLE_BATCH_PROMPT = """You are a PDF accessibility table-semantics assistant.
 
@@ -49,8 +50,9 @@ TABLE_BATCH_SCHEMA: dict[str, Any] = {
                     "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
                     "suggested_action": {
                         "type": "string",
-                        "enum": ["confirm_current_headers", "set_table_headers", "manual_only"],
+                        "enum": ["confirm_current_headers", "set_table_headers", "reclassify_region", "manual_only"],
                     },
+                    "resolved_kind": {"type": "string", "enum": ["layout_grid", "toc_group", "text_block", "form_region"]},
                     "reason": {"type": "string"},
                     "header_rows": {
                         "type": "array",
@@ -132,8 +134,8 @@ def _normalize_table_intelligence_result(
     raw: dict[str, Any],
     batch_generated: bool = False,
 ) -> dict[str, Any]:
-    suggested_action = str(raw.get("suggested_action") or "manual_only").strip() or "manual_only"
-    if suggested_action not in {"confirm_current_headers", "set_table_headers", "manual_only"}:
+    suggested_action = (table_action(raw) or "manual_only") or "manual_only"
+    if suggested_action not in {"confirm_current_headers", "set_table_headers", "reclassify_region", "manual_only"}:
         suggested_action = "manual_only"
     confidence = confidence_label(raw.get("confidence"))
     return {
@@ -142,11 +144,12 @@ def _normalize_table_intelligence_result(
         "confidence": confidence,
         "confidence_score": confidence_score(confidence),
         "suggested_action": suggested_action,
-        "reason": str(raw.get("reason") or "").strip(),
+        "reason": str(raw.get("reason") or raw.get("explanation") or raw.get("justification") or "").strip(),
+        "resolved_kind": raw.get("resolved_kind"),
         "table_review_id": table_review_id,
         "page": page_number,
-        "header_rows": _normalize_indices(raw.get("header_rows")),
-        "row_header_columns": _normalize_indices(raw.get("row_header_columns")),
+        "header_rows": raw.get("header_rows", []),
+        "row_header_columns": raw.get("row_header_columns", []),
         "batch_generated": batch_generated,
     }
 
@@ -206,6 +209,30 @@ async def generate_table_intelligence(
     return result
 
 
+def table_batch_decisions(parsed: dict, targets: list[dict]) -> dict[str, dict]:
+    """Accept recorded single-table and ID-keyed answers without guessing IDs."""
+    ids = {str(t.get("table_review_id") or "") for t in targets}
+    decisions = {}
+    for item in parsed.get("decisions", []) if isinstance(parsed.get("decisions"), list) else []:
+        if isinstance(item, dict):
+            review_id = str(item.get("table_review_id") or item.get("unit_id") or "")
+            if review_id in ids:
+                decisions[review_id] = item
+    for review_id in ids:
+        item = parsed.get(review_id)
+        if isinstance(item, dict):
+            decisions[review_id] = item
+        elif isinstance(item, str):
+            decisions[review_id] = {"suggested_action": item}
+    if table_action(parsed):
+        review_id = str(parsed.get("table_review_id") or parsed.get("unit_id") or "")
+        if not review_id and len(ids) == 1:
+            review_id = next(iter(ids))
+        if review_id in ids:
+            decisions[review_id] = parsed
+    return decisions
+
+
 async def generate_table_intelligence_for_page(
     *,
     job: Job,
@@ -236,16 +263,7 @@ async def generate_table_intelligence_for_page(
         cache_breakpoint_index=preferred_cache_breakpoint_index(content),
     )
 
-    decision_map: dict[str, dict[str, Any]] = {}
-    decisions = parsed.get("decisions")
-    if isinstance(decisions, list):
-        for item in decisions:
-            if not isinstance(item, dict):
-                continue
-            table_review_id = str(item.get("table_review_id") or "").strip()
-            if not table_review_id:
-                continue
-            decision_map[table_review_id] = item
+    decision_map = table_batch_decisions(parsed, targets)
 
     results = [
         _normalize_table_intelligence_result(

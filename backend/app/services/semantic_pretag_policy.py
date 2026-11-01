@@ -12,6 +12,7 @@ from app.services.document_intelligence import (
     collect_structure_fragments,
 )
 from app.services.form_fields import field_label_quality
+from app.services.table_decisions import LAYOUT_KINDS, table_action
 
 PRETAG_TABLE_ALLOWED_ACTIONS = frozenset({"confirm_current_headers", "set_table_headers"})
 PRETAG_FORM_ALLOWED_TYPES = frozenset({
@@ -75,10 +76,15 @@ def table_targets_with_cells(
 
 
 def should_auto_apply_table_intelligence(item: dict[str, object]) -> bool:
-    if str(item.get("confidence") or "").strip() != "high":
-        return False
-    action = str(item.get("suggested_action") or "").strip()
-    return action in PRETAG_TABLE_ALLOWED_ACTIONS
+    action = table_action(item)
+    if action == "set_table_headers":
+        # Bounds and existing headers are checked against the target at application.
+        rows, cols = item.get("header_rows", []), item.get("row_header_columns", [])
+        return (isinstance(rows, list) and isinstance(cols, list) and bool(rows or cols)
+                and all(type(i) is int and i >= 0 for i in [*rows, *cols]))
+    if action == "reclassify_region":
+        return item.get("resolved_kind") in LAYOUT_KINDS | {"form_region"}
+    return action == "confirm_current_headers" and item.get("confidence") == "high"
 
 
 def apply_table_intelligence_to_element(
@@ -88,33 +94,16 @@ def apply_table_intelligence_to_element(
     header_rows: list[int],
     row_header_columns: list[int],
 ) -> bool:
-    cells = element.get("cells")
-    if not isinstance(cells, list) or not cells:
+    from app.services.table_decisions import has_headers, header_selection
+
+    if action == "confirm_current_headers":
+        return True
+    if action != "set_table_headers" or has_headers(element):
         return False
-
-    header_row_set = {int(value) for value in header_rows if isinstance(value, int) and value >= 0}
-    row_header_col_set = {int(value) for value in row_header_columns if isinstance(value, int) and value >= 0}
-
-    updated = False
-    if action == "set_table_headers":
-        for cell in cells:
-            if not isinstance(cell, dict):
-                continue
-            row = cell.get("row")
-            col = cell.get("col")
-            column_header = isinstance(row, int) and row in header_row_set
-            row_header = isinstance(col, int) and col in row_header_col_set
-            if cell.get("column_header") != column_header:
-                cell["column_header"] = column_header
-                updated = True
-            if cell.get("row_header") != row_header:
-                cell["row_header"] = row_header
-                updated = True
-            is_header = column_header or row_header
-            if cell.get("is_header") != is_header:
-                cell["is_header"] = is_header
-                updated = True
-    return updated or action == "confirm_current_headers"
+    selected = header_selection(element, {"header_rows": header_rows, "row_header_columns": row_header_columns})
+    for cell, scope in selected:
+        cell.update(is_header=True, column_header=scope == "Column", row_header=scope == "Row")
+    return bool(selected)
 
 
 def should_retry_table_intelligence_aggressively(

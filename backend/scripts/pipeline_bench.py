@@ -142,7 +142,11 @@ async def step_ledger(session_maker, job_id: str) -> list[dict]:
             seconds = None
             if step.started_at and step.completed_at:
                 seconds = round((step.completed_at - step.started_at).total_seconds(), 2)
-            steps.append({"step": step.step_name, "status": step.status, "seconds": seconds})
+            entry = {"step": step.step_name, "status": step.status, "seconds": seconds}
+            if step.step_name == "tagging":
+                result = json.loads(step.result_json) if step.result_json else {}
+                entry["pretag_table_intelligence"] = result.get("table_intelligence_audit")
+            steps.append(entry)
         return steps
 
 
@@ -159,6 +163,8 @@ async def run_outcome(session_maker, job_id: str) -> dict:
         validation = json.loads(job.validation_json) if job and job.validation_json else {}
         fidelity = validation.get("fidelity") or {}
         return {
+            "table_decisions": (validation.get("tagging") or {}).get("table_decisions", []),
+            "table_readability": (validation.get("tagging") or {}).get("table_readability", []),
             "validation_compliant": validation.get("compliant"),
             "remaining_rules": sorted(
                 {

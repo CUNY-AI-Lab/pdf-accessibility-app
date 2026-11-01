@@ -33,7 +33,7 @@ async def paired(tmp_path, source, structure, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "change", ["join", "shift", "starts", "columns", "heading", "gap", "headers", "chain", "blank"]
+    "change", ["join", "shift", "starts", "columns", "heading", "gap", "headers", "chain", "blank", "unreadable"]
 )
 @pytest.mark.parametrize("form", [False, True])
 async def test_cross_page_rows_keep_mcrs_and_header_associations(
@@ -50,6 +50,8 @@ async def test_cross_page_rows_keep_mcrs_and_header_associations(
             if page == 0
             else [["Next", "three"], ["End", "four"]]
         )
+        if page and change == "unreadable":
+            rows[0][0] = "alpha beta gamma delta\nepsilon zeta eta theta"
         if page and change == "columns":
             rows = [r + ["extra"] for r in rows]
         headers = (
@@ -58,6 +60,8 @@ async def test_cross_page_rows_keep_mcrs_and_header_associations(
             else {}
         )
         elem = _fixture(part, rows, form=form, headers=headers)["elements"][0]
+        if page and change == "unreadable":
+            elem["cells"][0]["text"] = "theta eta zeta epsilon delta gamma beta alpha"
         dx = 24 if page and change in {"shift", "starts"} else 0
         dy = (
             -580 if page == 0 or change == "chain" and page == 1 else -160 if change == "gap" else 0
@@ -114,13 +118,13 @@ async def test_cross_page_rows_keep_mcrs_and_header_associations(
                 for col, cell in enumerate(row.K):
                     assert cell.S == "/TD"
                     assert table.K[0].K[col].ID in cell.A.Headers
-    assert "Next" in screen_reader_text(after)
+    assert ("alpha" if change == "unreadable" else "Next") in screen_reader_text(after)
     with pikepdf.open(before) as tagged:
         assert len(list(_tables(tagged.Root.StructTreeRoot))) == (3 if change == "chain" else 2)
 
 
 @pytest.mark.parametrize(
-    "change", ["recover", "plain", "far", "misaligned", "missing", "extractor"]
+    "change", ["recover", "plain", "far", "misaligned", "missing", "extractor", "unreadable"]
 )
 @pytest.mark.parametrize("form", [False, True])
 async def test_bold_headings_outside_grid_become_column_headers(
@@ -131,9 +135,13 @@ async def test_bold_headings_outside_grid_become_column_headers(
         ["Learning first topic", "Discussion first topic"],
         ["Learning other topic", "Discussion other topic"],
     ]
+    if change == "unreadable":
+        rows[0][0] = "a b c d e f g h"
     structure = _fixture(
         source, rows, form=form, headers={(0, 0): "Row"} if change == "extractor" else {}
     )
+    if change == "unreadable":
+        structure["elements"][0]["cells"][0]["text"] = "h g f e d c b a"
     headings = ["Learning outcomes", "Assessment"]
     with pikepdf.open(source, allow_overwriting_input=True) as pdf:
         pg = pdf.pages[0]

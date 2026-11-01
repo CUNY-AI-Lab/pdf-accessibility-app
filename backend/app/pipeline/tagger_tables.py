@@ -196,6 +196,7 @@ def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page
         index
         for index, table in enumerate(elements)
         if table.get("type") == "table"
+        and not table.get("_table_readability")
         and not table.get("_layout_table")
         and not table.get("_external_table_headers")
         and table.get("num_rows", 0) >= 2

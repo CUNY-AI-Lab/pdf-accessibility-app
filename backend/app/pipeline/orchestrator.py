@@ -221,9 +221,6 @@ from app.services.review_surface import (
     is_user_visible_applied_change_type,
 )
 from app.services.semantic_pretag_policy import (
-    apply_table_intelligence_to_element as _apply_table_intelligence_to_element,
-)
-from app.services.semantic_pretag_policy import (
     form_targets_for_intelligence as _form_targets_for_intelligence,
 )
 from app.services.semantic_pretag_policy import (
@@ -250,6 +247,7 @@ from app.services.semantic_pretag_policy import (
 from app.services.semantic_pretag_policy import (
     widget_targets_for_rationalization as _widget_targets_for_rationalization,
 )
+from app.services.table_decisions import queue_table_decision, queue_table_decisions
 from app.services.title_intelligence import enhance_document_title_with_intelligence
 from app.services.toc_intelligence import enhance_toc_structure_with_intelligence
 from app.services.validation_compare import is_better_validation as _is_better_validation
@@ -630,6 +628,8 @@ def _build_validation_payload(
             "bookmarks_added": tagging_result.bookmarks_added,
             "title_set": tagging_result.title_set,
             "reading_order_diagnostics": getattr(tagging_result, "reading_order_diagnostics", []),
+            "table_decisions": getattr(tagging_result, "table_intelligence_audit", []),
+            "table_readability": getattr(tagging_result, "table_readability", []),
             "lang_set": tagging_result.lang_set,
         },
         "semantic_coverage": _semantic_coverage_summary(
@@ -1055,6 +1055,10 @@ async def _apply_pretag_grounded_text_resolutions(
         approved_by_key,
     )
     audit.update(apply_audit)
+    updated_structure, queued = queue_table_decisions(
+        updated_structure, adjudication.get("table_intelligence", [])
+    )
+    audit["table_decisions_queued"] = queued
     return updated_structure, audit
 
 
@@ -1318,16 +1322,20 @@ async def _apply_pretag_table_intelligence(
         if not approved:
             continue
         action = str(approved.get("suggested_action") or "").strip()
-        if not _apply_table_intelligence_to_element(
-            element,
-            action=action,
-            header_rows=list(approved.get("header_rows") or []),
-            row_header_columns=list(approved.get("row_header_columns") or []),
-        ):
+        if action == "confirm_current_headers":
+            if not any(
+                c.get(f)
+                for c in element.get("cells", [])
+                for f in ("is_header", "column_header", "row_header")
+            ):
+                continue
+        elif not queue_table_decision(element, approved):
             continue
         element["review_id"] = review_id
-        element["table_llm_confirmed"] = True
-        element["table_llm_confidence"] = str(approved.get("confidence") or "").strip() or "high"
+        element["table_llm_confirmed"] = action == "confirm_current_headers"
+        element["table_llm_confidence"] = (
+            str(approved.get("confidence") or "").strip() or "unspecified"
+        )
         element["table_llm_action"] = action
         element["table_llm_reason"] = str(approved.get("reason") or "").strip()
         element["table_llm_summary"] = str(approved.get("summary") or "").strip()
@@ -1345,13 +1353,14 @@ async def _apply_pretag_table_intelligence(
         audit["reason"] = "no_matching_structure_elements"
         return structure_json, audit
 
-    audit["applied"] = True
-    audit["applied_count"] = applied_count
+    audit["applied"] = bool(confirmed_count)
+    audit["applied_count"] = confirmed_count
+    audit["queued_count"] = applied_count - confirmed_count
     audit["confirmed_count"] = confirmed_count
-    audit["set_headers_count"] = set_headers_count
+    audit["set_headers_count"] = 0
     audit["pages"] = sorted(applied_pages)
     audit["review_ids"] = applied_review_ids
-    audit["reason"] = "applied"
+    audit["reason"] = "queued_for_tagger" if audit["queued_count"] else "confirmed"
     return updated_structure, audit
 
 
@@ -2668,16 +2677,22 @@ def _candidate_is_acceptable(
 
 
 async def _retry_grounded_candidate(
-    candidate: Candidate, *, job: Job, settings: Settings, evaluate,
+    candidate: Candidate,
+    *,
+    job: Job,
+    settings: Settings,
+    evaluate,
 ) -> Candidate:
     safe_resolutions = _collect_safe_grounded_text_resolutions(candidate.grounded_text_adjudication)
-    if not safe_resolutions or not _blocking_task_count(candidate.review_tasks):
+    if not _blocking_task_count(candidate.review_tasks):
         return candidate
     retry_structure, retry_audit = _apply_grounded_text_resolutions_to_structure(
         candidate.structure_json,
         safe_resolutions,
     )
-    if not bool(retry_audit.get("applied")):
+    table_items = (candidate.grounded_text_adjudication or {}).get("table_intelligence", [])
+    retry_structure, queued = queue_table_decisions(retry_structure, table_items)
+    if not bool(retry_audit.get("applied")) and not queued:
         return candidate
     retry = await evaluate(
         input_path=candidate.output_path,
@@ -2688,10 +2703,9 @@ async def _retry_grounded_candidate(
         produced_by="grounded_text",
         adjudicate=False,
     )
-    if (
-        _candidate_is_acceptable(retry, candidate, require_improvement=True)
-        and not _has_grounded_text_candidate_task(retry.review_tasks)
-    ):
+    if _candidate_is_acceptable(
+        retry, candidate, require_improvement=True
+    ) and not _has_grounded_text_candidate_task(retry.review_tasks):
         return retry
     (
         retry.review_tasks,
@@ -2710,9 +2724,15 @@ async def _retry_grounded_candidate(
 
 
 async def _retry_structure_candidate(
-    candidate: Candidate, *, job: Job, settings: Settings, evaluate,
+    candidate: Candidate,
+    *,
+    job: Job,
+    settings: Settings,
+    evaluate,
 ) -> Candidate:
-    if not candidate.structure_json or not _blocking_task_count(candidate.review_tasks):
+    has_blocking_tasks = bool(_blocking_task_count(candidate.review_tasks))
+    has_table_tasks = any(t.get("task_type") == "table_semantics" for t in candidate.review_tasks)
+    if not candidate.structure_json or not (has_blocking_tasks or has_table_tasks):
         return candidate
     suggested_tasks, structure, applied_specs = await auto_apply_structure_tasks(
         job=_candidate_job(job, candidate),
@@ -2731,7 +2751,11 @@ async def _retry_structure_candidate(
         applied_change_specs=[*candidate.applied_change_specs, *applied_specs],
         produced_by="auto_structure",
     )
-    return retry if _candidate_is_acceptable(retry, candidate, require_improvement=True) else candidate
+    return (
+        retry
+        if _candidate_is_acceptable(retry, candidate, require_improvement=has_blocking_tasks)
+        else candidate
+    )
 
 
 async def _retry_font_map_candidate(
@@ -2789,7 +2813,11 @@ async def _retry_font_map_candidate(
 
 
 async def _prepare_tagging_inputs(
-    job: Job, db: AsyncSession, settings: Settings, working_pdf: Path, structure_json: dict,
+    job: Job,
+    db: AsyncSession,
+    settings: Settings,
+    working_pdf: Path,
+    structure_json: dict,
 ):
     """Apply the existing pretag policies and collect figure decisions once."""
     # Approved and rejected figure decisions go to the tagger; fidelity also
@@ -2837,9 +2865,7 @@ async def _prepare_tagging_inputs(
         structure_json=structure_json,
     )
     docling_pretag_plan = dict(docling_pretag_router.get("plan") or {})
-    docling_pretag_plan["forms"] = dict(
-        (docling_form_router.get("plan") or {}).get("forms") or {}
-    )
+    docling_pretag_plan["forms"] = dict((docling_form_router.get("plan") or {}).get("forms") or {})
     working_pdf, pretag_form_intelligence = await _apply_pretag_form_intelligence(
         job=job,
         settings=settings,
@@ -2875,6 +2901,23 @@ def _tagging_step_result(tagging_result, pretag_details):
     pretag_form_intelligence = pretag_details["pretag_form_intelligence"]
     pretag_llm_usage = pretag_details["pretag_llm_usage"]
     docling_pretag_plan = pretag_details["docling_pretag_plan"]
+    decisions = getattr(tagging_result, "table_intelligence_audit", [])
+    actual = [d for d in decisions if d.get("status") in {"applied_headers", "applied_layout"}]
+    pretag_table_intelligence = {
+        **pretag_table_intelligence,
+        "applied": bool(actual),
+        "applied_count": len(actual),
+        "pretag_reason": pretag_table_intelligence.get("reason"),
+        "reason": "applied"
+        if actual
+        else (
+            "no_safe_resolutions"
+            if pretag_table_intelligence.get("queued_count")
+            else pretag_table_intelligence.get("reason")
+        ),
+        "set_headers_count": sum(d.get("status") == "applied_headers" for d in actual),
+        "layout_count": sum(d.get("status") == "applied_layout" for d in actual),
+    }
     return {
         "tags_added": tagging_result.tags_added,
         "lang_set": tagging_result.lang_set,
@@ -2888,10 +2931,10 @@ def _tagging_step_result(tagging_result, pretag_details):
         "bookmarks_added": tagging_result.bookmarks_added,
         "title_set": tagging_result.title_set,
         "reading_order_diagnostics": getattr(tagging_result, "reading_order_diagnostics", []),
+        "table_decisions": getattr(tagging_result, "table_intelligence_audit", []),
+        "table_readability": getattr(tagging_result, "table_readability", []),
         "grounded_text_auto_applied": bool(pretag_grounded_text.get("applied")),
-        "grounded_text_auto_applied_count": int(
-            pretag_grounded_text.get("applied_count", 0) or 0
-        ),
+        "grounded_text_auto_applied_count": int(pretag_grounded_text.get("applied_count", 0) or 0),
         "grounded_text_code_auto_applied_count": int(
             pretag_grounded_text.get("applied_code_text_count", 0) or 0
         ),
@@ -2905,9 +2948,7 @@ def _tagging_step_result(tagging_result, pretag_details):
         "table_intelligence_set_headers_count": int(
             pretag_table_intelligence.get("set_headers_count", 0) or 0
         ),
-        "widget_rationalization_auto_applied": bool(
-            pretag_widget_rationalization.get("applied")
-        ),
+        "widget_rationalization_auto_applied": bool(pretag_widget_rationalization.get("applied")),
         "widget_rationalization_auto_applied_count": int(
             pretag_widget_rationalization.get("applied_count", 0) or 0
         ),
@@ -2918,7 +2959,10 @@ def _tagging_step_result(tagging_result, pretag_details):
         "pretag_llm_usage": pretag_llm_usage,
         "docling_pretag_ambiguity_plan": docling_pretag_plan,
         "grounded_text_audit": pretag_grounded_text,
-        "table_intelligence_audit": pretag_table_intelligence,
+        "table_intelligence_audit": {
+            **pretag_table_intelligence,
+            "decisions": getattr(tagging_result, "table_intelligence_audit", []),
+        },
         "widget_rationalization_audit": pretag_widget_rationalization,
         "form_intelligence_audit": pretag_form_intelligence,
     }
@@ -3315,13 +3359,20 @@ async def _run_tagging_and_validation(
         job_manager.emit_progress(job_id, step="tagging", status="running")
 
         (
-            working_pdf, structure_json, alt_entries, reviewed_alts, pretag_details,
+            working_pdf,
+            structure_json,
+            alt_entries,
+            reviewed_alts,
+            pretag_details,
         ) = await _prepare_tagging_inputs(job, db, settings, working_pdf, structure_json)
 
         async def on_tagged(tagging_result):
             nonlocal current_step
             await _update_step(
-                db, job_id, "tagging", "complete",
+                db,
+                job_id,
+                "tagging",
+                "complete",
                 result=_tagging_step_result(tagging_result, pretag_details),
             )
             job_manager.emit_progress(job_id, step="tagging", status="complete")
@@ -3339,7 +3390,10 @@ async def _run_tagging_and_validation(
                 "font_remediation_applied": bool(font_remediation.applied),
             }
             await _update_step(
-                db, job_id, "validation", "complete",
+                db,
+                job_id,
+                "validation",
+                "complete",
                 result={**result, "violations_count": len(candidate.validation.violations)},
             )
             job_manager.emit_progress(job_id, step="validation", status="complete", result=result)
@@ -3349,13 +3403,19 @@ async def _run_tagging_and_validation(
 
         llm_font_map_auto = {
             "enabled": False,
-            "attempted": False, "applied": False, "reason": "",
+            "attempted": False,
+            "applied": False,
+            "reason": "",
         }
         evaluate = partial(
             evaluate_candidate,
-            job=job, settings=settings, reviewed_alts=reviewed_alts,
-            alt_entries=alt_entries, baseline_validation=baseline_validation,
-            font_remediation=font_remediation, llm_font_map_auto=llm_font_map_auto,
+            job=job,
+            settings=settings,
+            reviewed_alts=reviewed_alts,
+            alt_entries=alt_entries,
+            baseline_validation=baseline_validation,
+            font_remediation=font_remediation,
+            llm_font_map_auto=llm_font_map_auto,
         )
         candidate = await evaluate(
             input_path=working_pdf,
@@ -3363,22 +3423,36 @@ async def _run_tagging_and_validation(
             structure_json=structure_json,
             fidelity_source_pdf=Path(job.input_path),
             applied_change_specs=pre_applied_change_specs or [],
-            produced_by="initial", remediate_fonts=True,
-            on_tagged=on_tagged, on_validated=on_validated,
+            produced_by="initial",
+            remediate_fonts=True,
+            on_tagged=on_tagged,
+            on_validated=on_validated,
         )
-        candidate = await _retry_grounded_candidate(candidate, job=job, settings=settings, evaluate=evaluate)
-        candidate = await _retry_structure_candidate(candidate, job=job, settings=settings, evaluate=evaluate)
+        candidate = await _retry_grounded_candidate(
+            candidate, job=job, settings=settings, evaluate=evaluate
+        )
+        candidate = await _retry_structure_candidate(
+            candidate, job=job, settings=settings, evaluate=evaluate
+        )
         # The font-map patch must inherit the selected structure retry's bytes.
         candidate, metadata_overrides = await _retry_font_map_candidate(
-            candidate, job=job, settings=settings, evaluate=evaluate,
-            baseline_validation=baseline_validation, font_remediation=font_remediation,
+            candidate,
+            job=job,
+            settings=settings,
+            evaluate=evaluate,
+            baseline_validation=baseline_validation,
+            font_remediation=font_remediation,
             llm_font_map_auto=llm_font_map_auto,
         )
         # Recheck the chosen output, as before, before publishing the review surface.
         await _assess_candidate_fidelity(candidate, job=job, settings=settings)
         await _store_candidate_result(
-            db=db, job=job, job_manager=job_manager, candidate=candidate,
-            alt_entries=alt_entries, review_task_metadata_overrides=metadata_overrides,
+            db=db,
+            job=job,
+            job_manager=job_manager,
+            candidate=candidate,
+            alt_entries=alt_entries,
+            review_task_metadata_overrides=metadata_overrides,
         )
 
     except Exception as e:
