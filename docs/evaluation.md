@@ -255,6 +255,19 @@ Once fixes were made from it, set 1 stopped being a held-out measure.
 
 **Set 2** found one cause behind 7 of its 10 holds: standard-14 Type 1 fonts (Times-Roman, Helvetica) were left unembedded in the Linux image (#55). Replayed through tagging and font repair in the production image, all seven pass veraPDF after #55, and none passed before. The full pipeline has not been re-run on set 2. Set 2 has now informed a fix, so the next honest measure needs a third sample.
 
+**Set 3** (2026-11-01) was drawn the same way, excluding sets 1 and 2, and ran on `main` at `363387d` (PRs #57–#61) before release:
+
+| Set | Documents | Code | Complete | Failed outright |
+|---|---:|---|---:|---:|
+| 3 | 33 (28 already tagged) | `363387d` | 26 | 0 |
+
+Every untagged input completed (5 of 5), and 21 of the 28 tagged inputs did. Its scan stratum came up empty: every scan the queries returned was already in set 1 or 2.
+
+The seven still held were:
+- four on font rules: 7.21.4.1-1 (embedding), 7.21.8-1 (.notdef glyph) and 7.21.7-2 (Unicode values);
+- one fillable handbook on 7.18.1-2;
+- three long handbooks on screen-reader text coverage.
+
 ### Untagged CUNY documents
 
 | Document | Kind | Pages | Classified | Status | Held by | veraPDF | Figures with alt text | Seconds | Cost (USD) |
