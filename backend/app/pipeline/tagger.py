@@ -87,6 +87,7 @@ from app.pipeline.tagger_content import _allocate_fragment_mcid as _allocate_fra
 from app.pipeline.tagger_content import (
     _artifact_properties_for_element as _artifact_properties_for_element,
 )
+from app.pipeline.tagger_content import _DeferredFigureText
 from app.pipeline.tagger_content import _figure_of as _figure_of
 from app.pipeline.tagger_content import _fragment_tag_for_element as _fragment_tag_for_element
 from app.pipeline.tagger_content import _instruction_paints_content as _instruction_paints_content
@@ -133,6 +134,7 @@ from app.pipeline.tagger_content_geometry import (
     _text_runs_look_like_hidden_ocr_layer as _text_runs_look_like_hidden_ocr_layer,
 )
 from app.pipeline.tagger_content_geometry import _update_text_pos as _update_text_pos
+from app.pipeline.tagger_figure_text import _figure_text_elements, _recover_figure_text_owners
 from app.pipeline.tagger_geometry import BLANK_PAGE_MAX_INK_RATIO as BLANK_PAGE_MAX_INK_RATIO
 from app.pipeline.tagger_geometry import (
     BLANK_PAGE_NONWHITE_THRESHOLD as BLANK_PAGE_NONWHITE_THRESHOLD,
@@ -600,6 +602,22 @@ async def tag_pdf(
                 )
                 if not nonsemantic_page and (has_semantics or has_words):
                     page_word_owners = page_owners[page_index]
+                    measured_ops, stream_starts = [], set()
+                    for ops in page_glyphs.ops.values():
+                        stream_starts.add(len(measured_ops))
+                        measured_ops.extend(ops)
+                    measured = dict(enumerate(measured_ops))
+                    recovered = _figure_text_elements(page_elems, measured, decorative_figures)
+                    _prepare_link_targets(page, builder, recovered)
+                    page_elems.extend(recovered)
+                    recovered_indices = set(range(len(page_elems) - len(recovered), len(page_elems)))
+                    _recover_figure_text_owners(page_word_owners, _word_owners(
+                        measured,
+                        [target for target in _content_targets(page_elems)
+                         if target.elem_idx in recovered_indices],
+                        stream_starts=stream_starts,
+                    ))
+                    deferred_figure_text = _DeferredFigureText()
                     def rewrite(owner, path=(), initial_ctm=IDENTITY, ancestors=frozenset()):
                         try:
                             instructions = _strip_existing_markers(
@@ -628,6 +646,7 @@ async def tag_pdf(
                             passthrough_regions=passthrough,
                             measured_ops=page_glyphs.ops.get(path),
                             word_owners=page_word_owners,
+                            deferred_figure_text=deferred_figure_text,
                         )
                         for form in forms:
                             if form.stream.objgen in ancestors:
@@ -641,6 +660,7 @@ async def tag_pdf(
                         return matched
 
                     matched_page_indices = rewrite(page)
+                    deferred_figure_text.finish(pdf, builder, page_index, page.obj)
                     page_tagged_elements.extend(
                         page_elems[idx] for idx in sorted(matched_page_indices)
                     )
@@ -655,7 +675,7 @@ async def tag_pdf(
                         if t == "figure":
                             if elem.get("figure_index") in decorative_figures:
                                 decorative_figures_artifacted += 1
-                            else:
+                            elif not elem.get("_figure_text_box"):
                                 figures_tagged += 1
                         elif t == "heading":
                             headings_tagged += 1

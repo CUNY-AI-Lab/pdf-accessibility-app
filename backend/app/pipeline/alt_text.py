@@ -7,10 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from app.config import Settings, get_settings
-from app.pipeline.figure_rules import content_protected, decorative_reasons
+from app.pipeline.figure_rules import decorative_reasons, model_decoration_allowed
 from app.pipeline.structure import FigureInfo
 from app.services.alt_text_cache import AltTextCache, usable_description
-from app.services.intelligence_figures import generate_figures_intelligence
+from app.services.intelligence_figures import (
+    generate_figure_intelligence,
+    generate_figures_intelligence,
+)
 from app.services.intelligence_normalize import confidence_label
 from app.services.llm_client import LlmClient
 
@@ -27,7 +30,8 @@ PROMPT_VERSION = "3-exact-request-context"
 def _caption_fallback(caption: str | None) -> str:
     if not isinstance(caption, str):
         return ""
-    return caption.strip()
+    caption = caption.strip()
+    return caption if usable_description(caption) else ""
 
 
 @dataclass
@@ -241,14 +245,14 @@ async def generate_alt_text(
             suggested_action = str(adjudication.get("suggested_action") or "").strip()
             confidence = confidence_label(adjudication.get("confidence"))
             resolved_kind = str(adjudication.get("resolved_kind") or "").strip() or None
-            if content_protected(fig, structure) and (
+            if not model_decoration_allowed(fig, structure, adjudication) and (
                 suggested_action == "mark_decorative" or adjudication.get("is_decorative")
                 or suggested_action == "reclassify_region" and resolved_kind == "artifact"
             ):
                 adjudication = {
                     **adjudication, "suggested_action": "manual_only", "is_decorative": False,
                     "alt_text": "", "confidence": "low",
-                    "reason": "Captioned, referenced or classified content cannot be marked decorative.",
+                    "reason": "Captioned or referenced content cannot be marked decorative; overriding a classification needs an explanation.",
                 }
                 suggested_action = "manual_only"
                 confidence = "low"
@@ -256,7 +260,7 @@ async def generate_alt_text(
             if suggested_action == "reclassify_region" and resolved_kind:
                 existing[fig.index] = AltTextResult(
                     figure_index=fig.index,
-                    generated_text="",
+                    generated_text=str(adjudication.get("alt_text") or "").strip(),
                     status="reclassified",
                     resolved_kind=resolved_kind,
                     suggested_action=suggested_action,
@@ -369,3 +373,70 @@ async def generate_alt_text(
         results.append(result)
 
     return results
+
+
+FIGURE_RECOVERY_FEEDBACK = """This region remains a figure in the accessible PDF.
+No tagged table or form carries its content. Supply alt_text describing the visible
+crop even if it looks like a table, form, screenshot, or part of a page layout.
+For a table, describe its subject, headers and legible key information briefly.
+For a form or screenshot, describe visible controls and state; for a photo,
+describe visible subjects without inferring identities. Return set_alt_text with
+a nonempty description, not reclassify_region. If the crop is truly empty or
+pure decoration with no information, return mark_decorative. Never use a
+placeholder or invent unreadable content; use manual_only if no description
+can be grounded in the crop. A captioned or referenced figure needs a description.
+"""
+
+
+async def describe_unresolved_figures(
+    figures: list[FigureInfo],
+    alt_texts: list[AltTextResult],
+    llm_client: LlmClient,
+    *,
+    structure: dict[str, Any],
+    job=None,
+    original_filename: str = "",
+) -> None:
+    """One targeted recovery for each unresolved figure after coverage checks.
+
+    This prompt differs from the initial semantic decision, so it deliberately
+    bypasses the persistent description cache. Failure leaves the release hold.
+    """
+    by_index = {figure.index: figure for figure in figures}
+
+    async def recover(result: AltTextResult) -> None:
+        if result.status != NEEDS_DESCRIPTION:
+            return
+        figure = by_index.get(result.figure_index)
+        if figure is None or not figure.path.is_file():
+            return
+        decision = await generate_figure_intelligence(
+            figure=figure, llm_client=llm_client, job=job,
+            original_filename=original_filename,
+            reviewer_feedback=FIGURE_RECOVERY_FEEDBACK,
+            previous_intelligence=result.remediation_intelligence,
+        )
+        action = decision.get("suggested_action")
+        text = str(decision.get("alt_text") or "").strip()
+        if action == "set_alt_text" and usable_description(text):
+            result.generated_text = text
+            result.status = "approved"
+            result.suggested_action = "set_alt_text"
+            result.used_placeholder_fallback = False
+            result.used_caption_fallback = False
+        elif action == "mark_decorative" and model_decoration_allowed(figure, structure, decision):
+            result.generated_text = "decorative"
+            result.status = "rejected"
+            result.suggested_action = "mark_decorative"
+        else:
+            return
+        result.confidence = confidence_label(decision.get("confidence"))
+        result.reason = str(decision.get("reason") or "")
+        result.summary = str(decision.get("summary") or "")
+        result.remediation_intelligence = dict(decision)
+        result.reviewable = True
+
+    # Bound queued work as well as model requests on large documents.
+    concurrency = max(1, get_settings().alt_text_max_concurrency)
+    for start in range(0, len(alt_texts), concurrency):
+        await asyncio.gather(*(recover(result) for result in alt_texts[start:start + concurrency]))

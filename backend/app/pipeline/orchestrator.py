@@ -18,7 +18,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.models import AltTextEntry, AppliedChange, Job, JobStep, ReviewTask
-from app.pipeline.alt_text import AltTextResult, figure_applied_change_specs, generate_alt_text
+from app.pipeline.alt_text import (
+    AltTextResult,
+    describe_unresolved_figures,
+    figure_applied_change_specs,
+    generate_alt_text,
+)
 from app.pipeline.classify import classify_pdf
 from app.pipeline.fidelity import _table_semantics_risk, assess_fidelity
 
@@ -151,8 +156,9 @@ from app.pipeline.ocr import run_ocr
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.pdfium_text import PdfiumText
 from app.pipeline.structure import docling_table_cell_matching, extract_structure
-from app.pipeline.tagger import TaggingResult, is_placeholder_alt_text, tag_pdf
+from app.pipeline.tagger import TaggingResult, tag_pdf
 from app.pipeline.validator import ValidationResult, validate_pdf
+from app.services.alt_text_cache import usable_description
 from app.services.applied_changes import add_applied_change
 from app.services.auto_structure_apply import auto_apply_structure_tasks
 from app.services.bookmark_intelligence import enhance_bookmark_structure_with_intelligence
@@ -729,8 +735,8 @@ def _alt_text_entry_state(
     An empty or placeholder description is never approved: the figure keeps
     no alt text and stays "pending_review" until a person describes it, unless
     its visible caption can stand in. A figure the model judged a table or
-    form region but that was kept (see _apply_figure_reclassification) always
-    waits for a person: a caption names a table, it does not read it.
+    form region but that was kept (see _apply_figure_reclassification) needs
+    a grounded description: a caption alone does not describe its content.
     """
     generated_text = (alt.generated_text or "").strip()
     status = alt.status
@@ -740,13 +746,14 @@ def _alt_text_entry_state(
         return "rejected", ""
     if status == "rejected":
         return status, generated_text
-    if status == "pending_review" and getattr(alt, "resolved_kind", None) in (
-        "table",
-        "form_region",
+    if (
+        status == "pending_review"
+        and not usable_description(generated_text)
+        and getattr(alt, "resolved_kind", None) in ("table", "form_region")
     ):
         return "pending_review", ""
-    if is_placeholder_alt_text(generated_text):
-        if caption_fallback and not is_placeholder_alt_text(caption_fallback):
+    if not usable_description(generated_text):
+        if usable_description(caption_fallback):
             return "approved", caption_fallback
         return "pending_review", ""
     if auto_approve:
@@ -850,9 +857,10 @@ def _apply_figure_reclassification(
 
     A figure judged a table or part of a form is removed only when a tagged
     table or form field covers its region (see _reclassified_figure_cover).
-    Otherwise it stays a figure with no description, which holds the document
-    for a person. A figure judged an artifact is kept and marked decorative,
-    as the model's mark_decorative decision is, so a person can review it.
+    Otherwise it stays a figure, retaining any grounded description for use
+    before the targeted description recovery step. A figure judged an artifact
+    is kept and marked decorative, as the model's mark_decorative decision is,
+    so a person can review it.
     The kept figures' results in ``alt_texts`` are updated in place.
     """
     audit: dict[str, object] = {
@@ -932,11 +940,16 @@ def _apply_figure_reclassification(
                 cover = _reclassified_figure_cover(element, resolved_kind, elements, working_pdf)
                 if cover is None:
                     result.status = "pending_review"
-                    result.generated_text = ""
-                    result.suggested_action = "manual_only"
+                    if usable_description(result.generated_text):
+                        result.status = "approved"
+                        result.suggested_action = "set_alt_text"
+                    else:
+                        result.generated_text = ""
+                        result.suggested_action = "manual_only"
                     result.reviewable = True
                     result.importance = "high"
-                    kept_for_review.append(figure_index)
+                    if result.status == "pending_review":
+                        kept_for_review.append(figure_index)
                     updated_elements.append(element)
                     continue
                 removed_indexes.append(figure_index)
@@ -1805,7 +1818,8 @@ async def _apply_table_model(
     from app.pipeline.table_model import HttpReader, rewrite_tables
 
     reader = HttpReader(
-        settings.table_model_url, settings.table_model_name, timeout=settings.table_model_timeout
+        settings.table_model_url, settings.table_model_name, timeout=settings.table_model_timeout,
+        max_request_bytes=settings.llm_max_request_bytes,
     )
     try:
         structure, audit = await rewrite_tables(
@@ -2321,15 +2335,17 @@ async def _run_pipeline(
                             structure=structure.document_json,
                             pdf_path=working_pdf,
                         )
+                        structure.document_json, figure_reclassification = _apply_figure_reclassification(
+                            structure.document_json, alt_texts, working_pdf=working_pdf,
+                        )
+                        await describe_unresolved_figures(
+                            structure.figures, alt_texts, llm_client,
+                            structure=structure.document_json, job=job,
+                            original_filename=job.original_filename,
+                        )
                     alt_text_llm_usage = _llm_usage_snapshot(usage)
                 finally:
                     await llm_client.close()
-
-                structure.document_json, figure_reclassification = _apply_figure_reclassification(
-                    structure.document_json,
-                    alt_texts,
-                    working_pdf=working_pdf,
-                )
                 if figure_reclassification.get("applied"):
                     job.structure_json = json.dumps(structure.document_json)
                     await db.commit()

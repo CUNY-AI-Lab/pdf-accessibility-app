@@ -8,6 +8,7 @@ import hashlib
 import math
 import re
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,22 @@ def content_protected(figure: FigureInfo, structure: dict[str, Any]) -> bool:
              or _REFERENCE.search(str(element.get("text") or "")))
         for element in structure.get("elements", [])
         if isinstance(element, dict)
+    )
+
+
+def model_decoration_allowed(
+    figure: FigureInfo, structure: dict[str, Any], decision: dict[str, Any],
+) -> bool:
+    """Image-aware semantics may correct a coarse picture classification.
+
+    Local heuristics still protect classified content. A model must explain its
+    decorative decision before overriding that hint; captions/references always
+    remain protected.
+    """
+    if not content_protected(figure, structure):
+        return True
+    return bool(str(decision.get("reason") or "").strip()) and not content_protected(
+        replace(figure, classification=None), structure,
     )
 
 

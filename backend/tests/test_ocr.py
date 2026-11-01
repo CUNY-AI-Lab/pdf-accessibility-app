@@ -134,6 +134,7 @@ async def test_gateway_engine_gives_ocrmypdf_the_connection_and_time_for_every_p
         ocr_model="vision-model",
         ocr_gateway_jobs=8,
         ocr_gateway_page_seconds=300,
+        llm_max_request_bytes=96 * 1024,
         subprocess_timeout_ocr=900,
     )
     monkeypatch.setattr(ocr, "get_settings", lambda: settings)
@@ -163,6 +164,7 @@ async def test_gateway_engine_gives_ocrmypdf_the_connection_and_time_for_every_p
     assert json.loads(seen["env"]["CAIL_OCR_HEADERS"]) == {"Authorization": "Bearer sk-app"}
     assert seen["env"]["CAIL_OCR_MODEL"] == "vision-model"
     assert seen["env"]["CAIL_OCR_PAGE_SECONDS"] == "300"
+    assert seen["env"]["CAIL_OCR_MAX_REQUEST_BYTES"] == str(96 * 1024)
     # 25 pages at 8 at a time is 4 rounds, each within the page limit plus
     # time for a Tesseract fallback: more than the configured 900 s.
     assert seen["timeout"] == 4 * (300 + ocr.GATEWAY_PAGE_FALLBACK_SECONDS)

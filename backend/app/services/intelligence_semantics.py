@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 from app.models import Job
+from app.services.figure_decisions import normalize_figure_decision
 from app.services.intelligence_llm_utils import (
     context_json_part,
     page_preview_parts,
@@ -334,6 +335,8 @@ async def adjudicate_semantic_unit(
         response_schema=SEMANTIC_DECISION_SCHEMA,
         cache_breakpoint_index=cache_breakpoint_index,
     )
+    if unit.unit_type == "figure":
+        parsed = normalize_figure_decision(parsed)
     missing_field = _missing_required_payload(parsed)
     if missing_field:
         repaired = await _repair_required_payload(
@@ -343,7 +346,7 @@ async def adjudicate_semantic_unit(
             missing_field=missing_field,
         )
         if isinstance(repaired, dict):
-            parsed = repaired
+            parsed = normalize_figure_decision(repaired) if unit.unit_type == "figure" else repaired
     return SemanticDecision(
         unit_id=unit.unit_id,
         unit_type=unit.unit_type,

@@ -9,6 +9,9 @@ from typing import Any
 
 import httpx
 
+from app.config import DEFAULT_LLM_MAX_REQUEST_BYTES
+from app.services.vision_requests import bound_vision_request
+
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -256,6 +259,7 @@ class LlmClient:
         max_backoff_seconds: float = DEFAULT_MAX_BACKOFF_SECONDS,
         max_concurrency: int = 2,
         headers: dict[str, str] | None = None,
+        max_request_bytes: int = DEFAULT_LLM_MAX_REQUEST_BYTES,
     ):
         if headers is None:
             token = api_key.strip()
@@ -276,8 +280,21 @@ class LlmClient:
             ),
         )
         self.model = model
+        self.max_request_bytes = max_request_bytes
+
+    async def prepare_request(self, messages: list[dict], **kwargs) -> dict:
+        return await asyncio.to_thread(
+            bound_vision_request,
+            {"model": self.model, "messages": messages, **kwargs},
+            self.max_request_bytes,
+        )
 
     async def chat_completion(self, messages: list[dict], **kwargs) -> dict:
+        raise_if_model_access_refused()
+        prepared = await self.prepare_request(messages, **kwargs)
+        messages = prepared.pop("messages")
+        prepared.pop("model")
+        kwargs = prepared
         attempt_count = self.max_retries + 1
         last_exc: BaseException | None = None
         for attempt_number in range(1, attempt_count + 1):
@@ -366,6 +383,7 @@ def make_llm_client_with_overrides(
         api_key="",
         headers=endpoint.headers,
         model=settings.llm_model,
+        max_request_bytes=getattr(settings, "llm_max_request_bytes", DEFAULT_LLM_MAX_REQUEST_BYTES),
         timeout=settings.llm_timeout if timeout is None else timeout,
         max_retries=settings.llm_max_retries if max_retries is None else max_retries,
         retry_backoff_base=(
