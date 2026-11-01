@@ -127,7 +127,7 @@ def _embed_system_fonts_sync(
             )
 
     def _embed_descriptor_font(
-        font_dict, descriptor, font_name: str, *, descendant_subtype=None
+        font_dict, descriptor, font_name: str, *, descendant_subtype=None, descriptor_owner=None
     ) -> bool:
         descriptor = _ensure_type1_descriptor(font_dict, descriptor, font_name)
         if not isinstance(descriptor, pikepdf.Dictionary):
@@ -152,7 +152,13 @@ def _embed_system_fonts_sync(
         stream = pdf.make_stream(font_bytes)
         for key, value in length_info.items():
             stream[pikepdf.Name(f"/{key}")] = int(value)
+        # Each dictionary can have different widths/encoding even when its
+        # original descriptor is shared. Keep the aligned program local to
+        # this use; otherwise later fonts inherit the first use's advances.
+        descriptor = pikepdf.Dictionary(descriptor)
         descriptor[pikepdf.Name(fontfile_key)] = stream
+        owner = font_dict if descriptor_owner is None else descriptor_owner
+        owner[pikepdf.Name("/FontDescriptor")] = pdf.make_indirect(descriptor)
         if fontfile_key == "/FontFile" and font_dict.get("/Subtype") == pikepdf.Name("/TrueType"):
             # URW base-35 substitutes are Type 1 programs. Retain the source's
             # character encoding, ToUnicode, and explicit PDF widths verbatim.
@@ -226,6 +232,7 @@ def _embed_system_fonts_sync(
             descriptor,
             font_name,
             descendant_subtype=cid_font.get("/Subtype"),
+            descriptor_owner=cid_font,
         )
         if changed and pikepdf.Name("/CIDToGIDMap") not in cid_font:
             cid_font[pikepdf.Name("/CIDToGIDMap")] = pikepdf.Name("/Identity")
