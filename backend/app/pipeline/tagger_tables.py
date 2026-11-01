@@ -197,6 +197,7 @@ def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page
         for index, table in enumerate(elements)
         if table.get("type") == "table"
         and not table.get("_layout_table")
+        and not table.get("_external_table_headers")
         and table.get("num_rows", 0) >= 2
         and table.get("num_cols", 0) >= 2
         and not any(
@@ -245,15 +246,14 @@ def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page
         def mark(cell, scope):
             cell.update(is_header=True, column_header=scope == "Column", row_header=scope == "Row")
 
-        # Terms followed by explanatory prose are a list/definition layout,
-        # even when its first entry is bold and underlined.
+        # Definition pairs can have row headers, but their first entry is
+        # not a column-heading row merely because it is bold or underlined.
         paired = [cs for cs in rows.values() if len(cs) == 2]
-        if table["num_cols"] == 2 and paired and sum(
+        definition_pairs = table["num_cols"] == 2 and paired and sum(
             len(text(sorted(cs, key=lambda c: c.get("col", 0))[0]).split()) <= 6
             and len(text(sorted(cs, key=lambda c: c.get("col", 0))[1]).split()) >= 8
             for cs in paired
-        ) >= len(paired) / 2:
-            continue
+        ) >= len(paired) / 2
 
         if table["num_cols"] == 2 and len(paired) >= 3:
             pairs = [sorted(cs, key=lambda c: c.get("col", 0)) for cs in paired]
@@ -360,6 +360,7 @@ def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page
             label_grid and _simple_label_row(first, rows)
             and (style_difference or rule_below or caps)
         )
+        column_header = column_header and not definition_pairs
         if column_header:
             for cell in first:
                 mark(cell, "Column")
@@ -402,6 +403,54 @@ def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page
             for cell in good_labels:
                 if any(text(v) for v in rows[cell.get("row", 0)] if v.get("col", 0) > 0):
                     mark(cell, "Row")
+
+        if (
+            table["num_cols"] == 2
+            and not column_header
+            and not any(c.get("is_header") for c in cells)
+        ):
+            pairs = [
+                sorted(cs, key=lambda c: c.get("col", 0))
+                for cs in rows.values()
+                if len(cs) == 2
+                and [c.get("col", 0) for c in sorted(cs, key=lambda c: c.get("col", 0))] == [0, 1]
+                and all(text(c) and c.get("col_span", 1) == 1 for c in cs)
+            ]
+
+            def label_pair(pair):
+                label, value = pair
+                t = text(label)
+                if sum(ch.isalpha() for ch in t) < 2 or label.get("row_span", 1) != 1:
+                    return False
+                gs = cell_glyphs.get((index, label.get("row", 0), 0), [])
+                # A bold lead run is enough even when the rest of a prompt
+                # is regular. An isolated emphasized character is not.
+                lead = gs[: min(6, len(gs))]
+                bold_lead = len(lead) >= 3 and all("bold" in g.font_name.lower() for g in lead)
+                value_text = text(value)
+                numeric = _numeric_table_text(value_text) or bool(
+                    re.fullmatch(
+                        r"[\d.,]+\s*(?:points?|pts?\.?|%)",
+                        value_text,
+                        re.I,
+                    )
+                )
+                short = len(t) <= 0.7 * len(value_text) and len(t.split()) <= 12
+                return short or bold_lead or numeric
+
+            if len(pairs) >= 2 and sum(label_pair(p) for p in pairs) >= 0.8 * len(pairs):
+                for pair in pairs:
+                    if label_pair(pair):
+                        mark(pair[0], "Row")
+                for cs in rows.values():
+                    if (
+                        len(cs) == 1
+                        and cs[0].get("col", 0) == 0
+                        and cs[0].get("col_span", 1) == 2
+                        and text(cs[0])
+                    ):
+                        mark(cs[0], "Row")
+                        cs[0]["_projected_row_header"] = True
 
 
 def _table_summary_text(table_data: dict, *, num_rows: int, num_cols: int) -> str:

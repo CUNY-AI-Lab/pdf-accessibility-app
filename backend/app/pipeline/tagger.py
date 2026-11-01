@@ -273,6 +273,10 @@ from app.pipeline.tagger_semantics import _spoken_formula_exponent as _spoken_fo
 from app.pipeline.tagger_semantics import is_placeholder_alt_text as is_placeholder_alt_text
 from app.pipeline.tagger_structure import StructTreeBuilder as StructTreeBuilder
 from app.pipeline.tagger_structure import _source_key as _source_key
+from app.pipeline.tagger_table_structure import (
+    _finish_table_structure,
+    _plan_external_table_headers,
+)
 from app.pipeline.tagger_tables import _clean_table_summary_text as _clean_table_summary_text
 from app.pipeline.tagger_tables import _complete_table_grid_cells as _complete_table_grid_cells
 from app.pipeline.tagger_tables import _infer_table_headers as _infer_table_headers
@@ -525,6 +529,7 @@ async def tag_pdf(
                 for elem in page_elems:
                     if elem.get("type") == "table":
                         elem["_layout_table"] = _layout_table_plan(elem, page_elems)
+                _plan_external_table_headers(page_elems, [g for op in eligible_ops for g in op.glyphs])
                 _infer_table_headers(
                     page_elems, [g for op in eligible_ops for g in op.glyphs], page,
                 )
@@ -686,13 +691,19 @@ async def tag_pdf(
                 annotations_tagged += _tag_generic_annotations(page, page.obj, builder)
 
             # 5. Finalize structure tree
+            tables_tagged -= _finish_table_structure(builder, pages_elements)
+            headings_tagged -= sum(
+                e.get("type") == "heading" and bool(e.get("_table_header_recovered"))
+                for e in elements
+            )
             builder.finalize()
 
             # 6. Add bookmarks from headings
             bookmarks_added = _add_bookmarks(
                 pdf,
                 builder.headings,
-                [elem for elem in elements if not elem.get("continuation")],
+                [elem for elem in elements
+                 if not elem.get("continuation") and not elem.get("_table_header_recovered")],
                 structure_json.get("bookmark_plan"),
                 structure_json.get("native_toc"),
                 structure_json.get("title"),
