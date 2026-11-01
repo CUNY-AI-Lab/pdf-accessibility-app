@@ -336,3 +336,38 @@ async def test_pipeline_keeps_partial_local_embedding_while_century_gothic_remai
     finally:
         programs._system_font_index.cache_clear()
         programs._system_font_program.cache_clear()
+
+
+def test_embedding_aligns_each_use_of_a_shared_descriptor(tmp_path, monkeypatch):
+    from app.pipeline.fonts.embedding import _embed_system_fonts_sync
+
+    _install_test_font(tmp_path, monkeypatch)
+    before, after = tmp_path / "before.pdf", tmp_path / "after.pdf"
+    _unembedded_pdf(before)
+    with pikepdf.open(before, allow_overwriting_input=True) as pdf:
+        first = pdf.pages[0].Resources.Font.F1
+        second = pikepdf.Dictionary(first)
+        second.Widths = pikepdf.Array(first.Widths)
+        first.Widths[65 - 32] = 400
+        second.Widths[65 - 32] = 700
+        pdf.pages[0].Resources.Font.F2 = pdf.make_indirect(second)
+        pdf.pages[0].Contents = pdf.make_stream(
+            pdf.pages[0].Contents.read_bytes() + b" BT /F2 12 Tf 72 680 Td (AB) Tj ET"
+        )
+        pdf.save(before)
+    text = screen_reader_text(before)
+    ok, message, stats = _embed_system_fonts_sync(before, after)
+    assert ok, message
+    assert stats["fonts_embedded"] == 2
+    assert _text_contract(before) == _text_contract(after)
+    assert screen_reader_text(after) == text
+    with pikepdf.open(before) as old, pikepdf.open(after) as pdf:
+        fonts = pdf.pages[0].Resources.Font
+        assert fonts.F1.FontDescriptor.objgen != fonts.F2.FontDescriptor.objgen
+        for name, advance in (("/F1", 400), ("/F2", 700)):
+            f = fonts[name]
+            assert tuple(f.Widths) == tuple(old.pages[0].Resources.Font[name].Widths)
+            with TTFont(BytesIO(f.FontDescriptor.FontFile2.read_bytes())) as program:
+                assert program["hmtx"].metrics["A"][0] == advance
+    # The width pass has no residual work, including on the second use.
+    assert not _repair_pdf_font_dicts_sync(after, tmp_path / "again.pdf")[0]

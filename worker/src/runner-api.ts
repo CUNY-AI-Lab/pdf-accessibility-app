@@ -73,8 +73,9 @@ export async function handleRunner(request: Request, env: Env, path: string): Pr
 
   if (action === "complete" && request.method === "POST") {
     const result = completeRequestSchema.safeParse(await request.json().catch(() => null));
-    if (!result.success) return detail(422, "Invalid completion");
-    return (await board.complete(jobId, lease, JSON.stringify(result.data), now)) ? noContent() : leaseLost();
+    if (!result.success) return detail(422, "Completion requires a defined terminal job status or review_refused");
+    const completed = await board.complete(jobId, lease, JSON.stringify(result.data), now);
+    return completed.ok ? noContent() : detail(completed.status, completed.detail);
   }
 
   if (action === "fail" && request.method === "POST") {

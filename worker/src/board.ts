@@ -17,6 +17,7 @@ import {
   type CompleteRequest,
   completeRequestSchema,
   type JobView,
+  jobStatusSchema,
   type Overrides,
   OUTPUT_READY_STATUSES,
   overridesSchema,
@@ -57,6 +58,7 @@ export const MESSAGES = {
     "Your sign-in ends before this PDF could finish. Sign in again and upload the PDF again.",
   interrupted: "Processing was interrupted twice. Upload the PDF again.",
   deadline: "Processing took longer than the time limit, so it was stopped.",
+  inconsistent: "This PDF's processing record was inconsistent, so it was stopped. Upload the PDF again.",
 };
 
 const jobRowSchema = z.object({
@@ -64,6 +66,7 @@ const jobRowSchema = z.object({
   owner: z.string(),
   original_filename: z.string(),
   file_size_bytes: z.number(),
+  // Stored rows parse leniently; transitions are guarded where they are written.
   status: z.string(),
   error: z.string().nullable(),
   notice: z.string().nullable(),
@@ -179,6 +182,50 @@ export interface Lease {
 }
 
 export type QueueResult = { ok: true } | { ok: false; status: number; detail: string };
+
+/** Guards run synchronously with the SQL writes; never await after reading a row. */
+const TASK_TRANSITIONS = {
+  queue: ["idle", "queued"],
+  claim: ["queued"],
+  renew: ["claimed"],
+  complete: ["claimed"],
+  refuse: ["claimed"],
+  retry: ["claimed"],
+  end: ["queued", "claimed"],
+};
+type TaskEvent = keyof typeof TASK_TRANSITIONS;
+
+function taskTransitionError(row: JobRow, event: TaskEvent): string | null {
+  const state = row.task_state ?? "idle";
+  if (!TASK_TRANSITIONS[event].includes(state)) return `Illegal task transition: ${state} -> ${event}`;
+  if (event === "refuse" && row.task_kind !== "review") return "Only a review task may report review_refused";
+  if (event === "retry" && row.attempt >= LIMITS.attempts) return "Task retry limit reached";
+  if (event === "queue" && row.task_kind !== null && row.task_kind !== "sync") return "Cannot replace an active process or review task";
+  return null;
+}
+
+function guardTaskTransition(row: JobRow, event: TaskEvent): void {
+  const error = taskTransitionError(row, event);
+  if (error !== null) throw new Error(error);
+}
+
+const JOB_TRANSITIONS = {
+  queued: ["processing", "failed"],
+  processing: ["queued", "processing", "complete", "manual_remediation", "failed"],
+  complete: ["processing", "complete", "manual_remediation", "failed"],
+  manual_remediation: ["processing", "complete", "manual_remediation", "failed"],
+  failed: ["failed"],
+};
+
+function guardJobTransition(row: JobRow, status: string): void {
+  // A status outside the vocabulary can only be failed out of, never resumed.
+  const current = jobStatusSchema.safeParse(row.status);
+  const allowed: readonly string[] = current.success ? JOB_TRANSITIONS[current.data] : ["failed"];
+  if (status === row.status) return;
+  if (!jobStatusSchema.safeParse(status).success || !allowed.includes(status)) {
+    throw new Error(`Illegal job transition: ${row.status} -> ${status}`);
+  }
+}
 
 function pendingSteps(): Step[] {
   return PIPELINE_STEPS.map((step_name) => ({
@@ -309,6 +356,11 @@ export class JobBoard extends DurableObject<Env> {
       gateway_jwt TEXT,
       gateway_exp INTEGER
     )`);
+    // A lease is the immutable attempt identity already sent by b0d9b79.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS completions (
+      job_id TEXT NOT NULL, lease_hash TEXT NOT NULL, result_json TEXT NOT NULL,
+      PRIMARY KEY (job_id, lease_hash)
+    )`);
     this.sql.exec("CREATE INDEX IF NOT EXISTS jobs_owner ON jobs (owner, created_at)");
     this.sql.exec("CREATE INDEX IF NOT EXISTS jobs_queue ON jobs (task_state, task_queued_at)");
   }
@@ -386,6 +438,7 @@ export class JobBoard extends DurableObject<Env> {
 
   async deleteJob(owner: string, id: string): Promise<boolean> {
     if (this.owned(owner, id) === null) return false;
+    this.sql.exec("DELETE FROM completions WHERE job_id = ?", id);
     this.sql.exec("DELETE FROM jobs WHERE id = ?", id);
     await this.deleteFiles(`jobs/${id}/`);
     return true;
@@ -428,6 +481,7 @@ export class JobBoard extends DurableObject<Env> {
       return { ok: false, status: 409, detail: "This PDF can no longer be changed in the app. Upload it again." };
     }
 
+    guardJobTransition(row, "processing");
     const steps = parseSteps(row.steps_json);
     const prior = JSON.stringify({ status: row.status, steps });
     const rerun = steps.map((step) =>
@@ -460,6 +514,9 @@ export class JobBoard extends DurableObject<Env> {
   }
 
   private queueTask(id: string, kind: string, action: ReviewAction | null, now: number): void {
+    const row = this.row(id);
+    if (row === null) throw new Error("Cannot queue a missing job");
+    guardTaskTransition(row, "queue");
     this.sql.exec(
       `UPDATE jobs SET task_kind = ?, task_state = 'queued', task_action_json = ?, task_queued_at = ?,
          attempt = 0, lease_hash = NULL, lease_expires = NULL, deadline = NULL, next_rev = NULL WHERE id = ?`,
@@ -471,7 +528,10 @@ export class JobBoard extends DurableObject<Env> {
   }
 
   /** The end of a task: clear it, and start whatever was waiting behind it. */
-  private endTask(id: string, now: number): void {
+  private endTask(id: string, now: number, dirtySync = true): void {
+    const current = this.row(id);
+    if (current === null) throw new Error("Cannot end a missing task");
+    guardTaskTransition(current, "end");
     this.sql.exec(
       `UPDATE jobs SET task_kind = NULL, task_state = NULL, task_action_json = NULL, task_queued_at = NULL,
          attempt = 0, lease_hash = NULL, lease_expires = NULL, deadline = NULL, next_rev = NULL,
@@ -491,7 +551,7 @@ export class JobBoard extends DurableObject<Env> {
       );
       this.queueTask(id, "review", pending.action, now);
     } else if (
-      row.overrides_version > row.synced_version &&
+      dirtySync && row.overrides_version > row.synced_version &&
       row.has_state === 1 &&
       OUTPUT_READY_STATUSES.includes(row.status)
     ) {
@@ -501,6 +561,8 @@ export class JobBoard extends DurableObject<Env> {
 
   /** Give the oldest queued task to a runner. */
   async claim(now: number): Promise<ClaimedTask | null> {
+    const lease = randomToken();
+    const leaseHash = await sha256Hex(lease);
     for (;;) {
       const row = this.rows(
         "SELECT * FROM jobs WHERE task_state = 'queued' ORDER BY task_kind = 'process', task_queued_at LIMIT 1",
@@ -513,15 +575,23 @@ export class JobBoard extends DurableObject<Env> {
         this.failRow(row, MESSAGES.signInEnding, "sign_in_ending", now);
         continue;
       }
-      const lease = randomToken();
       const deadline = needsGateway
         ? Math.min(now + LIMITS.jobMaxMs, gatewayExp - LIMITS.gatewayMarginMs)
         : now + LIMITS.syncMaxMs;
       const status = kind === "process" ? "processing" : row.status;
+      // One bad row must not stall the queue: retire it and claim the next.
+      try {
+        guardTaskTransition(row, "claim");
+        guardJobTransition(row, status);
+      } catch (error) {
+        this.failRow(row, MESSAGES.inconsistent, "runner", now);
+        console.error(`Retired job ${row.id} at claim: ${String(error)}`);
+        continue;
+      }
       this.sql.exec(
         `UPDATE jobs SET task_state = 'claimed', attempt = attempt + 1, lease_hash = ?, lease_expires = ?,
            deadline = ?, next_rev = rev + 1, status = ?, updated_at = ? WHERE id = ? AND task_state = 'queued'`,
-        await sha256Hex(lease),
+        leaseHash,
         now + LIMITS.leaseMs,
         deadline,
         status,
@@ -544,17 +614,19 @@ export class JobBoard extends DurableObject<Env> {
     }
   }
 
-  private async heldRow(id: string, lease: string, now: number): Promise<JobRow | null> {
+  private heldRow(id: string, leaseHash: string, now: number): JobRow | null {
     const row = this.row(id);
-    if (row === null || row.task_state !== "claimed" || row.lease_hash === null) return null;
-    if ((row.lease_expires ?? 0) < now || (row.deadline ?? 0) < now) return null;
-    return row.lease_hash === (await sha256Hex(lease)) ? row : null;
+    if (row === null || row.task_state !== "claimed" || row.lease_hash !== leaseHash) return null;
+    if ((row.lease_expires ?? 0) <= now || (row.deadline ?? 0) <= now) return null;
+    return row;
   }
 
   /** Check a runner's lease for a job, renewing it when asked. */
   async checkLease(id: string, lease: string, now: number, renew: boolean): Promise<Lease | null> {
-    const row = await this.heldRow(id, lease, now);
+    const leaseHash = await sha256Hex(lease);
+    const row = this.heldRow(id, leaseHash, now);
     if (row === null) return null;
+    guardTaskTransition(row, "renew");
     if (renew) this.sql.exec("UPDATE jobs SET lease_expires = ?, updated_at = ? WHERE id = ?", now + LIMITS.leaseMs, now, id);
     return {
       jobId: id,
@@ -567,15 +639,18 @@ export class JobBoard extends DurableObject<Env> {
 
   /** The person's Gateway leg, for a model call the job's runner makes. */
   async relayCredential(id: string, lease: string, now: number): Promise<string | null> {
-    const row = await this.heldRow(id, lease, now);
+    const leaseHash = await sha256Hex(lease);
+    const row = this.heldRow(id, leaseHash, now);
     if (row === null || row.task_kind === "sync" || row.gateway_jwt === null) return null;
     if ((row.gateway_exp ?? 0) - LIMITS.gatewayMarginMs < now) return null;
     return row.gateway_jwt;
   }
 
   async progress(id: string, lease: string, eventJson: string, now: number): Promise<boolean> {
-    const row = await this.heldRow(id, lease, now);
+    const leaseHash = await sha256Hex(lease);
+    const row = this.heldRow(id, leaseHash, now);
     if (row === null) return false;
+    guardTaskTransition(row, "renew");
     const event = progressEventSchema.parse(JSON.parse(eventJson));
     const steps = row.task_kind === "sync" ? parseSteps(row.steps_json) : applyProgress(parseSteps(row.steps_json), event, now);
     this.sql.exec(
@@ -588,12 +663,28 @@ export class JobBoard extends DurableObject<Env> {
     return true;
   }
 
-  async complete(id: string, lease: string, resultJson: string, now: number): Promise<boolean> {
-    const row = await this.heldRow(id, lease, now);
-    if (row === null) return false;
-    const result: CompleteRequest = completeRequestSchema.parse(JSON.parse(resultJson));
+  async complete(id: string, lease: string, resultJson: string, now: number): Promise<QueueResult> {
+    const parsed = completeRequestSchema.safeParse(JSON.parse(resultJson));
+    if (!parsed.success) return { ok: false, status: 422, detail: "Completion requires a defined terminal job status" };
+    const result: CompleteRequest = parsed.data;
+    const canonical = JSON.stringify(result);
+    const leaseHash = await sha256Hex(lease);
+    const receipt = this.sql.exec("SELECT result_json FROM completions WHERE job_id = ? AND lease_hash = ?", id, leaseHash).toArray()[0];
+    if (receipt !== undefined) {
+      return receipt["result_json"] === canonical
+        ? { ok: true }
+        : { ok: false, status: 409, detail: "Conflicting completion for this attempt" };
+    }
+    const row = this.heldRow(id, leaseHash, now);
+    if (row === null) return { ok: false, status: 409, detail: "This task is no longer held by the runner" };
+    const error = taskTransitionError(row, "review_refused" in result ? "refuse" : "complete");
+    if (error !== null) return { ok: false, status: 409, detail: error };
     if ("review_refused" in result) {
       const prior = row.prior_json === null ? null : priorSchema.parse(JSON.parse(row.prior_json));
+      if (prior === null || !OUTPUT_READY_STATUSES.includes(prior.status)) {
+        return { ok: false, status: 409, detail: "Review refusal requires a prior terminal result" };
+      }
+      guardJobTransition(row, prior.status);
       this.sql.exec(
         "UPDATE jobs SET status = ?, steps_json = ?, notice = ?, updated_at = ? WHERE id = ?",
         prior?.status ?? row.status,
@@ -602,14 +693,16 @@ export class JobBoard extends DurableObject<Env> {
         now,
         id,
       );
+      this.recordCompletion(id, leaseHash, canonical);
       this.endTask(id, now);
-      return true;
+      return { ok: true };
     }
     const files = [...result.files, ...(result.has_state ? ["state.tar.gz"] : [])];
     // A review queued while this re-render ran keeps the job processing; the
     // fresh result becomes what a refused review returns to.
     const waiting = row.pending_review_json !== null;
     const finished = { status: result.job.status, steps: result.job.steps };
+    guardJobTransition(row, waiting ? row.status : result.job.status);
     this.sql.exec(
       `UPDATE jobs SET status = ?, error = ?, job_json = ?, steps_json = ?, prior_json = ?, rev = ?, files_json = ?,
          has_state = ?, synced_version = ?, overrides_json = ?, updated_at = ? WHERE id = ?`,
@@ -626,12 +719,17 @@ export class JobBoard extends DurableObject<Env> {
       now,
       id,
     );
+    this.recordCompletion(id, leaseHash, canonical);
     this.endTask(id, now);
     if (row.rev > 0) await this.deleteFiles(`jobs/${id}/r${row.rev}/`);
     if (row.task_kind !== "sync") {
       await this.logFinished(row, result.job, `jobs/${id}/r${row.next_rev ?? row.rev + 1}/`, files, now);
     }
-    return true;
+    return { ok: true };
+  }
+
+  private recordCompletion(id: string, leaseHash: string, result: string): void {
+    this.sql.exec("INSERT INTO completions (job_id, lease_hash, result_json) VALUES (?, ?, ?)", id, leaseHash, result);
   }
 
   /**
@@ -672,14 +770,17 @@ export class JobBoard extends DurableObject<Env> {
   }
 
   async fail(id: string, lease: string, error: string, now: number): Promise<boolean> {
-    const row = await this.heldRow(id, lease, now);
+    const leaseHash = await sha256Hex(lease);
+    const row = this.heldRow(id, leaseHash, now);
     if (row === null) return false;
-    if (row.task_kind === "sync") this.endTask(id, now);
+    if (row.task_kind === "sync") this.retrySync(row, now);
     else this.failRow(row, error, "runner", now);
     return true;
   }
 
   private failRow(row: JobRow, error: string, reason: FailureReason, now: number): void {
+    guardTaskTransition(row, "end");
+    guardJobTransition(row, "failed");
     const before = parseSteps(row.steps_json);
     const steps = failSteps(before, error, now);
     this.sql.exec(
@@ -725,27 +826,43 @@ export class JobBoard extends DurableObject<Env> {
 
   async sweep(now: number): Promise<void> {
     for (const row of this.rows("SELECT * FROM jobs WHERE task_state = 'claimed'")) {
-      if ((row.deadline ?? 0) < now) {
-        if (row.task_kind === "sync") this.endTask(row.id, now);
+      if ((row.deadline ?? 0) <= now) {
+        if (row.task_kind === "sync") this.stopSync(row, now);
         else this.failRow(row, MESSAGES.deadline, "deadline", now);
-      } else if ((row.lease_expires ?? 0) < now) {
-        if (row.task_kind === "sync") this.endTask(row.id, now);
+      } else if ((row.lease_expires ?? 0) <= now) {
+        if (row.task_kind === "sync") this.retrySync(row, now);
         else if (row.attempt < LIMITS.attempts) {
-          this.sql.exec(
-            `UPDATE jobs SET task_state = 'queued', task_queued_at = ?, lease_hash = NULL, lease_expires = NULL,
-               deadline = NULL, next_rev = NULL, status = CASE WHEN task_kind = 'process' THEN 'queued' ELSE status END,
-               steps_json = ? WHERE id = ?`,
-            now,
-            JSON.stringify(row.task_kind === "process" ? pendingSteps() : parseSteps(row.steps_json)),
-            row.id,
-          );
+          this.requeue(row, now);
         } else this.failRow(row, MESSAGES.interrupted, "interrupted", now);
       }
     }
     for (const row of this.rows("SELECT * FROM jobs WHERE updated_at < ?", now - LIMITS.retentionMs)) {
+      this.sql.exec("DELETE FROM completions WHERE job_id = ?", row.id);
       this.sql.exec("DELETE FROM jobs WHERE id = ?", row.id);
       await this.deleteFiles(`jobs/${row.id}/`);
     }
+  }
+
+  private requeue(row: JobRow, now: number): void {
+    guardTaskTransition(row, "retry");
+    const status = row.task_kind === "process" ? "queued" : row.status;
+    guardJobTransition(row, status);
+    this.sql.exec(
+      `UPDATE jobs SET task_state = 'queued', task_queued_at = ?, lease_hash = NULL, lease_expires = NULL,
+         deadline = NULL, next_rev = NULL, status = ?, steps_json = ? WHERE id = ?`,
+      now, status, JSON.stringify(row.task_kind === "process" ? pendingSteps() : parseSteps(row.steps_json)), row.id,
+    );
+  }
+
+  private retrySync(row: JobRow, now: number): void {
+    if (row.pending_review_json !== null || row.attempt >= LIMITS.attempts) this.stopSync(row, now);
+    else this.requeue(row, now);
+  }
+
+  private stopSync(row: JobRow, now: number): void {
+    this.sql.exec("UPDATE jobs SET notice = ? WHERE id = ?", "Report refresh was interrupted. Your review choices are saved.", row.id);
+    // Keep the published result and unsynced overlays, but do not restart the exhausted task.
+    this.endTask(row.id, now, false);
   }
 
   private async deleteFiles(prefix: string): Promise<void> {

@@ -184,3 +184,110 @@ def test_build_ocrmypdf_args_limits_redo_ocr_to_the_given_pages():
     assert "--redo-ocr" in args
     assert args[args.index("--pages") + 1] == "1,3,6"
     assert args[-2:] == ["in.pdf", "out.pdf"]
+
+
+def _write_pdf(path, page_count):
+    with pikepdf.new() as pdf:
+        for _ in range(page_count):
+            pdf.add_blank_page()
+        pdf.save(path)
+
+
+@pytest.fixture
+def simulate_ocr(monkeypatch, tmp_path):
+    source = tmp_path / "in.pdf"
+    output = tmp_path / "out.pdf"
+    _write_pdf(source, 3)
+    calls = []
+
+    def install(attempts):
+        async def create_subprocess_exec(*args, **kwargs):
+            if calls:
+                assert not output.exists()
+            calls.append(args)
+            return SimpleNamespace(returncode=attempts[len(calls) - 1][0])
+
+        async def communicate(proc, timeout):
+            _, content = attempts[len(calls) - 1]
+            if isinstance(content, int):
+                _write_pdf(output, content)
+            elif content is not None:
+                output.write_bytes(content)
+            return b"", b"The generated PDF is INVALID"
+
+        monkeypatch.setattr(ocr.asyncio, "create_subprocess_exec", create_subprocess_exec)
+        monkeypatch.setattr(ocr, "communicate_with_timeout", communicate)
+        return source, output, calls
+
+    return install
+
+
+@pytest.mark.asyncio
+async def test_exit_4_accepts_readable_output_and_records_warning(simulate_ocr, caplog):
+    source, output, calls = simulate_ocr([(4, 3)])
+    # --pages still produces a whole document, not just the selected pages.
+    result = await ocr.run_ocr(source, output, language="spa", pages=[1])
+    assert result.success
+    assert result.output_path == output
+    assert not result.skipped
+    assert len(calls) == 1
+    assert "code 4" in result.message
+    assert "expected page count" in result.message
+    assert result.message in caplog.text
+    assert "-O0" not in calls[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unusable", [None, b"not a PDF", 2])
+@pytest.mark.parametrize("retry_code", [0, 4])
+async def test_exit_4_retries_unusable_output_once(simulate_ocr, unusable, retry_code, caplog):
+    source, output, calls = simulate_ocr([(4, unusable), (retry_code, 3)])
+    result = await ocr.run_ocr(source, output, language="por", mode="redo", pages=[1])
+    assert result.success
+    assert result.output_path == output
+    assert len(calls) == 2
+    assert calls[1] == (*calls[0][:-2], "-O0", *calls[0][-2:])
+    assert calls[1][calls[1].index("--output-type") + 1] == "pdf"
+    assert calls[1][calls[1].index("--language") + 1] == "por"
+    assert calls[1][calls[1].index("--pages") + 1] == "2"
+    assert "--redo-ocr" in calls[1]
+    assert "retrying once" in result.message
+    assert "-O0" in result.message
+    assert "retrying once" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unusable", [None, b"not a PDF", 2])
+@pytest.mark.parametrize("retry_code", [0, 4])
+async def test_exit_4_fails_when_retry_output_is_unusable(simulate_ocr, unusable, retry_code):
+    source, output, calls = simulate_ocr([(4, b"broken"), (retry_code, unusable)])
+    result = await ocr.run_ocr(source, output)
+    assert not result.success
+    assert result.output_path == source
+    assert len(calls) == 2
+    assert f"after retry (exit {retry_code})" in result.message
+    if unusable == 2:
+        assert "2 pages; expected 3" in result.message
+    else:
+        assert "Cannot open" in result.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code, mode, success",
+    [
+        (0, "skip", True),
+        (6, "skip", True),
+        (6, "redo", False),
+        (3, "skip", False),
+        (7, "skip", False),
+    ],
+)
+async def test_other_exit_codes_do_not_retry(simulate_ocr, code, mode, success):
+    source, output, calls = simulate_ocr([(code, 3)])
+    result = await ocr.run_ocr(source, output, mode=mode)
+    assert result.success is success
+    assert len(calls) == 1
+    assert result.skipped is (code == 6 and mode == "skip")
+    if not success:
+        assert f"OCR failed (exit {code})" in result.message
