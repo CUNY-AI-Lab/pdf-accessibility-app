@@ -5,9 +5,15 @@ from typing import Any
 
 import pikepdf
 
+from app.services.pdf_objects import pdf_text
+
 BUTTON_FLAG_RADIO = 1 << 15
 BUTTON_FLAG_PUSHBUTTON = 1 << 16
 CHOICE_FLAG_COMBO = 1 << 17
+# Default on-states that authoring tools give buttons; numbered defaults such as
+# Choice1 or 1 are caught by is_technical_field_name.
+GENERIC_BUTTON_STATES = frozenset({"on", "off"})
+GENERIC_CHECKBOX_STATES = GENERIC_BUTTON_STATES | {"yes"}
 
 
 def _objgen_str(obj: Any) -> str | None:
@@ -137,6 +143,61 @@ def field_label_quality(*, accessible_name: str, field_name: str) -> str:
     if technical_name and label == technical_name and is_technical_field_name(technical_name):
         return "weak"
     return "good"
+
+
+def kid_widget_field(widget: pikepdf.Dictionary) -> pikepdf.Dictionary | None:
+    """The terminal field of a widget that is only a kid annotation: it has no
+    /T of its own and its /Parent has one."""
+    if _normalize_text(pdf_text(widget.get("/T"))):
+        return None
+    parent = _resolve_dictionary(widget.get("/Parent"))
+    if parent is None or not _normalize_text(pdf_text(parent.get("/T"))):
+        return None
+    return parent
+
+
+def name_kid_widget_field(widget: pikepdf.Dictionary) -> None:
+    """Give a kid widget's terminal field its partial name /T as /TU when the
+    field has no name, as stand-alone fields are named from theirs."""
+    field = kid_widget_field(widget)
+    if field is not None and not _normalize_text(pdf_text(field.get("/TU"))):
+        field["/TU"] = pikepdf.String(_normalize_text(pdf_text(field.get("/T"))))
+
+
+def _decode_pdf_name(name: str) -> str:
+    # pikepdf resolves #xx escapes and keeps bytes that are not UTF-8 as
+    # surrogates, which a pikepdf.String cannot hold.
+    raw = name.removeprefix("/").encode("utf-8", "surrogateescape")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
+
+
+def button_option_name(widget: pikepdf.Dictionary) -> str:
+    """The option a radio-button or checkbox kid widget turns on: its on-state
+    appearance name, which is the export value, unless that name is generic."""
+    if kid_widget_field(widget) is None:
+        return ""
+    lineage = _iter_field_lineage(widget)
+    field_type = _field_type_name(_lineage_attr(lineage, "/FT"), _lineage_attr(lineage, "/Ff"))
+    if field_type == "radio_button":
+        generic = GENERIC_BUTTON_STATES
+    elif field_type == "checkbox":
+        generic = GENERIC_CHECKBOX_STATES
+    else:
+        return ""
+    appearances = _resolve_dictionary(widget.get("/AP"))
+    normal = _resolve_dictionary(appearances.get("/N")) if appearances is not None else None
+    if normal is None:
+        return ""
+    on_states = [key for key in normal.keys() if key != "/Off"]
+    if len(on_states) != 1:
+        return ""
+    name = _normalize_text(_decode_pdf_name(on_states[0]))
+    if not name or name.lower() in generic or is_technical_field_name(name):
+        return ""
+    return name
 
 
 def _field_review_id(widget: pikepdf.Dictionary, terminal_field: pikepdf.Dictionary, *, page_number: int, index: int) -> str:
