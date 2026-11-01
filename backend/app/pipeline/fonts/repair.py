@@ -1,4 +1,4 @@
-"""Repair CID font dictionaries and synchronize embedded CFF widths."""
+"""Repair CID dictionaries and embedded font width mismatches."""
 
 import asyncio
 from io import BytesIO
@@ -11,6 +11,7 @@ from app.pipeline.fonts.resources import (
     _obj_key,
     _resolve_dictionary,
 )
+from app.pipeline.fonts.widths import _align_truetype_advances
 from app.services.pdf_objects import pdf_text
 
 
@@ -140,6 +141,8 @@ def _repair_pdf_font_dicts_sync(
         "fonts_touched": 0,
         "cidtogid_added": 0,
         "cidset_removed": 0,
+        "truetype_widths_aligned": 0,
+        "truetype_width_conflicts": 0,
     }
     seen_fonts: set[tuple[int, int]] = set()
 
@@ -183,7 +186,36 @@ def _repair_pdf_font_dicts_sync(
 
     def _process_font(font_dict) -> None:
         subtype = font_dict.get("/Subtype")
-        if subtype == pikepdf.Name("/Type0"):
+        if subtype == pikepdf.Name("/TrueType"):
+            font_key = _obj_key(font_dict)
+            if font_key and font_key in seen_fonts:
+                return
+            if font_key:
+                seen_fonts.add(font_key)
+            descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
+            if not isinstance(descriptor, pikepdf.Dictionary):
+                return
+            program = descriptor.get("/FontFile2")
+            if not isinstance(program, pikepdf.Stream):
+                return
+            try:
+                aligned, count, conflicts = _align_truetype_advances(font_dict, program.read_bytes())
+            except Exception:
+                # One malformed/unsupported font must not prevent repairs of
+                # other fonts. Validation retains its unresolved failure.
+                return
+            stats["truetype_width_conflicts"] += conflicts
+            if count:
+                replacement = pdf.make_stream(aligned)
+                replacement["/Length1"] = len(aligned)
+                # A descriptor/program may be shared by dictionaries with
+                # different encodings or widths. Repair this use independently.
+                descriptor = pikepdf.Dictionary(descriptor)
+                descriptor["/FontFile2"] = replacement
+                font_dict["/FontDescriptor"] = pdf.make_indirect(descriptor)
+                stats["truetype_widths_aligned"] += count
+                stats["fonts_touched"] += 1
+        elif subtype == pikepdf.Name("/Type0"):
             descendants = font_dict.get("/DescendantFonts")
             if not isinstance(descendants, pikepdf.Array):
                 return
@@ -198,7 +230,7 @@ def _repair_pdf_font_dicts_sync(
                 _process_font(font_dict)
 
             if stats["fonts_touched"] <= 0:
-                return False, "No eligible CID font dictionaries found for repair", stats
+                return False, "No eligible font dictionary or TrueType width repairs found", stats
 
             pdf.save(str(output_path))
         return (
@@ -207,7 +239,8 @@ def _repair_pdf_font_dicts_sync(
                 f"Font dictionary repair completed "
                 f"(fonts={stats['fonts_touched']}, "
                 f"CIDToGIDMap added={stats['cidtogid_added']}, "
-                f"CIDSet removed={stats['cidset_removed']})"
+                f"CIDSet removed={stats['cidset_removed']}, "
+                f"TrueType advances aligned={stats['truetype_widths_aligned']})"
             ),
             stats,
         )

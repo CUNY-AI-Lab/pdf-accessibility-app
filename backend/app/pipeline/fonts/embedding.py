@@ -17,6 +17,7 @@ from app.pipeline.fonts.resources import (
     _obj_key,
     _resolve_dictionary,
 )
+from app.pipeline.fonts.widths import _align_truetype_advances
 from app.pipeline.subprocess_utils import (
     SubprocessTimeout,
     communicate_with_timeout,
@@ -145,6 +146,9 @@ def _embed_system_fonts_sync(
             stats["fonts_missing"] += 1
             return False
 
+        if fontfile_key == "/FontFile2" and font_dict.get("/Subtype") == pikepdf.Name("/TrueType"):
+            font_bytes, _, _ = _align_truetype_advances(font_dict, font_bytes)
+            length_info = {**length_info, "Length1": len(font_bytes)}
         stream = pdf.make_stream(font_bytes)
         for key, value in length_info.items():
             stream[pikepdf.Name(f"/{key}")] = int(value)

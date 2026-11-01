@@ -7,6 +7,7 @@ from io import BytesIO
 import pikepdf
 
 from app.pipeline.fonts.names import FONT_NAME_RE, _base_font_name
+from app.pipeline.fonts.symbols import _symbol_family, _symbol_font_unicode_map
 
 SAFE_IMPLICIT_STANDARD_BASEFONTS = frozenset(
     {
@@ -35,6 +36,8 @@ MAX_TOUNICODE_BFRANGE_SPAN = 65536
 def _simple_font_auto_unicode_policy(font_dict, font_bytes: bytes | None = None) -> str:
     import pikepdf
 
+    if _symbol_family(font_dict):
+        return "symbol"
     encoding = font_dict.get("/Encoding")
     if isinstance(encoding, pikepdf.Dictionary):
         if encoding.get("/BaseEncoding") is not None or encoding.get("/Differences") is not None:
@@ -178,6 +181,8 @@ def _cff_builtin_encoding_map(font_bytes: bytes) -> dict[int, str]:
 def _simple_font_unicode_map(font_dict, font_bytes: bytes | None) -> dict[int, str]:
     import pikepdf
 
+    if _symbol_family(font_dict):
+        return _symbol_font_unicode_map(font_dict, font_bytes)
     mapping: dict[int, str] = {}
 
     subtype = font_dict.get("/Subtype")
