@@ -23,22 +23,16 @@ def test_cell_matching_is_off_only_for_scanned_documents(classification, expecte
 async def _submitted_form(tmp_path, monkeypatch, **kwargs) -> dict:
     submitted: dict = {}
 
-    class StopAfterSubmit(Exception):
-        pass
+    async def convert(_self, _client, base_url, timeout, **request_kwargs):
+        submitted.update(request_kwargs["data"])
+        return {"document": {"json_content": {}}}
 
-    async def request(_client, method, url, **request_kwargs):
-        if method == "POST":
-            submitted.update(request_kwargs["data"])
-            raise StopAfterSubmit
-        raise AssertionError("polling should not be reached")
-
-    monkeypatch.setattr(structure, "_docling_serve_request", request)
+    monkeypatch.setattr(structure.DoclingConversion, "run", convert)
     pdf = tmp_path / "page.pdf"
     pdf.write_bytes(b"%PDF-1.7 page")
-    with pytest.raises(StopAfterSubmit):
-        await structure._convert_via_docling_serve(
-            pdf, tmp_path, "http://docling", 60, include_figure_images=False, **kwargs
-        )
+    await structure._convert_via_docling_serve(
+        pdf, tmp_path, "http://docling", 60, include_figure_images=False, **kwargs
+    )
     return submitted
 
 

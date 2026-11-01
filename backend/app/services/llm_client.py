@@ -1,3 +1,18 @@
+"""Runner model requests through the job's Worker relay, with bounded retries.
+
+Transitions::
+    waiting -> requesting | failed | cancelled
+    requesting -> backoff | succeeded | failed | cancelled
+    backoff -> requesting | failed | cancelled
+    succeeded/failed/cancelled -> terminal
+    access: available -> refused; refused -> refused (retain first reason)
+
+Each request has at most max_retries + 1 attempts and capped backoff. Connection
+failures and selected HTTP statuses retry; uncertain read timeouts do not.
+Access is checked before dispatch, after semaphore acquisition and on response.
+A new job scope owns a new access latch; nested scopes share the outer latch.
+"""
+
 import asyncio
 import logging
 from contextlib import contextmanager
@@ -5,6 +20,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from enum import Enum
 from typing import Any
 
 import httpx
@@ -103,12 +119,79 @@ class ModelAccessRefused(Exception):
         )
 
 
-@dataclass
-class ModelAccess:
-    """One job's model access: its endpoint, and the refusal that ends it."""
+class ModelAccessState(Enum):
+    AVAILABLE = "available"
+    REFUSED = "refused"
 
-    endpoint: ModelEndpoint | None = None
-    refusal: ModelAccessRefused | None = None
+
+class ModelAccess:
+    """A refusal is terminal within one job; a new scope creates new access."""
+
+    def __init__(self, endpoint: ModelEndpoint | None = None):
+        self.endpoint = endpoint
+        self._refusal: ModelAccessRefused | None = None
+
+    @property
+    def state(self) -> ModelAccessState:
+        return ModelAccessState.REFUSED if self._refusal else ModelAccessState.AVAILABLE
+
+    @property
+    def refusal(self) -> ModelAccessRefused | None:
+        return self._refusal
+
+    @refusal.setter
+    def refusal(self, reason: ModelAccessRefused) -> None:
+        self.refuse(reason)
+
+    def refuse(self, reason: ModelAccessRefused) -> ModelAccessRefused:
+        if not isinstance(reason, ModelAccessRefused):
+            raise ValueError("Illegal model access transition: refusal requires a reason")
+        # Multiple in-flight requests may be refused; retain the first reason.
+        if self.state is ModelAccessState.AVAILABLE:
+            self._refusal = reason
+        return self._refusal
+
+
+class RequestState(Enum):
+    WAITING = "waiting"
+    REQUESTING = "requesting"
+    BACKOFF = "backoff"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+_REQUEST_TRANSITIONS = {
+    RequestState.WAITING: {RequestState.REQUESTING, RequestState.FAILED, RequestState.CANCELLED},
+    RequestState.REQUESTING: {
+        RequestState.BACKOFF, RequestState.SUCCEEDED, RequestState.FAILED, RequestState.CANCELLED,
+    },
+    RequestState.BACKOFF: {RequestState.REQUESTING, RequestState.FAILED, RequestState.CANCELLED},
+    RequestState.SUCCEEDED: set(),
+    RequestState.FAILED: set(),
+    RequestState.CANCELLED: set(),
+}
+
+
+@dataclass
+class RequestAttempt:
+    max_attempts: int
+    state: RequestState = RequestState.WAITING
+    attempts: int = 0
+
+    def transition(self, state: RequestState) -> None:
+        if state not in _REQUEST_TRANSITIONS[self.state]:
+            raise ValueError(f"Illegal LLM request transition: {self.state.value} -> {state.value}")
+        if state is RequestState.REQUESTING:
+            if self.attempts >= self.max_attempts:
+                raise ValueError("LLM request attempt limit reached")
+            self.attempts += 1
+        self.state = state
+
+
+def refuse_model_access(reason: ModelAccessRefused) -> ModelAccessRefused:
+    access = _MODEL_ACCESS.get()
+    return access.refuse(reason) if access is not None else reason
 
 
 _MODEL_ACCESS: ContextVar[ModelAccess | None] = ContextVar("job_model_access", default=None)
@@ -153,7 +236,8 @@ def _refusal_from(response: httpx.Response) -> ModelAccessRefused | None:
     if status not in {401, 403, 429}:
         return None
     try:
-        error = response.json().get("error")
+        payload = response.json()
+        error = payload.get("error") if isinstance(payload, dict) else None
     except ValueError:
         error = None
     code = str(error.get("code") or error.get("type") or "") if isinstance(error, dict) else ""
@@ -279,6 +363,7 @@ class LlmClient:
                 max_keepalive_connections=self.max_concurrency,
             ),
         )
+        self.base_url = base_url.rstrip("/")
         self.model = model
         self.max_request_bytes = max_request_bytes
 
@@ -290,38 +375,39 @@ class LlmClient:
         )
 
     async def chat_completion(self, messages: list[dict], **kwargs) -> dict:
-        raise_if_model_access_refused()
-        prepared = await self.prepare_request(messages, **kwargs)
-        messages = prepared.pop("messages")
-        prepared.pop("model")
-        kwargs = prepared
-        attempt_count = self.max_retries + 1
-        last_exc: BaseException | None = None
-        for attempt_number in range(1, attempt_count + 1):
-            try:
-                return await self._do_chat_completion(messages, **kwargs)
-            except Exception as exc:
-                last_exc = exc
-                if not _is_retryable(exc) or attempt_number >= attempt_count:
-                    raise
-                delay = _retry_delay_seconds(
-                    exc,
-                    attempt_number=attempt_number,
-                    retry_backoff_base=self.retry_backoff_base,
-                    max_backoff_seconds=self.max_backoff_seconds,
-                )
-                logger.warning(
-                    "LLM request failed (%s: %s), retrying in %.1fs [attempt %s/%s]",
-                    type(exc).__name__,
-                    exc,
-                    delay,
-                    attempt_number,
-                    attempt_count,
-                )
-                await asyncio.sleep(delay)
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError("LLM request failed without returning a response")
+        attempt = RequestAttempt(self.max_retries + 1)
+        try:
+            raise_if_model_access_refused()
+            prepared = await self.prepare_request(messages, **kwargs)
+            messages = prepared.pop("messages")
+            prepared.pop("model")
+            while True:
+                raise_if_model_access_refused()
+                attempt.transition(RequestState.REQUESTING)
+                try:
+                    response = await self._do_chat_completion(messages, **prepared)
+                except Exception as exc:
+                    if not _is_retryable(exc) or attempt.attempts >= attempt.max_attempts:
+                        raise
+                    attempt.transition(RequestState.BACKOFF)
+                    delay = _retry_delay_seconds(
+                        exc,
+                        attempt_number=attempt.attempts,
+                        retry_backoff_base=self.retry_backoff_base,
+                        max_backoff_seconds=self.max_backoff_seconds,
+                    )
+                    logger.warning("LLM request failed (%s), retrying in %.1fs [%s/%s]",
+                                   type(exc).__name__, delay, attempt.attempts, attempt.max_attempts)
+                    await asyncio.sleep(delay)
+                    continue
+                attempt.transition(RequestState.SUCCEEDED)
+                return response
+        except asyncio.CancelledError:
+            attempt.transition(RequestState.CANCELLED)
+            raise
+        except Exception:
+            attempt.transition(RequestState.FAILED)
+            raise
 
     async def _do_chat_completion(self, messages: list[dict], **kwargs) -> dict:
         raise_if_model_access_refused()
@@ -340,10 +426,8 @@ class LlmClient:
                 )
             refusal = _refusal_from(response)
             if refusal is not None:
-                access = _MODEL_ACCESS.get()
-                if access is not None and access.refusal is None:
-                    access.refusal = refusal
-                raise refusal
+                raise refuse_model_access(refusal)
+            raise_if_model_access_refused()
             response.raise_for_status()
             payload = response.json()
             _record_response_usage(payload)
@@ -356,7 +440,8 @@ class LlmClient:
 def _error_message(response: httpx.Response) -> str:
     """The provider's own explanation of a refused request, if it gave one."""
     try:
-        error = response.json().get("error")
+        payload = response.json()
+        error = payload.get("error") if isinstance(payload, dict) else None
     except ValueError:
         return response.text[:300]
     if isinstance(error, dict):

@@ -1,5 +1,16 @@
+"""Schema preparation for runner task databases and the development server.
+
+Migration transitions::
+    pending -> applied (record only after successful migration)
+    applied -> terminal (replay skips; direct duplicate writes are rejected)
+
+Unknown stored migration IDs are retained without enum parsing. The runner
+creates its own per-task engine; lazy global engines/sessions serve FastAPI.
+"""
+
 from collections.abc import AsyncGenerator, Callable
 from datetime import UTC, datetime
+from enum import Enum
 
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -10,6 +21,16 @@ _engine = None
 _async_session = None
 
 SCHEMA_MIGRATIONS_TABLE = "schema_migrations"
+
+
+class MigrationState(Enum):
+    PENDING = "pending"
+    APPLIED = "applied"
+
+
+def guard_migration_transition(current: MigrationState, target: MigrationState) -> None:
+    if (current, target) != (MigrationState.PENDING, MigrationState.APPLIED):
+        raise ValueError(f"Illegal schema migration transition: {current.value} -> {target.value}")
 
 
 def get_engine():
@@ -66,6 +87,8 @@ def _applied_migration_ids(sync_conn) -> set[str]:
 
 
 def _record_migration(sync_conn, migration_id: str) -> None:
+    state = MigrationState.APPLIED if migration_id in _applied_migration_ids(sync_conn) else MigrationState.PENDING
+    guard_migration_transition(state, MigrationState.APPLIED)
     sync_conn.execute(
         text(
             f"""

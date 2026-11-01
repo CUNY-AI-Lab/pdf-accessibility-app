@@ -25,6 +25,17 @@ environment:
     CAIL_OCR_MODEL          vision model
     CAIL_OCR_PAGE_SECONDS   time for all of a page's Gateway calls
     CAIL_OCR_MAX_REQUEST_BYTES   maximum encoded JSON request bytes
+
+Page attempt transitions::
+    waiting -> requesting | failed
+    requesting -> backoff | answered | failed
+    backoff -> requesting | failed
+    answered -> regenerating | succeeded | failed
+    regenerating -> requesting | failed
+    succeeded/failed -> terminal
+
+One deadline spans at most three generations, each with two no-answer retries.
+Job refusal is shared through OcrJobAccess receipts, not a process-global latch.
 """
 
 from __future__ import annotations
@@ -37,6 +48,8 @@ import os
 import re
 import tempfile
 import time
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -48,6 +61,8 @@ from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
 from PIL import Image
 
 from app.config import DEFAULT_LLM_MAX_REQUEST_BYTES
+from app.services.llm_client import _refusal_from
+from app.services.ocr_access import OcrJobAccess
 from app.services.vision_requests import bound_vision_request
 
 if TYPE_CHECKING:
@@ -94,50 +109,88 @@ def _encoded_page(image: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def _refused(response: httpx.Response) -> bool:
-    """The Gateway refused the credential itself, so no page can succeed."""
-    if response.status_code in {401, 403}:
-        return True
-    return (
-        response.status_code == 429
-        and response.headers.get("x-should-retry", "").lower() == "false"
-    )
+class PageState(Enum):
+    WAITING = "waiting"
+    REQUESTING = "requesting"
+    BACKOFF = "backoff"
+    ANSWERED = "answered"
+    REGENERATING = "regenerating"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
 
 
-_credential_refused = False
+_PAGE_TRANSITIONS = {
+    PageState.WAITING: {PageState.REQUESTING, PageState.FAILED},
+    PageState.REQUESTING: {PageState.BACKOFF, PageState.ANSWERED, PageState.FAILED},
+    PageState.BACKOFF: {PageState.REQUESTING, PageState.FAILED},
+    PageState.ANSWERED: {PageState.REGENERATING, PageState.SUCCEEDED, PageState.FAILED},
+    PageState.REGENERATING: {PageState.REQUESTING, PageState.FAILED},
+    PageState.SUCCEEDED: set(),
+    PageState.FAILED: set(),
+}
 
 
-def _complete(base_url: str, headers: dict[str, str], body: dict, deadline: float) -> dict:
-    """One answer, sending the request again only after a status that carries
-    no answer, and giving up at the page's deadline."""
-    global _credential_refused
-    if _credential_refused:
-        raise GatewayOcrError("the Gateway refused this job's credential")
-    body = bound_vision_request(
-        body, int(os.environ.get("CAIL_OCR_MAX_REQUEST_BYTES", DEFAULT_LLM_MAX_REQUEST_BYTES)),
-    )
-    retry_delays = iter(RETRY_DELAYS_SECONDS)
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise GatewayOcrError("page time limit reached")
-        response = httpx.post(
-            f"{base_url.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=body,
-            timeout=remaining,
+@dataclass
+class PageAttempt:
+    state: PageState = PageState.WAITING
+    generation: int = 0
+    retries: int = 0
+
+    def transition(self, target: PageState) -> None:
+        if target not in _PAGE_TRANSITIONS[self.state]:
+            raise ValueError(f"Illegal OCR page transition: {self.state.value} -> {target.value}")
+        if target is PageState.BACKOFF:
+            if self.retries >= len(RETRY_DELAYS_SECONDS):
+                raise ValueError("OCR retry limit reached")
+            self.retries += 1
+        if target is PageState.REGENERATING:
+            if self.generation + 1 >= len(TEMPERATURES):
+                raise ValueError("OCR regeneration limit reached")
+            self.generation += 1
+            self.retries = 0
+        self.state = target
+
+
+def _complete(
+    base_url: str, headers: dict[str, str], body: dict, deadline: float,
+    *, attempt: PageAttempt | None = None, access: OcrJobAccess | None = None,
+) -> dict:
+    """Repeat only no-answer statuses, within the shared page deadline."""
+    attempt = attempt if attempt is not None else PageAttempt()
+    access = access if access is not None else OcrJobAccess.from_environment()
+    try:
+        body = bound_vision_request(
+            body, int(os.environ.get("CAIL_OCR_MAX_REQUEST_BYTES", DEFAULT_LLM_MAX_REQUEST_BYTES)),
         )
-        if _refused(response):
-            _credential_refused = True
-            raise GatewayOcrError(f"Gateway returned {response.status_code}")
-        if response.status_code == 200:
-            answer = response.json()
-            logger.info("Gateway OCR usage: %s", answer.get("usage"))
-            return answer["choices"][0]
-        delay = next(retry_delays, None)
-        if response.status_code not in NO_ANSWER_STATUSES or delay is None:
-            raise GatewayOcrError(f"Gateway returned {response.status_code}")
-        time.sleep(min(delay, max(deadline - time.monotonic(), 0)))
+        while True:
+            access.check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GatewayOcrError("page time limit reached")
+            attempt.transition(PageState.REQUESTING)
+            response = httpx.post(
+                f"{base_url.rstrip('/')}/chat/completions",
+                headers=headers, json=body, timeout=remaining,
+            )
+            if refusal := _refusal_from(response):
+                raise access.refuse(refusal)
+            access.check()
+            if time.monotonic() >= deadline:
+                raise GatewayOcrError("page time limit reached")
+            if response.status_code == 200:
+                answer = response.json()
+                choice = answer["choices"][0]
+                attempt.transition(PageState.ANSWERED)
+                logger.info("Gateway OCR usage: %s", answer.get("usage"))
+                return choice
+            if response.status_code not in NO_ANSWER_STATUSES or attempt.retries >= len(RETRY_DELAYS_SECONDS):
+                raise GatewayOcrError(f"Gateway returned {response.status_code}")
+            delay = RETRY_DELAYS_SECONDS[attempt.retries]
+            attempt.transition(PageState.BACKOFF)
+            time.sleep(min(delay, max(deadline - time.monotonic(), 0)))
+    except BaseException:
+        attempt.transition(PageState.FAILED)
+        raise
 
 
 def _request_lines(image: Image.Image) -> list[dict]:
@@ -170,6 +223,8 @@ def _request_lines(image: Image.Image) -> list[dict]:
         },
     ]
     problems = []
+    attempt = PageAttempt()
+    access = OcrJobAccess.from_environment()
     # A non-streamed answer arrives all at once, so one call may use all of it.
     deadline = time.monotonic() + float(page_seconds)
     for temperature in TEMPERATURES:
@@ -179,13 +234,21 @@ def _request_lines(image: Image.Image) -> list[dict]:
             "max_tokens": MAX_OUTPUT_TOKENS,
             "messages": messages,
         }
-        choice = _complete(base_url, headers, body, deadline)
-        content = choice["message"]["content"] or ""
-        finish = choice.get("finish_reason")
-        lines = parse_lines(content)
+        choice = _complete(base_url, headers, body, deadline, attempt=attempt, access=access)
+        try:
+            content = choice["message"]["content"] or ""
+            finish = choice.get("finish_reason")
+            lines = parse_lines(content)
+        except Exception:
+            attempt.transition(PageState.FAILED)
+            raise
         if finish == "stop" and (lines or _is_empty_array(content)):
+            attempt.transition(PageState.SUCCEEDED)
             return lines
         problems.append(f"{temperature}: finish_reason {finish}, {len(lines)} lines")
+        if attempt.generation + 1 < len(TEMPERATURES):
+            attempt.transition(PageState.REGENERATING)
+    attempt.transition(PageState.FAILED)
     raise GatewayOcrError("no usable answer (" + "; ".join(problems) + ")")
 
 

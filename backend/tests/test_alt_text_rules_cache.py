@@ -61,7 +61,7 @@ def isolated_model_capabilities(monkeypatch):
     # Each fake provider starts with its own capability negotiation.
     from app.services import intelligence_llm_utils
 
-    monkeypatch.setattr(intelligence_llm_utils, "JSON_SCHEMA_REFUSED_MODELS", set())
+    monkeypatch.setattr(intelligence_llm_utils, "FORMAT_CAPABILITIES", intelligence_llm_utils.FormatCapabilityCache())
 
 
 @pytest.fixture
@@ -481,12 +481,17 @@ async def test_repaired_json_responses_are_not_cached(tmp_path, settings):
 async def test_response_format_fallback_does_not_store_under_initial_inputs(tmp_path, settings, monkeypatch):
     from app.services import intelligence_llm_utils
 
-    monkeypatch.setattr(intelligence_llm_utils, "JSON_SCHEMA_REFUSED_MODELS", set())
+    monkeypatch.setattr(intelligence_llm_utils, "FORMAT_CAPABILITIES", intelligence_llm_utils.FormatCapabilityCache())
     class FormatClient(FakeLlmClient):
+        base_url = "https://gateway.test/v1"
+
         async def chat_completion(self, messages, **kwargs):
             if kwargs.get("response_format", {}).get("type") == "json_schema":
                 self.calls.append(messages)
-                raise ValueError("json_schema unsupported")
+                import httpx
+                response = httpx.Response(400, request=httpx.Request("POST", self.base_url),
+                    json={"error": {"code": "capability_unsupported", "message": "json_schema unsupported"}})
+                response.raise_for_status()
             return await super().chat_completion(messages, **kwargs)
 
     client = FormatClient()
