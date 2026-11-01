@@ -68,6 +68,58 @@ Unicode Standard, and to make copies of this file in any form for
 internal or external distribution as long as this notice remains
 attached.
 
+### TeX glyph names
+
+`tex_glyph_names.json` maps glyph names from the Computer Modern and AMS fonts
+that are not in the Adobe Glyph List (for example `negationslash`,
+`summationdisplay`, `parenleftbig`) to Unicode. `_glyph_name_to_unicode`
+consults it after the AGL, with and without a `.suffix`. It was generated once
+(2026-11-01) from three sources, which share no names:
+
+- 282 names from hayro's `hayro-font/src/generated/tex_glyph_names.rs`
+  ([LaurenzV/hayro](https://github.com/LaurenzV/hayro) commit `ba9d3fe`, added
+  in PR #1515). hayro built the table from the glyph names in the AMS font
+  metrics and mapped them with the Unicode Character Database.
+- 116 names from the "TeX-specific glyph names" block of pdf.js's
+  `src/core/glyphlist.js` ([mozilla/pdf.js](https://github.com/mozilla/pdf.js)
+  commit `6669a99`): the CMEX sized delimiters and operators.
+- Four names neither covers, mapped from Unicode Character Database character
+  names: `epsilon1` -> U+03F5 GREEK LUNATE EPSILON SYMBOL (in the AMS CMMI
+  metrics, code 15, TeX's lunate `\epsilon`, is `epsilon1`; code 34,
+  `\varepsilon`, is `epsilon`, which the AGL maps to U+03B5);
+  `angbracketleft` -> U+27E8 MATHEMATICAL LEFT ANGLE BRACKET;
+  `angbracketright` -> U+27E9 MATHEMATICAL RIGHT ANGLE BRACKET; `mapsto` ->
+  U+21A6 RIGHTWARDS ARROW FROM BAR.
+
+Nine pdf.js values are corrected locally against the Unicode Character
+Database:
+
+- `intercal` -> U+22BA INTERCALATE. pdf.js has U+1D40 MODIFIER LETTER CAPITAL
+  T.
+- The sized angle brackets `angbracketleftbig`, `angbracketleftBig`,
+  `angbracketleftbigg` and `angbracketleftBigg` -> U+27E8, and the four
+  `angbracketright` sizes -> U+27E9, the same characters as the unsized
+  names. pdf.js has U+2329 and U+232A. Unicode marks those two Deprecated
+  (UCD 18.0.0 `PropList.txt`), and Unicode Technical Report #25, revision 15,
+  section 2.10 ("Deprecated Delimiters") says they "are now deprecated for use
+  with mathematics because their canonical equivalence to CJK angle brackets
+  is likely to result in unintended wide spacing problems when used in
+  mathematical formulae", and that U+27E8 and U+27E9 should be used instead.
+  Under NFC they become the CJK brackets U+3008 and U+3009.
+
+Some TeX glyphs are parts of a symbol. `negationslash` (U+0338) is set before
+the symbol it negates, and CMSY's zero-width `mapsto` bar is set before an
+arrow, so extracted text has U+0338 before `=` for `\neq`, and U+21A6 followed
+by U+2192 for `\mapsto`.
+
+hayro: Copyright (c) The Hayro Authors, licensed under the Apache License,
+Version 2.0 or the MIT license; used here under the Apache License, Version
+2.0. pdf.js: Copyright 2012 Mozilla Foundation, licensed under the Apache
+License, Version 2.0. The license text is at
+http://www.apache.org/licenses/LICENSE-2.0. Both tables were converted to JSON.
+hayro's pairs are unchanged; pdf.js's are unchanged except for the corrections
+above.
+
 ### Program width repair
 
 For simple TrueType fonts, rule 7.21.5 is handled in the dictionary-repair

@@ -1,9 +1,12 @@
 """Simple-font encodings, ToUnicode CMaps, and text operand cleanup."""
 
+import json
 import re
 from collections.abc import Iterable
 from enum import StrEnum
+from functools import lru_cache
 from io import BytesIO
+from pathlib import Path
 
 import pikepdf
 
@@ -75,12 +78,14 @@ def _simple_font_auto_unicode_policy(font_dict, font_bytes: bytes | None = None)
     base_font = FONT_NAME_RE.sub("", _base_font_name(font_dict))
     if base_font in SAFE_IMPLICIT_STANDARD_BASEFONTS:
         return "standard14"
-    if (
-        font_bytes
-        and font_dict.get("/Subtype") in (pikepdf.Name("/Type1"), pikepdf.Name("/MMType1"))
-        and _cff_builtin_encoding_map(font_bytes)
+    if font_bytes and font_dict.get("/Subtype") in (
+        pikepdf.Name("/Type1"),
+        pikepdf.Name("/MMType1"),
     ):
-        return "embedded_cff"
+        if _cff_builtin_encoding_map(font_bytes):
+            return "embedded_cff"
+        if _type1_builtin_encoding_map(font_bytes):
+            return "embedded_type1"
     return "blocked"
 
 
@@ -112,6 +117,12 @@ def _decode_tounicode_hex(value: str) -> str | None:
     return text if _is_valid_unicode_text(text) else None
 
 
+@lru_cache(maxsize=1)
+def _tex_glyph_names() -> dict[str, str]:
+    # TeX/AMS glyph names outside the AGL; see README.md for provenance.
+    return json.loads(Path(__file__).with_name("tex_glyph_names.json").read_text())
+
+
 def _glyph_name_to_unicode(glyph_name: str | None) -> str | None:
     from fontTools.agl import toUnicode
 
@@ -119,9 +130,13 @@ def _glyph_name_to_unicode(glyph_name: str | None) -> str | None:
     if not raw or raw == ".notdef":
         return None
 
+    base = raw.split(".", 1)[0]
     text = toUnicode(raw)
     if not text and "." in raw:
-        text = toUnicode(raw.split(".", 1)[0])
+        text = toUnicode(base)
+    if not text:
+        tex_names = _tex_glyph_names()
+        text = tex_names.get(raw) or tex_names.get(base) or ""
     return text if _is_valid_unicode_text(text) else None
 
 
@@ -205,6 +220,37 @@ def _cff_builtin_encoding_map(font_bytes: bytes) -> dict[int, str]:
     return mapping
 
 
+TYPE1_ENCODING_RE = re.compile(
+    rb"/Encoding\s+(?:(?P<standard>StandardEncoding)\s+(?:readonly\s+)?def\b|\d+\s+array\b)"
+)
+TYPE1_ENCODING_ENTRY_RE = re.compile(rb"(?<!\S)dup\s+(\d+)\s*/([^\s/\[\]{}()<>%]+)\s+put(?!\S)")
+
+
+def _type1_builtin_encoding_map(font_bytes: bytes) -> dict[int, str]:
+    """Read the built-in encoding from the cleartext part of a /FontFile program.
+
+    The cleartext (the stream's first /Length1 bytes) ends at `currentfile
+    eexec`, so the token bounds it without /Length1. It sets /Encoding to
+    `StandardEncoding` or fills an array with `dup <code> /<name> put`.
+    """
+    cleartext_end = font_bytes.find(b"eexec")
+    if cleartext_end < 0:
+        return {}
+    cleartext = font_bytes[:cleartext_end]
+    match = TYPE1_ENCODING_RE.search(cleartext)
+    if match is None:
+        return {}
+    if match.group("standard"):
+        return _named_simple_encoding_map("/StandardEncoding")
+
+    mapping: dict[int, str] = {}
+    for code, glyph_name in TYPE1_ENCODING_ENTRY_RE.findall(cleartext, match.end()):
+        text = _glyph_name_to_unicode(glyph_name.decode("latin-1"))
+        if text:
+            mapping[int(code)] = text
+    return mapping
+
+
 def _simple_font_unicode_map(font_dict, font_bytes: bytes | None) -> dict[int, str]:
     import pikepdf
 
@@ -243,6 +289,8 @@ def _simple_font_unicode_map(font_dict, font_bytes: bytes | None) -> dict[int, s
             mapping.update(_named_simple_encoding_map("/StandardEncoding"))
         elif policy == "embedded_cff" and font_bytes:
             mapping.update(_cff_builtin_encoding_map(font_bytes))
+        elif policy == "embedded_type1" and font_bytes:
+            mapping.update(_type1_builtin_encoding_map(font_bytes))
 
     return {
         code: text
