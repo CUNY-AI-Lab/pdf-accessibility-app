@@ -32,6 +32,7 @@ from app.pipeline.language import (
     normalize_lang_tag as _normalize_lang_tag,
 )
 from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
+from app.services.thread_work import to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -1495,7 +1496,7 @@ async def extract_structure(
 
             return doc_dict, figures, result_processed_pdf_path
 
-        doc_dict, figures, processed_pdf_path = await asyncio.to_thread(_convert)
+        doc_dict, figures, processed_pdf_path = await to_thread(_convert)
 
     # Normalize into elements array and infer heading levels
     elements = _normalize_docling_elements(doc_dict)
@@ -1504,12 +1505,12 @@ async def extract_structure(
     elements = _expand_toc_item_tables(elements)
     elements = _rebuild_toc_with_docling_parse(elements, toc_source_pdf)
     title = _extract_title_from_docling(doc_dict, elements, pdf_path=pdf_path)
-    title_evidence = await asyncio.to_thread(
+    title_evidence = await to_thread(
         select_document_title, toc_source_pdf, {"title": title, "elements": elements}, pdf_path.name,
     )
     title = title_evidence["title"]
     document_language = _infer_document_language(elements, title)
-    native_toc = await asyncio.to_thread(_extract_native_toc_from_pdf, toc_source_pdf)
+    native_toc = await to_thread(_extract_native_toc_from_pdf, toc_source_pdf)
 
     page_count = len(doc_dict.get("pages", {}))
     figures_count = len(figures)

@@ -1,9 +1,10 @@
 """A job's working files on the runner, and the archive the Worker keeps.
 
 The pipeline records absolute paths (input, figures, output) in the job's
-database, so the runner keeps one layout under the settings' data root and
-the archive stores paths relative to it. Unpacking on any runner with the
-same layout restores a job exactly. Job files are removed after each task.
+database. Each lease has an isolated data root. Archives retain the deployed
+runner's relative layout and canonical file references; unpacking rebases only
+file-reference columns to the receiving attempt. Job files are removed after
+owned work, including cancelled threads, has joined.
 
 A shared cache keeps generated figure descriptions keyed by hashes of the
 image and exact model request, model ID, and prompt version. It stores no
@@ -17,8 +18,13 @@ ALT_TEXT_CACHE_ENABLED=false disables all cache file creation, reads, and
 writes. It defaults to true. Disabling it leaves any existing file untouched.
 """
 
+import fcntl
+import hashlib
 import shutil
+import sqlite3
 import tarfile
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import (
@@ -33,7 +39,10 @@ from app.database import prepare_schema
 
 
 def data_root(settings: Settings) -> Path:
-    roots = {d.resolve().parent for d in (settings.upload_dir, settings.processing_dir, settings.output_dir)}
+    roots = {
+        d.resolve().parent
+        for d in (settings.upload_dir, settings.processing_dir, settings.output_dir)
+    }
     if len(roots) != 1:
         raise RuntimeError(
             "The runner needs UPLOAD_DIR, PROCESSING_DIR and OUTPUT_DIR in one directory"
@@ -76,13 +85,24 @@ async def open_job_database(
     return engine, async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
-def pack_state(settings: Settings, job_id: str, archive: Path) -> Path:
+def pack_state(
+    settings: Settings, job_id: str, archive: Path, *, canonical_root: Path | None = None
+) -> Path:
     root = data_root(settings)
     archive.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "w:gz") as tar:
         for path in job_paths(settings, job_id):
             if path.exists():
-                tar.add(path, arcname=str(path.relative_to(root)))
+                name = str(path.relative_to(root))
+                if path == database_path(settings, job_id) and canonical_root is not None:
+                    with tempfile.TemporaryDirectory(dir=archive.parent) as temp:
+                        snapshot = Path(temp) / "state.db"
+                        with sqlite3.connect(path) as source, sqlite3.connect(snapshot) as target:
+                            source.backup(target)
+                        relocate_database(snapshot, job_id, canonical_root)
+                        tar.add(snapshot, arcname=name)
+                else:
+                    tar.add(path, arcname=name)
     return archive
 
 
@@ -92,6 +112,95 @@ def unpack_state(settings: Settings, job_id: str, archive: Path) -> None:
     with tarfile.open(archive, "r:gz") as tar:
         members = tar.getmembers()
         for member in members:
-            if not any(member.name == prefix or member.name.startswith(f"{prefix}/") for prefix in allowed):
+            if not any(
+                member.name == prefix or member.name.startswith(f"{prefix}/") for prefix in allowed
+            ):
                 raise ValueError(f"unexpected path in job state: {member.name}")
+        if any(not (member.isfile() or member.isdir()) for member in members):
+            raise ValueError("Saved state must contain only files and directories")
         tar.extractall(root, members=members, filter="data")
+    relocate_database(database_path(settings, job_id), job_id, root)
+
+
+def attempt_settings(settings: Settings, lease: str) -> Settings:
+    """Lease identity is unique even when a later review resets its attempt counter."""
+    root = data_root(settings) / "runner-attempts" / hashlib.sha256(lease.encode()).hexdigest()
+    return settings.model_copy(
+        update={
+            "upload_dir": root / settings.upload_dir.name,
+            "processing_dir": root / settings.processing_dir.name,
+            "output_dir": root / settings.output_dir.name,
+            "alt_text_cache_dir": settings.alt_text_cache_dir or settings.processing_dir.parent,
+        }
+    )
+
+
+def relocate_database(path: Path, job_id: str, root: Path) -> None:
+    """Rebase the file-reference columns without changing document or review text."""
+    with sqlite3.connect(path) as db:
+        row = db.execute("SELECT input_path FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise ValueError("Saved state has no job")
+        old_root = str(Path(row[0]).parent.parent) + "/"
+        new_root = str(root) + "/"
+        # Only file-reference columns are rebased. Document text and review JSON
+        # can contain literal paths and must remain byte-for-byte unchanged.
+        for table, column in (
+            ("jobs", "input_path"),
+            ("jobs", "output_path"),
+            ("alt_texts", "image_path"),
+        ):
+            db.execute(
+                f'UPDATE "{table}" SET "{column}" = replace("{column}", ?, ?)',
+                (old_root, new_root),
+            )
+
+
+@contextmanager
+def _workspace_index(settings: Settings):
+    root = data_root(settings)
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / ".runner-attempts.lock").open("ab") as index:
+        fcntl.flock(index, fcntl.LOCK_EX)
+        yield
+
+
+@contextmanager
+def attempt_workspace(settings: Settings, lease: str):
+    scoped = attempt_settings(settings, lease)
+    root = data_root(scoped)
+    # Coordinate creation and deletion so a startup reaper cannot take an
+    # attempt between its directory creation and ownership-lock acquisition.
+    with _workspace_index(settings):
+        root.mkdir(parents=True, exist_ok=True)
+        owner = (root / ".owner").open("ab")
+        try:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            owner.close()
+            raise RuntimeError("This attempt already has a local file owner") from exc
+    try:
+        yield scoped
+    finally:
+        with _workspace_index(settings):
+            try:
+                shutil.rmtree(root)
+            finally:
+                owner.close()
+
+
+def cleanup_abandoned_attempts(settings: Settings) -> None:
+    """At startup, reap crashed attempts while preserving other live runners."""
+    with _workspace_index(settings):
+        attempts = data_root(settings) / "runner-attempts"
+        if not attempts.exists():
+            return
+        for root in attempts.iterdir():
+            if root.is_symlink() or not root.is_dir():
+                continue
+            try:
+                with (root / ".owner").open("ab") as owner:
+                    fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    shutil.rmtree(root)
+            except (BlockingIOError, FileNotFoundError):
+                continue

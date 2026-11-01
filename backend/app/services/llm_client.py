@@ -26,6 +26,7 @@ from typing import Any
 import httpx
 
 from app.config import DEFAULT_LLM_MAX_REQUEST_BYTES
+from app.services.thread_work import to_thread
 from app.services.vision_requests import bound_vision_request
 
 logger = logging.getLogger(__name__)
@@ -368,7 +369,7 @@ class LlmClient:
         self.max_request_bytes = max_request_bytes
 
     async def prepare_request(self, messages: list[dict], **kwargs) -> dict:
-        return await asyncio.to_thread(
+        return await to_thread(
             bound_vision_request,
             {"model": self.model, "messages": messages, **kwargs},
             self.max_request_bytes,

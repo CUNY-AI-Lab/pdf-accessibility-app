@@ -1,6 +1,5 @@
 """Repair CID dictionaries and embedded font width mismatches."""
 
-import asyncio
 from io import BytesIO
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from app.pipeline.fonts.resources import (
 )
 from app.pipeline.fonts.widths import _align_truetype_advances
 from app.services.pdf_objects import pdf_text
+from app.services.thread_work import to_thread
 
 
 def _parse_cid_widths_array(widths_obj) -> dict[int, int]:
@@ -252,7 +252,7 @@ async def _repair_pdf_font_dicts(
     input_path: Path,
     output_path: Path,
 ) -> tuple[bool, str, dict[str, int]]:
-    return await asyncio.to_thread(_repair_pdf_font_dicts_sync, input_path, output_path)
+    return await to_thread(_repair_pdf_font_dicts_sync, input_path, output_path)
 
 
 def _sync_pdf_cid_cff_widths_sync(
@@ -350,4 +350,4 @@ async def _sync_pdf_cid_cff_widths(
     input_path: Path,
     output_path: Path,
 ) -> tuple[bool, str, dict[str, int]]:
-    return await asyncio.to_thread(_sync_pdf_cid_cff_widths_sync, input_path, output_path)
+    return await to_thread(_sync_pdf_cid_cff_widths_sync, input_path, output_path)

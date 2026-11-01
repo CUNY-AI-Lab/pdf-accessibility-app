@@ -258,6 +258,7 @@ from app.services.semantic_pretag_policy import (
 )
 from app.services.structure_text import screen_reader_text
 from app.services.table_decisions import queue_table_decision, queue_table_decisions
+from app.services.thread_work import to_thread
 from app.services.title_intelligence import enhance_document_title_with_intelligence
 from app.services.toc_intelligence import enhance_toc_structure_with_intelligence
 from app.services.validation_compare import is_better_validation as _is_better_validation
@@ -1953,7 +1954,7 @@ async def _run_pipeline(
             )
 
             try:
-                author_evidence = await asyncio.to_thread(read_author_structure, input_path)
+                author_evidence = await to_thread(read_author_structure, input_path)
             except Exception as exc:
                 logger.warning("Could not recover author evidence", exc_info=True)
                 author_evidence = {"elements": [], "author_read_error": type(exc).__name__}
@@ -2573,7 +2574,7 @@ async def _assess_candidate_fidelity(
     settings: Settings,
     adjudicate: bool = True,
 ) -> None:
-    candidate.fidelity_report, candidate.review_tasks = await asyncio.to_thread(
+    candidate.fidelity_report, candidate.review_tasks = await to_thread(
         assess_fidelity,
         input_pdf=Path(job.input_path),
         output_pdf=candidate.output_path,
@@ -2714,7 +2715,7 @@ async def _evaluate_author_candidate(
     )
     readability_error = None
     try:
-        readability = await asyncio.to_thread(author_table_readability, path, evidence)
+        readability = await to_thread(author_table_readability, path, evidence)
     except Exception as exc:
         readability = []
         readability_error = type(exc).__name__
@@ -2768,8 +2769,8 @@ async def _preserve_author_candidate(
     # Repair only a passing original. Re-evaluate the exact repaired file;
     # failure or an exception can never displace the passing source bytes.
     try:
-        repairs = await asyncio.to_thread(repair_author_pdf, original.output_path, output_path, evidence)
-        repaired_evidence = await asyncio.to_thread(read_author_structure, output_path)
+        repairs = await to_thread(repair_author_pdf, original.output_path, output_path, evidence)
+        repaired_evidence = await to_thread(read_author_structure, output_path)
         repaired = await _evaluate_author_candidate(
             job=job, settings=settings, path=output_path, evidence=repaired_evidence,
             baseline_validation=original.validation, produced_by="author_repaired",
@@ -2782,7 +2783,7 @@ async def _preserve_author_candidate(
             return screen_reader_text(original.output_path, figure_text=True, markdown=True) == screen_reader_text(
                 repaired.output_path, figure_text=True, markdown=True,
             )
-        reading_preserved = await asyncio.to_thread(same_reading)
+        reading_preserved = await to_thread(same_reading)
         selection["repair_reading_preserved"] = reading_preserved
         if repaired.validation.compliant and repaired.fidelity_report.get("passed") and reading_preserved:
             repaired.structure_json["author_candidate_audit"] = selection
@@ -2792,7 +2793,7 @@ async def _preserve_author_candidate(
         selection["repair_error"] = type(exc).__name__
     # Copy without serialization: fallback is the unrepaired original, byte for byte.
     fallback = output_path.with_name("author-original.pdf")
-    await asyncio.to_thread(shutil.copyfile, original.output_path, fallback)
+    await to_thread(shutil.copyfile, original.output_path, fallback)
     original.output_path = fallback
     original.tagging_result.output_path = fallback
     original.structure_json["author_candidate_audit"] = selection
@@ -2966,7 +2967,7 @@ async def _prepare_tagging_inputs(
     """Apply the existing pretag policies and collect figure decisions once."""
     evidence = {}
     try:
-        evidence = await asyncio.to_thread(read_author_structure, Path(job.input_path))
+        evidence = await to_thread(read_author_structure, Path(job.input_path))
         structure_json = apply_author_structure(structure_json, evidence)
     except Exception:
         logger.warning("Could not recover author evidence for re-tagging", exc_info=True)

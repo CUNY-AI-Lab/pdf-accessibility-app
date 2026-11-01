@@ -1,6 +1,5 @@
 """Step 5: orchestrate PDF/UA tagging; retain the historical tagger imports."""
 
-import asyncio
 import logging
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -292,6 +291,7 @@ from app.pipeline.tagger_tables import _set_list_numbering_attr as _set_list_num
 from app.pipeline.tagger_tables import _table_summary_text as _table_summary_text
 from app.services.pdf_objects import pdf_dictionary
 from app.services.pdf_objects import pdf_text as pdf_text
+from app.services.thread_work import to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -869,4 +869,4 @@ async def tag_pdf(
         with unique_form_instances(input_path) as tagging_input:
             return _tag(tagging_input)
 
-    return await asyncio.to_thread(_tag_with_forms)
+    return await to_thread(_tag_with_forms)

@@ -49,7 +49,6 @@ The optional AnswerCache is enabled by benchmark tooling, not the orchestrator.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import html
@@ -74,6 +73,7 @@ from app.config import DEFAULT_LLM_MAX_REQUEST_BYTES
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.page_glyphs import MeasuredGlyph, PdfGlyphReader, union_bbox
 from app.pipeline.tagger_ownership import _measured_words, _page_has_hidden_text
+from app.services.thread_work import to_thread
 from app.services.vision_requests import bound_vision_request
 
 logger = logging.getLogger(__name__)
@@ -213,7 +213,7 @@ class HttpReader:
                 {"type": "text", "text": PROMPT},
             ]}],
         }
-        body = await asyncio.to_thread(bound_vision_request, body, self.max_request_bytes)
+        body = await to_thread(bound_vision_request, body, self.max_request_bytes)
         started = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -1195,7 +1195,7 @@ async def rewrite_tables(
     pass, and a report of every table. The PDF is the one the tagger gets."""
     started = time.monotonic()
     elements = list(structure_json.get("elements") or [])
-    prepared = await asyncio.to_thread(prepare_tables, pdf_path, elements)
+    prepared = await to_thread(prepare_tables, pdf_path, elements)
     answers: list[ModelAnswer | None] = []
     circuit = TableServiceCircuit()
     for prep in prepared:
@@ -1211,7 +1211,7 @@ async def rewrite_tables(
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             logger.warning("table model failed for table %s: %r", prep.element_index, exc)
             answers.append(None)
-    updated, reports = await asyncio.to_thread(
+    updated, reports = await to_thread(
         rebuild_tables, elements, prepared, answers,
         min_coverage=min_coverage, min_coverage_scan=min_coverage_scan,
         correct_scan_text=correct_scan_text,
