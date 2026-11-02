@@ -63,10 +63,15 @@ def figure_author(path, *, alt='The author describes a gray square.', actual='')
         pdf.save(path)
 
 
-@pytest.mark.parametrize('placeholder', [False, True])
-async def test_author_figure_geometry_description_and_placeholder(tmp_path, monkeypatch, placeholder):
+@pytest.mark.parametrize('kind', ['description', 'placeholder', 'file_name'])
+async def test_author_figure_geometry_description_and_placeholder(tmp_path, monkeypatch, kind):
     source, output = tmp_path / 'source.pdf', tmp_path / 'output.pdf'
-    description = '[Could not determine figure semantics]' if placeholder else 'The author describes a gray square.'
+    placeholder = kind != 'description'
+    description = {
+        'description': 'The author describes a gray square.',
+        'placeholder': '[Could not determine figure semantics]',
+        'file_name': 'C:\\Users\\staff\\Pictures\\IMG_1234.jpg',
+    }[kind]
     figure_author(source, alt=description, actual='' if placeholder else 'Author replacement reading.')
     structure = {'elements': [dict(type='figure', figure_index=0, page=0,
                                   bbox=dict(l=20, b=20, r=70, t=70))]}
@@ -87,6 +92,21 @@ async def test_author_figure_geometry_description_and_placeholder(tmp_path, monk
         )
         assert results[0].generated_text == description
         assert results[0].status == 'approved'
+    if kind == 'file_name':
+        # A file name is no description: the figure is described as usual.
+        image = tmp_path / 'figure.png'
+        image.write_bytes(b'png')
+        asked = []
+        async def model(**kwargs):
+            asked.extend(figure.index for figure in kwargs['figures'])
+            return [{'suggested_action': 'set_alt_text', 'confidence': 'high',
+                     'alt_text': 'A gray square on a white page.'}]
+        monkeypatch.setattr(alt_text, 'generate_figures_intelligence', model)
+        results = await alt_text.generate_alt_text(
+            [FigureInfo(0, image, page=0)], SimpleNamespace(model=None), structure=enriched,
+        )
+        assert asked == [0]
+        assert results[0].generated_text == 'A gray square on a white page.'
     await tagger.tag_pdf(source, output, enriched)
     with pikepdf.open(output) as pdf:
         figure = _first_struct_elem(pdf.Root.StructTreeRoot, 'Figure')

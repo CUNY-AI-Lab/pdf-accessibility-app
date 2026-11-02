@@ -298,12 +298,52 @@ def _formula_alt_text(text: str | None) -> str:
     return re.sub(r"\s+", " ", spoken).strip()
 
 
+# Image, vector and temporary file extensions that authoring tools leave as
+# alt text in place of a description.
+_FILE_EXTENSIONS = "png|jpe?g|jfif|gif|bmp|tiff?|webp|heic|emf|wmf|eps|svg|psd|pict?|pdf|tmp"
+_FILE_NAME_ALT_RES = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        # A Windows path: C:\Users\... or C:/...
+        r"[a-z]:[\\/].*",
+        # A URL or an e-mail content id: https://..., cid:image001.png@...
+        r"(?:https?|ftp|file|cid|data):\S*",
+        # A name ending in a file extension: logo.vector.emf, Scan 3.jpg
+        rf".*\S\.(?:{_FILE_EXTENSIONS})",
+        # A camera or screenshot name: IMG_7191, DSC0001, PXL_20240101_120000
+        r"(?:IMG|DSC[NF]?|PXL|MVIMG|GOPR|DJI|SAM|WP|VID|PANO)[_-]?\d{3,}\S*",
+        # An Office embedded image's name, as Word fills it in: Description: image001
+        r"(?:description:\s*)?image\d{3,}",
+        # One token with letters and two path separators: a/b/c, www.x.edu/a/b
+        r"(?=\S*[^\W\d_])\S*[\\/]\S*[\\/]\S*",
+        # One token with letters and digits joined by _ or #: top_bw_150, P817TB2#y1
+        r"(?=\S*[^\W\d_])(?=\S*\d)\S*[_#]\S*",
+        # Three or more words joined by _ and nothing else.
+        r"[^\s_]+(?:_[^\s_]+){2,}",
+    )
+)
+
+
+def is_file_name_alt_text(text: Any) -> bool:
+    """True for alt text that is a file name, path or URL rather than a
+    description: what an authoring tool fills in when the author wrote none."""
+    normalized = " ".join(
+        "".join(" " if unicodedata.category(c)[0] == "C" else c for c in str(text or "")).split()
+    )
+    return bool(normalized) and any(pattern.fullmatch(normalized) for pattern in _FILE_NAME_ALT_RES)
+
+
 def is_placeholder_alt_text(text: Any) -> bool:
-    """True for alt text that describes nothing: empty, or a bracketed
-    placeholder such as "[Could not determine figure semantics]". It is never
-    written as /Alt; a figure without a description goes to a person."""
+    """True for alt text that describes nothing: empty, a bracketed
+    placeholder such as "[Could not determine figure semantics]", or a file
+    name (is_file_name_alt_text). It is never written as /Alt; such a figure
+    is described like one without alt text, or goes to a person."""
     normalized = " ".join(str(text or "").split()).strip()
-    return not normalized or (normalized.startswith("[") and normalized.endswith("]"))
+    return (
+        not normalized
+        or (normalized.startswith("[") and normalized.endswith("]"))
+        or is_file_name_alt_text(normalized)
+    )
 
 
 def _is_weak_figure_alt_text(text: Any) -> bool:
