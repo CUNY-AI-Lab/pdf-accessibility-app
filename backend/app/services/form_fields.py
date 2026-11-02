@@ -156,10 +156,13 @@ def kid_widget_field(widget: pikepdf.Dictionary) -> pikepdf.Dictionary | None:
     return parent
 
 
-def name_kid_widget_field(widget: pikepdf.Dictionary) -> None:
-    """Give a kid widget's terminal field its partial name /T as /TU when the
-    field has no name, as stand-alone fields are named from theirs."""
+def name_widget_field(widget: pikepdf.Dictionary) -> None:
+    """Give a widget's terminal field its partial name /T as /TU when the
+    field has no name: the parent of a kid widget, or the widget itself when
+    field and widget are one dictionary."""
     field = kid_widget_field(widget)
+    if field is None and _normalize_text(pdf_text(widget.get("/T"))):
+        field = widget
     if field is not None and not _normalize_text(pdf_text(field.get("/TU"))):
         field["/TU"] = pikepdf.String(_normalize_text(pdf_text(field.get("/T"))))
 

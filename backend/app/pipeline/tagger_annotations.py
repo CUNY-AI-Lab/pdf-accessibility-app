@@ -25,7 +25,7 @@ from app.pipeline.tagger_link_labels import (
 from app.pipeline.tagger_ownership import _best_bbox_match
 from app.pipeline.tagger_semantics import _element_accessible_text
 from app.pipeline.tagger_structure import StructTreeBuilder
-from app.services.form_fields import button_option_name, name_kid_widget_field
+from app.services.form_fields import button_option_name, name_widget_field
 from app.services.pdf_objects import pdf_text
 
 
@@ -318,8 +318,10 @@ def _tag_widget_annotations(
             if inferred_name:
                 annotation["/TU"] = pikepdf.String(inferred_name)
         # A kid widget's /TU names one option; readers and PDF/UA take the
-        # field's name from the terminal field itself.
-        name_kid_widget_field(annotation)
+        # field's name from the terminal field itself. docling-parse does not
+        # report every widget (choice fields, some radio buttons), so a field
+        # it leaves unnamed is named from its own /T.
+        name_widget_field(annotation)
 
         if not getattr(annotation, "is_indirect", False):
             try:
