@@ -30,6 +30,7 @@ from app.pipeline.language import (
 from app.pipeline.language import (
     normalize_lang_tag as _normalize_lang_tag,
 )
+from app.pipeline.page_orientation import SidewaysPage, elements_to_shown, upright_copy
 from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
 from app.services.thread_work import to_thread
 
@@ -1444,15 +1445,20 @@ async def extract_structure(
 ) -> StructureResult:
     """Extract document structure using Docling.
 
-    Use docling-serve when configured, otherwise local Docling.
+    Use docling-serve when configured, otherwise local Docling. Docling reads
+    sideways pages turned upright, and its boxes are moved back into the
+    frame of the page as shown (see page_orientation).
     """
     settings = get_settings()
     use_docling_serve = bool(settings.docling_serve_url)
+    upright_dir = job_dir / "docling-upright"
+    sideways: dict[int, SidewaysPage] = {}
 
     if use_docling_serve:
         logger.info("Using docling-serve at %s for structure extraction", settings.docling_serve_url)
+        docling_input, sideways = await to_thread(upright_copy, pdf_path, upright_dir)
         doc_dict, figures = await _convert_via_docling_serve(
-            pdf_path,
+            docling_input,
             job_dir,
             settings.docling_serve_url,
             settings.docling_serve_timeout,
@@ -1476,6 +1482,10 @@ async def extract_structure(
                 )
 
             def _convert_one(path: Path):
+                # The repaired file, when Docling needs one, has pages of its own.
+                docling_input, pages = upright_copy(path, upright_dir)
+                sideways.clear()
+                sideways.update(pages)
                 pipeline_options = pipeline_options_module.PdfPipelineOptions(
                     generate_picture_images=include_figure_images,
                     images_scale=2.0,
@@ -1493,7 +1503,7 @@ async def extract_structure(
                         ),
                     }
                 )
-                return converter.convert(str(path))
+                return converter.convert(str(docling_input))
 
             conv_result, result_processed_pdf_path = LocalDoclingConversion().run(
                 _convert_one, _repair_pdf_with_ghostscript, pdf_path, job_dir / "repaired_input.pdf",
@@ -1536,6 +1546,11 @@ async def extract_structure(
 
     # Normalize into elements array and infer heading levels
     elements = _normalize_docling_elements(doc_dict)
+    elements_to_shown(elements, sideways)
+    for figure in figures:
+        page = sideways.get(figure.page) if figure.page is not None else None
+        if page is not None and isinstance(figure.bbox, dict):
+            figure.bbox = page.to_shown(figure.bbox)
     toc_source_pdf = processed_pdf_path or pdf_path
     _mark_toc_sequences(elements)
     elements = _expand_toc_item_tables(elements)
