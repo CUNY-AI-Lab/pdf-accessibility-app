@@ -177,13 +177,14 @@ def _named_simple_encoding_map(encoding_name) -> dict[int, str]:
     return {}
 
 
-def _encoding_differences_map(differences) -> dict[int, str]:
+def _encoding_differences_names(differences) -> dict[int, str]:
+    """Glyph name per code in a Differences array; a later entry for a code wins."""
     import pikepdf
 
     if not isinstance(differences, pikepdf.Array):
         return {}
 
-    mapping: dict[int, str] = {}
+    names: dict[int, str] = {}
     current_code: int | None = None
     for item in differences:
         if isinstance(item, int):
@@ -191,11 +192,71 @@ def _encoding_differences_map(differences) -> dict[int, str]:
             continue
         if current_code is None:
             continue
-        text = _glyph_name_to_unicode(str(item))
-        if text:
-            mapping[current_code] = text
+        names[current_code] = str(item).lstrip("/")
         current_code += 1
+    return names
+
+
+def _encoding_differences_map(differences) -> dict[int, str]:
+    mapping: dict[int, str] = {}
+    for code, name in _encoding_differences_names(differences).items():
+        text = _glyph_name_to_unicode(name)
+        if text:
+            mapping[code] = text
     return mapping
+
+
+def _standard_encoding_over_winansi(encoding, *, implicit_standard: bool):
+    """Restate a StandardEncoding-based simple encoding over WinAnsiEncoding.
+
+    PDF/UA-1 (ISO 14289-1, 7.21.6) allows a non-symbolic TrueType font only
+    MacRomanEncoding or WinAnsiEncoding as its base, and only Adobe Glyph List
+    names in Differences. Each code keeps its glyph name: a Differences entry
+    names it wherever WinAnsiEncoding would give another character. Codes that
+    StandardEncoding leaves undefined keep WinAnsiEncoding's character. Returns
+    None when the encoding is not StandardEncoding-based, or a name is not in
+    the AGL.
+    """
+    from fontTools.agl import LEGACY_AGL2UV
+    from fontTools.encodings.StandardEncoding import StandardEncoding
+
+    standard = pikepdf.Name("/StandardEncoding")
+    if isinstance(encoding, pikepdf.Dictionary):
+        base = encoding.get("/BaseEncoding")
+        if base != standard and not (base is None and implicit_standard):
+            return None
+        differences = _encoding_differences_names(encoding.get("/Differences"))
+    elif encoding == standard or (encoding is None and implicit_standard):
+        differences = {}
+    else:
+        return None
+
+    names = {code: name for code, name in enumerate(StandardEncoding) if name != ".notdef"}
+    names.update(differences)
+    winansi = _named_simple_encoding_map("/WinAnsiEncoding")
+    entries: list[tuple[int, str]] = []
+    for code, name in sorted(names.items()):
+        if name == ".notdef":
+            continue
+        unicode = LEGACY_AGL2UV.get(name)
+        if unicode is None:
+            return None
+        if "".join(map(chr, unicode)) != winansi.get(code):
+            entries.append((code, name))
+
+    array = pikepdf.Array()
+    previous = None
+    for code, name in entries:
+        if previous is None or code != previous + 1:
+            array.append(code)
+        array.append(pikepdf.Name(f"/{name}"))
+        previous = code
+    restated = pikepdf.Dictionary(
+        Type=pikepdf.Name("/Encoding"), BaseEncoding=pikepdf.Name("/WinAnsiEncoding")
+    )
+    if entries:
+        restated["/Differences"] = array
+    return restated
 
 
 def _cff_builtin_encoding_map(font_bytes: bytes) -> dict[int, str]:

@@ -5,8 +5,8 @@ from io import BytesIO
 from pathlib import Path
 
 from app.config import get_settings
-from app.pipeline.fonts.gothic import gothic_style, gothic_truetype
 from app.pipeline.fonts.names import _base_font_name, _normalize_font_name
+from app.pipeline.fonts.urw import urw_substitute, urw_truetype
 from app.services.runtime_paths import resolve_binary
 
 SYSTEM_FONT_EXTENSIONS = {".ttf", ".otf", ".ttc"}
@@ -60,8 +60,8 @@ GHOSTSCRIPT_TYPE1_DESCRIPTOR_SPECS = {
 def _metric_compatible_names(font_name: str) -> tuple[str, str] | None:
     """Return approved metric-compatible substitutes, including PDF style aliases."""
     normalized = _normalize_font_name(font_name)
-    if style := gothic_style(normalized):
-        return f"URWGothic-{style}", font_name
+    if resource := urw_substitute(normalized):
+        return resource, font_name
     families = (
         (("arial", "helvetica"), "LiberationSans", "Helvetica"),
         (("timesnewromanps", "timesnewroman", "times"), "LiberationSerif", "Times"),
@@ -399,16 +399,22 @@ def _ghostscript_font_file(primary: Path | None, names: tuple[str, ...]) -> Path
 def _ghostscript_type1_font_program(
     font_name: str,
 ) -> tuple[bytes | None, str | None, dict[str, int] | None]:
-    from fontTools import t1Lib
-
     normalized = _normalize_font_name(font_name)
     if not normalized:
         return None, None, None
 
-    style = gothic_style(normalized)
-    resource_name = f"URWGothic-{style}" if style else GHOSTSCRIPT_TYPE1_SUBSTITUTES.get(normalized)
+    resource_name = urw_substitute(normalized) or GHOSTSCRIPT_TYPE1_SUBSTITUTES.get(normalized)
     if not resource_name:
         return None, None, None
+    return _urw_type1_program(resource_name)
+
+
+@lru_cache(maxsize=64)
+def _urw_type1_program(
+    resource_name: str,
+) -> tuple[bytes | None, str | None, dict[str, int] | None]:
+    """A URW base-35 Type 1 program by its resource name, e.g. `NimbusSans-Regular`."""
+    from fontTools import t1Lib
 
     resource_dir = _ghostscript_resource_font_dir()
     if resource_dir is None:
@@ -507,8 +513,12 @@ def _local_font_program(
     import pikepdf
 
     support_kind = _local_embed_support_kind(font_dict, descendant_subtype=descendant_subtype)
-    style = gothic_style(_normalize_font_name(font_name))
-    if style and support_kind in {"truetype", "type1_standard14"}:
+    resource = urw_substitute(_normalize_font_name(font_name))
+    if resource and support_kind in {"truetype", "type1_standard14"}:
+        if support_kind == "truetype":
+            font_bytes, matched_name = _system_font_program(font_name)
+            if font_bytes:
+                return font_bytes, matched_name, "/FontFile2", {"Length1": len(font_bytes)}
         encoding = font_dict.get("/Encoding")
         if isinstance(encoding, pikepdf.Dictionary):
             encoding = encoding.get("/BaseEncoding")
@@ -518,7 +528,7 @@ def _local_font_program(
             "/MacRomanEncoding",
             "/StandardEncoding",
         }:
-            data, name = gothic_truetype(style)
+            data, name = urw_truetype(resource)
             if data:
                 return data, name, "/FontFile2", {"Length1": len(data)}
         return None, None, None, None
