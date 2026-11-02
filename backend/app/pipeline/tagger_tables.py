@@ -17,6 +17,7 @@ from app.pipeline.tagger_geometry import (
     _transform_point,
 )
 from app.pipeline.tagger_ownership import _content_targets, _owner_of, _upright
+from app.services.table_decisions import HEADER_FLAGS
 
 
 def _complete_table_grid_cells(
@@ -174,6 +175,28 @@ def _numeric_table_text(text: str) -> bool:
     value = text.strip().replace(",", "").replace("\u2212", "-")
     value = value.strip("$€£¥()% ")
     return bool(re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", value))
+
+
+def _key_label(text: str) -> bool:
+    """A short label ending in a colon names the value beside it ("Page:
+    p. 70"), as key-value extraction reads "Key: Value"."""
+    text = " ".join(text.split())
+    return text.endswith(":") and sum(ch.isalpha() for ch in text) >= 2 and len(text.split()) <= 6
+
+
+def _key_value_table(table: dict) -> bool:
+    """Two columns whose filled rows pair a key label with its value, nearly
+    all of them: a data table whose first column holds row headers (W3C
+    WAI tables tutorial, "Tables with one header")."""
+    cells = [c for c in table.get("cells", []) if isinstance(c, dict)]
+    if table.get("num_cols") != 2 or any(c.get(f) for c in cells for f in HEADER_FLAGS):
+        return False
+    rows: dict[int, dict[int, str]] = {}
+    for c in cells:
+        if text := str(c.get("text") or "").strip():
+            rows.setdefault(c.get("row", 0), {})[c.get("col", 0)] = text
+    pairs = [r for r in rows.values() if set(r) == {0, 1}]
+    return len(pairs) >= 2 and sum(_key_label(r[0]) for r in pairs) >= 0.8 * len(pairs)
 
 
 def _simple_label_row(first: list[dict], rows: dict[int, list[dict]]) -> bool:
@@ -483,7 +506,7 @@ def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page
                     )
                 )
                 short = len(t) <= 0.7 * len(value_text) and len(t.split()) <= 12
-                return short or bold_lead or numeric
+                return short or bold_lead or numeric or _key_label(t)
 
             if len(pairs) >= 2 and sum(label_pair(p) for p in pairs) >= 0.8 * len(pairs):
                 for pair in pairs:
