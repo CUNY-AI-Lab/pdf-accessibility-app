@@ -1,5 +1,7 @@
 """Typed reads of pikepdf's dynamically decoded PDF values."""
 
+import unicodedata
+
 import pikepdf
 
 
@@ -25,6 +27,22 @@ def pdf_named_resource(resources: object, name: object) -> pikepdf.Object | None
 def pdf_text(value: object, default: str = "") -> str:
     """Decode a PDF string or name, preserving the caller's missing default."""
     return str(value) if isinstance(value, (pikepdf.String, pikepdf.Name, str)) else default
+
+
+def author_text(value: object) -> str:
+    """Decode text an author put in a PDF, without its control characters.
+
+    Word and other tools leave a trailing NUL, a vertical tab or carriage
+    return in alt text, link contents and bookmark titles, which a screen
+    reader announces or stops at. Line and tab breaks read as spaces, other
+    control characters (Unicode Cc) are dropped, and spaces collapse.
+    """
+    text = "".join(
+        character
+        for character in pdf_text(value)
+        if character.isspace() or unicodedata.category(character) != "Cc"
+    )
+    return " ".join(text.split())
 
 
 def pdf_integer(value: object, default: int = 1) -> int:

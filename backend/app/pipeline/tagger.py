@@ -210,6 +210,9 @@ from app.pipeline.tagger_normalization import FILE_NAME_TITLE_RE as FILE_NAME_TI
 from app.pipeline.tagger_normalization import OFFICE_TITLE_PREFIX_RE as OFFICE_TITLE_PREFIX_RE
 from app.pipeline.tagger_normalization import PLACEHOLDER_TITLE_RE as PLACEHOLDER_TITLE_RE
 from app.pipeline.tagger_normalization import (
+    _clean_author_text_in_place as _clean_author_text_in_place,
+)
+from app.pipeline.tagger_normalization import (
     _is_placeholder_document_title as _is_placeholder_document_title,
 )
 from app.pipeline.tagger_normalization import (
@@ -297,7 +300,7 @@ from app.pipeline.tagger_tables import _numeric_table_text as _numeric_table_tex
 from app.pipeline.tagger_tables import _painted_table_rules as _painted_table_rules
 from app.pipeline.tagger_tables import _set_list_numbering_attr as _set_list_numbering_attr
 from app.pipeline.tagger_tables import _table_summary_text as _table_summary_text
-from app.services.pdf_objects import pdf_dictionary
+from app.services.pdf_objects import author_text, pdf_dictionary
 from app.services.pdf_objects import pdf_text as pdf_text
 from app.services.thread_work import to_thread
 
@@ -477,6 +480,11 @@ async def tag_pdf(
                 author_evidence = {}
             enriched = apply_author_structure(structure_json, author_evidence) if author_evidence else structure_json
             elements = _elements_in_user_space(enriched.get("elements", []), frames)
+            # A structure stored before author text was cleaned on reading.
+            for elem in elements:
+                for field in ("author_alt", "author_actual_text"):
+                    if field in elem:
+                        elem[field] = author_text(elem[field])
             source_figure_alt_lookup = {
                 e["figure_index"]: e.get("author_alt") or e.get("author_actual_text")
                 for e in elements if e.get("type") == "figure"
@@ -502,6 +510,7 @@ async def tag_pdf(
             tags_added += 1
 
             # 3. Set document title
+            _clean_author_text_in_place(pdf)
             title = _set_document_title(pdf, structure_json, original_filename, pdf_path=input_path)
             title_set = bool(title)
             _set_pdfua_identification(pdf)
@@ -527,9 +536,9 @@ async def tag_pdf(
                 if status == "rejected" or bool(alt.get("decorative")):
                     decorative_figures.add(fig_idx)
                     continue
-                text = alt.get("text")
-                if isinstance(text, str) and not is_placeholder_alt_text(text):
-                    alt_lookup[fig_idx] = text.strip()
+                text = author_text(alt.get("text"))
+                if not is_placeholder_alt_text(text):
+                    alt_lookup[fig_idx] = text
 
             for fig_idx, source_alt in source_figure_alt_lookup.items():
                 if _is_weak_figure_alt_text(source_alt):
