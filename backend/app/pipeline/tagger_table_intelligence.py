@@ -6,7 +6,14 @@ import pikepdf
 
 from app.pipeline.tagger_table_structure import _associate_columns, _table_has_headers
 from app.pipeline.tagger_tables import _key_value_table
-from app.services.table_decisions import LAYOUT_KINDS, has_headers, header_selection, table_action
+from app.services.table_decisions import (
+    LAYOUT_KINDS,
+    TABLE_REGION_KINDS,
+    has_headers,
+    header_selection,
+    table_action,
+    unsupported_region_kind,
+)
 
 
 def _model_table_layout(table: dict, continues: dict | None = None) -> dict | None:
@@ -66,7 +73,10 @@ def _apply_model_table_headers(builder, pages: dict[int, list[dict]]) -> list[di
             for item in table.get("table_llm_decisions", []):
                 action, kind = table_action(item), item.get("resolved_kind")
                 status = "unsupported_decision"
-                if table.get("_joined_table"):
+                if unsupported_region_kind(item):
+                    # The model named a kind nothing applies; the table stays.
+                    status = "unsupported_kind"
+                elif table.get("_joined_table"):
                     # Its rows are the table's it continues, whose decision covers them.
                     status = "joined_previous_table"
                 elif layout.get("continues_page"):
@@ -82,7 +92,7 @@ def _apply_model_table_headers(builder, pages: dict[int, list[dict]]) -> list[di
                         else:
                             status = "applied_layout"
                             applied_layouts.add(id(table))
-                elif action == "reclassify_region" and kind in LAYOUT_KINDS | {"form_region"}:
+                elif action == "reclassify_region" and kind in TABLE_REGION_KINDS:
                     status = "kept_table"
                 elif action == "set_table_headers" and cells:
                     node = next(iter(cells.values())).P.P
