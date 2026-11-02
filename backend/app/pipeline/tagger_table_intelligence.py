@@ -5,24 +5,25 @@ from collections import defaultdict
 import pikepdf
 
 from app.pipeline.tagger_table_structure import _associate_columns, _table_has_headers
-from app.pipeline.tagger_tables import _key_value_table
+from app.pipeline.tagger_tables import _key_value_table, _name_code_pairs
 from app.services.table_decisions import LAYOUT_KINDS, has_headers, header_selection, table_action
 
 
 def _model_table_layout(table: dict, continues: dict | None = None) -> dict | None:
     """The layout a model reclassification makes of ``table``. The part of
     a table continued from the page before (_continued_table) takes that
-    table's layout instead of any decision of its own. A key-value table
-    stays a table (its keys become row headers) against a low-confidence
-    reclassification."""
+    table's layout instead of any decision of its own. A key-value table or
+    a name | code directory stays a table (its labels become row headers)
+    against a low-confidence reclassification."""
     if table.get("_table_readability") or has_headers(table):
         return None
     if continues is None:
+        paired = _key_value_table(table) or _name_code_pairs(table) is not None
         kinds = [
             item.get("resolved_kind")
             for item in table.get("table_llm_decisions", [])
             if table_action(item) == "reclassify_region"
-            and not (item.get("confidence") == "low" and _key_value_table(table))
+            and not (item.get("confidence") == "low" and paired)
         ]
     else:
         kinds = [(continues.get("_layout_table") or {}).get("model_kind")]
