@@ -9,6 +9,7 @@ import pytest
 from app.pipeline import tagger
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.page_glyphs import PdfGlyphReader, union_bbox
+from app.pipeline.tagger_table_intelligence import _model_table_layout
 from app.pipeline.tagger_table_structure import _continued_table, _mark_table_continuation
 from app.services.structure_text import screen_reader_text
 from app.services.table_decisions import queue_table_decisions
@@ -570,3 +571,68 @@ async def test_continued_rows_join_the_table_and_take_its_model_headers(tmp_path
             tag, properties = shown[text]
             assert tag == "/Artifact" and properties.Type == "/Pagination"
         assert "/MCID" in shown["3"][1]
+
+
+LAYOUT = dict(suggested_action="reclassify_region", resolved_kind="text_block", confidence="low")
+
+
+@pytest.mark.parametrize("change", ["layout", "headers", "lower", "shift", "own_layout"])
+def test_continuation_follows_the_layout_the_model_made_of_the_table(change):
+    """The model made the table on page one a text block. The table that
+    starts the next page with the same columns is the same text block,
+    unless it has header cells of its own or does not line up."""
+    first = part(STEPS, page=0, top=100, table_llm_decisions=[LAYOUT])
+    first["_layout_table"] = (
+        {"reason": "bullet label column", "order": "row", "blocks": []}
+        if change == "own_layout"
+        else _model_table_layout(first)
+    )
+    second = part(
+        MORE,
+        page=1,
+        top=650 if change == "lower" else 720,
+        flagged=(0,) if change == "headers" else (),
+        shift=20 if change == "shift" else 0.0,
+    )
+    found = _continued_table([first], [second], (LETTER, LETTER))
+    if change != "layout":
+        assert found is None
+        return
+    assert found == (first, second)
+    layout = _model_table_layout(second, first)
+    assert layout["model_kind"] == "text_block" and layout["continues_page"] == 1
+    assert layout["blocks"] == [{"role": "P", "groups": [[(0, 0), (0, 1)], [(1, 0), (1, 1)]]}]
+    # Its rows are not joined to the first table's: neither is a Table.
+    assert not _mark_table_continuation(*found, [dict(second, _layout_table=layout)])
+
+
+@pytest.mark.parametrize("own", ["none", "headers"])
+async def test_continued_part_takes_the_layout_the_model_made_of_the_table(tmp_path, own):
+    """A table at the foot of page one that the model made a text block
+    continues at the head of page two; page two's part is read as the same
+    text block, whatever the model said of it alone."""
+    decisions = [dict(LAYOUT, table_review_id="review-0", page=1)]
+    if own == "headers":
+        decisions.append(
+            dict(
+                table_review_id="review-1",
+                page=2,
+                suggested_action="set_table_headers",
+                header_rows=[0],
+            )
+        )
+    source, structure = await two_pages(tmp_path, STEPS, MORE, decisions)
+    output = tmp_path / "output.pdf"
+    result = await tagger.tag_pdf(source, output, structure, [], language="en")
+    assert rendered(source) == rendered(output)
+    with pikepdf.open(output) as pdf:
+        assert not list(_tables(pdf.Root.StructTreeRoot))
+    heard = screen_reader_text(output, markdown=True)
+    assert "<table>" not in heard
+    for number, step in [*STEPS[1:], *MORE]:
+        assert f"{number} {step}" in heard
+    assert [(d["table_review_id"], d["status"]) for d in result.table_intelligence_audit] == [
+        ("review-0", "applied_layout"),
+        *([("review-1", "follows_previous_table")] if own == "headers" else []),
+    ]
+    assert result.tables_joined == []

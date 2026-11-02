@@ -573,12 +573,12 @@ async def tag_pdf(
                     if elem.get("type") == "table":
                         # The model reviewed this page's part of a continued
                         # table alone; the table it continues decides.
-                        own_review = not (continued and elem is continued[1])
+                        continues = continued[0] if continued and elem is continued[1] else None
                         elem["_layout_table"] = (
                             None
                             if elem.get("_table_readability")
                             else (
-                                (_model_table_layout(elem) if own_review else None)
+                                _model_table_layout(elem, continues)
                                 or _layout_table_plan(
                                     elem,
                                     page_elems,
