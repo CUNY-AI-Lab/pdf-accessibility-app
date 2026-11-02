@@ -42,6 +42,8 @@ TOC_GROUP_DIRECT_SCHEMA: dict[str, Any] = {
     ],
 }
 
+TOC_MAX_OUTPUT_TOKENS = 8192
+
 TOC_GROUP_DIRECT_PROMPT = """You are a PDF accessibility table-of-contents assistant.
 
 Decide whether the provided PDF pages contain a real table of contents represented by the supplied candidate group.
@@ -162,6 +164,8 @@ async def generate_toc_group_intelligence(
             },
         },
         response_schema=TOC_GROUP_DIRECT_SCHEMA,
+        # Recorded answers run to about 1,400 tokens; a long TOC lists more.
+        max_tokens=TOC_MAX_OUTPUT_TOKENS,
         system_instruction=(
             "You are evaluating PDF accessibility and TOC semantics. "
             "Stay grounded in the provided PDF pages."

@@ -359,6 +359,11 @@ def _requires_single_figure_followup(result: dict[str, object]) -> bool:
         return True
     if suggested_action == "manual_only":
         return True
+    # Hiding or replacing a figure is decided on that figure alone. The batch
+    # prompt favours hiding "redundant child details" and has hidden charts
+    # and text headings that the single-figure prompt describes.
+    if suggested_action in {"mark_decorative", "reclassify_region"} or result.get("is_decorative"):
+        return True
     if suggested_action == "set_alt_text" and not usable_description(alt_text):
         return True
     return False

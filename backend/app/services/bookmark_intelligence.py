@@ -182,6 +182,9 @@ Rules:
 
 
 MAX_BOOKMARK_TOC_ITEMS = 80
+# A plan lists headings, which grow with the document: recorded heading
+# supplements run to about 6,250 tokens.
+BOOKMARK_MAX_OUTPUT_TOKENS = 16384
 BOOKMARK_HEADING_TYPES = {"heading"}
 BOOKMARK_LANDMARK_TYPES = {"paragraph", "list_item", "note"}
 BOOKMARK_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
@@ -395,6 +398,7 @@ async def _request_bookmark_json(
         schema_name=response_schema["properties"]["task_type"]["enum"][0],
         response_schema=response_schema,
         cache_breakpoint_index=preferred_cache_breakpoint_index(content),
+        max_tokens=BOOKMARK_MAX_OUTPUT_TOKENS,
     )
 
 

@@ -23,7 +23,7 @@ from app.pipeline.tagger_layout_tables import _layout_table_plan
 from app.pipeline.tagger_tables import _infer_table_headers
 from app.services.structure_text import screen_reader_text
 from tests.pdf_fixtures import rendered
-from tests.test_tagger_figure_text import _fixture, _structs
+from tests.test_tagger_figure_text import _figure_on_ground, _structs
 
 
 def _program(*, square=False, triangle=False):
@@ -209,7 +209,9 @@ def test_font_resources_reach_named_widget_appearance_states():
 @pytest.mark.parametrize("form", [False, True])
 async def test_described_figure_does_not_swallow_live_labels(tmp_path, form):
     source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
-    elements = _fixture(source, image=True, form=form)
+    # A picture with a label. Text set on a plain banner is tagged as text
+    # instead (test_tagger_figure_text).
+    elements = _figure_on_ground(source, "chart", "Support students with a donation", form=form)
     await tag_pdf(
         source,
         output,

@@ -1,6 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
+from app.services.intelligence_llm_utils import DEFAULT_MAX_OUTPUT_TOKENS
 from app.services.intelligence_toc import generate_toc_group_intelligence
 from app.services.toc_intelligence import (
     apply_toc_intelligence,
@@ -234,6 +235,8 @@ def test_generate_toc_group_intelligence_asks_the_model_about_the_toc_pages(monk
     async def _fake_pages_request(**kwargs):
         assert kwargs["page_numbers"] == [1, 2]
         assert kwargs["context_payload"]["semantic_unit"]["caption_index"] == 0
+        # A TOC lists entries, so it may run longer than other structured answers.
+        assert kwargs["max_tokens"] > DEFAULT_MAX_OUTPUT_TOKENS
         return {
             "task_type": "toc_group_intelligence",
             "summary": "Visible TOC confirmed.",

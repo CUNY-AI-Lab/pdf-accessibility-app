@@ -403,3 +403,102 @@ async def test_description_recovery_excludes_reclassification_and_uses_the_crop(
         'set_alt_text','mark_decorative','manual_only',
     }
     assert any(part.get('image_url',{}).get('url','').startswith('data:image/') for part in request['content'])
+
+
+def _checkered_page(path, *, rotate=0):
+    """A page drawing an 8x8 checkerboard image at user box (40, 100)-(120, 180)."""
+    import pikepdf
+
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 300))
+    pixels = bytes(255 * ((x + y) % 2) for y in range(8) for x in range(8))
+    image = pdf.make_stream(pixels)
+    image.update(
+        {
+            "/Type": pikepdf.Name("/XObject"),
+            "/Subtype": pikepdf.Name("/Image"),
+            "/Width": 8,
+            "/Height": 8,
+            "/ColorSpace": pikepdf.Name("/DeviceGray"),
+            "/BitsPerComponent": 8,
+        }
+    )
+    page["/Resources"] = pikepdf.Dictionary({"/XObject": pikepdf.Dictionary({"/Im0": image})})
+    page["/Contents"] = pdf.make_stream(b"q 80 0 0 80 40 100 cm /Im0 Do Q\n")
+    if rotate:
+        page["/Rotate"] = rotate
+    pdf.save(path)
+    return path
+
+
+def _docling_box(pdf_path, user_box):
+    import pypdfium2 as pdfium
+
+    from app.pipeline.page_frame import PageFrame
+
+    document = pdfium.PdfDocument(str(pdf_path))
+    try:
+        return PageFrame.of(document[0]).to_docling(user_box)
+    finally:
+        document.close()
+
+
+@pytest.mark.parametrize("rotate", [0, 90])
+def test_docling_image_showing_less_than_the_page_is_replaced(tmp_path, rotate):
+    from app.pipeline.structure import ensure_figure_images
+
+    source = _checkered_page(tmp_path / "source.pdf", rotate=rotate)
+    bbox = _docling_box(source, {"l": 40, "b": 100, "r": 120, "t": 180})
+    path = tmp_path / "figure_0.png"
+    Image.new("RGB", (160, 160), (190, 190, 190)).save(path)
+    figure = FigureInfo(index=0, path=path, page=0, bbox=bbox)
+    structure = {"elements": [{"type": "figure", "figure_index": 0, "page": 0, "bbox": bbox}]}
+    [result] = ensure_figure_images(source, structure, [figure], tmp_path / "figures")
+    assert result.path == path
+    # The figure now shows the page's checkerboard: each cell black or white,
+    # and each unlike its neighbour, whichever way the page is turned.
+    with Image.open(path) as image:
+        cells = image.convert("L").resize((8, 8), Image.Resampling.BOX)
+    dark = [[cells.getpixel((x, y)) < 64 for x in range(8)] for y in range(8)]
+    assert all(
+        cells.getpixel((x, y)) < 64 or cells.getpixel((x, y)) > 191
+        for x in range(8)
+        for y in range(8)
+    )
+    assert all(dark[y][x] != dark[y][x + 1] for y in range(8) for x in range(7))
+    assert all(dark[y][x] != dark[y + 1][x] for y in range(7) for x in range(8))
+
+
+def test_docling_image_matching_the_page_is_kept(tmp_path):
+    from app.pipeline.structure import ensure_figure_images
+
+    source = _checkered_page(tmp_path / "source.pdf")
+    path = tmp_path / "figure_0.png"
+    checks = Image.new("L", (8, 8))
+    checks.putdata([255 * ((x + y) % 2) for y in range(8) for x in range(8)])
+    checks.resize((160, 160), Image.Resampling.NEAREST).save(path)
+    before = path.read_bytes()
+    bbox = {"l": 40, "b": 100, "r": 120, "t": 180}
+    ensure_figure_images(
+        source, {"elements": []}, [FigureInfo(0, path, page=0, bbox=bbox)], tmp_path / "figures"
+    )
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("content", ["flat", "unreadable"])
+def test_docling_image_kept_when_the_page_region_is_blank_or_unreadable(tmp_path, content):
+    from app.pipeline.structure import ensure_figure_images
+
+    source = _checkered_page(tmp_path / "source.pdf")
+    path = tmp_path / "figure_0.png"
+    if content == "flat":
+        Image.new("RGB", (40, 40), (190, 190, 190)).save(path)
+        bbox = {"l": 130, "b": 20, "r": 190, "t": 80}  # empty white page area
+    else:
+        path.write_bytes(b"not an image")
+        bbox = {"l": 40, "b": 100, "r": 120, "t": 180}
+    before = path.read_bytes()
+    ensure_figure_images(
+        source, {"elements": []}, [FigureInfo(0, path, page=0, bbox=bbox)], tmp_path / "figures"
+    )
+    assert path.read_bytes() == before

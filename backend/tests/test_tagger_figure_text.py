@@ -1,5 +1,7 @@
 """A decorative image decision must not hide the PDF's live text."""
 
+import random
+
 import pikepdf
 import pytest
 
@@ -146,3 +148,183 @@ async def test_live_text_over_decorative_banner_keeps_content_and_mcid_owners(tm
             s.get("/S") == pikepdf.Name.Figure for s in _structs(pdf.Root.StructTreeRoot)
         )
     assert rendered(source) == rendered(output)
+
+
+def _ground_pixels(ground):
+    """A ground image's size and RGB samples."""
+    if ground == "panel":
+        return 1, 1, bytes((51, 102, 204))
+    if ground == "plain":
+        return 1, 1, bytes((255, 255, 255))
+    if ground == "photo":
+        noise = random.Random(7)
+        return 48, 16, bytes(noise.randrange(256) for _ in range(48 * 16 * 3))
+    if ground == "blob":
+        # A soft round shape, like a shaded pie or a blurred photo: much ink,
+        # little edge detail.
+        width, height = 192, 64
+
+        def shade(x, y):
+            fade = min(1.0, ((x - 96) ** 2 / 4 + (y - 32) ** 2) / 1024)
+            return (int(200 + 55 * fade), int(90 + 165 * fade), int(30 + 225 * fade))
+
+        return (
+            width,
+            height,
+            bytes(value for y in range(height) for x in range(width) for value in shade(x, y)),
+        )
+    if ground == "diagram":
+        # A few thin lines on white: little ink, much edge detail.
+        width, height = 140, 48
+        return (
+            width,
+            height,
+            bytes(
+                value
+                for y in range(height)
+                for x in range(width)
+                for value in ((0, 0, 0) if x % 35 == 0 or y % 24 == 0 else (255, 255, 255))
+            ),
+        )
+    if ground == "icon":
+        # A small logo at the left of a white strip, as beside a social handle.
+        width, height = 140, 48
+
+        def mark(x, y):
+            if not (2 <= x < 12 and 2 <= y < 12):
+                return (255, 255, 255)
+            stem = 5 <= x < 7 or (y == 5 and 3 <= x < 9)
+            return (255, 255, 255) if stem else (59, 89, 152)
+
+        return (
+            width,
+            height,
+            bytes(value for y in range(height) for x in range(width) for value in mark(x, y)),
+        )
+    # A bar chart: seven bars of different heights and colours on white.
+    width, height = 36, 12
+    rows = []
+    for y in range(height):
+        for x in range(width):
+            bar, offset = divmod(x, 5)
+            tall = (3, 7, 5, 10, 6, 8, 2)[bar] if bar < 7 else 0
+            filled = offset < 4 and height - y <= tall
+            rows.append((40 * bar, 120, 220 - 30 * bar) if filled else (255, 255, 255))
+    return width, height, bytes(value for pixel in rows for value in pixel)
+
+
+def _figure_on_ground(source, ground, text, *, lines=1, form=False, rotate=0):
+    """A described picture at (20, 140)-(370, 260) holding ``lines`` lines of
+    live text, which cover less than half of it, over ``ground``."""
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(400, 300))
+    font = helvetica(pdf)
+    page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+    width, height, samples = _ground_pixels(ground)
+    picture = pdf.make_stream(samples)
+    picture.Type = pikepdf.Name.XObject
+    picture.Subtype = pikepdf.Name.Image
+    picture.Width, picture.Height = width, height
+    picture.ColorSpace = pikepdf.Name.DeviceRGB
+    picture.BitsPerComponent = 8
+    page.Resources.XObject = pikepdf.Dictionary(Picture=picture)
+    colour = b"1 1 1 rg" if ground in {"panel", "photo"} else b"0 0 0 rg"
+    line = (
+        b"BT /F1 10 Tf "
+        + colour
+        + b" 30 245 Td 0 -16 TD"
+        + b" T*".join(b" (" + text.encode() + b") Tj" for _ in range(lines))
+        + b" ET"
+    )
+    if form:
+        overlay = pdf.make_stream(line)
+        overlay.Type = pikepdf.Name.XObject
+        overlay.Subtype = pikepdf.Name.Form
+        overlay.BBox = [0, 0, 400, 300]
+        overlay.Resources = pikepdf.Dictionary(Font=page.Resources.Font)
+        page.Resources.XObject["/Overlay"] = overlay
+        line = b"/Overlay Do"
+    page.Contents = pdf.make_stream(
+        b"BT /F1 10 Tf 30 270 Td (Before) Tj ET\n"
+        + b"q 350 0 0 120 20 140 cm /Picture Do Q\n"
+        + line
+        + b"\nBT /F1 10 Tf 30 60 Td (After) Tj ET"
+    )
+    if rotate:
+        page.Rotate = rotate
+    pdf.save(source)
+    pdf.close()
+    return [
+        {"type": "paragraph", "page": 0, "bbox": {"l": 25, "b": 265, "r": 100, "t": 285}},
+        {
+            "type": "figure",
+            "page": 0,
+            "figure_index": 0,
+            "bbox": {"l": 20, "b": 140, "r": 370, "t": 260},
+        },
+        {"type": "paragraph", "page": 0, "bbox": {"l": 25, "b": 55, "r": 100, "t": 75}},
+    ]
+
+
+async def _tag_described(tmp_path, elements):
+    import pypdfium2
+
+    from app.pipeline.page_frame import PageFrame
+
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    document = pypdfium2.PdfDocument(source)
+    frame = PageFrame.of(document[0])
+    document.close()
+    # Boxes are given in user space; the structure is in Docling's frame.
+    elements = [dict(e, bbox=frame.to_docling(e["bbox"])) for e in elements]
+    await tag_pdf(
+        source,
+        output,
+        {"elements": elements},
+        [{"figure_index": 0, "status": "approved", "text": "A described figure."}],
+    )
+    with pikepdf.open(output) as pdf:
+        figures = [
+            str(s.get("/Alt"))
+            for s in _structs(pdf.Root.StructTreeRoot)
+            if s.get("/S") == pikepdf.Name.Figure
+        ]
+    return " ".join(screen_reader_text(output).split()), figures
+
+
+@pytest.mark.parametrize("form", [False, True])
+@pytest.mark.parametrize("rotate", [0, 90])
+async def test_described_figure_that_is_text_on_a_panel_is_read_as_text(tmp_path, form, rotate):
+    elements = _figure_on_ground(
+        tmp_path / "source.pdf",
+        "panel",
+        "Support students with a donation",
+        lines=2,
+        form=form,
+        rotate=rotate,
+    )
+    text, figures = await _tag_described(tmp_path, elements)
+    assert figures == []
+    assert text == "Before " + "Support students with a donation " * 2 + "After"
+    assert rendered(tmp_path / "source.pdf") == rendered(tmp_path / "output.pdf")
+
+
+@pytest.mark.parametrize(
+    "ground,text,lines",
+    [
+        ("chart", "Enrollment by year", 1),
+        ("photo", "Students at the fair", 1),
+        # Hiding the labels removes most of the ink but leaves the lines.
+        ("diagram", "Forces on the incline and the angle", 6),
+        # Hiding the labels removes most of the edges but leaves the shape.
+        ("blob", "Share of students by campus", 6),
+        # Glyphs that plot a chart are not words, even on a plain ground.
+        ("plain", "X  X  X  3/20  3/21  3/24", 1),
+        # A logo names what the handle beside it belongs to.
+        ("icon", "@HunterSchoolofEd", 4),
+    ],
+)
+async def test_a_picture_with_some_text_stays_a_described_figure(tmp_path, ground, text, lines):
+    elements = _figure_on_ground(tmp_path / "source.pdf", ground, text, lines=lines)
+    _text, figures = await _tag_described(tmp_path, elements)
+    assert figures == ["A described figure."]

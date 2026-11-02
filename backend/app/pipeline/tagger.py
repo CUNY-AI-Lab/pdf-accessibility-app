@@ -2,6 +2,7 @@
 
 import logging
 from dataclasses import dataclass, field
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -134,7 +135,11 @@ from app.pipeline.tagger_content_geometry import (
     _text_runs_look_like_hidden_ocr_layer as _text_runs_look_like_hidden_ocr_layer,
 )
 from app.pipeline.tagger_content_geometry import _update_text_pos as _update_text_pos
-from app.pipeline.tagger_figure_text import _figure_text_elements, _recover_figure_text_owners
+from app.pipeline.tagger_figure_text import (
+    _figure_text_elements,
+    _figures_on_plain_ground,
+    _recover_figure_text_owners,
+)
 from app.pipeline.tagger_geometry import BLANK_PAGE_MAX_INK_RATIO as BLANK_PAGE_MAX_INK_RATIO
 from app.pipeline.tagger_geometry import (
     BLANK_PAGE_NONWHITE_THRESHOLD as BLANK_PAGE_NONWHITE_THRESHOLD,
@@ -688,7 +693,15 @@ async def tag_pdf(
                         stream_starts.add(len(measured_ops))
                         measured_ops.extend(ops)
                     measured = dict(enumerate(measured_ops))
-                    recovered = _figure_text_elements(page_elems, measured, decorative_figures, set(alt_lookup))
+                    recovered = _figure_text_elements(
+                        page_elems,
+                        measured,
+                        decorative_figures,
+                        set(alt_lookup),
+                        plain_ground=partial(
+                            _figures_on_plain_ground, input_path, page_index, frames[page_index]
+                        ),
+                    )
                     _prepare_link_targets(page, builder, recovered)
                     page_elems.extend(recovered)
                     recovered_indices = set(range(len(page_elems) - len(recovered), len(page_elems)))
