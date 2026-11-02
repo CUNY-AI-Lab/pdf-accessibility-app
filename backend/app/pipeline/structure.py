@@ -83,10 +83,16 @@ def ensure_figure_images(
     A missing crop must not silently remove a figure from semantic analysis.
     Render it from the source page, or retain a missing-path candidate so its
     unresolved description remains visible to the review and release checks.
+    A Docling image that shows much less than the page does is replaced by
+    the page's own rendering (see _show_figures_as_the_page_does).
     """
     from app.services.pdf_preview import render_bbox_preview_png_bytes
 
     by_index = {figure.index: figure for figure in figures}
+    _show_figures_as_the_page_does(
+        pdf_path,
+        [figure for figure in figures if figure.path.is_file()],
+    )
     figures_dir.mkdir(parents=True, exist_ok=True)
     for elem in structure.get("elements", []):
         index, page = elem.get("figure_index"), elem.get("page")
@@ -110,6 +116,100 @@ def ensure_figure_images(
         except Exception:
             logger.warning("Could not recover figure %s crop", index, exc_info=True)
     return sorted(by_index.values(), key=lambda figure: figure.index)
+
+
+# Docling's renderer draws some images without their soft masks or
+# transparency groups, so a photo can come back as a flat or graded block of
+# colour, and the model then calls it blank or decorative. A figure image
+# with less than this share of the detail the page shows in the same box is
+# replaced by the page's own rendering.
+FIGURE_IMAGE_DETAIL_SHARE = 0.5
+# Docling renders figure images at images_scale 2.0.
+FIGURE_RENDER_SCALE = 2.0
+FIGURE_RENDER_MAX_SIDE = 4000
+
+
+def _image_detail(image: Image.Image) -> float:
+    """Mean edge strength of an image seen at a fixed small size; 0 for one colour."""
+    from PIL import Image as PILImage
+    from PIL import ImageFilter, ImageStat
+
+    small = image.convert("L").resize((64, 64), PILImage.Resampling.BOX)
+    return ImageStat.Stat(small.filter(ImageFilter.FIND_EDGES).crop((1, 1, 63, 63))).mean[0]
+
+
+def _show_figures_as_the_page_does(pdf_path: Path, figures: list[FigureInfo]) -> None:
+    """Replace each figure image that shows much less than its page region.
+
+    Boxes are in Docling's frame, the page as displayed with the origin at the
+    bottom left, which is the frame pdfium renders. Each page is rendered once.
+    Anything that cannot be read or rendered keeps Docling's image.
+    """
+    by_page: dict[int, list[FigureInfo]] = {}
+    for figure in figures:
+        if isinstance(figure.page, int) and figure.page >= 0 and isinstance(figure.bbox, dict):
+            by_page.setdefault(figure.page, []).append(figure)
+    if not by_page:
+        return
+    try:
+        import pypdfium2 as pdfium
+        from PIL import Image as PILImage
+
+        document = pdfium.PdfDocument(str(pdf_path))
+    except Exception:
+        logger.warning("Could not open the PDF to check figure images", exc_info=True)
+        return
+    try:
+        for page_index, page_figures in sorted(by_page.items()):
+            try:
+                if page_index >= len(document):
+                    continue
+                page = document[page_index]
+                try:
+                    scale = min(
+                        FIGURE_RENDER_SCALE,
+                        FIGURE_RENDER_MAX_SIDE / max(*page.get_size(), 1.0),
+                    )
+                    bitmap = page.render(scale=scale, draw_annots=False)
+                    try:
+                        rendered = bitmap.to_pil().convert("RGB")
+                    finally:
+                        bitmap.close()
+                finally:
+                    page.close()
+            except Exception:
+                logger.warning(
+                    "Could not render page %s to check figure images", page_index + 1, exc_info=True
+                )
+                continue
+            for figure in page_figures:
+                try:
+                    bbox = figure.bbox or {}
+                    box = (
+                        max(0, round(float(bbox["l"]) * scale)),
+                        max(0, round(rendered.height - float(bbox["t"]) * scale)),
+                        min(rendered.width, round(float(bbox["r"]) * scale)),
+                        min(rendered.height, round(rendered.height - float(bbox["b"]) * scale)),
+                    )
+                    if box[2] - box[0] < 2 or box[3] - box[1] < 2:
+                        continue
+                    region = rendered.crop(box)
+                    with PILImage.open(figure.path) as image:
+                        shown = _image_detail(image)
+                    page_detail = _image_detail(region)
+                    if shown < FIGURE_IMAGE_DETAIL_SHARE * page_detail:
+                        region.save(figure.path, format="PNG")
+                        logger.info(
+                            "Figure %s: Docling's image shows less than the page (detail %.1f of %.1f); "
+                            "using the page's rendering",
+                            figure.index,
+                            shown,
+                            page_detail,
+                        )
+                except Exception:
+                    logger.warning("Could not check figure %s image", figure.index, exc_info=True)
+    finally:
+        document.close()
 
 
 def _normalize_native_toc(node: Any) -> dict[str, Any] | None:
