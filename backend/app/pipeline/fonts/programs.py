@@ -409,11 +409,13 @@ def _ghostscript_type1_font_program(
     return _urw_type1_program(resource_name)
 
 
-@lru_cache(maxsize=64)
 def _urw_type1_program(
     resource_name: str,
 ) -> tuple[bytes | None, str | None, dict[str, int] | None]:
-    """A URW base-35 Type 1 program by its resource name, e.g. `NimbusSans-Regular`."""
+    """A URW base-35 Type 1 program by its resource name, e.g. `NimbusSans-Regular`.
+
+    Uncached: its callers cache, and tests clear their caches.
+    """
     from fontTools import t1Lib
 
     resource_dir = _ghostscript_resource_font_dir()
