@@ -467,3 +467,67 @@ def test_a_request_without_a_schema_is_unchanged():
     asyncio.run(request_llm_json(llm_client=llm, content=content))
     [only] = llm.messages
     assert only[-1]["content"] == content
+
+
+class _AnsweringLlm:
+    model = "test-model"
+    base_url = "https://gateway.test/v1"
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.calls = []
+
+    async def chat_completion(self, messages, **kwargs):
+        self.calls.append(kwargs)
+        content, finish = self.answers.pop(0)
+        return {"choices": [{"message": {"content": content}, "finish_reason": finish}]}
+
+
+@pytest.mark.parametrize("cap", [None, 900])
+def test_every_structured_request_caps_its_output(cap):
+    from app.services.intelligence_llm_utils import DEFAULT_MAX_OUTPUT_TOKENS
+
+    llm = _AnsweringLlm(('{"summary":"ok"}', "stop"))
+    options = {} if cap is None else {"max_tokens": cap}
+    parsed = asyncio.run(
+        request_llm_json(llm_client=llm, content=[{"type": "text", "text": "hi"}], **options)
+    )
+    assert parsed == {"summary": "ok"}
+    assert llm.calls[0]["max_tokens"] == (cap or DEFAULT_MAX_OUTPUT_TOKENS)
+
+
+@pytest.mark.parametrize(
+    "content",
+    ['{"decisions": [{"figure_index": 3}]}', '{"decisions": [{"figure_index": 3, "alt', ""],
+)
+def test_an_answer_cut_off_at_the_cap_is_a_failed_call(content):
+    from app.services.intelligence_llm_utils import ModelOutputCutOff
+
+    llm = _AnsweringLlm((content, "length"), ('{"decisions": []}', "stop"))
+    with pytest.raises(ModelOutputCutOff):
+        asyncio.run(request_llm_json(llm_client=llm, content=[{"type": "text", "text": "hi"}]))
+    # Asking again under the same cap would run on the same way.
+    assert len(llm.calls) == 1
+
+
+def test_the_cap_reaches_the_pages_request(monkeypatch, tmp_path):
+    from app.services import intelligence_llm_utils
+
+    pdf_path = tmp_path / "one.pdf"
+    pdf = pikepdf.new()
+    pdf.add_blank_page(page_size=(200, 200))
+    pdf.save(pdf_path)
+    llm = _AnsweringLlm(('{"title":"T"}', "stop"))
+    llm.close = lambda: asyncio.sleep(0)
+    monkeypatch.setattr(intelligence_llm_utils, "make_llm_client", lambda settings: llm)
+    monkeypatch.setattr(intelligence_llm_utils, "page_preview_parts", lambda job, pages: [])
+    asyncio.run(
+        request_pdf_pages_json(
+            pdf_path=pdf_path,
+            page_numbers=[1],
+            prompt="Title?",
+            system_instruction="Read.",
+            max_tokens=1234,
+        )
+    )
+    assert llm.calls[0]["max_tokens"] == 1234

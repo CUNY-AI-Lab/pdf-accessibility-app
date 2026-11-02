@@ -10,6 +10,7 @@ Transitions::
 Capability keys include endpoint, model and format; access, transport, invalid
 schema and unrelated capability failures cannot downgrade or poison the cache.
 A request sent without json_schema states its schema in the prompt instead.
+Every request caps its output; an answer cut off at the cap is a failed call.
 """
 
 import copy
@@ -118,6 +119,17 @@ def _should_try_alternate_response_format(exc: BaseException, mode: ResponseForm
         code in {"capability_unsupported", "unsupported_response_format", "unsupported_value"}
         or (param == "response_format" and ("not support" in message or "unsupported" in message))
     )
+
+
+# The output cap for a structured answer. Recorded answers to the figure,
+# table, form and semantic calls end within about 1,000 tokens (most within
+# 300); calls whose answers grow with the document pass a larger cap. A model
+# that runs on without one has produced 16,384 tokens of undecodable JSON.
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
+
+
+class ModelOutputCutOff(ValueError):
+    """The model stopped at the output cap, so its answer is incomplete."""
 
 
 class JsonAttempt(Enum):
@@ -305,6 +317,7 @@ async def request_llm_json(
     response_schema: dict[str, Any] | None = None,
     cache_breakpoint_index: int | None = None,
     conversation_prefix: list[dict[str, Any]] | None = None,
+    max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> dict[str, Any]:
     parsed, _ = await request_llm_json_with_response(
         llm_client=llm_client,
@@ -313,6 +326,7 @@ async def request_llm_json(
         response_schema=response_schema,
         cache_breakpoint_index=cache_breakpoint_index,
         conversation_prefix=conversation_prefix,
+        max_tokens=max_tokens,
     )
     return parsed
 
@@ -325,6 +339,7 @@ async def request_llm_json_with_response(
     response_schema: dict[str, Any] | None = None,
     cache_breakpoint_index: int | None = None,
     conversation_prefix: list[dict[str, Any]] | None = None,
+    max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     repair_note: str | None = None
 
@@ -333,7 +348,7 @@ async def request_llm_json_with_response(
         if conversation_prefix:
             messages.extend(copy.deepcopy(conversation_prefix))
         messages.append({"role": "user", "content": request_content})
-        request_kwargs: dict[str, Any] = {"temperature": 0}
+        request_kwargs: dict[str, Any] = {"temperature": 0, "max_tokens": max_tokens}
         mode = ResponseFormatMode.SCHEMA if response_schema and schema_name else ResponseFormatMode.OBJECT
         endpoint = str(getattr(llm_client, "base_url", ""))
         while True:
@@ -391,10 +406,16 @@ async def request_llm_json_with_response(
             raise
 
         try:
-            message = response["choices"][0]["message"]
+            choice = response["choices"][0]
+            message = choice["message"]
         except (KeyError, IndexError, TypeError) as exc:
             attempt = transition_json_attempt(attempt, JsonAttempt.FAILED)
             raise ValueError(f"Unexpected LLM response format: {exc}") from exc
+        if isinstance(choice, dict) and choice.get("finish_reason") == "length":
+            # Whatever parses from a cut-off answer is not the model's decision,
+            # and asking again with the same cap would run on the same way.
+            attempt = transition_json_attempt(attempt, JsonAttempt.FAILED)
+            raise ModelOutputCutOff(f"The model's answer reached the {max_tokens}-token output cap")
         try:
             parsed = extract_message_json(message)
         except ValueError as exc:
@@ -418,6 +439,7 @@ async def request_pdf_pages_json(
     response_schema: dict[str, Any] | None = None,
     schema_name: str = "document_decision",
     system_instruction: str,
+    max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> dict[str, Any]:
     """Ask the model lane about some pages of a PDF, shown as rendered page
     images."""
@@ -436,6 +458,7 @@ async def request_pdf_pages_json(
             schema_name=schema_name if response_schema else None,
             response_schema=response_schema,
             conversation_prefix=[{"role": "system", "content": system_instruction}],
+            max_tokens=max_tokens,
         )
     finally:
         await client.close()

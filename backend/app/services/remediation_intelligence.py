@@ -39,6 +39,8 @@ MAX_AUTO_FONT_MAP_TARGETS = 8
 MAX_READING_ORDER_BLOCKS_PER_PAGE = 40
 MAX_SUSPICIOUS_READING_BLOCKS = 6
 MAX_TABLE_TARGETS = 6
+# Recorded font reviews run to about 1,550 tokens.
+FONT_REVIEW_MAX_OUTPUT_TOKENS = 8192
 AUTO_FONT_MAP_ACTIONS = {"font_map_candidate", "actualtext_candidate"}
 AUTO_FONT_ARTIFACT_ACTIONS = {"artifact_if_decorative"}
 AUTO_FONT_RESOLUTION_ACTIONS = AUTO_FONT_MAP_ACTIONS | AUTO_FONT_ARTIFACT_ACTIONS
@@ -934,6 +936,7 @@ async def generate_remediation_intelligence(
             content=content,
             cache_breakpoint_index=preferred_cache_breakpoint_index(content),
             conversation_prefix=[],
+            max_tokens=FONT_REVIEW_MAX_OUTPUT_TOKENS,
         )
     elif task.task_type == "reading_order":
         metadata = _parse_metadata(task)

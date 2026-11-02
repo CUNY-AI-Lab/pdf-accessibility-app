@@ -12,6 +12,7 @@ from app.services.bookmark_intelligence import (
     collect_bookmark_heading_candidates,
     enhance_bookmark_structure_with_intelligence,
 )
+from app.services.intelligence_llm_utils import DEFAULT_MAX_OUTPUT_TOKENS
 
 
 def _make_pdf(pdf_path, page_count=6):
@@ -267,6 +268,7 @@ def test_bookmark_intelligence_sends_page_images(monkeypatch, tmp_path):
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path, page_count=5)
     seen_calls: list[tuple[str, list[dict[str, object]]]] = []
+    caps: list[int | None] = []
 
     async def _fake_request_llm_json(
         *,
@@ -276,8 +278,10 @@ def test_bookmark_intelligence_sends_page_images(monkeypatch, tmp_path):
         response_schema=None,
         cache_breakpoint_index=None,
         conversation_prefix=None,
+        max_tokens=None,
     ):
         seen_calls.append((schema_name, content))
+        caps.append(max_tokens)
         if schema_name == "bookmark_document_candidate_plan":
             return {
                 "task_type": "bookmark_document_candidate_plan",
@@ -352,6 +356,8 @@ def test_bookmark_intelligence_sends_page_images(monkeypatch, tmp_path):
         "bookmark_document_landmark_plan",
     ]
     assert all(any(item.get("type") == "image_url" for item in content) for _schema_name, content in seen_calls)
+    # A plan lists headings, so it may run longer than other structured answers.
+    assert all(cap is not None and cap > DEFAULT_MAX_OUTPUT_TOKENS for cap in caps)
     assert [entry["text"] for entry in updated["bookmark_plan"]] == [
         "Cover",
         "TABLE OF CONTENTS",
