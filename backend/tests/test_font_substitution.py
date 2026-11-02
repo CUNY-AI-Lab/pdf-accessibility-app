@@ -97,6 +97,29 @@ def _unembedded_pdf(path: Path, name="ArialMT"):
         pdf.save(path)
 
 
+def _standard_names() -> dict[int, str]:
+    from fontTools.encodings.StandardEncoding import StandardEncoding
+
+    return {code: name for code, name in enumerate(StandardEncoding) if name != ".notdef"}
+
+
+def _assert_winansi_restatement(font, type1_names: dict[int, str]) -> None:
+    """ISO 14289-1 7.21.6: WinAnsi base, AGL-only Differences, same glyph per code."""
+    from fontTools.agl import LEGACY_AGL2UV, toUnicode
+
+    from app.pipeline.fonts.encoding import _simple_font_unicode_map
+
+    assert font.Subtype == pikepdf.Name.TrueType
+    assert font.Encoding.BaseEncoding == pikepdf.Name.WinAnsiEncoding
+    differences = font.Encoding.get("/Differences", [])
+    names = [str(item)[1:] for item in differences if isinstance(item, pikepdf.Name)]
+    assert all(name in LEGACY_AGL2UV for name in names)
+    selected = _simple_font_unicode_map(font, None)
+    assert {code: selected.get(code) for code in type1_names} == {
+        code: toUnicode(name) for code, name in type1_names.items()
+    }
+
+
 def _text_contract(path):
     with pikepdf.open(path) as pdf:
         font = pdf.pages[0].Resources.Font.F1
@@ -193,7 +216,7 @@ def test_original_font_program_is_preferred_over_a_substitute(tmp_path, monkeypa
     assert screen_reader_text(before) == screen_reader_text(after)
 
 
-@pytest.mark.parametrize("name", ["ArialNarrow", "HelveticaNeue", "UnknownFont"])
+@pytest.mark.parametrize("name", ["ArialBlack", "HelveticaNeue", "UnknownFont"])
 def test_substitution_does_not_guess_other_families(tmp_path, monkeypatch, name):
     _install_test_font(tmp_path, monkeypatch)
     font = pikepdf.Dictionary(Subtype=pikepdf.Name.TrueType, Encoding=pikepdf.Name.WinAnsiEncoding)
@@ -312,11 +335,13 @@ def test_standard14_without_widths_or_descriptor_embeds_without_afm(
             assert float(f.Widths[65]) == program["hmtx"].metrics[glyph][0]
             assert float(f.Widths[66]) == program["hmtx"].metrics["B"][0] == 700
             assert float(f.Widths[32]) == program["hmtx"].metrics["space"][0] == 250
-        if encoding == "differences":
-            assert f.Encoding.BaseEncoding == pikepdf.Name.StandardEncoding
-            assert list(f.Encoding.Differences) == [65, pikepdf.Name.B]
+        if encoding == "/WinAnsiEncoding":
+            assert f.Encoding == pikepdf.Name.WinAnsiEncoding
         else:
-            assert f.Encoding == pikepdf.Name(encoding or "/StandardEncoding")
+            # The Type 1 font's implicit StandardEncoding, restated as PDF/UA
+            # requires of a non-symbolic TrueType font.
+            type1_names = {**_standard_names(), **({65: "B"} if encoding else {})}
+            _assert_winansi_restatement(f, type1_names)
 
 
 async def test_arial_embeds_after_tagging_and_in_author_repairs(tmp_path, monkeypatch):
@@ -366,3 +391,104 @@ def test_partial_ghostscript_directories_do_not_hide_urw_font_files(tmp_path, mo
     monkeypatch.setattr(programs, "resolve_binary", lambda *args, **kwargs: str(gs))
     assert programs._ghostscript_type1_font_program("ZapfDingbats")[0] == program
     assert programs._ghostscript_type1_descriptor("ZapfDingbats")["Widths"][65] == 600
+
+
+def _form_pdf(path: Path) -> None:
+    """An Acrobat-style form: /Helv in /DR, Differences without a base, drawn by a widget."""
+    with pikepdf.new() as pdf:
+        page = pdf.add_blank_page()
+        helv = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1, BaseFont=pikepdf.Name.Helvetica,
+            Encoding=pikepdf.Dictionary(Type=pikepdf.Name.Encoding, Differences=[
+                24, pikepdf.Name.breve, pikepdf.Name.caron, 39, pikepdf.Name.quotesingle,
+                96, pikepdf.Name.grave, 128, pikepdf.Name.bullet, 160, pikepdf.Name.Euro,
+            ]),
+        ))
+        appearance = pdf.make_stream(
+            b"/Tx BMC BT /Helv 11 Tf 2 7 Td (AB) Tj ET EMC",
+            Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Form, BBox=[0, 0, 100, 20],
+            Resources=pikepdf.Dictionary(Font=pikepdf.Dictionary(Helv=helv)),
+        )
+        widget = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Widget, FT=pikepdf.Name.Ch,
+            T=pikepdf.String("Plan"), Rect=[72, 600, 172, 620], P=page.obj,
+            DA=pikepdf.String("/Helv 11 Tf 0 g"), AP=pikepdf.Dictionary(N=appearance),
+        ))
+        page.Annots = pdf.make_indirect(pikepdf.Array([widget]))
+        pdf.Root.AcroForm = pikepdf.Dictionary(
+            Fields=[widget], DA=pikepdf.String("/Helv 0 Tf 0 g"),
+            DR=pikepdf.Dictionary(Font=pikepdf.Dictionary(Helv=helv)),
+        )
+        pdf.save(path)
+
+
+def test_form_field_font_embeds_with_an_encoding_pdf_ua_allows_for_truetype(tmp_path, monkeypatch):
+    _install_test_font(tmp_path, monkeypatch)
+    monkeypatch.setattr(programs, "_ghostscript_type1_font_program", lambda _: (None, None, None))
+    before, after = tmp_path / "before.pdf", tmp_path / "after.pdf"
+    _form_pdf(before)
+    ok, message, stats = embedding._embed_system_fonts_sync(before, after)
+    assert ok, message
+    assert stats["fonts_embedded"] == 1
+    with pikepdf.open(before) as old, pikepdf.open(after) as pdf:
+        helv = pdf.Root.AcroForm.DR.Font.Helv
+        widget = pdf.pages[0].Annots[0]
+        assert widget.AP.N.Resources.Font.Helv.objgen == helv.objgen
+        assert helv.FontDescriptor.FontFile2.read_bytes()
+        assert widget.AP.N.read_bytes() == old.pages[0].Annots[0].AP.N.read_bytes()
+        names = {
+            **_standard_names(), 24: "breve", 25: "caron", 39: "quotesingle", 96: "grave",
+            128: "bullet", 160: "Euro",
+        }
+        _assert_winansi_restatement(helv, names)
+        assert float(helv.Widths[65]) == 600
+
+
+def test_truetype_on_standard_encoding_is_restated_but_a_symbolic_one_is_not(tmp_path, monkeypatch):
+    _install_test_font(tmp_path, monkeypatch, family="Arial")
+    _install_test_font(tmp_path, monkeypatch, family="LiberationSerif")
+    cases = ((32, "TimesNewRomanPSMT", True), (4, "Arial", True), (32, "Arial", False))
+    for index, (flags, name, standard) in enumerate(cases):
+        before, after = tmp_path / f"before{index}.pdf", tmp_path / f"after{index}.pdf"
+        _unembedded_pdf(before, name)
+        with pikepdf.open(before, allow_overwriting_input=True) as pdf:
+            font = pdf.pages[0].Resources.Font.F1
+            if standard:
+                font.Encoding = pikepdf.Name.StandardEncoding
+            else:
+                del font["/Encoding"]
+            font.FontDescriptor.Flags = flags
+            pdf.save(before)
+        text = screen_reader_text(before)
+        ok, message, _ = embedding._embed_system_fonts_sync(before, after)
+        assert ok, message
+        assert screen_reader_text(after) == text
+        with pikepdf.open(after) as pdf:
+            font = pdf.pages[0].Resources.Font.F1
+            assert font.FontDescriptor.FontFile2.read_bytes()
+            if not standard:
+                # A TrueType font without an encoding uses its built-in one.
+                assert "/Encoding" not in font
+            elif flags == 4:
+                # A symbolic font selects glyphs by code through its cmap.
+                assert font.Encoding == pikepdf.Name.StandardEncoding
+            else:
+                _assert_winansi_restatement(font, _standard_names())
+
+
+@pytest.mark.parametrize(
+    "encoding,implicit_standard",
+    [
+        (pikepdf.Name.WinAnsiEncoding, True),
+        (pikepdf.Name.MacRomanEncoding, True),
+        (pikepdf.Dictionary(BaseEncoding=pikepdf.Name.WinAnsiEncoding), True),
+        (None, False),
+        (pikepdf.Dictionary(Differences=[65, pikepdf.Name.B]), False),
+        # Not in the Adobe Glyph List, so PDF/UA rejects it in a TrueType Differences.
+        (pikepdf.Dictionary(Differences=[65, pikepdf.Name("/g123")]), True),
+    ],
+)
+def test_only_agl_named_standard_encodings_are_restated(encoding, implicit_standard):
+    from app.pipeline.fonts.encoding import _standard_encoding_over_winansi
+
+    assert _standard_encoding_over_winansi(encoding, implicit_standard=implicit_standard) is None

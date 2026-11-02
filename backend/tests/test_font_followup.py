@@ -13,9 +13,9 @@ from app.pipeline.fonts.encoding import (
     _raw_text_bytes,
     _render_tounicode_cmap,
 )
-from app.pipeline.fonts.gothic import gothic_style
 from app.pipeline.fonts.notdef_content import repair_notdef_content
 from app.pipeline.fonts.ocr import unmapped_type3_pages
+from app.pipeline.fonts.urw import urw_substitute
 from tests.pdf_fixtures import rendered
 from tests.test_heldout_release_repairs import _cid_pdf, _program
 from tests.test_quality_ocr import type3_document
@@ -160,7 +160,7 @@ def test_invalid_author_unicode_forces_ocr_even_when_glyph_names_can_be_decoded(
 def test_owner_approved_gothic_aliases_select_the_correct_urw_style(name, style):
     from app.pipeline.fonts.names import _normalize_font_name
 
-    assert gothic_style(_normalize_font_name(name)) == style
+    assert urw_substitute(_normalize_font_name(name)) == f"URWGothic-{style}"
     assert programs._metric_compatible_names(name)[0] == f"URWGothic-{style}"
 
 
@@ -178,7 +178,7 @@ def test_gothic_embedding_uses_truetype_width_alignment_and_preserves_dictionary
         pdf.pages[0].Resources.Font.F1.Widths[65 - 32] = 721
         pdf.pages[0].Resources.Font.F1.Widths[66 - 32] = 433
         pdf.save(source)
-    monkeypatch.setattr(programs, "gothic_truetype", lambda _: (data, "URWGothic-Demi"))
+    monkeypatch.setattr(programs, "urw_truetype", lambda _: (data, "URWGothic-Demi"))
     assert _embed_system_fonts_sync(source, output)[0]
     with pikepdf.open(source) as before, pikepdf.open(output) as after:
         old = before.pages[0].Resources.Font.F1
@@ -190,6 +190,83 @@ def test_gothic_embedding_uses_truetype_width_alignment_and_preserves_dictionary
             assert font["hmtx"].metrics["B"][0] == 433
     programs._system_font_index.cache_clear()
     programs._system_font_program.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "name,resource",
+    [
+        ("ArialNarrow", "NimbusSansNarrow-Regular"),
+        ("ABCDEF+ArialNarrow-Bold", "NimbusSansNarrow-Bold"),
+        ("ArialNarrow,Italic", "NimbusSansNarrow-Oblique"),
+        ("ArialNarrow-BoldItalic", "NimbusSansNarrow-BoldOblique"),
+        ("Helvetica-Narrow-BoldOblique", "NimbusSansNarrow-BoldOblique"),
+        ("Arial", None),
+        ("ArialBlack", None),
+        ("Helvetica-Bold", None),
+    ],
+)
+def test_narrow_sans_names_select_the_metric_compatible_urw_style(name, resource):
+    from app.pipeline.fonts.names import _normalize_font_name
+
+    assert urw_substitute(_normalize_font_name(name)) == resource
+
+
+def test_arial_narrow_embeds_urw_narrow_with_advances_aligned_to_the_pdf_widths(
+    tmp_path, monkeypatch
+):
+    from app.pipeline.fonts.embedding import _embed_system_fonts_sync
+    from tests.test_font_substitution import _install_test_font, _unembedded_pdf
+
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    _unembedded_pdf(source, name="ABCDEF+ArialNarrow-Bold")
+    _install_test_font(tmp_path, monkeypatch)
+    data = (tmp_path / "fonts/LiberationSans-Regular.ttf").read_bytes()
+    with pikepdf.open(source, allow_overwriting_input=True) as pdf:
+        pdf.pages[0].Resources.Font.F1.Widths[65 - 32] = 497
+        pdf.save(source)
+    requested = []
+    monkeypatch.setattr(
+        programs, "urw_truetype", lambda name: requested.append(name) or (data, name)
+    )
+    assert _embed_system_fonts_sync(source, output)[0]
+    assert requested == ["NimbusSansNarrow-Bold"]
+    with pikepdf.open(source) as before, pikepdf.open(output) as after:
+        old = before.pages[0].Resources.Font.F1
+        new = after.pages[0].Resources.Font.F1
+        assert list(old.Widths) == list(new.Widths)
+        assert new.Encoding == pikepdf.Name.WinAnsiEncoding
+        with TTFont(BytesIO(new.FontDescriptor.FontFile2.read_bytes())) as font:
+            assert font["hmtx"].metrics["A"][0] == 497
+
+
+def test_an_installed_arial_narrow_is_preferred_over_the_urw_substitute(tmp_path, monkeypatch):
+    from app.pipeline.fonts.embedding import _embed_system_fonts_sync
+    from tests.test_font_substitution import _install_test_font, _unembedded_pdf
+
+    source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
+    _unembedded_pdf(source, name="ArialNarrow")
+    _install_test_font(tmp_path, monkeypatch, family="ArialNarrow")
+    monkeypatch.setattr(programs, "urw_truetype", lambda _: pytest.fail("substituted"))
+    assert _embed_system_fonts_sync(source, output)[0]
+    with pikepdf.open(output) as pdf:
+        stream = pdf.pages[0].Resources.Font.F1.FontDescriptor.FontFile2
+        with TTFont(BytesIO(stream.read_bytes())) as font:
+            assert font["name"].getDebugName(6) == "ArialNarrow-Regular"
+
+
+def test_urw_narrow_converts_to_truetype_with_its_own_metrics():
+    from app.pipeline.fonts.urw import urw_truetype
+
+    if not programs._urw_type1_program("NimbusSansNarrow-Oblique")[0]:
+        pytest.skip("Ghostscript URW font programs are not installed")
+    data, name = urw_truetype("NimbusSansNarrow-Oblique")
+    assert name == "NimbusSansNarrow-Oblique"
+    with TTFont(BytesIO(data)) as font:
+        cmap = font.getBestCmap()
+        assert "glyf" in font and cmap[0x41] and cmap[0xB0]
+        assert font["post"].italicAngle < 0
+        assert font["name"].getDebugName(6) == name
+        assert 0 < font["hmtx"].metrics[cmap[0x41]][0] < 1000
 
 
 @pytest.mark.parametrize("width_kind", ["array", "range"])

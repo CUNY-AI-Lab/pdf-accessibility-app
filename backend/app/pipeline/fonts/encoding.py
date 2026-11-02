@@ -177,13 +177,14 @@ def _named_simple_encoding_map(encoding_name) -> dict[int, str]:
     return {}
 
 
-def _encoding_differences_map(differences) -> dict[int, str]:
+def _encoding_differences_names(differences) -> dict[int, str]:
+    """Glyph name per code in a Differences array; a later entry for a code wins."""
     import pikepdf
 
     if not isinstance(differences, pikepdf.Array):
         return {}
 
-    mapping: dict[int, str] = {}
+    names: dict[int, str] = {}
     current_code: int | None = None
     for item in differences:
         if isinstance(item, int):
@@ -191,14 +192,102 @@ def _encoding_differences_map(differences) -> dict[int, str]:
             continue
         if current_code is None:
             continue
-        text = _glyph_name_to_unicode(str(item))
-        if text:
-            mapping[current_code] = text
+        names[current_code] = str(item).lstrip("/")
         current_code += 1
+    return names
+
+
+def _encoding_differences_map(differences) -> dict[int, str]:
+    mapping: dict[int, str] = {}
+    for code, name in _encoding_differences_names(differences).items():
+        text = _glyph_name_to_unicode(name)
+        if text:
+            mapping[code] = text
     return mapping
 
 
-def _cff_builtin_encoding_map(font_bytes: bytes) -> dict[int, str]:
+def _standard_encoding_over_winansi(encoding, *, implicit_standard: bool):
+    """Restate a StandardEncoding-based simple encoding over WinAnsiEncoding.
+
+    PDF/UA-1 (ISO 14289-1, 7.21.6) allows a non-symbolic TrueType font only
+    MacRomanEncoding or WinAnsiEncoding as its base, and only Adobe Glyph List
+    names in Differences. Each code keeps its glyph name: a Differences entry
+    names it wherever WinAnsiEncoding would give another character. Codes that
+    StandardEncoding leaves undefined keep WinAnsiEncoding's character. Returns
+    None when the encoding is not StandardEncoding-based, or a name is not in
+    the AGL.
+    """
+    from fontTools.agl import LEGACY_AGL2UV
+    from fontTools.encodings.StandardEncoding import StandardEncoding
+
+    standard = pikepdf.Name("/StandardEncoding")
+    if isinstance(encoding, pikepdf.Dictionary):
+        base = encoding.get("/BaseEncoding")
+        if base != standard and not (base is None and implicit_standard):
+            return None
+        differences = _encoding_differences_names(encoding.get("/Differences"))
+    elif encoding == standard or (encoding is None and implicit_standard):
+        differences = {}
+    else:
+        return None
+
+    names = {code: name for code, name in enumerate(StandardEncoding) if name != ".notdef"}
+    names.update(differences)
+    winansi = _named_simple_encoding_map("/WinAnsiEncoding")
+    entries: list[tuple[int, str]] = []
+    for code, name in sorted(names.items()):
+        if name == ".notdef":
+            continue
+        unicode = LEGACY_AGL2UV.get(name)
+        if unicode is None:
+            return None
+        if "".join(map(chr, unicode)) != winansi.get(code):
+            entries.append((code, name))
+
+    array = pikepdf.Array()
+    previous = None
+    for code, name in entries:
+        if previous is None or code != previous + 1:
+            array.append(code)
+        array.append(pikepdf.Name(f"/{name}"))
+        previous = code
+    restated = pikepdf.Dictionary(
+        Type=pikepdf.Name("/Encoding"), BaseEncoding=pikepdf.Name("/WinAnsiEncoding")
+    )
+    if entries:
+        restated["/Differences"] = array
+    return restated
+
+
+def _truetype_glyph_name_unicode(font_bytes: bytes, names: dict[int, str]) -> dict[int, str]:
+    """Unicode for codes whose glyph names only the embedded TrueType program knows.
+
+    A name selects a glyph through the program's own `post` names, so its
+    Unicode cmap entry for that glyph is the font's statement of the character.
+    Symbol cmaps and private-use values are not evidence.
+    """
+    from fontTools.ttLib import TTFont
+
+    try:
+        with TTFont(BytesIO(font_bytes), lazy=True) as font:
+            if "cmap" not in font:
+                return {}
+            glyphs = set(font.getGlyphOrder())
+            reverse = font["cmap"].buildReversed()
+    except Exception:
+        return {}
+
+    mapping: dict[int, str] = {}
+    for code, name in names.items():
+        if name not in glyphs:
+            continue
+        values = sorted(value for value in reverse.get(name, ()) if not 0xE000 <= value <= 0xF8FF)
+        if values and _is_valid_unicode_text(chr(values[0])):
+            mapping[code] = chr(values[0])
+    return mapping
+
+
+def _cff_builtin_encoding_names(font_bytes: bytes) -> dict[int, str]:
     from fontTools.cffLib import CFFFontSet
 
     try:
@@ -211,9 +300,12 @@ def _cff_builtin_encoding_map(font_bytes: bytes) -> dict[int, str]:
     encoding = getattr(top, "Encoding", None)
     if not isinstance(encoding, list):
         return {}
+    return {code: str(name) for code, name in enumerate(encoding) if name and name != ".notdef"}
 
+
+def _cff_builtin_encoding_map(font_bytes: bytes) -> dict[int, str]:
     mapping: dict[int, str] = {}
-    for code, glyph_name in enumerate(encoding):
+    for code, glyph_name in _cff_builtin_encoding_names(font_bytes).items():
         text = _glyph_name_to_unicode(glyph_name)
         if text:
             mapping[code] = text
@@ -226,7 +318,7 @@ TYPE1_ENCODING_RE = re.compile(
 TYPE1_ENCODING_ENTRY_RE = re.compile(rb"(?<!\S)dup\s+(\d+)\s*/([^\s/\[\]{}()<>%]+)\s+put(?!\S)")
 
 
-def _type1_builtin_encoding_map(font_bytes: bytes) -> dict[int, str]:
+def _type1_builtin_encoding_names(font_bytes: bytes) -> dict[int, str]:
     """Read the built-in encoding from the cleartext part of a /FontFile program.
 
     The cleartext (the stream's first /Length1 bytes) ends at `currentfile
@@ -241,14 +333,83 @@ def _type1_builtin_encoding_map(font_bytes: bytes) -> dict[int, str]:
     if match is None:
         return {}
     if match.group("standard"):
-        return _named_simple_encoding_map("/StandardEncoding")
+        return _named_encoding_glyph_names("/StandardEncoding")
+    return {
+        int(code): glyph_name.decode("latin-1")
+        for code, glyph_name in TYPE1_ENCODING_ENTRY_RE.findall(cleartext, match.end())
+        if glyph_name != b".notdef"
+    }
 
+
+def _type1_builtin_encoding_map(font_bytes: bytes) -> dict[int, str]:
     mapping: dict[int, str] = {}
-    for code, glyph_name in TYPE1_ENCODING_ENTRY_RE.findall(cleartext, match.end()):
-        text = _glyph_name_to_unicode(glyph_name.decode("latin-1"))
+    for code, glyph_name in _type1_builtin_encoding_names(font_bytes).items():
+        text = _glyph_name_to_unicode(glyph_name)
         if text:
-            mapping[int(code)] = text
+            mapping[code] = text
     return mapping
+
+
+def _named_encoding_glyph_names(encoding_name) -> dict[int, str]:
+    """Glyph names of the PDF's named simple encodings, by code."""
+    from fontTools.agl import UV2AGL
+    from fontTools.encodings import MacRoman, StandardEncoding
+
+    name = str(encoding_name or "")
+    if name == "/StandardEncoding":
+        names = list(StandardEncoding.StandardEncoding)
+    elif name == "/MacRomanEncoding":
+        names = list(MacRoman.MacRoman)
+    elif name == "/WinAnsiEncoding":
+        names = [
+            UV2AGL.get(ord(text)) or f"uni{ord(text):04X}"
+            if 32 <= code != 127 and text != "\ufffd"
+            else ".notdef"
+            for code, text in enumerate(bytes(range(256)).decode("cp1252", errors="replace"))
+        ]
+    else:
+        return {}
+    return {code: glyph for code, glyph in enumerate(names) if glyph != ".notdef"}
+
+
+def _glyph_name_for_code(font_dict, code: int, font_bytes: bytes | None) -> tuple[str, str] | None:
+    """The name the font gives the glyph at a simple-font code, and its source.
+
+    Differences first, then the named base encoding, then the embedded
+    program: a Type 1 or CFF built-in encoding, or the stored `post` name of
+    the glyph a symbolic TrueType cmap selects.
+    """
+    encoding = font_dict.get("/Encoding")
+    base = encoding
+    if isinstance(encoding, pikepdf.Dictionary):
+        differences = _encoding_differences_names(encoding.get("/Differences"))
+        if code in differences:
+            return differences[code], "Differences"
+        base = encoding.get("/BaseEncoding")
+    if (name := _named_encoding_glyph_names(base).get(code)) is not None:
+        return name, str(base).lstrip("/")
+    if not font_bytes:
+        return None
+    subtype = font_dict.get("/Subtype")
+    if subtype in (pikepdf.Name("/Type1"), pikepdf.Name("/MMType1")):
+        names = _cff_builtin_encoding_names(font_bytes) or _type1_builtin_encoding_names(font_bytes)
+        if (name := names.get(code)) is not None:
+            return name, "font program built-in encoding"
+    elif subtype == pikepdf.Name("/TrueType") and encoding is None:
+        from fontTools.ttLib import TTFont
+
+        try:
+            with TTFont(BytesIO(font_bytes), lazy=True) as font:
+                if "post" not in font or getattr(font["post"], "formatType", None) != 2.0:
+                    return None
+                for platform, encoding_id, offset in ((3, 0, 0xF000), (1, 0, 0)):
+                    table = font["cmap"].getcmap(platform, encoding_id)
+                    glyph = table.cmap.get(offset + code) if table is not None else None
+                    if glyph and glyph != ".notdef":
+                        return glyph, "TrueType program glyph name"
+        except Exception:
+            return None
+    return None
 
 
 def _simple_font_unicode_map(font_dict, font_bytes: bytes | None) -> dict[int, str]:
@@ -266,18 +427,18 @@ def _simple_font_unicode_map(font_dict, font_bytes: bytes | None) -> dict[int, s
     encoding = font_dict.get("/Encoding")
     if isinstance(encoding, pikepdf.Dictionary):
         mapping.update(_named_simple_encoding_map(encoding.get("/BaseEncoding")))
-        mapping.update(_encoding_differences_map(encoding.get("/Differences")))
-        if subtype == pikepdf.Name("/Type3"):
-            # An opaque CharProc name replaces the base encoding too. It is
-            # not evidence for the Latin character at the same byte code.
-            code = 0
-            for item in encoding.get("/Differences") or ():
-                if isinstance(item, int):
-                    code = item
-                else:
-                    if _glyph_name_to_unicode(str(item).lstrip("/")) is None:
-                        mapping.pop(code, None)
-                    code += 1
+        unknown: dict[int, str] = {}
+        for code, name in _encoding_differences_names(encoding.get("/Differences")).items():
+            text = _glyph_name_to_unicode(name)
+            if text:
+                mapping[code] = text
+            else:
+                # A Differences name replaces the glyph at its code, so the
+                # base encoding's character there is not evidence for it.
+                mapping.pop(code, None)
+                unknown[code] = name
+        if unknown and font_bytes and subtype == pikepdf.Name("/TrueType"):
+            mapping.update(_truetype_glyph_name_unicode(font_bytes, unknown))
     else:
         mapping.update(_named_simple_encoding_map(encoding))
 

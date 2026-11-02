@@ -27,7 +27,7 @@ from app.services.llm_client import LlmClient
 from app.services.page_intelligence import suspicious_text_signals
 from app.services.pdf_preview import (
     render_page_jpeg_data_url,
-    render_target_preview_png_data_url,
+    render_target_previews_png_data_urls,
 )
 from app.services.text_grounding import extract_ocr_text_from_bbox
 
@@ -107,6 +107,8 @@ Rules:
 - Only include an item in actualtext_candidates when you can tie it to a specific page and operator_index from the provided font_review_targets.
 - Leave actualtext_candidates empty if the visible text is uncertain.
 - Base any glyph hypothesis on the supplied page images, target crop previews, nearby_text/decoded_text, repeated same-font same-code occurrences, and page_structure_fragments.
+- A target's glyph_name is the font's own name for the glyph at that code; glyph_name_source says whether it comes from the PDF's Differences, a named base encoding, or the embedded font program. A descriptive name (for example "epsilonlunatesymbol" or "arrowright") is strong evidence of the character; check it against the glyph images. An opaque identifier (for example "g37", "d102", "glyph00012" or "cid123") says nothing about the character.
+- In a zoomed target preview the red circle surrounds the target glyph without covering it; the next image shows that glyph alone. Identify the glyph inside the circle, not its neighbors.
 - Do not infer a glyph from the font name alone.
 - If the repeated occurrence looks like a list marker or decorative pointer and the surrounding structure already conveys that meaning, prefer "artifact_if_decorative" or "manual_only" over "font_map_candidate".
 - Keep summaries concise and factual.
@@ -586,7 +588,7 @@ def _font_task_payload(
             if not context_path:
                 continue
             try:
-                preview_url = render_target_preview_png_data_url(pdf_path, context_path)
+                previews = render_target_previews_png_data_urls(pdf_path, context_path)
             except Exception:
                 continue
             target_previews.append(
@@ -594,13 +596,11 @@ def _font_task_payload(
                     "page": page,
                     "operator_index": operator_index,
                     "font": target.get("font"),
+                    "images": [description for description, _ in previews],
                 }
             )
-            images.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": preview_url},
-                }
+            images.extend(
+                {"type": "image_url", "image_url": {"url": url}} for _, url in previews
             )
 
     payload = {
@@ -630,7 +630,7 @@ def _font_task_payload(
         payload["correction_context"] = correction_context
     prompt_text = (
         f"{FONT_REVIEW_PROMPT}\n\n"
-        "Image order: full-page previews first, then target crop previews in the same order as target_previews.\n\n"
+        "Image order: full-page previews first, then each target_previews entry's images, in the order its images field lists them.\n\n"
         "Context JSON:\n"
         f"{json.dumps(payload, indent=2, ensure_ascii=True)}"
     )

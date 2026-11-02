@@ -120,6 +120,38 @@ http://www.apache.org/licenses/LICENSE-2.0. Both tables were converted to JSON.
 hayro's pairs are unchanged; pdf.js's are unchanged except for the corrections
 above.
 
+### Glyph names nothing resolves
+
+A Differences name replaces the glyph at its code, so the base encoding's
+character at that code is not evidence for it, in any simple font. A name that
+neither the AGL nor the TeX table resolves gets Unicode only from other
+evidence: an authored ToUnicode entry (the rebuilt ToUnicode keeps it), or,
+for a TrueType font, the embedded program's Unicode cmap entry for the glyph of
+that name (private-use values excluded). Otherwise the code stays unmapped and
+veraPDF reports it (7.21.7-1) and the document is held for review. For
+example, `epsilonlunatesymbol` in a WinAnsi-based Type 1 font had been read as
+the base encoding's U+001F at its code.
+
+### Substitute programs
+
+Standard-14 and Arial/Times/Courier fonts get Liberation (`fonts-liberation2`)
+TrueType programs. A Type 1 font that becomes TrueType, or a TrueType font on
+StandardEncoding, gets its glyph names restated over WinAnsiEncoding: PDF/UA-1
+7.21.6 allows a non-symbolic TrueType font only MacRomanEncoding or
+WinAnsiEncoding as its base, and only AGL names in Differences. Each code keeps
+its glyph; codes StandardEncoding leaves undefined take WinAnsiEncoding's
+character. Acrobat's form font (`/Helv`, Differences with no base) is the
+common case.
+
+Families Liberation lacks are converted from the URW base-35 Type 1 programs
+(`fonts-urw-base35`, installed in the image, not in the repository) to
+TrueType at runtime (`urw.py`), so their advances can be aligned to the PDF's
+widths. Century Gothic gets URW Gothic (owner-approved; not metric
+compatible). Arial Narrow and Helvetica Narrow get Nimbus Sans Narrow, which
+fontconfig's `conf.d/30-metric-aliases.conf` lists as metric-compatible with
+both; Liberation Sans Narrow is not in Liberation 2. An installed original
+program is used before any substitute.
+
 ### Program width repair
 
 For simple TrueType fonts, rule 7.21.5 is handled in the dictionary-repair
