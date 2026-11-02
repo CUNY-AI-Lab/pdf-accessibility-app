@@ -356,3 +356,114 @@ def test_a_model_that_refused_json_schema_is_asked_for_json_object_next_time():
         "json_object",
     ]
     assert [call["response_format"]["type"] for call in second.calls] == ["json_object"]
+
+
+class _RecordingSchemaFallbackLlm(_SchemaFallbackLlm):
+    def __init__(self, *, reject_schema=True):
+        super().__init__()
+        self.messages = []
+        self.reject_schema = reject_schema
+
+    async def chat_completion(self, messages, **kwargs):
+        self.messages.append(messages)
+        if not self.reject_schema:
+            self.calls.append(kwargs)
+            return {"choices": [{"message": {"content": '{"summary":"ok"}'}}]}
+        return await super().chat_completion(messages, **kwargs)
+
+
+def _stated_schema(message):
+    """The JSON object stated in the last text part of a user message, if any."""
+    last = message["content"][-1]
+    if last.get("type") != "text" or "{" not in last["text"]:
+        return None
+    return extract_json_object(last["text"][last["text"].index("{") :])
+
+
+_DECISION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "decisions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"figure_index": {"type": "integer"}},
+                "required": ["figure_index"],
+            },
+        }
+    },
+    "required": ["decisions"],
+}
+
+
+@pytest.mark.parametrize("prefix", [None, [{"role": "system", "content": "You read documents."}]])
+def test_json_object_fallback_states_the_schema_in_the_user_turn(prefix):
+    llm = _RecordingSchemaFallbackLlm()
+    content = [
+        {"type": "text", "text": "Decide each figure."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+    ]
+
+    asyncio.run(
+        request_llm_json(
+            llm_client=llm,
+            content=content,
+            schema_name="figure_batch",
+            response_schema=_DECISION_SCHEMA,
+            conversation_prefix=prefix,
+        )
+    )
+
+    schema_call, object_call = llm.messages
+    assert [call["response_format"]["type"] for call in llm.calls] == ["json_schema", "json_object"]
+    # The provider enforces json_schema itself; that request is unchanged.
+    assert schema_call[-1]["content"] == content
+    assert object_call[:-1] == schema_call[:-1]
+    assert object_call[-1]["role"] == "user"
+    assert object_call[-1]["content"][: len(content)] == content
+    assert _stated_schema(object_call[-1]) == _DECISION_SCHEMA
+
+
+def test_a_remembered_refusal_still_states_the_schema():
+    first, second = _RecordingSchemaFallbackLlm(), _RecordingSchemaFallbackLlm()
+    for llm in (first, second):
+        asyncio.run(
+            request_llm_json(
+                llm_client=llm,
+                content=[{"type": "text", "text": "hello"}],
+                schema_name="demo",
+                response_schema=_DECISION_SCHEMA,
+            )
+        )
+    [only] = second.messages
+    assert _stated_schema(only[-1]) == _DECISION_SCHEMA
+
+
+@pytest.mark.parametrize("schema_name", [None, "demo"])
+def test_schema_is_stated_only_when_the_provider_cannot_enforce_it(schema_name):
+    llm = _RecordingSchemaFallbackLlm(reject_schema=False)
+    asyncio.run(
+        request_llm_json(
+            llm_client=llm,
+            content=[{"type": "text", "text": "hello"}],
+            schema_name=schema_name,
+            response_schema=_DECISION_SCHEMA,
+        )
+    )
+    [only] = llm.messages
+    if schema_name:
+        assert llm.calls[0]["response_format"]["type"] == "json_schema"
+        assert _stated_schema(only[-1]) is None
+    else:
+        # A schema without a name is never sent as json_schema.
+        assert llm.calls[0]["response_format"]["type"] == "json_object"
+        assert _stated_schema(only[-1]) == _DECISION_SCHEMA
+
+
+def test_a_request_without_a_schema_is_unchanged():
+    llm = _RecordingSchemaFallbackLlm(reject_schema=False)
+    content = [{"type": "text", "text": 'Return {"summary": "..."}'}]
+    asyncio.run(request_llm_json(llm_client=llm, content=content))
+    [only] = llm.messages
+    assert only[-1]["content"] == content

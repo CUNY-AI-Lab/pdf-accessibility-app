@@ -9,6 +9,7 @@ Transitions::
 
 Capability keys include endpoint, model and format; access, transport, invalid
 schema and unrelated capability failures cannot downgrade or poison the cache.
+A request sent without json_schema states its schema in the prompt instead.
 """
 
 import copy
@@ -272,6 +273,30 @@ def preferred_cache_breakpoint_index(content: list[dict[str, Any]]) -> int | Non
     return len(content) - 1
 
 
+def _with_schema_instruction(
+    messages: list[dict[str, Any]], response_schema: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """The messages with the response schema stated in the last user turn.
+
+    Without json_schema the provider does not see or enforce the schema, so
+    the model would name fields itself. Stating the schema in the prompt is
+    the usual practice for JSON mode; the request otherwise stays the same.
+    """
+    *earlier, last = messages
+    instruction = {
+        "type": "text",
+        "text": (
+            "Respond with one JSON object, and nothing else, that conforms to this JSON "
+            "Schema. Use exactly its property names and allowed values, include every "
+            "required property, and add no others:\n"
+            + json.dumps(response_schema, separators=(",", ":"), ensure_ascii=True)
+        ),
+    }
+    content = last.get("content")
+    parts = content if isinstance(content, list) else [{"type": "text", "text": str(content or "")}]
+    return [*earlier, {**last, "content": [*parts, instruction]}]
+
+
 async def request_llm_json(
     *,
     llm_client: LlmClient,
@@ -308,14 +333,16 @@ async def request_llm_json_with_response(
         if conversation_prefix:
             messages.extend(copy.deepcopy(conversation_prefix))
         messages.append({"role": "user", "content": request_content})
-        request_kwargs: dict[str, Any] = {
-            "messages": messages,
-            "temperature": 0,
-        }
+        request_kwargs: dict[str, Any] = {"temperature": 0}
         mode = ResponseFormatMode.SCHEMA if response_schema and schema_name else ResponseFormatMode.OBJECT
         endpoint = str(getattr(llm_client, "base_url", ""))
         while True:
             key = (endpoint, str(llm_client.model), mode)
+            request_kwargs["messages"] = (
+                messages
+                if mode is ResponseFormatMode.SCHEMA or not response_schema
+                else _with_schema_instruction(messages, response_schema)
+            )
             if mode is not ResponseFormatMode.TEXT:
                 if endpoint and FORMAT_CAPABILITIES.get(key) is FormatCapability.UNSUPPORTED:
                     mode = downgrade_response_format(mode)
