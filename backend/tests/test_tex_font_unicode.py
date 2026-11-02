@@ -159,3 +159,68 @@ def test_rebuilt_simple_tounicode_keeps_authored_values_for_used_codes_it_cannot
         67: "C",
         68: "D",
     }
+
+
+def _truetype_program(cmap: dict[int, str]) -> bytes:
+    from io import BytesIO
+
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+
+    builder = FontBuilder(1000, isTTF=True)
+    order = [".notdef", "space", "glyph37"]
+    builder.setupGlyphOrder(order)
+    builder.setupCharacterMap(cmap)
+    builder.setupGlyf({name: TTGlyphPen(None).glyph() for name in order})
+    builder.setupHorizontalMetrics({name: (500, 0) for name in order})
+    builder.setupHorizontalHeader(ascent=800, descent=-200)
+    builder.setupPost()
+    buffer = BytesIO()
+    builder.save(buffer)
+    return buffer.getvalue()
+
+
+def _winansi_font(subtype: str, name: str = "opaqueglyph"):
+    # Code 54 is "6" in WinAnsiEncoding; Differences gives it another glyph.
+    return pikepdf.Dictionary(
+        Subtype=pikepdf.Name(subtype),
+        BaseFont=pikepdf.Name("/ABCDEF+Fixture"),
+        Encoding=pikepdf.Dictionary(
+            BaseEncoding=pikepdf.Name.WinAnsiEncoding,
+            Differences=pikepdf.Array([54, pikepdf.Name(f"/{name}")]),
+        ),
+    )
+
+
+@pytest.mark.parametrize("subtype", ["/Type1", "/TrueType", "/Type3"])
+def test_unknown_differences_name_drops_the_base_encoding_character(subtype):
+    mapping = _simple_font_unicode_map(_winansi_font(subtype), None)
+
+    assert 54 not in mapping
+    assert mapping[55] == "7"
+
+
+def test_rebuilt_tounicode_leaves_an_unknown_glyph_to_the_author_or_unmapped(tmp_path):
+    encoding = _winansi_font("/Type1").Encoding
+
+    assert _repaired_map(tmp_path, b"67", encoding=encoding) == {55: "7"}
+    authored = _repaired_map(tmp_path, b"67", encoding=encoding, tounicode={54: "≠"})
+    assert authored == {54: "≠", 55: "7"}
+
+
+@pytest.mark.parametrize(
+    ("cmap", "expected"),
+    [
+        ({0x20: "space", 0x2260: "glyph37"}, "≠"),
+        # Private-use values carry no character.
+        ({0x20: "space", 0xE000: "glyph37"}, None),
+        ({0x20: "space"}, None),
+    ],
+)
+def test_truetype_program_cmap_names_the_character_of_an_unknown_glyph_name(cmap, expected):
+    program = _truetype_program(cmap)
+    mapping = _simple_font_unicode_map(_winansi_font("/TrueType", "glyph37"), program)
+
+    assert mapping.get(54) == expected
+    # A Type 1 dictionary does not select glyphs through a TrueType cmap.
+    assert 54 not in _simple_font_unicode_map(_winansi_font("/Type1", "glyph37"), program)

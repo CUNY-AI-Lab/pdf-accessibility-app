@@ -259,6 +259,34 @@ def _standard_encoding_over_winansi(encoding, *, implicit_standard: bool):
     return restated
 
 
+def _truetype_glyph_name_unicode(font_bytes: bytes, names: dict[int, str]) -> dict[int, str]:
+    """Unicode for codes whose glyph names only the embedded TrueType program knows.
+
+    A name selects a glyph through the program's own `post` names, so its
+    Unicode cmap entry for that glyph is the font's statement of the character.
+    Symbol cmaps and private-use values are not evidence.
+    """
+    from fontTools.ttLib import TTFont
+
+    try:
+        with TTFont(BytesIO(font_bytes), lazy=True) as font:
+            if "cmap" not in font:
+                return {}
+            glyphs = set(font.getGlyphOrder())
+            reverse = font["cmap"].buildReversed()
+    except Exception:
+        return {}
+
+    mapping: dict[int, str] = {}
+    for code, name in names.items():
+        if name not in glyphs:
+            continue
+        values = sorted(value for value in reverse.get(name, ()) if not 0xE000 <= value <= 0xF8FF)
+        if values and _is_valid_unicode_text(chr(values[0])):
+            mapping[code] = chr(values[0])
+    return mapping
+
+
 def _cff_builtin_encoding_map(font_bytes: bytes) -> dict[int, str]:
     from fontTools.cffLib import CFFFontSet
 
@@ -327,18 +355,18 @@ def _simple_font_unicode_map(font_dict, font_bytes: bytes | None) -> dict[int, s
     encoding = font_dict.get("/Encoding")
     if isinstance(encoding, pikepdf.Dictionary):
         mapping.update(_named_simple_encoding_map(encoding.get("/BaseEncoding")))
-        mapping.update(_encoding_differences_map(encoding.get("/Differences")))
-        if subtype == pikepdf.Name("/Type3"):
-            # An opaque CharProc name replaces the base encoding too. It is
-            # not evidence for the Latin character at the same byte code.
-            code = 0
-            for item in encoding.get("/Differences") or ():
-                if isinstance(item, int):
-                    code = item
-                else:
-                    if _glyph_name_to_unicode(str(item).lstrip("/")) is None:
-                        mapping.pop(code, None)
-                    code += 1
+        unknown: dict[int, str] = {}
+        for code, name in _encoding_differences_names(encoding.get("/Differences")).items():
+            text = _glyph_name_to_unicode(name)
+            if text:
+                mapping[code] = text
+            else:
+                # A Differences name replaces the glyph at its code, so the
+                # base encoding's character there is not evidence for it.
+                mapping.pop(code, None)
+                unknown[code] = name
+        if unknown and font_bytes and subtype == pikepdf.Name("/TrueType"):
+            mapping.update(_truetype_glyph_name_unicode(font_bytes, unknown))
     else:
         mapping.update(_named_simple_encoding_map(encoding))
 
