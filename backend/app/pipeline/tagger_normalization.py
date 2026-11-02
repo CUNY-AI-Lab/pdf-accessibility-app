@@ -393,15 +393,28 @@ def _normalize_media_clip_data_dicts(pdf: pikepdf.Pdf) -> int:
 
 
 def _save_pdf_for_viewer_compatibility(pdf: pikepdf.Pdf, output_path: Path) -> None:
-    """Save linearized output when possible; fall back to a normal save."""
+    """Save linearized output when possible; fall back to a normal save.
+
+    The linearized file is written from a plain save read back, never from
+    ``pdf`` itself. qpdf 12.3 linearizes from a table of object numbers that,
+    when more than a tenth of the numbers in memory are unused, is sized for
+    the file as read; with object streams kept, an object created since and
+    numbered past that table is left out, and references to it are written
+    as null (0 0 R): the structure tree, rewritten page content, new
+    metadata. A plain save numbers every object densely and loses nothing.
+    """
     add_missing_icc_components(pdf)
+    plain_path = output_path.with_name(f"{output_path.name}.plain.tmp")
     tmp_path = output_path.with_name(f"{output_path.name}.tmp")
     tmp_path.unlink(missing_ok=True)
+    pdf.save(str(plain_path))
     try:
-        pdf.save(str(tmp_path), linearize=True)
+        with pikepdf.open(str(plain_path)) as renumbered:
+            renumbered.save(str(tmp_path), linearize=True)
     except Exception as exc:
         tmp_path.unlink(missing_ok=True)
         logger.warning("Could not save linearized PDF %s: %s", output_path.name, exc)
-        pdf.save(str(output_path))
+        plain_path.replace(output_path)
     else:
         tmp_path.replace(output_path)
+        plain_path.unlink()
