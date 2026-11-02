@@ -564,7 +564,9 @@ async def tag_pdf(
                     stream_starts.add(len(eligible_ops))
                     eligible_ops.extend(ops)
                 glyphs = [g for op in eligible_ops for g in op.glyphs]
-                table_readability.extend(_mark_unreadable_tables(page_elems, glyphs))
+                table_readability.extend(
+                    _mark_unreadable_tables(page_elems, glyphs, frames[page_index].rotation // 90)
+                )
                 continued = (
                     _continued_table(
                         pages_elements.get(page_index - 1, []),

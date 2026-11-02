@@ -30,7 +30,7 @@ def author_table_readability(path: Path, evidence: dict) -> list[dict]:
                     elements.append({**table, 'page': page, 'cells': cells,
                                      'bbox': union_bbox(c['bbox'] for c in cells)})
             glyphs = [g for op in reader.page(page).ops.values() for run in op for g in run.glyphs]
-            diagnostics.extend(_mark_unreadable_tables(elements, glyphs))
+            diagnostics.extend(_mark_unreadable_tables(elements, glyphs, frame.rotation // 90))
     return diagnostics
 
 
