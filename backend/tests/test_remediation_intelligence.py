@@ -99,8 +99,10 @@ def test_font_task_payload_uses_review_targets_and_page_structure_context(monkey
     )
     monkeypatch.setattr(
         remediation_intelligence,
-        "render_target_preview_png_data_url",
-        lambda pdf_path, context_path: f"data:image/png;base64,target-{hash(context_path) % 10}",
+        "render_target_previews_png_data_urls",
+        lambda pdf_path, context_path: [
+            ("target region", f"data:image/png;base64,target-{hash(context_path) % 10}")
+        ],
     )
 
     prompt_text, content = _font_task_payload(
