@@ -272,7 +272,11 @@ from app.services.semantic_pretag_policy import (
     widget_targets_for_rationalization as _widget_targets_for_rationalization,
 )
 from app.services.structure_text import screen_reader_text
-from app.services.table_decisions import queue_table_decision, queue_table_decisions
+from app.services.table_decisions import (
+    queue_table_decision,
+    queue_table_decisions,
+    unsupported_region_kind,
+)
 from app.services.thread_work import to_thread
 from app.services.title_intelligence import enhance_document_title_with_intelligence
 from app.services.toc_intelligence import enhance_toc_structure_with_intelligence
@@ -1346,7 +1350,10 @@ async def _apply_pretag_table_intelligence(
 
     approved_by_id: dict[str, dict[str, object]] = {}
     for item in intelligence_items:
-        if not isinstance(item, dict) or not _should_auto_apply_table_intelligence(item):
+        # A kind nothing applies is kept for the decision audit (queue_table_decision).
+        if not isinstance(item, dict) or not (
+            _should_auto_apply_table_intelligence(item) or unsupported_region_kind(item)
+        ):
             continue
         table_review_id = str(item.get("table_review_id") or "").strip()
         if table_review_id:
@@ -1366,6 +1373,7 @@ async def _apply_pretag_table_intelligence(
     applied_count = 0
     confirmed_count = 0
     set_headers_count = 0
+    recorded_count = 0
     for index, element in enumerate(elements):
         if not isinstance(element, dict) or element.get("type") != "table":
             continue
@@ -1382,6 +1390,9 @@ async def _apply_pretag_table_intelligence(
             ):
                 continue
         elif not queue_table_decision(element, approved):
+            if unsupported_region_kind(approved):
+                element["review_id"] = review_id
+                recorded_count += 1
             continue
         element["review_id"] = review_id
         element["table_llm_confirmed"] = action == "confirm_current_headers"
@@ -1401,8 +1412,12 @@ async def _apply_pretag_table_intelligence(
         elif action == "set_table_headers":
             set_headers_count += 1
 
+    audit["unsupported_kind_count"] = recorded_count
     if applied_count <= 0:
         audit["reason"] = "no_matching_structure_elements"
+        if recorded_count:
+            audit["reason"] = "unsupported_kinds_only"
+            return updated_structure, audit
         return structure_json, audit
 
     audit["applied"] = bool(confirmed_count)

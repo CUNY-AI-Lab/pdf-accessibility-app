@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from typing import Any
@@ -16,11 +17,11 @@ from app.services.intelligence_normalize import confidence_label, confidence_sco
 from app.services.llm_client import LlmClient
 from app.services.pdf_preview import render_bbox_preview_png_data_url
 from app.services.semantic_units import SemanticDecision, SemanticUnit
-from app.services.table_decisions import table_action
+from app.services.table_decisions import TABLE_REGION_KINDS, table_action
 
 logger = logging.getLogger(__name__)
 
-SEMANTIC_ADJUDICATION_PROMPT = """You are a PDF accessibility semantic adjudication assistant.
+SEMANTIC_ADJUDICATION_PROMPT = f"""You are a PDF accessibility semantic adjudication assistant.
 
 You will receive exactly one semantic unit from a PDF. The semantic unit type will be one of:
 - text_block
@@ -47,7 +48,6 @@ Definitions:
 - decorative: visible content that does not add meaning beyond nearby text or structure and should not be announced by assistive technology.
 - meaningful: visible content that carries information users need to understand.
 - layout_grid: a region arranged in rows/columns for visual organization, but not a true data table with consistent header logic.
-- org_chart: a hierarchical relationship diagram laid out in boxes or cells, where forcing table semantics would misrepresent the meaning.
 - code_block: preformatted code or command text where line breaks and indentation carry meaning.
 - caption: text whose purpose is to label or explain a nearby figure, table, or region.
 - instructions: explanatory text that supports a control or region but is not itself the control label.
@@ -77,13 +77,13 @@ Table rules:
 - Use confirm_current_headers when the current header_rows and row_header_columns already provide an acceptable accessible reading.
 - Use set_table_headers when simple header rows and row-header columns clearly improve assistive-tech understanding.
 - Use manual_only only when simple header rows and row-header columns would still clearly misrepresent the table.
-- Use reclassify_region when the candidate is not really a data table at all, such as an org chart, layout grid, form region, or decorative layout block.
+- Use reclassify_region when the candidate is not really a data table at all: a layout grid, a list such as a table of contents, running text, or a form region.
 - Treat grouped, stacked, or multi-row headers as acceptable for set_table_headers when marking the visible header band and row-header columns would give a faithful accessible reading.
 - Multi-row or grouped headers do not require manual_only by themselves if marking all visible header rows and the right row-header columns is faithful enough.
 - Prefer a faithful first-pass accessible reading over visual perfection.
 - If semantic_unit.metadata.confirm_existing is true, treat the current headers as the default and only change them when a different simple assignment is clearly better.
 - If semantic_unit.metadata.aggressive is true, prefer set_table_headers over manual_only whenever a plausible simple accessible reading is still faithful.
-- When using reclassify_region from a table candidate, prefer resolved_kind values like org_chart, layout_grid, form_region, or artifact.
+- When using reclassify_region from a table candidate, set resolved_kind to one of: {', '.join(TABLE_REGION_KINDS)}. Any other kind of region, such as an org chart or a decorative block, is manual_only.
 
 Form-field rules:
 - Use confirm_current_label when the current accessible label is already good.
@@ -171,7 +171,6 @@ SEMANTIC_DECISION_SCHEMA: dict[str, Any] = {
                 "artifact",
                 "form_region",
                 "layout_grid",
-                "org_chart",
                 "code_block",
                 "caption",
                 "instructions",
@@ -202,6 +201,16 @@ SEMANTIC_DECISION_SCHEMA: dict[str, Any] = {
 }
 
 
+def semantic_decision_schema(unit_type: str) -> dict[str, Any]:
+    """The decision schema for a unit of ``unit_type``. A table is offered
+    only the kinds the tagger can reclassify it as (table_decisions)."""
+    if unit_type != "table":
+        return SEMANTIC_DECISION_SCHEMA
+    schema = copy.deepcopy(SEMANTIC_DECISION_SCHEMA)
+    schema["properties"]["resolved_kind"]["enum"] = list(TABLE_REGION_KINDS)
+    return schema
+
+
 def _missing_required_payload(parsed: dict[str, Any]) -> str | None:
     action = str(parsed.get("suggested_action") or "").strip()
     if action == "set_field_label" and not str(parsed.get("accessible_label") or "").strip():
@@ -219,6 +228,7 @@ async def _repair_required_payload(
     content: list[dict[str, Any]],
     parsed: dict[str, Any],
     missing_field: str,
+    schema: dict[str, Any],
 ) -> dict[str, Any]:
     repair_content = list(content)
     repair_prompt = {
@@ -237,7 +247,7 @@ async def _repair_required_payload(
         llm_client=llm_client,
         content=repair_content,
         schema_name="semantic_unit_adjudication",
-        response_schema=SEMANTIC_DECISION_SCHEMA,
+        response_schema=schema,
     )
 
 
@@ -328,12 +338,13 @@ async def adjudicate_semantic_unit(
         context_json_part(payload),
     ]
     cache_breakpoint_index = preferred_cache_breakpoint_index(content)
+    schema = semantic_decision_schema(unit.unit_type)
 
     parsed = await request_llm_json(
         llm_client=llm_client,
         content=content,
         schema_name="semantic_unit_adjudication",
-        response_schema=SEMANTIC_DECISION_SCHEMA,
+        response_schema=schema,
         cache_breakpoint_index=cache_breakpoint_index,
     )
     if unit.unit_type == "figure":
@@ -345,6 +356,7 @@ async def adjudicate_semantic_unit(
             content=content,
             parsed=parsed,
             missing_field=missing_field,
+            schema=schema,
         )
         if isinstance(repaired, dict):
             parsed = normalize_figure_decision(repaired) if unit.unit_type == "figure" else repaired

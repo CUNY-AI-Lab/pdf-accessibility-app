@@ -12,7 +12,7 @@ from app.services.document_intelligence import (
     collect_structure_fragments,
 )
 from app.services.form_fields import field_label_quality
-from app.services.table_decisions import LAYOUT_KINDS, table_action
+from app.services.table_decisions import TABLE_REGION_KINDS, table_action
 
 PRETAG_TABLE_ALLOWED_ACTIONS = frozenset({"confirm_current_headers", "set_table_headers"})
 PRETAG_FORM_ALLOWED_TYPES = frozenset({
@@ -83,7 +83,7 @@ def should_auto_apply_table_intelligence(item: dict[str, object]) -> bool:
         return (isinstance(rows, list) and isinstance(cols, list) and bool(rows or cols)
                 and all(type(i) is int and i >= 0 for i in [*rows, *cols]))
     if action == "reclassify_region":
-        return item.get("resolved_kind") in LAYOUT_KINDS | {"form_region"}
+        return item.get("resolved_kind") in TABLE_REGION_KINDS
     return action == "confirm_current_headers" and item.get("confidence") == "high"
 
 
