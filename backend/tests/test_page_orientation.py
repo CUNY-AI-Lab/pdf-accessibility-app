@@ -19,8 +19,9 @@ RUNS = {0: "1 0 0 1 72 600", 1: "0 1 -1 0 300 72", 2: "-1 0 0 -1 540 300", 3: "0
 LINE = "Stock Lead Review Level Rationale"
 
 
-def page(pdf, lines, rotate=0):
-    """A page drawing each (turn, text) line from its own origin."""
+def page(pdf, lines, rotate=0, mode=0):
+    """A page drawing each (turn, text) line from its own origin, in text
+    render mode ``mode`` (3 is invisible, as an OCR layer is)."""
     new = pdf.add_blank_page(page_size=(612, 792))
     new.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
     ops = []
@@ -28,7 +29,7 @@ def page(pdf, lines, rotate=0):
         a, b, c, d, e, f = (float(v) for v in RUNS[turn].split())
         # Later lines one leading further along the text's own downward axis.
         e, f = e + index * 14 * c * -1, f + index * 14 * d * -1
-        ops.append(f"BT /F1 10 Tf {a} {b} {c} {d} {e} {f} Tm ({text}) Tj ET")
+        ops.append(f"BT {mode} Tr /F1 10 Tf {a} {b} {c} {d} {e} {f} Tm ({text}) Tj ET")
     new.Contents = pdf.make_stream(" ".join(ops).encode())
     if rotate:
         new.Rotate = rotate
@@ -37,8 +38,8 @@ def page(pdf, lines, rotate=0):
 
 def document(path, pages):
     pdf = pikepdf.new()
-    for lines, rotate in pages:
-        page(pdf, lines, rotate)
+    for lines, rotate, *mode in pages:
+        page(pdf, lines, rotate, *mode)
     pdf.save(path)
 
 
@@ -51,6 +52,9 @@ PAGES = [
     ([(0, LINE)] * 3 + [(1, "Rotated column heading")], 0),  # a minority turned
     ([(1, LINE), (1, LINE), (0, LINE), (2, LINE)], 0),  # mostly up the page, not a majority
     ([], 0),  # no text
+    ([(1, LINE)] * 4, 0, 3),  # an OCR layer read sideways: the engine's guess
+    # Glyphs mostly without Unicode outnumber an upright page number.
+    ([(1, "\x04\x05\x06\x07\x08ab")] * 4 + [(0, "Page 12 of 40")], 0),
 ]
 
 
@@ -58,8 +62,19 @@ def test_a_page_is_sideways_when_most_of_its_text_runs_another_way_than_shown(tm
     source = tmp_path / "in.pdf"
     document(source, PAGES)
     pages = sideways_pages(source)
-    assert {index: page.upright.rotation for index, page in pages.items()} == {1: 90, 2: 270, 4: 0}
-    assert {index: page.shown.rotation for index, page in pages.items()} == {1: 0, 2: 0, 4: 90}
+    assert {index: page.upright.rotation for index, page in pages.items()} == {
+        1: 90,
+        2: 270,
+        4: 0,
+        9: 90,
+    }
+    assert {index: page.shown.rotation for index, page in pages.items()} == {
+        1: 0,
+        2: 0,
+        4: 90,
+        9: 0,
+    }
+    assert set(sideways_pages(source, only={2, 3, 8})) == {2}
 
 
 def test_a_file_pdfium_cannot_read_has_no_sideways_pages(tmp_path):
@@ -77,8 +92,9 @@ def test_only_the_copy_docling_reads_is_turned(tmp_path):
     assert copy == tmp_path / "upright" / "in.pdf"
     assert source.read_bytes() == before
     with pikepdf.open(copy) as pdf:
-        assert [int(p.obj.Rotate) if "/Rotate" in p.obj else 0 for p in pdf.pages] == [0, 90, 270, 90, 0, 0, 0, 0]
-    assert set(pages) == {1, 2, 4}
+        rotations = [int(p.obj.Rotate) if "/Rotate" in p.obj else 0 for p in pdf.pages]
+    assert rotations == [0, 90, 270, 90, 0, 0, 0, 0, 0, 90]
+    assert set(pages) == {1, 2, 4, 9}
 
     upright = tmp_path / "upright.pdf"
     document(upright, PAGES[:1])

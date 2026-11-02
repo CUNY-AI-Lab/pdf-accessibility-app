@@ -10,12 +10,17 @@ with an orientation probe and maps what it finds back to the displayed page
 (docling.rs#937), and OCRmyPDF's ``--rotate-pages`` does the same for scans
 whose text it recognizes sideways.
 
-Here the evidence is the page's own text: a page where a strict majority of
-the characters run in one direction other than the displayed one is
-sideways. Docling converts a copy whose /Rotate shows that text upright, and
-the boxes it returns move back into the displayed page's frame (see
-page_frame). The copy is only Docling's input; the document keeps its
-/Rotate.
+Here the evidence is the glyphs the page draws: a page where a strict
+majority of its visible glyphs run in one direction other than the displayed
+one is sideways. A glyph's direction is its drawn geometry, so it counts even
+when its font maps it to no Unicode. Invisible text does not count: it is an
+OCR layer, whose direction is the OCR engine's own guess wherever it could
+not tell the page's orientation (Tesseract reads text it finds running
+sideways on a page it was not told to turn, sometimes upside down). Docling
+converts a copy whose /Rotate shows that text upright, and the boxes it
+returns move back into the displayed page's frame (see page_frame). The copy
+is only Docling's input; the document keeps its /Rotate. The OCR step turns
+the pages it reads on the same evidence (see ocr.run_ocr).
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import dataclasses
 import logging
 import math
 from collections import Counter
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,18 +54,30 @@ class SidewaysPage:
         return self.shown.to_docling(self.upright.to_user_space(box))
 
 
+# Text render modes that paint nothing (ISO 32000-1, 9.3.6).
+INVISIBLE_MODES = {
+    pdfium_c.FPDF_TEXTRENDERMODE_INVISIBLE,
+    pdfium_c.FPDF_TEXTRENDERMODE_CLIP,
+}
+
+
 def text_turns(page: pdfium.PdfPage) -> Counter[int]:
-    """How many of the page's characters run each number of quarter turns
-    counterclockwise, from each character's matrix in user space (as
-    MeasuredGlyph.turn). Spaces and characters pdfium inferred do not count."""
+    """How many of the page's visible glyphs run each number of quarter
+    turns counterclockwise, from each glyph's matrix in user space (as
+    MeasuredGlyph.turn). Spaces, characters pdfium inferred and invisible
+    text do not count."""
     text_page = page.get_textpage()
     try:
         turns: Counter[int] = Counter()
         matrix = pdfium_c.FS_MATRIX()
         for index in range(text_page.count_chars()):
+            code = pdfium_c.FPDFText_GetUnicode(text_page, index)
+            text_object = pdfium_c.FPDFText_GetTextObject(text_page, index)
             if (
-                pdfium_c.FPDFText_GetUnicode(text_page, index) <= 0x20
+                chr(code).isspace()
                 or pdfium_c.FPDFText_IsGenerated(text_page, index) == 1
+                or not text_object
+                or pdfium_c.FPDFTextObj_GetTextRenderMode(text_object) in INVISIBLE_MODES
                 or not pdfium_c.FPDFText_GetMatrix(text_page, index, ctypes.byref(matrix))
             ):
                 continue
@@ -69,10 +87,10 @@ def text_turns(page: pdfium.PdfPage) -> Counter[int]:
         text_page.close()
 
 
-def sideways_pages(pdf_path: Path) -> dict[int, SidewaysPage]:
-    """Each page, by index, where a strict majority of the characters run
-    one way other than upright as shown, with the frame that shows them
-    upright. A file pdfium cannot read has none."""
+def sideways_pages(pdf_path: Path, only: Collection[int] | None = None) -> dict[int, SidewaysPage]:
+    """Each page, by index (of ``only``, when given), where a strict majority
+    of the visible glyphs run one way other than upright as shown, with the
+    frame that shows them upright. A file pdfium cannot read has none."""
     pages: dict[int, SidewaysPage] = {}
     try:
         document = pdfium.PdfDocument(str(pdf_path))
@@ -81,6 +99,9 @@ def sideways_pages(pdf_path: Path) -> dict[int, SidewaysPage]:
         return pages
     try:
         for index, page in enumerate(document):
+            if only is not None and index not in only:
+                page.close()
+                continue
             try:
                 turns = text_turns(page)
                 if not turns:
@@ -98,12 +119,14 @@ def sideways_pages(pdf_path: Path) -> dict[int, SidewaysPage]:
     return pages
 
 
-def upright_copy(pdf_path: Path, directory: Path) -> tuple[Path, dict[int, SidewaysPage]]:
-    """The file Docling should read for ``pdf_path``, and its sideways
-    pages: the file itself when none is, else a copy in ``directory``, under
-    the same name, whose sideways pages are shown upright. A copy that
-    cannot be written leaves Docling the file itself."""
-    pages = sideways_pages(pdf_path)
+def upright_copy(
+    pdf_path: Path, directory: Path, only: Collection[int] | None = None
+) -> tuple[Path, dict[int, SidewaysPage]]:
+    """The file to read ``pdf_path`` from, and its sideways pages (of
+    ``only``, when given): the file itself when none is, else a copy in
+    ``directory``, under the same name, whose sideways pages are shown
+    upright. A copy that cannot be written leaves the file itself."""
+    pages = sideways_pages(pdf_path, only)
     if not pages:
         return pdf_path, {}
     copy = directory / pdf_path.name
@@ -117,7 +140,7 @@ def upright_copy(pdf_path: Path, directory: Path) -> tuple[Path, dict[int, Sidew
         logger.warning("Could not turn %s's sideways pages upright", pdf_path.name, exc_info=True)
         return pdf_path, {}
     logger.info(
-        "Docling reads %d sideways page(s) of %s upright: %s",
+        "Turned %d sideways page(s) of %s upright: %s",
         len(pages),
         pdf_path.name,
         sorted(index + 1 for index in pages),
