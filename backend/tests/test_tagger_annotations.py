@@ -373,6 +373,124 @@ def test_tag_widget_annotations_uses_docling_widget_metadata_for_missing_tooltip
     assert str(annotation.get("/TU")) == "Last Name (Family Name)"
 
 
+
+def _button_group(pdf, page, *, name, flags, options, field_name=None):
+    """A button field with one kid widget per (on-state, widget /TU) option."""
+    field = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/T": pikepdf.String(name),
+                "/FT": pikepdf.Name("/Btn"),
+                "/Ff": flags,
+            }
+        )
+    )
+    if field_name is not None:
+        field["/TU"] = pikepdf.String(field_name)
+    kids = []
+    for index, (state, widget_name) in enumerate(options):
+        off = pdf.make_stream(b"")
+        on = pdf.make_stream(b"")
+        widget = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/Annot"),
+                    "/Subtype": pikepdf.Name("/Widget"),
+                    "/Rect": pikepdf.Array([20 + 40 * index, 20, 30 + 40 * index, 30]),
+                    "/Parent": field,
+                    "/AP": pikepdf.Dictionary({"/N": pikepdf.Dictionary({state: on, "/Off": off})}),
+                }
+            )
+        )
+        if widget_name is not None:
+            widget["/TU"] = pikepdf.String(widget_name)
+        kids.append(widget)
+    field["/Kids"] = pikepdf.Array(kids)
+    page["/Annots"] = pikepdf.Array([*page.get("/Annots", pikepdf.Array()), *kids])
+    return field
+
+
+def _tag_page_widgets(pdf):
+    builder = StructTreeBuilder(pdf)
+    builder.setup()
+    page = pdf.pages[0]
+    tagged = _tag_widget_annotations(page, page.obj, builder, docling_page_widgets=[])
+    builder.finalize()
+    return tagged
+
+
+def _widget_names(field):
+    return [str(kid.get("/TU", "")) for kid in field["/Kids"]]
+
+
+def test_radio_group_gets_its_field_name_and_unnamed_options_their_state(tmp_path):
+    source = tmp_path / "radio.pdf"
+    with pikepdf.new() as pdf:
+        page = pdf.add_blank_page(page_size=(300, 100))
+        _button_group(
+            pdf,
+            page,
+            name="Semester",
+            flags=49152,
+            options=[
+                ("/Fall", "Fall"),
+                ("/Spring", "Spring"),
+                ("/Summer Term", ""),
+                ("/Caf_E9", None),
+            ],
+        )
+        pdf.save(source, object_stream_mode=pikepdf.ObjectStreamMode.disable)
+    # A name that is not UTF-8, written in PDF name syntax.
+    source.write_bytes(source.read_bytes().replace(b"/Caf_E9", b"/Caf#E9"))
+
+    with pikepdf.open(source) as pdf:
+        tagged = _tag_page_widgets(pdf)
+        field = pdf.pages[0].Annots[0].Parent
+
+        assert tagged == 4
+        assert str(field["/TU"]) == "Semester"
+        assert _widget_names(field) == ["Fall", "Spring", "Summer Term", "Café"]
+
+
+def test_generic_button_states_do_not_name_options():
+    with pikepdf.new() as pdf:
+        page = pdf.add_blank_page(page_size=(300, 100))
+        radio = _button_group(
+            pdf,
+            page,
+            name="Choice",
+            flags=49152,
+            options=[("/Choice1", ""), ("/1", ""), ("/On", ""), ("/Yes", ""), ("/No", "")],
+        )
+        checkbox = _button_group(
+            pdf, page, name="Agree", flags=0, options=[("/Yes", ""), ("/0", "")]
+        )
+
+        _tag_page_widgets(pdf)
+
+        # Yes is a checkbox's default on-state, but one option of a radio group.
+        assert _widget_names(radio) == ["", "", "", "Yes", "No"]
+        assert _widget_names(checkbox) == ["", ""]
+
+
+def test_named_button_fields_and_options_keep_their_names():
+    with pikepdf.new() as pdf:
+        page = pdf.add_blank_page(page_size=(300, 100))
+        field = _button_group(
+            pdf,
+            page,
+            name="Semester",
+            flags=49152,
+            field_name="Semester of the change",
+            options=[("/Fall", "Autumn"), ("/Spring", "")],
+        )
+
+        _tag_page_widgets(pdf)
+
+        assert str(field["/TU"]) == "Semester of the change"
+        assert _widget_names(field) == ["Autumn", "Spring"]
+
+
 def test_infer_link_contents_rejects_sentence_length_paragraph_overlap():
     pdf = pikepdf.new()
     annotation = pdf.make_indirect(pikepdf.Dictionary({

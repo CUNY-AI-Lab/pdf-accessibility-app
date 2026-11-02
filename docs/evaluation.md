@@ -283,6 +283,24 @@ We found three new causes among the five documents the pipeline held:
 - Two are LaTeX lecture notes. Their Computer Modern math fonts have no ToUnicode map, and their glyph names, such as `negationslash` and `summationdisplay`, are not in Adobe's glyph list (7.21.7-1).
 - One is a slide deck with a table the model classified, at low confidence, as a form layout. The pipeline left it as a table without headers, and the `table_headers` check failed.
 
+We then fixed the three causes and the unnamed field. Set 4 informed these fixes, so we no longer count it as held out. The fixes:
+- the pipeline gives a font that shows only invisible text, and draws .notdef, an empty glyph for every code, following Tesseract's glyphless font;
+- the pipeline maps TeX glyph names and Type 1 built-in encodings to Unicode;
+- the pipeline names radio groups and their unnamed options;
+- the tagger joins a table continued on the next page to the table before it, so the first page's headers apply to its rows.
+
+We re-ran every set with these fixes, and sets 1 and 2 also on the released code. Of 7,834 model calls, 606 went to the model and the rest replayed from the cassette; the runs used $1.56 of the Gateway quota.
+
+| Set | Documents | Complete before | Complete after |
+|---|---:|---:|---:|
+| 47 documents above | 47 | 44 | 44 |
+| 1 | 39 | 32 | 35 |
+| 2 | 40 | 37 | 38 |
+| 3 | 33 | 31 | 31 |
+| 4 | 37 | 32 | 37 |
+
+"Before" is the released `c867c05` for sets 1, 2 and 4, and the #64 branch for the 47 documents and set 3. Every document that completed before still completes. Extracted text is unchanged in every document except six LaTeX documents. In those, the pipeline now maps the math symbols (∑, ≠, ⟨⟩, ↦), and in two of them a screen reader no longer hears some formulas twice.
+
 ### Untagged CUNY documents
 
 | Document | Kind | Pages | Classified | Status | Held by | veraPDF | Figures with alt text | Seconds | Cost (USD) |

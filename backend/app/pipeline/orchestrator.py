@@ -655,6 +655,7 @@ def _build_validation_payload(
             "reading_order_diagnostics": getattr(tagging_result, "reading_order_diagnostics", []),
             "table_decisions": getattr(tagging_result, "table_intelligence_audit", []),
             "table_readability": getattr(tagging_result, "table_readability", []),
+            "tables_joined": getattr(tagging_result, "tables_joined", []),
             "lang_set": tagging_result.lang_set,
         },
         "semantic_coverage": _semantic_coverage_summary(

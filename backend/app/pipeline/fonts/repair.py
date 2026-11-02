@@ -145,6 +145,7 @@ def _repair_pdf_font_dicts_sync(
         "truetype_widths_aligned": 0,
         "truetype_width_conflicts": 0,
         "notdef_mappings_repaired": 0,
+        "invisible_fonts_replaced": 0,
     }
     seen_fonts: set[tuple[int, int]] = set()
 
@@ -239,8 +240,12 @@ def _repair_pdf_font_dicts_sync(
             for font_dict in _iter_pdf_fonts(pdf):
                 _process_font(font_dict)
 
+            from app.pipeline.fonts.invisible import repair_invisible_fonts
             from app.pipeline.fonts.notdef_content import repair_notdef_content
 
+            invisible_stats = repair_invisible_fonts(pdf)
+            stats.update(invisible_stats)
+            stats["fonts_touched"] += invisible_stats["invisible_fonts_replaced"]
             content_stats = repair_notdef_content(pdf)
             stats.update(content_stats)
             if stats["fonts_touched"] <= 0 and not any(content_stats.values()):
@@ -254,7 +259,8 @@ def _repair_pdf_font_dicts_sync(
                 f"(fonts={stats['fonts_touched']}, "
                 f"CIDToGIDMap added={stats['cidtogid_added']}, "
                 f"CIDSet removed={stats['cidset_removed']}, "
-                f"TrueType advances aligned={stats['truetype_widths_aligned']})"
+                f"TrueType advances aligned={stats['truetype_widths_aligned']}, "
+                f"invisible fonts replaced={stats['invisible_fonts_replaced']})"
             ),
             stats,
         )

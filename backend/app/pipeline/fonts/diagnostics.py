@@ -169,7 +169,10 @@ def _unicode_repair_gate_from_diagnostics(
             int(item.get("invalid_tounicode_entries", 0) or 0) > 0
             or int(item.get("repairable_missing_used_codes", 0) or 0) > 0
         )
-        if policy in {"explicit", "standard14", "embedded_cff", "symbol"} and repair_evidence:
+        if (
+            policy in {"explicit", "standard14", "embedded_cff", "embedded_type1", "symbol"}
+            and repair_evidence
+        ):
             profile["safe_simple_candidates"] = int(profile["safe_simple_candidates"]) + 1
             continue
 

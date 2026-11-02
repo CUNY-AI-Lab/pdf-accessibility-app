@@ -42,6 +42,12 @@ def _model_table_layout(table: dict) -> dict | None:
 def _apply_model_table_headers(builder, pages: dict[int, list[dict]]) -> list[dict]:
     audit = []
     applied_layouts = set()
+    # The parts of a table on later pages, joined to it (_finish_table_structure).
+    parts = defaultdict(list)
+    for elems in pages.values():
+        for table in elems:
+            if table.get("_joined_table"):
+                parts[id(table["_continues_table"])].append(table)
     for elems in pages.values():
         for table in elems:
             if table.get("type") != "table":
@@ -51,7 +57,10 @@ def _apply_model_table_headers(builder, pages: dict[int, list[dict]]) -> list[di
             for item in table.get("table_llm_decisions", []):
                 action, kind = table_action(item), item.get("resolved_kind")
                 status = "unsupported_decision"
-                if table.get("_table_readability"):
+                if table.get("_joined_table"):
+                    # Its rows are the table's it continues, whose decision covers them.
+                    status = "joined_previous_table"
+                elif table.get("_table_readability"):
                     status = "blocked_unreadable_table"
                 elif layout:
                     status = "superseded_by_layout"
@@ -85,6 +94,22 @@ def _apply_model_table_headers(builder, pages: dict[int, list[dict]]) -> list[di
                                 cell.ID = pikepdf.String(
                                     f"t{node.objgen[0]}-model-r{c.get('row', 0)}-c{c.get('col', 0)}"
                                 )
+                            # Its row headers label the rows it continues onto too.
+                            columns = set(item.get("row_header_columns") or [])
+                            for part in parts.get(id(table), []):
+                                offset = part["_joined_row_offset"]
+                                part_cells = builder._fragmented_table_cache.get(id(part), {})
+                                for (row, col), cell in part_cells.items():
+                                    if col in columns and cell.S == "/TD":
+                                        cell.S = pikepdf.Name.TH
+                                        attrs = cell.get("/A") or pikepdf.Dictionary(
+                                            O=pikepdf.Name.Table
+                                        )
+                                        attrs.Scope = pikepdf.Name.Row
+                                        cell.A = attrs
+                                        cell.ID = pikepdf.String(
+                                            f"t{node.objgen[0]}-model-r{offset + row}-c{col}"
+                                        )
                             _associate_columns(node)
                             for row in node.K:
                                 row_ids = [
@@ -95,8 +120,9 @@ def _apply_model_table_headers(builder, pages: dict[int, list[dict]]) -> list[di
                                         attrs = cell.get("/A") or pikepdf.Dictionary(
                                             O=pikepdf.Name.Table
                                         )
+                                        existing = list(attrs.get("/Headers") or [])
                                         attrs.Headers = pikepdf.Array(
-                                            [*(attrs.get("/Headers") or []), *row_ids]
+                                            existing + [i for i in row_ids if i not in existing]
                                         )
                                         cell.A = attrs
                             status = "applied_headers"

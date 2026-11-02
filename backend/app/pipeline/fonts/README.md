@@ -68,6 +68,58 @@ Unicode Standard, and to make copies of this file in any form for
 internal or external distribution as long as this notice remains
 attached.
 
+### TeX glyph names
+
+`tex_glyph_names.json` maps glyph names from the Computer Modern and AMS fonts
+that are not in the Adobe Glyph List (for example `negationslash`,
+`summationdisplay`, `parenleftbig`) to Unicode. `_glyph_name_to_unicode`
+consults it after the AGL, with and without a `.suffix`. It was generated once
+(2026-11-01) from three sources, which share no names:
+
+- 282 names from hayro's `hayro-font/src/generated/tex_glyph_names.rs`
+  ([LaurenzV/hayro](https://github.com/LaurenzV/hayro) commit `ba9d3fe`, added
+  in PR #1515). hayro built the table from the glyph names in the AMS font
+  metrics and mapped them with the Unicode Character Database.
+- 116 names from the "TeX-specific glyph names" block of pdf.js's
+  `src/core/glyphlist.js` ([mozilla/pdf.js](https://github.com/mozilla/pdf.js)
+  commit `6669a99`): the CMEX sized delimiters and operators.
+- Four names neither covers, mapped from Unicode Character Database character
+  names: `epsilon1` -> U+03F5 GREEK LUNATE EPSILON SYMBOL (in the AMS CMMI
+  metrics, code 15, TeX's lunate `\epsilon`, is `epsilon1`; code 34,
+  `\varepsilon`, is `epsilon`, which the AGL maps to U+03B5);
+  `angbracketleft` -> U+27E8 MATHEMATICAL LEFT ANGLE BRACKET;
+  `angbracketright` -> U+27E9 MATHEMATICAL RIGHT ANGLE BRACKET; `mapsto` ->
+  U+21A6 RIGHTWARDS ARROW FROM BAR.
+
+Nine pdf.js values are corrected locally against the Unicode Character
+Database:
+
+- `intercal` -> U+22BA INTERCALATE. pdf.js has U+1D40 MODIFIER LETTER CAPITAL
+  T.
+- The sized angle brackets `angbracketleftbig`, `angbracketleftBig`,
+  `angbracketleftbigg` and `angbracketleftBigg` -> U+27E8, and the four
+  `angbracketright` sizes -> U+27E9, the same characters as the unsized
+  names. pdf.js has U+2329 and U+232A. Unicode marks those two Deprecated
+  (UCD 18.0.0 `PropList.txt`), and Unicode Technical Report #25, revision 15,
+  section 2.10 ("Deprecated Delimiters") says they "are now deprecated for use
+  with mathematics because their canonical equivalence to CJK angle brackets
+  is likely to result in unintended wide spacing problems when used in
+  mathematical formulae", and that U+27E8 and U+27E9 should be used instead.
+  Under NFC they become the CJK brackets U+3008 and U+3009.
+
+Some TeX glyphs are parts of a symbol. `negationslash` (U+0338) is set before
+the symbol it negates, and CMSY's zero-width `mapsto` bar is set before an
+arrow, so extracted text has U+0338 before `=` for `\neq`, and U+21A6 followed
+by U+2192 for `\mapsto`.
+
+hayro: Copyright (c) The Hayro Authors, licensed under the Apache License,
+Version 2.0 or the MIT license; used here under the Apache License, Version
+2.0. pdf.js: Copyright 2012 Mozilla Foundation, licensed under the Apache
+License, Version 2.0. The license text is at
+http://www.apache.org/licenses/LICENSE-2.0. Both tables were converted to JSON.
+hayro's pairs are unchanged; pdf.js's are unchanged except for the corrections
+above.
+
 ### Program width repair
 
 For simple TrueType fonts, rule 7.21.5 is handled in the dictionary-repair
@@ -78,3 +130,30 @@ content operators remain unchanged. Conflicting aliases (one glyph assigned
 two PDF widths) are counted and left unresolved. A shared descriptor/program
 is copied for the font use being repaired. Local TrueType embedding performs
 the same alignment before installing the program.
+
+### Invisible OCR fonts
+
+`invisible.repair_invisible_fonts()` runs in the dictionary-repair lane before
+`repair_notdef_content`. It handles a Type0 font with `/Identity-H` that shows
+text only in rendering mode 3, such as Acrobat's `HiddenHorzOCR`, when a used
+code selects .notdef in its embedded program. Rule 7.21.8 applies in every
+rendering mode. The descendant becomes a CIDFontType2 with a TrueType built at
+runtime (glyph 0 .notdef, glyph 1 empty) and a `/CIDToGIDMap` that sends CIDs 1
+through the highest used code to glyph 1, the structure of Tesseract's
+`GlyphLessFont`. CID 0 stays .notdef. The Type0 dictionary, ToUnicode, `/W` and
+`/DW` stay, and the content is unchanged. veraPDF's 7.21.5 width check exempts
+rendering mode 3, so one advance (`/DW`) serves every width. Pages, nested
+Forms, appearances, tiling patterns, Type 3 glyphs and soft masks are walked
+with `Tr` tracked through q/Q; a font painted in any of them, or listed in the
+AcroForm `/DR`, is left alone. `repair_notdef_content` never removes codes
+shown in rendering mode 3: they are the document's recognized text.
+
+### Writing ToUnicode CMaps
+
+`encoding._render_tounicode_cmap()` writes runs of consecutive codes whose
+destinations are consecutive single BMP code points as `bfrange` entries, and
+everything else as `bfchar`, at most 100 entries per block. A range stays
+within one 256-code block on both sides: only the last source byte may vary
+(Adobe Technical Note #5014), and the last destination byte must not pass 255
+(ISO 32000-1, 9.10.3). `_parse_tounicode_map_details` reads the result back
+exactly.

@@ -278,8 +278,11 @@ from app.pipeline.tagger_structure import _source_key as _source_key
 from app.pipeline.tagger_table_intelligence import _apply_model_table_headers, _model_table_layout
 from app.pipeline.tagger_table_readability import _mark_unreadable_tables
 from app.pipeline.tagger_table_structure import (
+    _continued_table,
     _finish_table_structure,
+    _mark_table_continuation,
     _plan_external_table_headers,
+    _table_review_id,
 )
 from app.pipeline.tagger_tables import _clean_table_summary_text as _clean_table_summary_text
 from app.pipeline.tagger_tables import _complete_table_grid_cells as _complete_table_grid_cells
@@ -317,6 +320,8 @@ class TaggingResult:
     unowned_words_by_page: list[dict[str, int]] = field(default_factory=list)
     table_intelligence_audit: list[dict[str, Any]] = field(default_factory=list)
     table_readability: list[dict[str, Any]] = field(default_factory=list)
+    # Tables tagged as rows of the table they continue on the page before.
+    tables_joined: list[dict[str, Any]] = field(default_factory=list)
     author_structure_audit: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -555,13 +560,25 @@ async def tag_pdf(
                     eligible_ops.extend(ops)
                 glyphs = [g for op in eligible_ops for g in op.glyphs]
                 table_readability.extend(_mark_unreadable_tables(page_elems, glyphs))
+                continued = (
+                    _continued_table(
+                        pages_elements.get(page_index - 1, []),
+                        page_elems,
+                        (frames[page_index - 1], frames[page_index]),
+                    )
+                    if page_index
+                    else None
+                )
                 for elem in page_elems:
                     if elem.get("type") == "table":
+                        # The model reviewed this page's part of a continued
+                        # table alone; the table it continues decides.
+                        own_review = not (continued and elem is continued[1])
                         elem["_layout_table"] = (
                             None
                             if elem.get("_table_readability")
                             else (
-                                _model_table_layout(elem)
+                                (_model_table_layout(elem) if own_review else None)
                                 or _layout_table_plan(
                                     elem,
                                     page_elems,
@@ -583,6 +600,8 @@ async def tag_pdf(
                     [g for op in eligible_ops for g in op.glyphs],
                     page,
                 )
+                if continued:
+                    _mark_table_continuation(*continued, page_elems)
                 diagnostic = {"page": page_index, "before": 0, "after": 0}
                 owners = _word_owners(
                     dict(enumerate(eligible_ops)),
@@ -809,6 +828,16 @@ async def tag_pdf(
                 for e in elements
             )
             table_intelligence_audit = _apply_model_table_headers(builder, pages_elements)
+            tables_joined = [
+                {
+                    "page": elem["page"] + 1,
+                    "table_review_id": _table_review_id(elem),
+                    "continues_page": elem["_continues_table"]["page"] + 1,
+                    "continues_table_review_id": _table_review_id(elem["_continues_table"]),
+                }
+                for elem in elements
+                if elem.get("_joined_table")
+            ]
             builder.finalize()
 
             # 6. Add bookmarks from headings
@@ -884,6 +913,7 @@ async def tag_pdf(
             unowned_words_by_page=unowned_words_by_page,
             table_intelligence_audit=table_intelligence_audit,
             table_readability=table_readability,
+            tables_joined=tables_joined,
             author_structure_audit=author_structure_audit,
         )
 

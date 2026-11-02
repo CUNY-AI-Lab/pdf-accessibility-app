@@ -1,4 +1,23 @@
-"""Recover table structure after tagging, without changing content ownership."""
+"""Recover table structure after tagging, without changing content ownership.
+
+A table that continues on the next page is one Table (ISO 32000-1, Table
+337: its header rows "may be redrawn at the top of each table fragment",
+and there is still one THead). Its rows on the next page are tagged under
+the Table of the page before, so that page's column headers apply to them,
+and a header row the next page repeats is an Artifact, as the PDF
+Association's Tagged PDF Best Practice Guide (4.2.6) asks.
+
+A table continues when it is the last body block on its page (headers,
+footers and other artifacts aside) and the next page's first body block is
+a table, near the bottom and top edges, with the same number of columns,
+column starts and sides, no caption of its own (or one saying it
+continues), and no header row except a repeat of the first table's. The
+first table must get a header row: from its extractor, the tagger's
+inference, the headings above it, or the model decision that sets its
+headers. This follows Docling's open proposal (docling#2976) and MinerU's
+and Azure Document Intelligence's merges: the last and first body blocks,
+column count, aligned left edges, repeated header rows stripped.
+"""
 
 import re
 from statistics import median
@@ -6,21 +25,32 @@ from typing import TYPE_CHECKING
 
 import pikepdf
 
-from app.pipeline.page_glyphs import MeasuredGlyph
+from app.pipeline.page_frame import PageFrame
+from app.pipeline.page_glyphs import MeasuredGlyph, union_bbox
 from app.pipeline.tagger_ownership import _content_targets, _owner_of
+from app.services.table_decisions import header_selection, table_action
 
 if TYPE_CHECKING:
     from app.pipeline.tagger_structure import StructTreeBuilder
 
 
 HEADER_FLAGS = ("is_header", "column_header", "row_header")
+# Docling's frame, in points: the bottom and top bands a continued table
+# ends and starts in, and how far its column starts and sides may move.
+CONTINUATION_EDGE = 108.0
+CONTINUATION_COLUMN_SLACK = 12.0
+CONTINUATION_SIDE_SLACK = 8.0
+CONTINUED_CAPTION = re.compile(r"\bcont(?:inued|['’]d|\.)|续", re.IGNORECASE)
+NON_BODY_TYPES = {"artifact", "page_header", "page_footer"}
 
 
-def _column_starts(table: dict) -> list[float]:
+def _column_starts(table: dict, frame: PageFrame | None = None) -> list[float]:
+    """Each column's median text start, in user space or, given the page's
+    frame, in Docling's (the page as displayed)."""
     columns = []
     for col in range(table.get("num_cols", 0)):
         xs = [
-            c["bbox"]["l"]
+            (frame.to_docling(c["bbox"]) if frame else c["bbox"])["l"]
             for c in table.get("cells", [])
             if c.get("col", 0) == col
             and c.get("col_span", 1) == 1
@@ -31,6 +61,175 @@ def _column_starts(table: dict) -> list[float]:
             return []
         columns.append(median(xs))
     return columns
+
+
+def _text(value) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _table_review_id(table: dict) -> str:
+    """The id the table's review and fidelity give it: its own, or its index
+    among the structure's elements."""
+    return str(table.get("review_id") or f"review-{table.get('_docling_order')}")
+
+
+def _scope(cell: dict) -> str | None:
+    """The scope the tagger gives a header cell (see _ensure_fragmented_table)."""
+    if not any(cell.get(flag) for flag in HEADER_FLAGS):
+        return None
+    if cell.get("author_scope") in {"Row", "Column", "Both"}:
+        return cell["author_scope"]
+    if cell.get("row_header"):
+        return "Row"
+    if cell.get("column_header"):
+        return "Column"
+    return "Row" if cell.get("col", 0) == 0 else "Column"
+
+
+def _cells(table: dict) -> list[dict]:
+    return [c for c in table.get("cells", []) if isinstance(c, dict)]
+
+
+def _row(cells: list[dict], row: int) -> list[tuple[int, int, str]]:
+    return sorted(
+        (c.get("col", 0), c.get("col_span", 1), _text(c.get("text")))
+        for c in cells
+        if c.get("row", 0) == row
+    )
+
+
+def _column_header_rows(table: dict) -> list[int]:
+    return sorted({c.get("row", 0) for c in _cells(table) if _scope(c) in {"Column", "Both"}})
+
+
+def _header_rows(table: dict) -> list[list[tuple[int, int, str]]] | None:
+    """The header rows the tagger will give a table, each as its cells'
+    (column, span, text): the rows its extractor or inference marked, the
+    headings recovered above it, or the rows of the first model decision
+    that will set its headers (see _apply_model_table_headers). None when
+    it gets no header row."""
+    if table.get("_layout_table") or table.get("_table_readability"):
+        return None
+    cells = _cells(table)
+    if any(c.get(flag) for c in cells for flag in HEADER_FLAGS):
+        rows = _column_header_rows(table)
+    elif headings := table.get("_external_table_headers"):
+        return [[(col, 1, _text(h.get("text"))) for col, h in enumerate(headings)]]
+    else:
+        rows = next(
+            (
+                sorted(set(item.get("header_rows") or []))
+                for item in table.get("table_llm_decisions", [])
+                if table_action(item) == "set_table_headers" and header_selection(table, item)
+            ),
+            [],
+        )
+    header = [_row(cells, row) for row in rows]
+    return header if any(text for row in header for _, _, text in row) else None
+
+
+def _repeated_rows(header: list[list[tuple[int, int, str]]], table: dict) -> int:
+    """How many leading rows of ``table`` repeat ``header`` exactly."""
+    cells = _cells(table)
+    if all(_row(cells, row) == cells_of for row, cells_of in enumerate(header)):
+        return len(header)
+    return 0
+
+
+def _body_blocks(elements: list[dict]) -> list[dict]:
+    return [
+        e
+        for e in elements
+        if isinstance(e.get("bbox"), dict) and e.get("type") not in NON_BODY_TYPES
+    ]
+
+
+def _page_height(frame: PageFrame) -> float:
+    if frame.rotation in (90, 270):
+        return frame.right - frame.left
+    return frame.top - frame.bottom
+
+
+def _continued_table(
+    previous: list[dict], current: list[dict], frames: tuple[PageFrame, PageFrame]
+) -> tuple[dict, dict] | None:
+    """The table the first body block of this page continues, and that
+    block, judged before its own headers are inferred: the first table of
+    the run (it carries the header rows), and this page's part."""
+    before, after = _body_blocks(previous), _body_blocks(current)
+    if not before or not after:
+        return None
+    previous_frame, frame = frames
+    last = min(before, key=lambda e: previous_frame.to_docling(e["bbox"])["b"])
+    first = max(after, key=lambda e: frame.to_docling(e["bbox"])["t"])
+    if last.get("type") != "table" or first.get("type") != "table":
+        return None
+    root = last.get("_continues_table") or last
+    header = _header_rows(root)
+    if (
+        header is None
+        or first.get("_table_readability")
+        or not 2 <= first.get("num_cols", 0) == last.get("num_cols", 0) == root.get("num_cols", 0)
+        or (
+            _text(first.get("caption"))
+            and not CONTINUED_CAPTION.search(_text(first.get("caption")))
+        )
+        or not set(_column_header_rows(first)) <= set(range(_repeated_rows(header, first)))
+    ):
+        return None
+    a, b = previous_frame.to_docling(last["bbox"]), frame.to_docling(first["bbox"])
+    if a["b"] > CONTINUATION_EDGE or _page_height(frame) - b["t"] > CONTINUATION_EDGE:
+        return None
+    if any(abs(a[side] - b[side]) > CONTINUATION_SIDE_SLACK for side in ("l", "r")):
+        return None
+    xs, ys = _column_starts(last, previous_frame), _column_starts(first, frame)
+    if (
+        len(xs) < 2
+        or len(xs) != len(ys)
+        or any(abs(x - y) > CONTINUATION_COLUMN_SLACK for x, y in zip(xs, ys, strict=True))
+    ):
+        return None
+    return root, first
+
+
+def _mark_table_continuation(root: dict, table: dict, elements: list[dict]) -> bool:
+    """Once this page's headers are inferred, mark ``table`` as rows of
+    ``root`` (_finish_table_structure joins them), unless it now has a
+    header row of its own. A header row repeating the root's becomes an
+    Artifact element over its cells, and the rows after it are renumbered."""
+    if table.get("_layout_table") or table.get("_external_table_headers"):
+        return False
+    header = _header_rows(root)
+    if header is None:
+        return False
+    repeated = _repeated_rows(header, table)
+    if not set(_column_header_rows(table)) <= set(range(repeated)):
+        return False
+    cells = _cells(table)
+    if repeated:
+        repeat = [c for c in cells if c.get("row", 0) < repeated]
+        kept = [c for c in cells if c.get("row", 0) >= repeated]
+        if (
+            not kept
+            or not all(isinstance(c.get("bbox"), dict) for c in cells)
+            or any(c.get("row", 0) + c.get("row_span", 1) > repeated for c in repeat)
+        ):
+            return False
+        table["cells"] = [{**c, "row": c.get("row", 0) - repeated} for c in kept]
+        table["num_rows"] = table.get("num_rows", 0) - repeated
+        elements.append(
+            {
+                "type": "artifact",
+                "artifact_type": "pagination",
+                "text": " ".join(_text(c.get("text")) for c in repeat),
+                "page": table.get("page"),
+                "bbox": union_bbox(c["bbox"] for c in repeat),
+                "reading_order": table.get("reading_order"),
+                "_docling_order": table.get("_docling_order"),
+            }
+        )
+    table["_continues_table"] = root
+    return True
 
 
 def _plan_external_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph]) -> None:
@@ -179,41 +378,27 @@ def _finish_table_structure(builder: "StructTreeBuilder", pages: dict[int, list[
                 )
             ]
             _associate_columns(node)
+    # The rows of a continued table (see _continued_table) join the Table it
+    # continues, before model decisions set that Table's headers.
     merged = 0
     for page_index in sorted(pages):
-
-        def semantic(e):
-            return e.get("bbox") and e.get("type") not in {"artifact", "page_header", "page_footer"}
-
-        current = [e for e in pages[page_index] if semantic(e)]
-        previous = [e for e in pages.get(page_index - 1, []) if semantic(e)]
-        if not current or not previous:
-            continue
-        first = max(current, key=lambda e: e["bbox"]["t"])
-        last = min(previous, key=lambda e: e["bbox"]["b"])
-        a, b = nodes.get(id(last)), nodes.get(id(first))
-        if a is None or b is None or a == b or not _table_has_headers(a) or _table_has_headers(b):
-            continue
-        height = float(builder.pdf.pages[page_index].MediaBox[3])
-        if last["bbox"]["b"] > 108 or height - first["bbox"]["t"] > 108:
-            continue
-        xs, ys = _column_starts(last), _column_starts(first)
-        if (
-            len(xs) < 2
-            or len(xs) != len(ys)
-            or any(abs(x - y) > 12 for x, y in zip(xs, ys, strict=True))
-            or any(abs(last["bbox"][s] - first["bbox"][s]) > 8 for s in ("l", "r"))
-        ):
-            continue
-        for row in b.K:
-            row.P = a
-            a.K.append(row)
-        b.K = pikepdf.Array([])
-        builder.doc_elem.K = pikepdf.Array([k for k in builder.doc_elem.K if k != b])
-        nodes[id(first)] = a
-        changed[a.objgen] = a
-        merged += 1
-        _associate_columns(a)
+        for table in pages[page_index]:
+            if (root := table.get("_continues_table")) is None:
+                continue
+            a, b = nodes.get(id(root)), nodes.get(id(table))
+            if a is None or b is None or a == b:
+                continue
+            table["_joined_row_offset"] = len(a.K)
+            for row in b.K:
+                row.P = a
+                a.K.append(row)
+            b.K = pikepdf.Array([])
+            builder.doc_elem.K = pikepdf.Array([k for k in builder.doc_elem.K if k != b])
+            nodes[id(table)] = a
+            changed[a.objgen] = a
+            table["_joined_table"] = True
+            merged += 1
+            _associate_columns(a)
     for node in changed.values():
         attrs = node.get("/A", {})
         if attrs.get("/Summary"):
