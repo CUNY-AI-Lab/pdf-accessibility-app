@@ -9,6 +9,7 @@ import pytest
 from app.pipeline import tagger
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.page_glyphs import PdfGlyphReader, union_bbox
+from app.pipeline.tagger_table_intelligence import _model_table_layout
 from app.pipeline.tagger_table_structure import _continued_table, _mark_table_continuation
 from app.services.structure_text import screen_reader_text
 from app.services.table_decisions import queue_table_decisions
@@ -198,10 +199,20 @@ async def test_bold_headings_outside_grid_become_column_headers(
         assert heard.count("Learning outcomes") == 1
 
 
-@pytest.mark.parametrize("kind", ["points", "percent", "definition", "bold", "sections"])
+SOURCE_CARD = [
+    ["Source:", "Morris, W. (1977). Word origins."],
+    ["Page:", "p. 70"],
+    ["Quote:", "Blue-chip stock comes from poker chips."],
+]
+
+
+@pytest.mark.parametrize("kind", ["points", "percent", "definition", "bold", "sections", "colons"])
 async def test_two_column_labels_are_row_headers(tmp_path, kind):
     kwargs = {}
-    if kind == "points":
+    if kind == "colons":
+        # Labels ending in a colon, one as long as its value.
+        rows = SOURCE_CARD
+    elif kind == "points":
         rows = [
             ["Understanding and knowledge of the subject", "15 points"],
             ["Quality of selected visual aids", "10 points"],
@@ -239,10 +250,52 @@ async def test_two_column_labels_are_row_headers(tmp_path, kind):
     )
 
 
-@pytest.mark.parametrize("kind", ["three", "records", "blank", "contents", "extractor"])
+@pytest.mark.parametrize("confidence,keys", [("low", 3), ("medium", 3), ("low", 2)])
+async def test_key_value_table_stays_a_table_against_a_low_confidence_layout(
+    tmp_path, confidence, keys
+):
+    """The model calls a key-value table a layout grid. At low confidence a
+    table whose labels nearly all end in a colon keeps them as row headers;
+    otherwise the layout applies."""
+    card = [
+        [label if r < keys else label.rstrip(":"), value]
+        for r, (label, value) in enumerate(SOURCE_CARD)
+    ]
+    rows = [[textwrap.fill(t, 27) for t in r] for r in card]
+    source, output = tmp_path / "input.pdf", tmp_path / "output.pdf"
+    structure = _fixture(source, rows, row_height=90)
+    structure["elements"][0]["review_id"] = "review-0"
+    decision = dict(
+        table_review_id="review-0",
+        suggested_action="reclassify_region",
+        resolved_kind="layout_grid",
+        confidence=confidence,
+    )
+    structure, _ = queue_table_decisions(structure, [decision])
+    result = await tagger.tag_pdf(source, output, structure, [], language="en")
+    statuses = [d["status"] for d in result.table_intelligence_audit]
+    if confidence == "low" and keys == 3:
+        _assert_table(output, rows, {(r, 0): "Row" for r in range(len(rows))})
+        assert statuses == ["kept_table"]
+    else:
+        with pikepdf.open(output) as pdf:
+            assert not list(_tables(pdf.Root.StructTreeRoot))
+        assert statuses == ["applied_layout"]
+
+
+@pytest.mark.parametrize(
+    "kind", ["three", "records", "blank", "contents", "extractor", "no_colons", "colon_sentences"]
+)
 async def test_row_headers_leave_ambiguous_tables_unchanged(tmp_path, kind):
     rows, kwargs, expected = [["Apple", "red"], ["Pear", "green"]], {}, {}
-    if kind == "three":
+    if kind == "no_colons":
+        rows = [[label.rstrip(":"), value] for label, value in SOURCE_CARD]
+    elif kind == "colon_sentences":
+        rows = [
+            ["Bring these items to the first class meeting:", "Pens and paper"],
+            ["Return these two forms to the department office:", "Both forms"],
+        ]
+    elif kind == "three":
         rows = [
             ["Term", "A detailed explanation of this term", "extra"],
             ["Other", "A detailed explanation of another term", "extra"],
@@ -570,3 +623,68 @@ async def test_continued_rows_join_the_table_and_take_its_model_headers(tmp_path
             tag, properties = shown[text]
             assert tag == "/Artifact" and properties.Type == "/Pagination"
         assert "/MCID" in shown["3"][1]
+
+
+LAYOUT = dict(suggested_action="reclassify_region", resolved_kind="text_block", confidence="low")
+
+
+@pytest.mark.parametrize("change", ["layout", "headers", "lower", "shift", "own_layout"])
+def test_continuation_follows_the_layout_the_model_made_of_the_table(change):
+    """The model made the table on page one a text block. The table that
+    starts the next page with the same columns is the same text block,
+    unless it has header cells of its own or does not line up."""
+    first = part(STEPS, page=0, top=100, table_llm_decisions=[LAYOUT])
+    first["_layout_table"] = (
+        {"reason": "bullet label column", "order": "row", "blocks": []}
+        if change == "own_layout"
+        else _model_table_layout(first)
+    )
+    second = part(
+        MORE,
+        page=1,
+        top=650 if change == "lower" else 720,
+        flagged=(0,) if change == "headers" else (),
+        shift=20 if change == "shift" else 0.0,
+    )
+    found = _continued_table([first], [second], (LETTER, LETTER))
+    if change != "layout":
+        assert found is None
+        return
+    assert found == (first, second)
+    layout = _model_table_layout(second, first)
+    assert layout["model_kind"] == "text_block" and layout["continues_page"] == 1
+    assert layout["blocks"] == [{"role": "P", "groups": [[(0, 0), (0, 1)], [(1, 0), (1, 1)]]}]
+    # Its rows are not joined to the first table's: neither is a Table.
+    assert not _mark_table_continuation(*found, [dict(second, _layout_table=layout)])
+
+
+@pytest.mark.parametrize("own", ["none", "headers"])
+async def test_continued_part_takes_the_layout_the_model_made_of_the_table(tmp_path, own):
+    """A table at the foot of page one that the model made a text block
+    continues at the head of page two; page two's part is read as the same
+    text block, whatever the model said of it alone."""
+    decisions = [dict(LAYOUT, table_review_id="review-0", page=1)]
+    if own == "headers":
+        decisions.append(
+            dict(
+                table_review_id="review-1",
+                page=2,
+                suggested_action="set_table_headers",
+                header_rows=[0],
+            )
+        )
+    source, structure = await two_pages(tmp_path, STEPS, MORE, decisions)
+    output = tmp_path / "output.pdf"
+    result = await tagger.tag_pdf(source, output, structure, [], language="en")
+    assert rendered(source) == rendered(output)
+    with pikepdf.open(output) as pdf:
+        assert not list(_tables(pdf.Root.StructTreeRoot))
+    heard = screen_reader_text(output, markdown=True)
+    assert "<table>" not in heard
+    for number, step in [*STEPS[1:], *MORE]:
+        assert f"{number} {step}" in heard
+    assert [(d["table_review_id"], d["status"]) for d in result.table_intelligence_audit] == [
+        ("review-0", "applied_layout"),
+        *([("review-1", "follows_previous_table")] if own == "headers" else []),
+    ]
+    assert result.tables_joined == []

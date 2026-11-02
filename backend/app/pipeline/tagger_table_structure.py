@@ -14,9 +14,12 @@ column starts and sides, no caption of its own (or one saying it
 continues), and no header row except a repeat of the first table's. The
 first table must get a header row: from its extractor, the tagger's
 inference, the headings above it, or the model decision that sets its
-headers. This follows Docling's open proposal (docling#2976) and MinerU's
-and Azure Document Intelligence's merges: the last and first body blocks,
-column count, aligned left edges, repeated header rows stripped.
+headers. Or the model made the first table a layout (a list or text
+block), and then the part on the next page, with no header cells of its
+own, is the same layout. This follows Docling's open proposal
+(docling#2976) and MinerU's and Azure Document Intelligence's merges: the
+last and first body blocks, column count, aligned left edges, repeated
+header rows stripped.
 """
 
 import re
@@ -28,7 +31,7 @@ import pikepdf
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.page_glyphs import MeasuredGlyph, union_bbox
 from app.pipeline.tagger_ownership import _content_targets, _owner_of
-from app.services.table_decisions import header_selection, table_action
+from app.services.table_decisions import has_headers, header_selection, table_action
 
 if TYPE_CHECKING:
     from app.pipeline.tagger_structure import StructTreeBuilder
@@ -155,7 +158,8 @@ def _continued_table(
 ) -> tuple[dict, dict] | None:
     """The table the first body block of this page continues, and that
     block, judged before its own headers are inferred: the first table of
-    the run (it carries the header rows), and this page's part."""
+    the run (it carries the header rows or the model's layout), and this
+    page's part."""
     before, after = _body_blocks(previous), _body_blocks(current)
     if not before or not after:
         return None
@@ -166,15 +170,21 @@ def _continued_table(
         return None
     root = last.get("_continues_table") or last
     header = _header_rows(root)
+    # A layout the model made of the table (_model_table_layout) has no header.
+    layout = (root.get("_layout_table") or {}).get("model_kind")
     if (
-        header is None
+        (header is None and layout is None)
         or first.get("_table_readability")
         or not 2 <= first.get("num_cols", 0) == last.get("num_cols", 0) == root.get("num_cols", 0)
         or (
             _text(first.get("caption"))
             and not CONTINUED_CAPTION.search(_text(first.get("caption")))
         )
-        or not set(_column_header_rows(first)) <= set(range(_repeated_rows(header, first)))
+        or (
+            has_headers(first)
+            if header is None
+            else not set(_column_header_rows(first)) <= set(range(_repeated_rows(header, first)))
+        )
     ):
         return None
     a, b = previous_frame.to_docling(last["bbox"]), frame.to_docling(first["bbox"])

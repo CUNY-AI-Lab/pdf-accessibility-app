@@ -1112,12 +1112,14 @@ async def _apply_pretag_table_intelligence(
         "page_batch_resolved_count": 0,
         "page_batch_failed_count": 0,
         "individual_fallback_count": 0,
+        "individual_fallback_failed_count": 0,
         "pages": [],
         "review_ids": [],
         "confirmed_count": 0,
         "set_headers_count": 0,
         "aggressive_retry_count": 0,
         "confirm_existing_retry_count": 0,
+        "retry_failed_count": 0,
         "llm_usage": _empty_llm_usage(),
     }
     if not settings.auto_apply_table_intelligence:
@@ -1239,18 +1241,26 @@ async def _apply_pretag_table_intelligence(
                 review_id = str(target.get("table_review_id") or "").strip()
                 page = target.get("page")
                 page_number = int(page) if isinstance(page, int) else None
-                intelligence = await _await_llm_operation(
-                    settings=settings,
-                    label=f"table_intelligence[{review_id or '?'}]",
-                    timeout_seconds=fallback_timeout,
-                    awaitable=generate_table_intelligence(
-                        job=job,
-                        target=target,
-                        page_structure_fragments=page_fragments_by_page.get(page_number or -1)
-                        or [],
-                        llm_client=llm_client,
-                    ),
-                )
+                try:
+                    intelligence = await _await_llm_operation(
+                        settings=settings,
+                        label=f"table_intelligence[{review_id or '?'}]",
+                        timeout_seconds=fallback_timeout,
+                        awaitable=generate_table_intelligence(
+                            job=job,
+                            target=target,
+                            page_structure_fragments=page_fragments_by_page.get(page_number or -1)
+                            or [],
+                            llm_client=llm_client,
+                        ),
+                    )
+                except Exception:
+                    # One table's failed call leaves the other tables' decisions
+                    # standing, as in the widget and form passes.
+                    audit["individual_fallback_failed_count"] = (
+                        int(audit.get("individual_fallback_failed_count", 0)) + 1
+                    )
+                    continue
                 page_items_by_id[review_id] = intelligence
 
             intelligence_items = list(page_items_by_id.values())
@@ -1269,19 +1279,24 @@ async def _apply_pretag_table_intelligence(
                 )
                 page = detailed_target.get("page")
                 page_number = int(page) if isinstance(page, int) else None
-                retried_item = await _await_llm_operation(
-                    settings=settings,
-                    label=f"table_intelligence[{review_id or '?'}].aggressive",
-                    timeout_seconds=fallback_timeout,
-                    awaitable=generate_table_intelligence(
-                        job=job,
-                        target=detailed_target,
-                        page_structure_fragments=page_fragments_by_page.get(page_number or -1)
-                        or [],
-                        llm_client=llm_client,
-                        aggressive=True,
-                    ),
-                )
+                try:
+                    retried_item = await _await_llm_operation(
+                        settings=settings,
+                        label=f"table_intelligence[{review_id or '?'}].aggressive",
+                        timeout_seconds=fallback_timeout,
+                        awaitable=generate_table_intelligence(
+                            job=job,
+                            target=detailed_target,
+                            page_structure_fragments=page_fragments_by_page.get(page_number or -1)
+                            or [],
+                            llm_client=llm_client,
+                            aggressive=True,
+                        ),
+                    )
+                except Exception:
+                    # The table keeps the decision it had.
+                    audit["retry_failed_count"] = int(audit.get("retry_failed_count", 0)) + 1
+                    continue
                 intelligence_items[idx] = retried_item
                 retried += 1
             audit["aggressive_retry_count"] = retried
@@ -1300,20 +1315,25 @@ async def _apply_pretag_table_intelligence(
                 )
                 page = detailed_target.get("page")
                 page_number = int(page) if isinstance(page, int) else None
-                retried_item = await _await_llm_operation(
-                    settings=settings,
-                    label=f"table_intelligence[{review_id or '?'}].confirm_existing",
-                    timeout_seconds=fallback_timeout,
-                    awaitable=generate_table_intelligence(
-                        job=job,
-                        target=detailed_target,
-                        page_structure_fragments=page_fragments_by_page.get(page_number or -1)
-                        or [],
-                        llm_client=llm_client,
-                        aggressive=True,
-                        confirm_existing=True,
-                    ),
-                )
+                try:
+                    retried_item = await _await_llm_operation(
+                        settings=settings,
+                        label=f"table_intelligence[{review_id or '?'}].confirm_existing",
+                        timeout_seconds=fallback_timeout,
+                        awaitable=generate_table_intelligence(
+                            job=job,
+                            target=detailed_target,
+                            page_structure_fragments=page_fragments_by_page.get(page_number or -1)
+                            or [],
+                            llm_client=llm_client,
+                            aggressive=True,
+                            confirm_existing=True,
+                        ),
+                    )
+                except Exception:
+                    # The table keeps the decision it had.
+                    audit["retry_failed_count"] = int(audit.get("retry_failed_count", 0)) + 1
+                    continue
                 intelligence_items[idx] = retried_item
                 confirm_existing_retried += 1
             audit["confirm_existing_retry_count"] = confirm_existing_retried
