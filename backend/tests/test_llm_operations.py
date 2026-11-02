@@ -44,6 +44,18 @@ def test_pretag_fallback_timeout_uses_shorter_single_attempt_bound():
     assert pretag_llm_fallback_operation_timeout_seconds(settings) == 10
 
 
+def test_default_fallback_bound_lets_the_longest_table_answer_finish():
+    """Through the Gateway a call takes about 1 s, plus 15 ms per output token
+    and 0.07 s per 1,000 prompt tokens, with 3 s to spare at the 99th
+    percentile. The longest table answer seen was 807 tokens, and prompts
+    reach 28,500 tokens. The per-table bound leaves that answer room and
+    still cuts a runaway answer before the page-batch bound would."""
+    settings = _settings()
+    longest_answer = 1.0 + 0.0153 * 807 + 0.073 * 28.5 + 3.0
+    fallback = pretag_llm_fallback_operation_timeout_seconds(settings)
+    assert 1.5 * longest_answer <= fallback < pretag_llm_operation_timeout_seconds(settings)
+
+
 def test_make_pretag_llm_client_applies_pretag_overrides():
     client = make_pretag_llm_client(
         _settings(
