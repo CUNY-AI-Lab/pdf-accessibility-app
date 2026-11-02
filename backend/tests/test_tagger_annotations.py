@@ -373,6 +373,36 @@ def test_tag_widget_annotations_uses_docling_widget_metadata_for_missing_tooltip
     assert str(annotation.get("/TU")) == "Last Name (Family Name)"
 
 
+def test_field_merged_with_its_widget_is_named_without_docling_metadata():
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(300, 300))
+    on = pdf.make_stream(b"")
+    radio = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Widget"),
+        "/T": pikepdf.String("Group29"),
+        "/FT": pikepdf.Name("/Btn"),
+        "/Ff": 49152,
+        "/Rect": pikepdf.Array([40, 40, 52, 52]),
+        "/AP": pikepdf.Dictionary({"/N": pikepdf.Dictionary({"/Choice2": on})}),
+    }))
+    named = pdf.make_indirect(pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/Annot"),
+        "/Subtype": pikepdf.Name("/Widget"),
+        "/T": pikepdf.String("Text1"),
+        "/TU": pikepdf.String("Date of birth"),
+        "/FT": pikepdf.Name("/Tx"),
+        "/Rect": pikepdf.Array([40, 80, 180, 98]),
+    }))
+    page["/Annots"] = pikepdf.Array([radio, named])
+
+    tagged = _tag_page_widgets(pdf)
+
+    assert tagged == 2
+    assert str(radio["/TU"]) == "Group29"
+    assert str(named["/TU"]) == "Date of birth"
+
+
 
 def _button_group(pdf, page, *, name, flags, options, field_name=None):
     """A button field with one kid widget per (on-state, widget /TU) option."""
