@@ -11,6 +11,7 @@ from app.pipeline.page_frame import PageFrame
 from app.pipeline.page_glyphs import PdfGlyphReader, union_bbox
 from app.pipeline.tagger_table_intelligence import _model_table_layout
 from app.pipeline.tagger_table_structure import _continued_table, _mark_table_continuation
+from app.pipeline.tagger_tables import _infer_table_headers
 from app.services.structure_text import screen_reader_text
 from app.services.table_decisions import queue_table_decisions
 from tests.pdf_fixtures import rendered
@@ -688,3 +689,120 @@ async def test_continued_part_takes_the_layout_the_model_made_of_the_table(tmp_p
         *([("review-1", "follows_previous_table")] if own == "headers" else []),
     ]
     assert result.tables_joined == []
+
+
+LEGEND = [
+    ["Alumni Hall", "AE", "Delany Hall", "DY", "Student Union", "SU"],
+    ["Campbell Dome", "DM", "Dining Hall", "DH", "Summit Apartments", "SA"],
+    ["Colden Auditorium", "CA", "FitzGerald Gym", "FG", "Parking Lots", None],
+    ["Colwin Hall", "CH", "Frese Hall", "==MU", "Shuttle Bus Stop", None],
+    ["Continuing Ed 2", "C2", "Gertz Center", "GC", None, None],
+]
+
+
+def legend(rows):
+    cells = [
+        dict(row=r, col=c, text=text, row_span=1, col_span=1)
+        for r, texts in enumerate(rows)
+        for c, text in enumerate(texts)
+        if text is not None
+    ]
+    return dict(type="table", cells=cells, num_rows=len(rows), num_cols=len(rows[0]))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "legend",
+        "wrapped",
+        "orphan_code",
+        "header_row",
+        "first_unreadable",
+        "long_code",
+        "numbers",
+        "noise",
+        "two",
+    ],
+)
+def test_name_code_pairs_label_their_codes_only_when_pairing_is_clear(change):
+    """A legend repeating name | code pairs gives each name a row header for
+    the code beside it, with a few unreadable codes and names without a
+    code at the end of a column. A wrapped name, a code without a name, a
+    header row, long or numeric values, or too much noise leave it alone."""
+    rows = [list(r) for r in LEGEND]
+    if change == "wrapped":
+        # The code sits on the second line of a name split over two rows.
+        rows[2][2], rows[2][3], rows[3][2] = "Mathematics &", None, "Computer Studies"
+    elif change == "orphan_code":
+        rows[4][4], rows[4][5] = None, "PL"
+    elif change == "header_row":
+        rows = [["Building", "Code", "Building", "Code", "Building", "Code"], *rows, *rows]
+    elif change == "first_unreadable":
+        rows[0][1] = "pp"
+    elif change == "long_code":
+        rows[3][1] = "Built in 1950 for students"
+    elif change == "numbers":
+        for r in rows:
+            r[2] = "12,345"
+    elif change == "noise":
+        rows[1][1], rows[2][1], rows[2][3], rows[4][3] = "pp", "Cl", "RE -_", "gc"
+    elif change == "two":
+        rows = [r[:2] for r in rows]
+    table = legend(rows)
+    _infer_table_headers([table], [], None)
+    headed = {(c["row"], c["col"]) for c in table["cells"] if c.get("row_header")}
+    if change != "legend":
+        assert not any(c.get("is_header") for c in table["cells"])
+        return
+    assert headed == {
+        (r, c)
+        for r, texts in enumerate(rows)
+        for c in (0, 2, 4)
+        if texts[c] is not None and texts[c + 1] is not None
+    }
+    from app.pipeline.tagger_structure import StructTreeBuilder
+
+    with pikepdf.new() as pdf:
+        pdf.add_blank_page()
+        builder = StructTreeBuilder(pdf)
+        builder.setup()
+        structs = builder._ensure_fragmented_table(table)
+        for row, col in headed:
+            assert list(structs[row, col + 1].A.Headers) == [structs[row, col].ID]
+
+
+@pytest.mark.parametrize(
+    "decision,confidence",
+    [("form_region", "low"), ("layout_grid", "low"), ("layout_grid", "medium"), (None, None)],
+)
+async def test_name_code_legend_keeps_its_row_headers_against_a_weak_reclassification(
+    tmp_path, decision, confidence
+):
+    """Whatever the model says at low confidence, a recognised name | code
+    legend is a table whose names are row headers; a confident layout call
+    still applies."""
+    rows = [r[:4] for r in LEGEND[:3]]
+    source, output = tmp_path / "input.pdf", tmp_path / "output.pdf"
+    structure = _fixture(source, rows)
+    structure["elements"][0]["review_id"] = "review-0"
+    if decision:
+        structure, _ = queue_table_decisions(
+            structure,
+            [
+                dict(
+                    table_review_id="review-0",
+                    suggested_action="reclassify_region",
+                    resolved_kind=decision,
+                    confidence=confidence,
+                )
+            ],
+        )
+    result = await tagger.tag_pdf(source, output, structure, [], language="en")
+    statuses = [d["status"] for d in result.table_intelligence_audit]
+    if confidence == "medium":
+        with pikepdf.open(output) as pdf:
+            assert not list(_tables(pdf.Root.StructTreeRoot))
+        assert statuses == ["applied_layout"]
+        return
+    _assert_table(output, rows, {(r, c): "Row" for r in range(3) for c in (0, 2)})
+    assert statuses == (["kept_table"] if decision else [])

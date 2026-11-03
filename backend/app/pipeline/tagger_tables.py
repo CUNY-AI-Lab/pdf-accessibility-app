@@ -199,6 +199,65 @@ def _key_value_table(table: dict) -> bool:
     return len(pairs) >= 2 and sum(_key_label(r[0]) for r in pairs) >= 0.8 * len(pairs)
 
 
+CODE = re.compile(r"(?=.*[A-Z0-9])[A-Z0-9][A-Z0-9.\-/]{0,9}")
+
+
+def _name_code_pairs(table: dict) -> list[dict] | None:
+    """The name cells of a directory or legend that repeats name | code
+    column pairs across the page ("Alumni Hall | AE | Delany Hall | DY"),
+    each name the row header of the code beside it (WCAG H43); None when
+    the table is not one, or its pairing is ambiguous.
+
+    Codes are short tokens and nearly all of them code-like (OCR noise in a
+    few is tolerated); names are words. A name with no code followed, in
+    the same pair of columns, by one with a code is a wrapped name whose
+    code sits on its last line, so the pairing is unknown; so is a code
+    with no name."""
+    cols = table.get("num_cols", 0)
+    cells = [c for c in table.get("cells", []) if isinstance(c, dict)]
+    if cols < 4 or cols % 2 or any(c.get("col_span", 1) != 1 for c in cells):
+        return None
+    grid = {
+        (c.get("row", 0), c.get("col", 0)): c for c in cells if str(c.get("text") or "").strip()
+    }
+
+    def text(cell):
+        return " ".join(str(cell.get("text") or "").split()) if cell else ""
+
+    rows = sorted({r for r, _ in grid})
+    names, codes = [], []
+    for start in range(0, cols, 2):
+        for index, row in enumerate(rows):
+            name, code = grid.get((row, start)), grid.get((row, start + 1))
+            if code and not name:
+                return None
+            following = rows[index + 1] if index + 1 < len(rows) else None
+            if (
+                name
+                and not code
+                and following is not None
+                and grid.get((following, start))
+                and grid.get((following, start + 1))
+            ):
+                return None
+            if name and code:
+                names.append(name)
+                codes.append(code)
+    if len(names) < 4 or len(rows) < 2:
+        return None
+    first = [code for name, code in zip(names, codes, strict=True) if name.get("row", 0) == rows[0]]
+    word = [sum(ch.isalpha() for ch in text(n)) >= 2 and not CODE.fullmatch(text(n)) for n in names]
+    return (
+        names
+        if all(len(text(c)) <= 10 and len(text(c).split()) <= 2 for c in codes)
+        and sum(bool(CODE.fullmatch(text(c))) for c in codes) >= 0.8 * len(codes)
+        and first
+        and all(CODE.fullmatch(text(c)) for c in first)
+        and sum(word) >= 0.8 * len(names)
+        else None
+    )
+
+
 def _simple_label_row(first: list[dict], rows: dict[int, list[dict]]) -> bool:
     """Short, distinct labels over contrasting data, never a first data record.
 
@@ -291,29 +350,11 @@ def _infer_table_headers(elements: list[dict], glyphs: list[MeasuredGlyph], page
         def mark(cell, scope):
             cell.update(is_header=True, column_header=scope == "Column", row_header=scope == "Row")
 
-        # Room directories repeat name/location pairs horizontally. Each name
-        # labels its adjacent room code, rather than heading a data column.
-        ordered_rows = [sorted(cs, key=lambda c: c.get("col", 0)) for cs in rows.values()]
-        room_code = re.compile(r"[A-Z]{1,4}-\d+[A-Z]+\d+", re.I)
-        if (
-            len(ordered_rows) >= 3
-            and table["num_cols"] % 2 == 0
-            and all(
-                len(cs) == table["num_cols"]
-                and [c.get("col", 0) for c in cs] == list(range(table["num_cols"]))
-                and all(c.get("row_span", 1) == c.get("col_span", 1) == 1 for c in cs)
-                and all(
-                    any(ch.isalpha() for ch in text(cs[col]))
-                    and not room_code.fullmatch(text(cs[col]))
-                    and room_code.fullmatch(text(cs[col + 1]))
-                    for col in range(0, len(cs), 2)
-                )
-                for cs in ordered_rows
-            )
-        ):
-            for cs in ordered_rows:
-                for col in range(0, len(cs), 2):
-                    mark(cs[col], "Row")
+        # Directories and legends repeat name/code pairs across the page.
+        # Each name labels the code beside it, rather than heading a column.
+        if (names := _name_code_pairs(table)) is not None:
+            for cell in names:
+                mark(cell, "Row")
             continue
 
         # Definition pairs can have row headers, but their first entry is
