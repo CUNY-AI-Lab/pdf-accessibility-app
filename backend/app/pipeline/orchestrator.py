@@ -263,6 +263,9 @@ from app.services.semantic_pretag_policy import (
     should_retry_table_intelligence_confirm_existing as _should_retry_table_intelligence_confirm_existing,
 )
 from app.services.semantic_pretag_policy import (
+    table_intelligence_resolves as _table_intelligence_resolves,
+)
+from app.services.semantic_pretag_policy import (
     table_page_structure_fragments as _table_page_structure_fragments,
 )
 from app.services.semantic_pretag_policy import (
@@ -1228,17 +1231,17 @@ async def _apply_pretag_table_intelligence(
                         page_items_by_id[review_id] = item
                     intelligence_items.append(item)
 
-            resolved_page_results = sum(
-                1
-                for item in page_items_by_id.values()
-                if _should_auto_apply_table_intelligence(item)
-            )
-            audit["page_batch_resolved_count"] = resolved_page_results
+            resolved = {
+                review_id
+                for review_id, target in detailed_targets_by_review_id.items()
+                if _table_intelligence_resolves(page_items_by_id.get(review_id, {}), target)
+            }
+            audit["page_batch_resolved_count"] = len(resolved)
 
             unresolved_targets = [
                 target
                 for review_id, target in detailed_targets_by_review_id.items()
-                if not _should_auto_apply_table_intelligence(page_items_by_id.get(review_id, {}))
+                if review_id not in resolved
             ]
             audit["individual_fallback_count"] = len(unresolved_targets)
             for target in unresolved_targets:
