@@ -5,7 +5,7 @@ from typing import Any
 
 import pikepdf
 
-from app.services.pdf_objects import pdf_text
+from app.services.pdf_objects import author_text, pdf_text
 
 BUTTON_FLAG_RADIO = 1 << 15
 BUTTON_FLAG_PUSHBUTTON = 1 << 16
@@ -163,8 +163,8 @@ def name_widget_field(widget: pikepdf.Dictionary) -> None:
     field = kid_widget_field(widget)
     if field is None and _normalize_text(pdf_text(widget.get("/T"))):
         field = widget
-    if field is not None and not _normalize_text(pdf_text(field.get("/TU"))):
-        field["/TU"] = pikepdf.String(_normalize_text(pdf_text(field.get("/T"))))
+    if field is not None and not author_text(field.get("/TU")):
+        field["/TU"] = pikepdf.String(author_text(field.get("/T")))
 
 
 def _decode_pdf_name(name: str) -> str:

@@ -19,7 +19,7 @@ from app.pipeline.fonts.resources import TAGGER_RESOURCES, _has_embedded_font, _
 from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
 from app.pipeline.pdf_repair import add_missing_icc_components
 from app.pipeline.tagger_geometry import _as_positive_int, _obj_key, _resolve_dictionary
-from app.services.pdf_objects import pdf_text
+from app.services.pdf_objects import author_text, pdf_text
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,68 @@ def _set_document_title(
     pdf.Root["/ViewerPreferences"]["/DisplayDocTitle"] = True
 
     return title
+
+
+# Author text the output keeps where the author put it: what a screen reader
+# announces for an annotation or a form field.
+_ANNOTATION_TEXT_KEYS = ("/Contents", "/TU", "/TM")
+
+
+def _clean_author_text_in_place(pdf: pikepdf.Pdf) -> int:
+    """Remove control characters from author text kept in the output.
+
+    Covers annotations' /Contents, /TU and /TM (and a markup annotation's
+    /T title, not a form field's name), form fields' /TU and /TM, and bookmark
+    titles. The document title is chosen from cleaned candidates
+    (document_title), and the tagger keeps no other document information.
+    Returns how many values changed.
+    """
+    changed = 0
+
+    def clean(owner: pikepdf.Dictionary, keys: tuple[str, ...]) -> None:
+        nonlocal changed
+        for key in keys:
+            value = owner.get(key)
+            if not isinstance(value, pikepdf.String):
+                continue
+            text = author_text(value)
+            if text == str(value):
+                continue
+            if text:
+                owner[key] = pikepdf.String(text)
+            else:
+                del owner[key]
+            changed += 1
+
+    def each(pending: list[Any], following: tuple[str, ...]):
+        """Every dictionary reachable from ``pending`` by ``following`` keys, once."""
+        seen: set[tuple[int, int]] = set()
+        while pending:
+            node = pending.pop()
+            if not isinstance(node, pikepdf.Dictionary):
+                continue
+            if node.is_indirect:
+                if node.objgen in seen:
+                    continue
+                seen.add(node.objgen)
+            yield node
+            for key in following:
+                value = node.get(key)
+                pending.extend(value if isinstance(value, pikepdf.Array) else [value])
+
+    for page in pdf.pages:
+        for annotation in each(list(page.get("/Annots") or []), ()):
+            markup = annotation.get("/Subtype") != pikepdf.Name("/Widget")
+            clean(annotation, _ANNOTATION_TEXT_KEYS + (("/T",) if markup else ()))
+    acroform = pdf.Root.get("/AcroForm")
+    if isinstance(acroform, pikepdf.Dictionary):
+        for field in each(list(acroform.get("/Fields") or []), ("/Kids",)):
+            clean(field, ("/TU", "/TM"))
+    outlines = pdf.Root.get("/Outlines")
+    if isinstance(outlines, pikepdf.Dictionary):
+        for item in each([outlines.get("/First")], ("/Next", "/First")):
+            clean(item, ("/Title",))
+    return changed
 
 
 def _set_pdfua_identification(pdf: pikepdf.Pdf):
