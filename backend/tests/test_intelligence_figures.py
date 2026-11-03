@@ -599,3 +599,62 @@ def test_a_batch_cannot_hide_a_figure_the_single_review_describes(monkeypatch, t
     assert single_calls == [4]
     assert [result["suggested_action"] for result in results] == ["set_alt_text", "set_alt_text"]
     assert results[0]["alt_text"].startswith("Shaded selection box")
+
+
+@pytest.mark.parametrize(
+    "batch,kept",
+    [
+        ({"suggested_action": "reclassify_region", "resolved_kind": "artifact"}, True),
+        ({"suggested_action": "reclassify_region", "resolved_kind": "table"}, True),
+        ({"suggested_action": "mark_decorative"}, True),
+        # A doubtful batch decision is the single review's to make.
+        (
+            {
+                "suggested_action": "reclassify_region",
+                "resolved_kind": "table",
+                "confidence": "low",
+            },
+            False,
+        ),
+    ],
+)
+def test_a_review_that_cannot_describe_leaves_the_batch_decision(
+    monkeypatch, tmp_path, batch, kept
+):
+    # Recorded: a scanned list of names, an algorithm and a text fragment the
+    # batch replaced or hid, and the single review declined to describe
+    # because it would tag them as text or code.
+    path = tmp_path / "list.png"
+    _write_png(path)
+
+    async def _batch(**kwargs):
+        decision = {
+            "figure_index": 4,
+            "summary": "List of graduates by degree.",
+            "confidence": "high",
+            "reason": "Structured text, not a picture.",
+            **batch,
+        }
+        return {"task_type": "figure_batch_intelligence", "decisions": [decision]}
+
+    async def _single(**kwargs):
+        return {
+            "suggested_action": "manual_only",
+            "confidence": "high",
+            "figure_index": 4,
+            "alt_text": "",
+            "reason": "Reclassifying as text_block preserves its meaning.",
+        }
+
+    monkeypatch.setattr("app.services.intelligence_figures.request_llm_json", _batch)
+    monkeypatch.setattr("app.services.intelligence_figures.generate_figure_intelligence", _single)
+    [result] = asyncio.run(
+        generate_figures_intelligence(
+            figures=[FigureInfo(index=4, path=path, page=0)], llm_client=object()
+        )
+    )
+    if kept:
+        assert result["suggested_action"] == batch["suggested_action"]
+        assert result.get("resolved_kind") == batch.get("resolved_kind")
+    else:
+        assert result["suggested_action"] == "manual_only"
