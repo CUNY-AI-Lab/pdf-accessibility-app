@@ -87,6 +87,17 @@ def should_auto_apply_table_intelligence(item: dict[str, object]) -> bool:
     return action == "confirm_current_headers" and item.get("confidence") == "high"
 
 
+def table_intelligence_resolves(item: dict[str, object], target: dict[str, object]) -> bool:
+    """Whether a page's answer settles ``target``. Confirming the current
+    headers of a table that has none settles nothing (the confirmation is
+    not applied), so that table is still asked about on its own."""
+    if table_action(item) == "confirm_current_headers" and not (
+        target.get("header_rows") or target.get("row_header_columns")
+    ):
+        return False
+    return should_auto_apply_table_intelligence(item)
+
+
 def apply_table_intelligence_to_element(
     element: dict[str, object],
     *,

@@ -1790,6 +1790,85 @@ async def test_pretag_table_intelligence_keeps_decisions_when_one_table_call_fai
 
 
 @pytest.mark.asyncio
+async def test_pretag_table_confirmation_of_no_headers_asks_about_the_table_alone(
+    monkeypatch, tmp_path
+):
+    """A page's answer that confirms the current headers settles a table that
+    has headers. For a table with none it confirms nothing, so that table is
+    asked about on its own and gets the decision of that answer."""
+
+    def target(review_id, page, header_rows):
+        return {
+            "table_review_id": review_id,
+            "page": page,
+            "bbox": {"l": 10, "t": 20, "r": 100, "b": 60},
+            "num_rows": 2,
+            "num_cols": 2,
+            "risk_score": 1.0,
+            "risk_reasons": ["missing_docling_simple_headers"],
+            "header_rows": header_rows,
+            "row_header_columns": [],
+        }
+
+    targets = [target("review-plain", 1, []), target("review-headed", 1, [0])]
+    asked = []
+
+    async def _fake_generate_page(**kwargs):
+        return [
+            {
+                "table_review_id": t["table_review_id"],
+                "confidence": "high",
+                "suggested_action": "confirm_current_headers",
+                "resolved_kind": "layout_grid",
+            }
+            for t in kwargs["targets"]
+        ]
+
+    async def _fake_generate(**kwargs):
+        asked.append(kwargs["target"]["table_review_id"])
+        return {
+            "table_review_id": kwargs["target"]["table_review_id"],
+            "confidence": "low",
+            "suggested_action": "reclassify_region",
+            "resolved_kind": "layout_grid",
+        }
+
+    def table(review_id, headed):
+        return {
+            "review_id": review_id,
+            "type": "table",
+            "page": 0,
+            "num_rows": 2,
+            "num_cols": 2,
+            "cells": [
+                {"row": r, "col": c, "text": f"{r}{c}", "column_header": headed and r == 0}
+                for r in range(2)
+                for c in range(2)
+            ],
+        }
+
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence_for_page", _fake_generate_page)
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence", _fake_generate)
+    updated, audit = await _apply_pretag_table_intelligence(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_table_intelligence=True),
+        structure_json={"elements": [table("review-plain", False), table("review-headed", True)]},
+        targets=targets,
+    )
+
+    plain, headed = updated["elements"]
+    assert asked == ["review-plain"]
+    assert audit["page_batch_resolved_count"] == 1
+    assert [d["resolved_kind"] for d in plain["table_llm_decisions"]] == ["layout_grid"]
+    assert headed["table_llm_confirmed"] is True and "table_llm_decisions" not in headed
+
+
+@pytest.mark.asyncio
 async def test_pretag_table_intelligence_uses_pretag_timeout_override(monkeypatch, tmp_path):
     async def _fake_generate(**kwargs):
         await asyncio.sleep(2)
