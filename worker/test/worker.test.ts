@@ -574,9 +574,11 @@ describe("guarded task transitions", () => {
   });
 
   it("renews the current lease and rejects it exactly at expiry", async () => {
+    // Read the clock before the claim: the lease runs from the claim, so a
+    // renewal 10 ms before `now + leaseMs` is always inside it.
+    const now = Date.now();
     const { id, task } = await start();
     const board = jobBoard(env);
-    const now = Date.now();
     expect(await board.progress(id, task.lease, "{}", now + LIMITS.leaseMs - 10)).toEqual({ ok: true });
     expect(await board.checkLease(id, task.lease, now + LIMITS.leaseMs + 10, false)).not.toBeNull();
     expect(await board.checkLease(id, task.lease, now + 2 * LIMITS.leaseMs - 10, false)).toBeNull();
