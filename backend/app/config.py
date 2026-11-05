@@ -41,7 +41,13 @@ class Settings(BaseSettings):
     llm_max_request_bytes: int = Field(default=DEFAULT_LLM_MAX_REQUEST_BYTES, ge=64 * 1024)
     llm_timeout: int = 120
     llm_pretag_timeout: int = 45
-    llm_pretag_fallback_timeout: int = 15
+    # One table or field at a time, after its page's batch call. Through the
+    # Gateway a call takes about 1 s, plus 15 ms per output token and 0.07 s
+    # per 1,000 prompt tokens; the longest table answer seen (807 tokens, on
+    # a 28,500-token prompt) needs about 18 s. This leaves it room and stops
+    # an answer that runs away (thousands of repeated tokens) well before
+    # the page-batch bound.
+    llm_pretag_fallback_timeout: int = 30
     llm_strict_validation: bool = True
     auto_approve_generated_alt_text: bool = True
     skip_alt_text_generation: bool = False

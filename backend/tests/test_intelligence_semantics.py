@@ -230,9 +230,10 @@ def test_adjudicate_semantic_unit_repairs_missing_required_payload(monkeypatch, 
     repair_prompt = llm.calls[1]["messages"][0]["content"][1]["text"]
     assert "populate `accessible_label`" in repair_prompt
 
-def test_adjudicate_semantic_unit_allows_cross_type_reclassification_for_table(
-    monkeypatch, tmp_path
-):
+
+def test_a_table_is_offered_only_the_kinds_the_tagger_applies(monkeypatch, tmp_path):
+    from app.services.table_decisions import TABLE_REGION_KINDS
+
     monkeypatch.setattr(
         intelligence_semantics,
         "page_preview_parts",
@@ -243,32 +244,40 @@ def test_adjudicate_semantic_unit_allows_cross_type_reclassification_for_table(
             }
         ],
     )
-    llm = _FakeLlmClient(
-        [
-            {
-                "task_type": "semantic_unit_adjudication",
-                "summary": "This is a hierarchical org chart, not a data table.",
-                "confidence": "high",
-                "unit_id": "table-1",
-                "unit_type": "table",
-                "suggested_action": "reclassify_region",
-                "reason": "The boxes show reporting relationships instead of row and column headers.",
-                "resolved_kind": "org_chart",
-            }
-        ]
-    )
-
-    unit = SemanticUnit(
-        unit_id="table-1",
-        unit_type="table",
-        page=1,
-        accessibility_goal="Interpret the table faithfully for assistive technology.",
-        current_semantics={"header_rows": [0], "row_header_columns": [0]},
-    )
-    decision = asyncio.run(adjudicate_semantic_unit(job=_job(tmp_path), unit=unit, llm_client=llm))
-
-    assert decision.suggested_action == "reclassify_region"
-    assert decision.resolved_kind == "org_chart"
+    answers = {
+        "table": dict(suggested_action="reclassify_region", resolved_kind="layout_grid"),
+        "figure": dict(suggested_action="reclassify_region", resolved_kind="artifact"),
+    }
+    offered = {}
+    for unit_type, answer in answers.items():
+        llm = _FakeLlmClient(
+            [
+                {
+                    "task_type": "semantic_unit_adjudication",
+                    "summary": "Not what it was labelled.",
+                    "confidence": "high",
+                    "unit_id": "unit-1",
+                    "unit_type": unit_type,
+                    "reason": "Visible layout.",
+                    **answer,
+                }
+            ]
+        )
+        unit = SemanticUnit(
+            unit_id="unit-1",
+            unit_type=unit_type,
+            page=1,
+            accessibility_goal="Interpret the region faithfully for assistive technology.",
+        )
+        decision = asyncio.run(
+            adjudicate_semantic_unit(job=_job(tmp_path), unit=unit, llm_client=llm)
+        )
+        assert decision.suggested_action == "reclassify_region"
+        assert decision.resolved_kind == answer["resolved_kind"]
+        schema = llm.calls[0]["kwargs"]["response_format"]["json_schema"]["schema"]
+        offered[unit_type] = schema["properties"]["resolved_kind"]["enum"]
+    assert offered["table"] == list(TABLE_REGION_KINDS)
+    assert {"artifact", "table", "form_region"} <= set(offered["figure"])
 
 
 def test_unit_images_are_not_repeated_as_prompt_text():

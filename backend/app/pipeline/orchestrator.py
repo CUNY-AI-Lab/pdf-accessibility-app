@@ -263,6 +263,9 @@ from app.services.semantic_pretag_policy import (
     should_retry_table_intelligence_confirm_existing as _should_retry_table_intelligence_confirm_existing,
 )
 from app.services.semantic_pretag_policy import (
+    table_intelligence_resolves as _table_intelligence_resolves,
+)
+from app.services.semantic_pretag_policy import (
     table_page_structure_fragments as _table_page_structure_fragments,
 )
 from app.services.semantic_pretag_policy import (
@@ -272,7 +275,11 @@ from app.services.semantic_pretag_policy import (
     widget_targets_for_rationalization as _widget_targets_for_rationalization,
 )
 from app.services.structure_text import screen_reader_text
-from app.services.table_decisions import queue_table_decision, queue_table_decisions
+from app.services.table_decisions import (
+    queue_table_decision,
+    queue_table_decisions,
+    unsupported_region_kind,
+)
 from app.services.thread_work import to_thread
 from app.services.title_intelligence import enhance_document_title_with_intelligence
 from app.services.toc_intelligence import enhance_toc_structure_with_intelligence
@@ -655,6 +662,7 @@ def _build_validation_payload(
             "reading_order_diagnostics": getattr(tagging_result, "reading_order_diagnostics", []),
             "table_decisions": getattr(tagging_result, "table_intelligence_audit", []),
             "table_readability": getattr(tagging_result, "table_readability", []),
+            "tables_joined": getattr(tagging_result, "tables_joined", []),
             "lang_set": tagging_result.lang_set,
         },
         "semantic_coverage": _semantic_coverage_summary(
@@ -1111,12 +1119,14 @@ async def _apply_pretag_table_intelligence(
         "page_batch_resolved_count": 0,
         "page_batch_failed_count": 0,
         "individual_fallback_count": 0,
+        "individual_fallback_failed_count": 0,
         "pages": [],
         "review_ids": [],
         "confirmed_count": 0,
         "set_headers_count": 0,
         "aggressive_retry_count": 0,
         "confirm_existing_retry_count": 0,
+        "retry_failed_count": 0,
         "llm_usage": _empty_llm_usage(),
     }
     if not settings.auto_apply_table_intelligence:
@@ -1221,35 +1231,43 @@ async def _apply_pretag_table_intelligence(
                         page_items_by_id[review_id] = item
                     intelligence_items.append(item)
 
-            resolved_page_results = sum(
-                1
-                for item in page_items_by_id.values()
-                if _should_auto_apply_table_intelligence(item)
-            )
-            audit["page_batch_resolved_count"] = resolved_page_results
+            resolved = {
+                review_id
+                for review_id, target in detailed_targets_by_review_id.items()
+                if _table_intelligence_resolves(page_items_by_id.get(review_id, {}), target)
+            }
+            audit["page_batch_resolved_count"] = len(resolved)
 
             unresolved_targets = [
                 target
                 for review_id, target in detailed_targets_by_review_id.items()
-                if not _should_auto_apply_table_intelligence(page_items_by_id.get(review_id, {}))
+                if review_id not in resolved
             ]
             audit["individual_fallback_count"] = len(unresolved_targets)
             for target in unresolved_targets:
                 review_id = str(target.get("table_review_id") or "").strip()
                 page = target.get("page")
                 page_number = int(page) if isinstance(page, int) else None
-                intelligence = await _await_llm_operation(
-                    settings=settings,
-                    label=f"table_intelligence[{review_id or '?'}]",
-                    timeout_seconds=fallback_timeout,
-                    awaitable=generate_table_intelligence(
-                        job=job,
-                        target=target,
-                        page_structure_fragments=page_fragments_by_page.get(page_number or -1)
-                        or [],
-                        llm_client=llm_client,
-                    ),
-                )
+                try:
+                    intelligence = await _await_llm_operation(
+                        settings=settings,
+                        label=f"table_intelligence[{review_id or '?'}]",
+                        timeout_seconds=fallback_timeout,
+                        awaitable=generate_table_intelligence(
+                            job=job,
+                            target=target,
+                            page_structure_fragments=page_fragments_by_page.get(page_number or -1)
+                            or [],
+                            llm_client=llm_client,
+                        ),
+                    )
+                except Exception:
+                    # One table's failed call leaves the other tables' decisions
+                    # standing, as in the widget and form passes.
+                    audit["individual_fallback_failed_count"] = (
+                        int(audit.get("individual_fallback_failed_count", 0)) + 1
+                    )
+                    continue
                 page_items_by_id[review_id] = intelligence
 
             intelligence_items = list(page_items_by_id.values())
@@ -1268,19 +1286,24 @@ async def _apply_pretag_table_intelligence(
                 )
                 page = detailed_target.get("page")
                 page_number = int(page) if isinstance(page, int) else None
-                retried_item = await _await_llm_operation(
-                    settings=settings,
-                    label=f"table_intelligence[{review_id or '?'}].aggressive",
-                    timeout_seconds=fallback_timeout,
-                    awaitable=generate_table_intelligence(
-                        job=job,
-                        target=detailed_target,
-                        page_structure_fragments=page_fragments_by_page.get(page_number or -1)
-                        or [],
-                        llm_client=llm_client,
-                        aggressive=True,
-                    ),
-                )
+                try:
+                    retried_item = await _await_llm_operation(
+                        settings=settings,
+                        label=f"table_intelligence[{review_id or '?'}].aggressive",
+                        timeout_seconds=fallback_timeout,
+                        awaitable=generate_table_intelligence(
+                            job=job,
+                            target=detailed_target,
+                            page_structure_fragments=page_fragments_by_page.get(page_number or -1)
+                            or [],
+                            llm_client=llm_client,
+                            aggressive=True,
+                        ),
+                    )
+                except Exception:
+                    # The table keeps the decision it had.
+                    audit["retry_failed_count"] = int(audit.get("retry_failed_count", 0)) + 1
+                    continue
                 intelligence_items[idx] = retried_item
                 retried += 1
             audit["aggressive_retry_count"] = retried
@@ -1299,20 +1322,25 @@ async def _apply_pretag_table_intelligence(
                 )
                 page = detailed_target.get("page")
                 page_number = int(page) if isinstance(page, int) else None
-                retried_item = await _await_llm_operation(
-                    settings=settings,
-                    label=f"table_intelligence[{review_id or '?'}].confirm_existing",
-                    timeout_seconds=fallback_timeout,
-                    awaitable=generate_table_intelligence(
-                        job=job,
-                        target=detailed_target,
-                        page_structure_fragments=page_fragments_by_page.get(page_number or -1)
-                        or [],
-                        llm_client=llm_client,
-                        aggressive=True,
-                        confirm_existing=True,
-                    ),
-                )
+                try:
+                    retried_item = await _await_llm_operation(
+                        settings=settings,
+                        label=f"table_intelligence[{review_id or '?'}].confirm_existing",
+                        timeout_seconds=fallback_timeout,
+                        awaitable=generate_table_intelligence(
+                            job=job,
+                            target=detailed_target,
+                            page_structure_fragments=page_fragments_by_page.get(page_number or -1)
+                            or [],
+                            llm_client=llm_client,
+                            aggressive=True,
+                            confirm_existing=True,
+                        ),
+                    )
+                except Exception:
+                    # The table keeps the decision it had.
+                    audit["retry_failed_count"] = int(audit.get("retry_failed_count", 0)) + 1
+                    continue
                 intelligence_items[idx] = retried_item
                 confirm_existing_retried += 1
             audit["confirm_existing_retry_count"] = confirm_existing_retried
@@ -1325,7 +1353,10 @@ async def _apply_pretag_table_intelligence(
 
     approved_by_id: dict[str, dict[str, object]] = {}
     for item in intelligence_items:
-        if not isinstance(item, dict) or not _should_auto_apply_table_intelligence(item):
+        # A kind nothing applies is kept for the decision audit (queue_table_decision).
+        if not isinstance(item, dict) or not (
+            _should_auto_apply_table_intelligence(item) or unsupported_region_kind(item)
+        ):
             continue
         table_review_id = str(item.get("table_review_id") or "").strip()
         if table_review_id:
@@ -1345,6 +1376,8 @@ async def _apply_pretag_table_intelligence(
     applied_count = 0
     confirmed_count = 0
     set_headers_count = 0
+    recorded_count = 0
+    confirmed_no_headers_count = 0
     for index, element in enumerate(elements):
         if not isinstance(element, dict) or element.get("type") != "table":
             continue
@@ -1353,14 +1386,31 @@ async def _apply_pretag_table_intelligence(
         if not approved:
             continue
         action = str(approved.get("suggested_action") or "").strip()
-        if action == "confirm_current_headers":
-            if not any(
-                c.get(f)
-                for c in element.get("cells", [])
-                for f in ("is_header", "column_header", "row_header")
-            ):
+        headerless = not any(
+            c.get(f)
+            for c in element.get("cells", [])
+            for f in ("is_header", "column_header", "row_header")
+        )
+        if action == "confirm_current_headers" and headerless:
+            # With the schema stated, the model answers "this is not a data
+            # table" as a confident confirmation of headers it lacks, where it
+            # used to reclassify the region as a layout grid. Apply that
+            # layout. Only high-confidence confirmations are approved (see
+            # should_auto_apply_table_intelligence); others leave it held.
+            approved = {
+                **approved,
+                "suggested_action": "reclassify_region",
+                "resolved_kind": "layout_grid",
+                "confirmed_no_headers": True,
+            }
+            action = "reclassify_region"
+            if not queue_table_decision(element, approved):
                 continue
-        elif not queue_table_decision(element, approved):
+            confirmed_no_headers_count += 1
+        elif action != "confirm_current_headers" and not queue_table_decision(element, approved):
+            if unsupported_region_kind(approved):
+                element["review_id"] = review_id
+                recorded_count += 1
             continue
         element["review_id"] = review_id
         element["table_llm_confirmed"] = action == "confirm_current_headers"
@@ -1380,8 +1430,13 @@ async def _apply_pretag_table_intelligence(
         elif action == "set_table_headers":
             set_headers_count += 1
 
+    audit["unsupported_kind_count"] = recorded_count
+    audit["confirmed_no_headers_layout_count"] = confirmed_no_headers_count
     if applied_count <= 0:
         audit["reason"] = "no_matching_structure_elements"
+        if recorded_count:
+            audit["reason"] = "unsupported_kinds_only"
+            return updated_structure, audit
         return structure_json, audit
 
     audit["applied"] = bool(confirmed_count)

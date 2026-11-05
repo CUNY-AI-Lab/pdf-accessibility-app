@@ -6,7 +6,11 @@ from types import SimpleNamespace
 import pytest
 
 from app.services import remediation_intelligence
-from app.services.intelligence_llm_utils import extract_json_object, job_pdf_path
+from app.services.intelligence_llm_utils import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    extract_json_object,
+    job_pdf_path,
+)
 from app.services.remediation_intelligence import (
     _document_model,
     _font_task_payload,
@@ -99,8 +103,10 @@ def test_font_task_payload_uses_review_targets_and_page_structure_context(monkey
     )
     monkeypatch.setattr(
         remediation_intelligence,
-        "render_target_preview_png_data_url",
-        lambda pdf_path, context_path: f"data:image/png;base64,target-{hash(context_path) % 10}",
+        "render_target_previews_png_data_urls",
+        lambda pdf_path, context_path: [
+            ("target region", f"data:image/png;base64,target-{hash(context_path) % 10}")
+        ],
     )
 
     prompt_text, content = _font_task_payload(
@@ -510,6 +516,8 @@ def test_generate_remediation_intelligence_keeps_font_actualtext_candidates(monk
     assert candidates[0]["operator_index"] == 132
     assert candidates[0]["proposed_actualtext"] == "bullet"
     assert fake_llm.calls[0]["kwargs"]["temperature"] == 0
+    # A font review lists every target, so it may run longer than other answers.
+    assert fake_llm.calls[0]["kwargs"]["max_tokens"] > DEFAULT_MAX_OUTPUT_TOKENS
 
 
 def test_table_targets_for_review_collects_table_targets(tmp_path):

@@ -5,12 +5,15 @@ from pathlib import Path
 import pikepdf
 
 from app.pipeline.fonts.encoding import (
+    _glyph_name_for_code,
+    _glyph_name_to_unicode,
     _is_valid_unicode_text,
     _parse_tounicode_map_details,
     _raw_text_bytes,
     _render_tounicode_cmap,
 )
 from app.pipeline.fonts.names import _base_font_name
+from app.pipeline.fonts.resources import _font_stream_bytes, _resolve_dictionary
 from app.services.font_actualtext import (
     _resolve_object,
     _resolve_target_stream_from_context,
@@ -93,12 +96,24 @@ def _resolve_target_font_details(pdf: pikepdf.Pdf, context_path: str) -> dict[st
 def inspect_context_font_target(*, pdf_path: Path, context_path: str) -> dict[str, object]:
     with pikepdf.open(str(pdf_path)) as pdf:
         details = _resolve_target_font_details(pdf, context_path)
-    return {
-        "font_code": int(details["font_code"]),
-        "font_code_hex": f"{int(details['font_code']):02X}",
-        "font_base_name": str(details["font_base_name"]),
-        "target_operator": str(details["target_operator"]),
-    }
+        target: dict[str, object] = {
+            "font_code": int(details["font_code"]),
+            "font_code_hex": f"{int(details['font_code']):02X}",
+            "font_base_name": str(details["font_base_name"]),
+            "target_operator": str(details["target_operator"]),
+        }
+        # The font's own name for the glyph is evidence of its character.
+        font_dict = details["font_dict"]
+        assert isinstance(font_dict, pikepdf.Dictionary)
+        descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
+        named = _glyph_name_for_code(
+            font_dict, int(details["font_code"]), _font_stream_bytes(descriptor)
+        )
+    if named is not None:
+        target["glyph_name"], target["glyph_name_source"] = named
+        if text := _glyph_name_to_unicode(named[0]):
+            target["glyph_name_unicode"] = text
+    return target
 
 
 def _apply_unicode_override_to_font(

@@ -19,6 +19,7 @@ from app.pipeline.page_frame import PageFrame
 from app.pipeline.page_glyphs import PdfGlyphReader, union_bbox
 from app.pipeline.pdfium_text import PdfiumText, read_page_text
 from app.pipeline.tagger_semantics import is_placeholder_alt_text
+from app.services.pdf_objects import author_text
 from app.services.structure_text import MarkedContentReader, _form_paths, _standard_role
 
 
@@ -29,10 +30,10 @@ def read_author_structure(path: Path) -> dict:
         if not isinstance(root, pikepdf.Dictionary):
             return {}
         evidence = {'elements': [], 'language': normalize_lang_tag(str(pdf.Root.get('/Lang') or '')),
-                    'title': str(pdf.docinfo.get('/Title') or '')}
+                    'title': author_text(pdf.docinfo.get('/Title'))}
         if not evidence['title']:
             with pdf.open_metadata() as metadata:
-                evidence['title'] = str(metadata.get('dc:title', ''))
+                evidence['title'] = author_text(metadata.get('dc:title', ''))
         pages = {p.obj.objgen: i for i, p in enumerate(pdf.pages)}
         role_map = root.get('/RoleMap')
         with PdfGlyphReader(path) as glyphs, PdfiumText(path) as visual:
@@ -127,8 +128,8 @@ def read_author_structure(path: Path) -> dict:
                         else:
                             item['type'] = 'figure' if role == 'Figure' else 'heading'
                             if role == 'Figure':
-                                item['author_alt'] = str(node.get('/Alt') or '')
-                                item['author_actual_text'] = str(node.get('/ActualText') or '')
+                                item['author_alt'] = author_text(node.get('/Alt'))
+                                item['author_actual_text'] = author_text(node.get('/ActualText'))
                             else:
                                 item['level'] = int(role[1:])
                             evidence['elements'].append(item)

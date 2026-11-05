@@ -7,8 +7,13 @@ import pikepdf
 import pytest
 
 from app.pipeline import tagger
+from app.pipeline.page_frame import PageFrame
 from app.pipeline.page_glyphs import PdfGlyphReader, union_bbox
+from app.pipeline.tagger_table_intelligence import _model_table_layout
+from app.pipeline.tagger_table_structure import _continued_table, _mark_table_continuation
+from app.pipeline.tagger_tables import _infer_table_headers
 from app.services.structure_text import screen_reader_text
+from app.services.table_decisions import queue_table_decisions
 from tests.pdf_fixtures import rendered
 from tests.test_tagger_tables import _assert_table, _fixture, _tables, _tag
 
@@ -195,10 +200,20 @@ async def test_bold_headings_outside_grid_become_column_headers(
         assert heard.count("Learning outcomes") == 1
 
 
-@pytest.mark.parametrize("kind", ["points", "percent", "definition", "bold", "sections"])
+SOURCE_CARD = [
+    ["Source:", "Morris, W. (1977). Word origins."],
+    ["Page:", "p. 70"],
+    ["Quote:", "Blue-chip stock comes from poker chips."],
+]
+
+
+@pytest.mark.parametrize("kind", ["points", "percent", "definition", "bold", "sections", "colons"])
 async def test_two_column_labels_are_row_headers(tmp_path, kind):
     kwargs = {}
-    if kind == "points":
+    if kind == "colons":
+        # Labels ending in a colon, one as long as its value.
+        rows = SOURCE_CARD
+    elif kind == "points":
         rows = [
             ["Understanding and knowledge of the subject", "15 points"],
             ["Quality of selected visual aids", "10 points"],
@@ -236,10 +251,52 @@ async def test_two_column_labels_are_row_headers(tmp_path, kind):
     )
 
 
-@pytest.mark.parametrize("kind", ["three", "records", "blank", "contents", "extractor"])
+@pytest.mark.parametrize("confidence,keys", [("low", 3), ("medium", 3), ("low", 2)])
+async def test_key_value_table_stays_a_table_against_a_low_confidence_layout(
+    tmp_path, confidence, keys
+):
+    """The model calls a key-value table a layout grid. At low confidence a
+    table whose labels nearly all end in a colon keeps them as row headers;
+    otherwise the layout applies."""
+    card = [
+        [label if r < keys else label.rstrip(":"), value]
+        for r, (label, value) in enumerate(SOURCE_CARD)
+    ]
+    rows = [[textwrap.fill(t, 27) for t in r] for r in card]
+    source, output = tmp_path / "input.pdf", tmp_path / "output.pdf"
+    structure = _fixture(source, rows, row_height=90)
+    structure["elements"][0]["review_id"] = "review-0"
+    decision = dict(
+        table_review_id="review-0",
+        suggested_action="reclassify_region",
+        resolved_kind="layout_grid",
+        confidence=confidence,
+    )
+    structure, _ = queue_table_decisions(structure, [decision])
+    result = await tagger.tag_pdf(source, output, structure, [], language="en")
+    statuses = [d["status"] for d in result.table_intelligence_audit]
+    if confidence == "low" and keys == 3:
+        _assert_table(output, rows, {(r, 0): "Row" for r in range(len(rows))})
+        assert statuses == ["kept_table"]
+    else:
+        with pikepdf.open(output) as pdf:
+            assert not list(_tables(pdf.Root.StructTreeRoot))
+        assert statuses == ["applied_layout"]
+
+
+@pytest.mark.parametrize(
+    "kind", ["three", "records", "blank", "contents", "extractor", "no_colons", "colon_sentences"]
+)
 async def test_row_headers_leave_ambiguous_tables_unchanged(tmp_path, kind):
     rows, kwargs, expected = [["Apple", "red"], ["Pear", "green"]], {}, {}
-    if kind == "three":
+    if kind == "no_colons":
+        rows = [[label.rstrip(":"), value] for label, value in SOURCE_CARD]
+    elif kind == "colon_sentences":
+        rows = [
+            ["Bring these items to the first class meeting:", "Pens and paper"],
+            ["Return these two forms to the department office:", "Both forms"],
+        ]
+    elif kind == "three":
         rows = [
             ["Term", "A detailed explanation of this term", "extra"],
             ["Other", "A detailed explanation of another term", "extra"],
@@ -291,3 +348,461 @@ async def test_row_label_uses_bold_lead_run_not_incidental_emphasis(tmp_path, em
     await tagger.tag_pdf(source, output, structure, [], language="en")
     expected = {(r, 0): "Row" for r in range(2)} if emphasis == "lead" else {}
     _assert_table(output, rows, expected)
+
+
+LETTER = PageFrame(rotation=0, left=0, bottom=0, right=612, top=792)
+STEPS = [["No.", "Step"], ["1", "Open the site"], ["2", "Sign in"]]
+MORE = [["3", "Choose a file"], ["4", "Upload it"]]
+
+
+def part(rows, *, page, top, flagged=(), shift=0.0, **extra):
+    """A two-column table on ``page`` whose first row's top is at ``top``
+    (user space, 20 pt rows), with the rows in ``flagged`` marked as column
+    headers by the extractor."""
+    cells = [
+        dict(
+            row=r,
+            col=c,
+            text=text,
+            row_span=1,
+            col_span=1,
+            is_header=r in flagged,
+            column_header=r in flagged,
+            row_header=False,
+            bbox=dict(
+                l=72 + 200 * c + shift,
+                b=top - 20 * r - 12,
+                r=72 + 200 * c + 150 + shift,
+                t=top - 20 * r,
+            ),
+        )
+        for r, texts in enumerate(rows)
+        for c, text in enumerate(texts)
+    ]
+    box = dict(l=70 + shift, b=top - 20 * len(rows), r=430 + shift, t=top + 2)
+    return dict(
+        dict(
+            type="table",
+            page=page,
+            num_rows=len(rows),
+            num_cols=len(rows[0]),
+            cells=cells,
+            bbox=box,
+            caption=None,
+            reading_order=0,
+            _docling_order=page,
+        ),
+        **extra,
+    )
+
+
+HEADERS = dict(suggested_action="set_table_headers", header_rows=[0], row_header_columns=[0])
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "model",
+        "extractor",
+        "external",
+        "footer",
+        "continued",
+        "repeat",
+        "repeat_flagged",
+        "none",
+        "row_headers",
+        "own_headers",
+        "caption",
+        "heading",
+        "note",
+        "middle",
+        "lower",
+        "columns",
+        "shift",
+        "layout",
+        "unreadable",
+    ],
+)
+def test_continuation_needs_last_and_first_blocks_with_the_same_columns(change):
+    """A table continues on the next page only when it ends the page, the
+    next page starts with a table of the same columns, and the first gets a
+    header row the second does not replace."""
+    decisions = [] if change in {"extractor", "external", "none", "row_headers"} else [HEADERS]
+    if change == "row_headers":
+        decisions = [dict(HEADERS, header_rows=[])]
+    first = part(
+        STEPS,
+        page=0,
+        top=100,
+        flagged=(0,) if change == "extractor" else (),
+        table_llm_decisions=decisions,
+    )
+    if change == "external":
+        first["_external_table_headers"] = [dict(text="No."), dict(text="Step")]
+    if change == "layout":
+        first["_layout_table"] = {"blocks": []}
+    previous = [
+        dict(type="heading", page=0, text="Steps", bbox=dict(l=70, b=500, r=300, t=520)),
+        first,
+    ]
+    rows = [STEPS[0], *MORE] if change.startswith("repeat") else MORE
+    if change == "own_headers":
+        rows = [["Part", "Task"], *MORE]
+    second = part(
+        rows,
+        page=1,
+        top={"middle": 500, "lower": 650}.get(change, 720),
+        flagged=(0,) if change in {"repeat_flagged", "own_headers"} else (),
+        shift=20 if change == "shift" else 0.0,
+        caption={"caption": "Table 2. Fees", "continued": "Table 1 (continued)"}.get(change),
+    )
+    if change == "columns":
+        for cell in second["cells"]:
+            cell["col"] = 2 * cell["col"]
+        second["num_cols"] = 3
+    if change == "unreadable":
+        second["_table_readability"] = {"page": 2}
+    current = [second]
+    if change == "footer":
+        previous.append(
+            dict(
+                type="artifact",
+                artifact_type="page_footer",
+                page=0,
+                text="Page 1",
+                bbox=dict(l=280, b=20, r=330, t=32),
+            )
+        )
+    if change == "heading":
+        current.insert(
+            0, dict(type="heading", page=1, text="Fees", bbox=dict(l=70, b=740, r=300, t=760))
+        )
+    if change == "note":
+        previous.append(
+            dict(
+                type="paragraph",
+                page=0,
+                text="Note: steps vary.",
+                bbox=dict(l=70, b=30, r=300, t=40),
+            )
+        )
+    found = _continued_table(previous, current, (LETTER, LETTER))
+    joined = {"model", "extractor", "external", "footer", "continued", "repeat", "repeat_flagged"}
+    if change not in joined:
+        assert found is None
+        return
+    assert found == (first, second)
+    assert _mark_table_continuation(*found, current)
+    assert second["_continues_table"] is first
+    if change.startswith("repeat"):
+        # The repeated header row becomes a pagination artifact over its cells.
+        (artifact,) = (e for e in current if e.get("type") == "artifact")
+        assert artifact["artifact_type"] == "pagination"
+        assert artifact["bbox"]["t"] == 720 and artifact["bbox"]["b"] == 708
+        assert second["num_rows"] == 2
+        assert [(c["row"], c["text"]) for c in second["cells"] if c["col"] == 0] == [
+            (0, "3"),
+            (1, "4"),
+        ]
+    else:
+        assert current == [second] and second["num_rows"] == 2
+
+
+def test_inferred_header_row_keeps_the_next_page_table_its_own():
+    first = part(STEPS, page=0, top=100, table_llm_decisions=[HEADERS])
+    second = part(MORE, page=1, top=720)
+    found = _continued_table([first], [second], (LETTER, LETTER))
+    assert found == (first, second)
+    # The tagger's inference then found a header row of its own.
+    second["cells"][0].update(is_header=True, column_header=True)
+    second["cells"][1].update(is_header=True, column_header=True)
+    assert not _mark_table_continuation(*found, [second])
+    assert "_continues_table" not in second
+
+
+async def two_pages(tmp_path, first, second, decisions, *, form=False):
+    """A table at the foot of page one and the next page's table at its head."""
+    pdf, elements = pikepdf.new(), []
+    for page, rows in enumerate((first, second)):
+        piece_path = tmp_path / f"p{page}.pdf"
+        element = _fixture(piece_path, rows, form=form)["elements"][0]
+        with pikepdf.open(piece_path) as piece:
+            pg = piece.pages[0]
+            if page == 0:
+                pg.Contents = piece.make_stream(
+                    b"q 1 0 0 1 0 -580 cm " + pg.Contents.read_bytes() + b" Q"
+                )
+                for box in [element["bbox"], *[c["bbox"] for c in element["cells"]]]:
+                    box["t"] -= 580
+                    box["b"] -= 580
+            pdf.pages.append(pg)
+        element.update(page=page, review_id=f"review-{page}")
+        elements.append(element)
+    source = tmp_path / "input.pdf"
+    pdf.save(source)
+    structure, _ = queue_table_decisions(dict(title="Steps", elements=elements), decisions)
+    return source, structure
+
+
+@pytest.mark.parametrize("second", ["form_region", "layout_grid", "headers", "repeat", "none"])
+@pytest.mark.parametrize("form", [False, True])
+async def test_continued_rows_join_the_table_and_take_its_model_headers(tmp_path, second, form):
+    """The model gave headers to the table on page one; its rows on page two
+    are tagged under the same Table, whatever the model said of them alone."""
+    decisions = [dict(HEADERS, table_review_id="review-0", page=1, confidence="low")]
+    if second in {"form_region", "layout_grid"}:
+        decisions.append(
+            dict(
+                table_review_id="review-1",
+                page=2,
+                confidence="low",
+                suggested_action="reclassify_region",
+                resolved_kind=second,
+            )
+        )
+    elif second == "headers":
+        decisions.append(
+            dict(
+                table_review_id="review-1",
+                page=2,
+                suggested_action="set_table_headers",
+                header_rows=[0],
+            )
+        )
+    rows = [STEPS[0], *MORE] if second == "repeat" else MORE
+    source, structure = await two_pages(tmp_path, STEPS, rows, decisions, form=form)
+    output = tmp_path / "output.pdf"
+    original = copy.deepcopy(structure)
+    result = await tagger.tag_pdf(source, output, structure, [], language="en")
+    assert structure == original
+    with pikepdf.open(output) as pdf:
+        (table,) = _tables(pdf.Root.StructTreeRoot)
+        pages = [page.obj.objgen for page in pdf.pages]
+        assert len(table.K) == 5
+        header = table.K[0]
+        assert [str(c.S) for c in header.K] == ["/TH", "/TH"]
+        assert all(c.A.Scope == "/Column" for c in header.K)
+        for index, row in enumerate(table.K):
+            assert row.P == table
+            assert {mcr.Pg.objgen for cell in row.K for mcr in cell.K} == {
+                pages[0] if index < 3 else pages[1]
+            }
+            if index:
+                label, value = row.K
+                assert label.S == "/TH" and label.A.Scope == "/Row"
+                assert value.S == "/TD"
+                assert set(value.A.Headers) == {header.K[1].ID, label.ID}
+    statuses = [d["status"] for d in result.table_intelligence_audit]
+    assert statuses[0] == "applied_headers"
+    assert all(status == "joined_previous_table" for status in statuses[1:])
+    assert result.tables_joined == [
+        dict(
+            page=2,
+            table_review_id="review-1",
+            continues_page=1,
+            continues_table_review_id="review-0",
+        )
+    ]
+    heard = screen_reader_text(output, markdown=True)
+    assert heard.count("<th>No.</th><th>Step</th>") == 1
+    assert "<tr><th>3</th><td>Choose a file</td></tr>" in heard
+    if second == "repeat":
+        # The header row the second page repeats is still drawn, as an artifact.
+        assert rendered(source) == rendered(output)
+        with pikepdf.open(output) as pdf:
+            page = pdf.pages[1]
+            owner = page.Resources.XObject.OCR if form else page
+            marks, shown = [], {}
+            for operands, operator in pikepdf.parse_content_stream(owner):
+                if str(operator) in {"BDC", "BMC"}:
+                    marks.append(operands)
+                elif str(operator) == "EMC":
+                    marks.pop()
+                elif str(operator) == "Tj":
+                    shown[str(operands[0])] = marks[-1]
+        for text in STEPS[0]:
+            tag, properties = shown[text]
+            assert tag == "/Artifact" and properties.Type == "/Pagination"
+        assert "/MCID" in shown["3"][1]
+
+
+LAYOUT = dict(suggested_action="reclassify_region", resolved_kind="text_block", confidence="low")
+
+
+@pytest.mark.parametrize("change", ["layout", "headers", "lower", "shift", "own_layout"])
+def test_continuation_follows_the_layout_the_model_made_of_the_table(change):
+    """The model made the table on page one a text block. The table that
+    starts the next page with the same columns is the same text block,
+    unless it has header cells of its own or does not line up."""
+    first = part(STEPS, page=0, top=100, table_llm_decisions=[LAYOUT])
+    first["_layout_table"] = (
+        {"reason": "bullet label column", "order": "row", "blocks": []}
+        if change == "own_layout"
+        else _model_table_layout(first)
+    )
+    second = part(
+        MORE,
+        page=1,
+        top=650 if change == "lower" else 720,
+        flagged=(0,) if change == "headers" else (),
+        shift=20 if change == "shift" else 0.0,
+    )
+    found = _continued_table([first], [second], (LETTER, LETTER))
+    if change != "layout":
+        assert found is None
+        return
+    assert found == (first, second)
+    layout = _model_table_layout(second, first)
+    assert layout["model_kind"] == "text_block" and layout["continues_page"] == 1
+    assert layout["blocks"] == [{"role": "P", "groups": [[(0, 0), (0, 1)], [(1, 0), (1, 1)]]}]
+    # Its rows are not joined to the first table's: neither is a Table.
+    assert not _mark_table_continuation(*found, [dict(second, _layout_table=layout)])
+
+
+@pytest.mark.parametrize("own", ["none", "headers"])
+async def test_continued_part_takes_the_layout_the_model_made_of_the_table(tmp_path, own):
+    """A table at the foot of page one that the model made a text block
+    continues at the head of page two; page two's part is read as the same
+    text block, whatever the model said of it alone."""
+    decisions = [dict(LAYOUT, table_review_id="review-0", page=1)]
+    if own == "headers":
+        decisions.append(
+            dict(
+                table_review_id="review-1",
+                page=2,
+                suggested_action="set_table_headers",
+                header_rows=[0],
+            )
+        )
+    source, structure = await two_pages(tmp_path, STEPS, MORE, decisions)
+    output = tmp_path / "output.pdf"
+    result = await tagger.tag_pdf(source, output, structure, [], language="en")
+    assert rendered(source) == rendered(output)
+    with pikepdf.open(output) as pdf:
+        assert not list(_tables(pdf.Root.StructTreeRoot))
+    heard = screen_reader_text(output, markdown=True)
+    assert "<table>" not in heard
+    for number, step in [*STEPS[1:], *MORE]:
+        assert f"{number} {step}" in heard
+    assert [(d["table_review_id"], d["status"]) for d in result.table_intelligence_audit] == [
+        ("review-0", "applied_layout"),
+        *([("review-1", "follows_previous_table")] if own == "headers" else []),
+    ]
+    assert result.tables_joined == []
+
+
+LEGEND = [
+    ["Alumni Hall", "AE", "Delany Hall", "DY", "Student Union", "SU"],
+    ["Campbell Dome", "DM", "Dining Hall", "DH", "Summit Apartments", "SA"],
+    ["Colden Auditorium", "CA", "FitzGerald Gym", "FG", "Parking Lots", None],
+    ["Colwin Hall", "CH", "Frese Hall", "==MU", "Shuttle Bus Stop", None],
+    ["Continuing Ed 2", "C2", "Gertz Center", "GC", None, None],
+]
+
+
+def legend(rows):
+    cells = [
+        dict(row=r, col=c, text=text, row_span=1, col_span=1)
+        for r, texts in enumerate(rows)
+        for c, text in enumerate(texts)
+        if text is not None
+    ]
+    return dict(type="table", cells=cells, num_rows=len(rows), num_cols=len(rows[0]))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "legend",
+        "wrapped",
+        "orphan_code",
+        "header_row",
+        "first_unreadable",
+        "long_code",
+        "numbers",
+        "noise",
+        "two",
+    ],
+)
+def test_name_code_pairs_label_their_codes_only_when_pairing_is_clear(change):
+    """A legend repeating name | code pairs gives each name a row header for
+    the code beside it, with a few unreadable codes and names without a
+    code at the end of a column. A wrapped name, a code without a name, a
+    header row, long or numeric values, or too much noise leave it alone."""
+    rows = [list(r) for r in LEGEND]
+    if change == "wrapped":
+        # The code sits on the second line of a name split over two rows.
+        rows[2][2], rows[2][3], rows[3][2] = "Mathematics &", None, "Computer Studies"
+    elif change == "orphan_code":
+        rows[4][4], rows[4][5] = None, "PL"
+    elif change == "header_row":
+        rows = [["Building", "Code", "Building", "Code", "Building", "Code"], *rows, *rows]
+    elif change == "first_unreadable":
+        rows[0][1] = "pp"
+    elif change == "long_code":
+        rows[3][1] = "Built in 1950 for students"
+    elif change == "numbers":
+        for r in rows:
+            r[2] = "12,345"
+    elif change == "noise":
+        rows[1][1], rows[2][1], rows[2][3], rows[4][3] = "pp", "Cl", "RE -_", "gc"
+    elif change == "two":
+        rows = [r[:2] for r in rows]
+    table = legend(rows)
+    _infer_table_headers([table], [], None)
+    headed = {(c["row"], c["col"]) for c in table["cells"] if c.get("row_header")}
+    if change != "legend":
+        assert not any(c.get("is_header") for c in table["cells"])
+        return
+    assert headed == {
+        (r, c)
+        for r, texts in enumerate(rows)
+        for c in (0, 2, 4)
+        if texts[c] is not None and texts[c + 1] is not None
+    }
+    from app.pipeline.tagger_structure import StructTreeBuilder
+
+    with pikepdf.new() as pdf:
+        pdf.add_blank_page()
+        builder = StructTreeBuilder(pdf)
+        builder.setup()
+        structs = builder._ensure_fragmented_table(table)
+        for row, col in headed:
+            assert list(structs[row, col + 1].A.Headers) == [structs[row, col].ID]
+
+
+@pytest.mark.parametrize(
+    "decision,confidence",
+    [("form_region", "low"), ("layout_grid", "low"), ("layout_grid", "medium"), (None, None)],
+)
+async def test_name_code_legend_keeps_its_row_headers_against_a_weak_reclassification(
+    tmp_path, decision, confidence
+):
+    """Whatever the model says at low confidence, a recognised name | code
+    legend is a table whose names are row headers; a confident layout call
+    still applies."""
+    rows = [r[:4] for r in LEGEND[:3]]
+    source, output = tmp_path / "input.pdf", tmp_path / "output.pdf"
+    structure = _fixture(source, rows)
+    structure["elements"][0]["review_id"] = "review-0"
+    if decision:
+        structure, _ = queue_table_decisions(
+            structure,
+            [
+                dict(
+                    table_review_id="review-0",
+                    suggested_action="reclassify_region",
+                    resolved_kind=decision,
+                    confidence=confidence,
+                )
+            ],
+        )
+    result = await tagger.tag_pdf(source, output, structure, [], language="en")
+    statuses = [d["status"] for d in result.table_intelligence_audit]
+    if confidence == "medium":
+        with pikepdf.open(output) as pdf:
+            assert not list(_tables(pdf.Root.StructTreeRoot))
+        assert statuses == ["applied_layout"]
+        return
+    _assert_table(output, rows, {(r, c): "Row" for r in range(3) for c in (0, 2)})
+    assert statuses == (["kept_table"] if decision else [])

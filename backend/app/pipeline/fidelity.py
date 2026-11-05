@@ -592,7 +592,11 @@ def _table_review_targets(
     return targets
 
 
-def _table_semantics_risk(structure_json: dict[str, Any]) -> dict[str, Any]:
+def _table_semantics_risk(
+    structure_json: dict[str, Any], *, continued: frozenset[str] = frozenset()
+) -> dict[str, Any]:
+    """Tables whose review ids are in ``continued`` were tagged as rows of
+    the table they continue on the page before, and are judged with it."""
     elements = structure_json.get("elements", [])
     if not isinstance(elements, list):
         return {
@@ -610,6 +614,8 @@ def _table_semantics_risk(structure_json: dict[str, Any]) -> dict[str, Any]:
 
     for index, element in enumerate(elements):
         if not isinstance(element, dict) or element.get("type") != "table":
+            continue
+        if str(element.get("review_id") or f"review-{index}") in continued:
             continue
         cells = element.get("cells")
         if not isinstance(cells, list) or not cells:
@@ -719,8 +725,10 @@ def _table_semantics_risk(structure_json: dict[str, Any]) -> dict[str, Any]:
     return {
         "table_count": sum(
             1
-            for element in elements
-            if isinstance(element, dict) and element.get("type") == "table"
+            for index, element in enumerate(elements)
+            if isinstance(element, dict)
+            and element.get("type") == "table"
+            and str(element.get("review_id") or f"review-{index}") not in continued
         ),
         "complex_tables": complex_tables,
         "high_risk_tables": high_risk_tables,
@@ -1272,6 +1280,8 @@ class _FidelityInputs:
     covered_figure_count: int
     table_count: int
     tagged_table_count: int
+    # Review ids of tables tagged as rows of the table before (see tagger_table_structure).
+    continued_tables: frozenset[str]
 
 
 @dataclass
@@ -1405,8 +1415,13 @@ def _build_fidelity_inputs(
     figure_pages: dict[int, int] = {}
     figure_targets: list[dict[str, Any]] = []
     table_count = 0
+    continued_tables = frozenset(
+        str(item["table_review_id"])
+        for item in tagging_metrics.get("tables_joined") or []
+        if isinstance(item, dict) and item.get("table_review_id")
+    )
     if isinstance(elements, list):
-        for element in elements:
+        for index, element in enumerate(elements):
             if not isinstance(element, dict):
                 continue
             if element.get("type") == "figure" and isinstance(element.get("figure_index"), int):
@@ -1429,7 +1444,9 @@ def _build_fidelity_inputs(
                 if caption:
                     target["caption"] = caption[:240]
                 figure_targets.append(target)
-            elif element.get("type") == "table":
+            elif element.get("type") == "table" and (
+                str(element.get("review_id") or f"review-{index}") not in continued_tables
+            ):
                 table_count += 1
 
     figure_count = len(figure_captions)
@@ -1480,6 +1497,7 @@ def _build_fidelity_inputs(
         covered_figure_count=covered_figure_count,
         table_count=table_count,
         tagged_table_count=tagged_table_count,
+        continued_tables=continued_tables,
     )
 
 
@@ -2342,7 +2360,7 @@ def _check_table_headers(inputs: _FidelityInputs, out: _FidelityCollector) -> No
 
 def _check_table_risk(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     if inputs.table_count > 0:
-        table_risk = _table_semantics_risk(inputs.structure_json)
+        table_risk = _table_semantics_risk(inputs.structure_json, continued=inputs.continued_tables)
         if table_risk["complex_tables"] > 0:
             risk_targets = table_risk["targets"]
             severity = "medium"

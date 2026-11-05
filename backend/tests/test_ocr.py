@@ -291,3 +291,51 @@ async def test_other_exit_codes_do_not_retry(simulate_ocr, code, mode, success):
     assert result.skipped is (code == 6 and mode == "skip")
     if not success:
         assert f"OCR failed (exit {code})" in result.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rotate_pages", [True, False])
+async def test_pages_whose_glyphs_run_sideways_are_read_upright(
+    monkeypatch, tmp_path, rotate_pages
+):
+    from tests.test_page_orientation import LINE, document
+
+    source, output = tmp_path / "in.pdf", tmp_path / "out.pdf"
+    document(
+        source,
+        [
+            ([(1, LINE)] * 4, 0),  # drawn sideways
+            ([(1, LINE)] * 4, 0, 3),  # an earlier OCR layer read sideways
+            ([(0, LINE)] * 4, 0),  # upright
+            ([(3, LINE)] * 4, 0),  # sideways, but not among the pages to read
+        ],
+    )
+    before = source.read_bytes()
+    seen = {}
+
+    async def create_subprocess_exec(*args, **kwargs):
+        given = Path(args[-2])
+        with pikepdf.open(given) as pdf:
+            seen["rotations"] = [int(p.obj.get("/Rotate", 0)) for p in pdf.pages]
+            pdf.save(output)
+        seen["given"] = given
+        return SimpleNamespace(returncode=0)
+
+    async def communicate(proc, timeout):
+        return b"", b""
+
+    monkeypatch.setattr(ocr.asyncio, "create_subprocess_exec", create_subprocess_exec)
+    monkeypatch.setattr(ocr, "communicate_with_timeout", communicate)
+
+    result = await ocr.run_ocr(
+        source, output, mode="redo", pages=[0, 1, 2], rotate_pages=rotate_pages
+    )
+
+    assert result.success and result.output_path == output
+    assert source.read_bytes() == before
+    if rotate_pages:
+        assert seen["rotations"] == [90, 0, 0, 0]
+        assert "[1]" in result.message
+    else:
+        assert seen["given"] == source
+        assert seen["rotations"] == [0, 0, 0, 0]

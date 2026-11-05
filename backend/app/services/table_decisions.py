@@ -4,6 +4,10 @@ from copy import deepcopy
 from typing import Any
 
 LAYOUT_KINDS = frozenset({"layout_grid", "toc_group", "text_block"})
+# What a table can be reclassified as: a layout the tagger makes of its
+# cells, or a form region, which stays a table. The model is offered these
+# only (intelligence_tables, intelligence_semantics).
+TABLE_REGION_KINDS = ("layout_grid", "toc_group", "text_block", "form_region")
 HEADER_FLAGS = ("is_header", "column_header", "row_header")
 
 
@@ -38,14 +42,25 @@ def header_selection(table: dict, item: dict) -> list[tuple[dict, str]]:
     ]
 
 
+def unsupported_region_kind(item: dict) -> bool:
+    """A reclassification of a table as a kind nothing can apply."""
+    return (
+        table_action(item) == "reclassify_region"
+        and item.get("resolved_kind") not in TABLE_REGION_KINDS
+    )
+
+
 def queue_table_decision(table: dict, item: dict) -> bool:
-    """Keep the original cell ownership and extractor flags until tagging."""
+    """Keep the original cell ownership and extractor flags until tagging.
+    A reclassification as a kind nothing can apply is kept too, applying
+    nothing, so the tagger's decision audit records it; it is not queued."""
     action = table_action(item)
+    unsupported = unsupported_region_kind(item)
     if action == "set_table_headers":
         if has_headers(table) or not header_selection(table, item):
             return False
     elif action == "reclassify_region":
-        if has_headers(table) or item.get("resolved_kind") not in LAYOUT_KINDS | {"form_region"}:
+        if has_headers(table) and not unsupported:
             return False
     else:
         return False
@@ -66,7 +81,7 @@ def queue_table_decision(table: dict, item: dict) -> bool:
     if decision in pending:
         return False
     pending.append(decision)
-    return True
+    return not unsupported
 
 
 def queue_table_decisions(structure: dict, items: list[dict]) -> tuple[dict, list[dict[str, Any]]]:
@@ -93,4 +108,6 @@ def queue_table_decisions(structure: dict, items: list[dict]) -> tuple[dict, lis
                         "status": "queued",
                     }
                 )
+            elif unsupported_region_kind(item):
+                table["review_id"] = review_id  # kept for the decision audit
     return result, queued

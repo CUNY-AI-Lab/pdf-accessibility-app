@@ -63,10 +63,15 @@ def figure_author(path, *, alt='The author describes a gray square.', actual='')
         pdf.save(path)
 
 
-@pytest.mark.parametrize('placeholder', [False, True])
-async def test_author_figure_geometry_description_and_placeholder(tmp_path, monkeypatch, placeholder):
+@pytest.mark.parametrize('kind', ['description', 'placeholder', 'file_name'])
+async def test_author_figure_geometry_description_and_placeholder(tmp_path, monkeypatch, kind):
     source, output = tmp_path / 'source.pdf', tmp_path / 'output.pdf'
-    description = '[Could not determine figure semantics]' if placeholder else 'The author describes a gray square.'
+    placeholder = kind != 'description'
+    description = {
+        'description': 'The author describes a gray square.',
+        'placeholder': '[Could not determine figure semantics]',
+        'file_name': 'C:\\Users\\staff\\Pictures\\IMG_1234.jpg',
+    }[kind]
     figure_author(source, alt=description, actual='' if placeholder else 'Author replacement reading.')
     structure = {'elements': [dict(type='figure', figure_index=0, page=0,
                                   bbox=dict(l=20, b=20, r=70, t=70))]}
@@ -87,6 +92,21 @@ async def test_author_figure_geometry_description_and_placeholder(tmp_path, monk
         )
         assert results[0].generated_text == description
         assert results[0].status == 'approved'
+    if kind == 'file_name':
+        # A file name is no description: the figure is described as usual.
+        image = tmp_path / 'figure.png'
+        image.write_bytes(b'png')
+        asked = []
+        async def model(**kwargs):
+            asked.extend(figure.index for figure in kwargs['figures'])
+            return [{'suggested_action': 'set_alt_text', 'confidence': 'high',
+                     'alt_text': 'A gray square on a white page.'}]
+        monkeypatch.setattr(alt_text, 'generate_figures_intelligence', model)
+        results = await alt_text.generate_alt_text(
+            [FigureInfo(0, image, page=0)], SimpleNamespace(model=None), structure=enriched,
+        )
+        assert asked == [0]
+        assert results[0].generated_text == 'A gray square on a white page.'
     await tagger.tag_pdf(source, output, enriched)
     with pikepdf.open(output) as pdf:
         figure = _first_struct_elem(pdf.Root.StructTreeRoot, 'Figure')
@@ -250,3 +270,138 @@ def test_author_repairs_keep_structure_and_rendering(tmp_path):
     assert read_author_structure(output) == before
     assert screen_reader_text(output) == screen_reader_text(source)
     assert rendered(output) == rendered(source)
+
+
+@pytest.mark.parametrize(
+    'raw,clean',
+    [
+        ('gcc logo\x00', 'gcc logo'),
+        ('A blue text on a white background\n\nAI-generated content may be incorrect.',
+         'A blue text on a white background AI-generated content may be incorrect.'),
+        ('Know where to get help\x0b      ', 'Know where to get help'),
+        ('Robustness and resilience of complex networks\r', 'Robustness and resilience of complex networks'),
+        ('CUNY\tAcademic\x07 Works\x1f', 'CUNY Academic Works'),
+        # Only control characters go: other marks and letters stay.
+        ('Café — naïve ✓ x​y', 'Café — naïve ✓ x​y'),
+    ],
+)
+def test_author_text_drops_control_characters(raw, clean):
+    from app.services.pdf_objects import author_text
+
+    assert author_text(pikepdf.String(raw)) == clean
+
+
+def _author_text_everywhere(path):
+    """A tagged figure, a link, a note, a form field and bookmarks whose
+    author text carries the control characters Word leaves behind."""
+    figure_author(path, alt='gcc logo\x00', actual='Author replacement\nreading.\x00')
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        page = pdf.pages[0]
+        link = pikepdf.Dictionary(Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Link,
+                                  Rect=[100, 100, 150, 120], Contents=pikepdf.String('CUNY\nAcademic Works'),
+                                  A=pikepdf.Dictionary(S=pikepdf.Name.URI, URI=pikepdf.String('https://x.org')))
+        note = pikepdf.Dictionary(Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Text,
+                                  Rect=[160, 160, 180, 180], Contents=pikepdf.String('Check\x00'),
+                                  T=pikepdf.String('J. Author\x00'))
+        field = pikepdf.Dictionary(Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Widget, FT=pikepdf.Name.Tx,
+                                   Rect=[20, 150, 90, 170], T=pikepdf.String('name\x00'),
+                                   TU=pikepdf.String('Your name\x00'))
+        # A radio group is a field of its own, named apart from its widgets.
+        group = pdf.make_indirect(pikepdf.Dictionary(FT=pikepdf.Name.Btn, Ff=49152, T=pikepdf.String('choice'),
+                                                     TU=pikepdf.String('Pick one\x00')))
+        option = pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Widget,
+                                                      Rect=[20, 120, 30, 130], Parent=group))
+        group.Kids = pikepdf.Array([option])
+        annots = [pdf.make_indirect(a) for a in (link, note, field)]
+        page.Annots = pikepdf.Array([*annots, option])
+        pdf.Root.AcroForm = pikepdf.Dictionary(Fields=pikepdf.Array([annots[2], group]))
+        outlines = pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.Outlines))
+        first = pdf.make_indirect(pikepdf.Dictionary(Title=pikepdf.String('Introduction\r'), Parent=outlines,
+                                                     Dest=pikepdf.Array([page.obj, pikepdf.Name.Fit])))
+        second = pdf.make_indirect(pikepdf.Dictionary(Title=pikepdf.String('Get help\x0b   '), Parent=outlines,
+                                                      Prev=first, Dest=pikepdf.Array([page.obj, pikepdf.Name.Fit])))
+        first.Next = second
+        outlines.First, outlines.Last, outlines.Count = first, second, 2
+        pdf.Root.Outlines = outlines
+        pdf.docinfo['/Title'] = pikepdf.String('Annual report\x00')
+        pdf.save(path)
+
+
+async def test_author_text_reaches_the_output_without_control_characters(tmp_path):
+    source, output = tmp_path / 'source.pdf', tmp_path / 'output.pdf'
+    _author_text_everywhere(source)
+    structure = {'elements': [dict(type='figure', figure_index=0, page=0,
+                                  bbox=dict(l=20, b=20, r=70, t=70))]}
+    enriched = apply_author_structure(structure, read_author_structure(source))
+    assert enriched['elements'][0]['author_alt'] == 'gcc logo'
+    assert enriched['title'] == 'Annual report'
+    await tagger.tag_pdf(source, output, enriched)
+    with pikepdf.open(output) as pdf:
+        figure = _first_struct_elem(pdf.Root.StructTreeRoot, 'Figure')
+        assert str(figure.Alt) == 'gcc logo'
+        assert str(figure.ActualText) == 'Author replacement reading.'
+        link, note, field, option = (a for a in pdf.pages[0].Annots)
+        assert str(option.Parent.TU) == 'Pick one'
+        assert str(link.Contents) == 'CUNY Academic Works'
+        assert (str(note.Contents), str(note.T)) == ('Check', 'J. Author')
+        assert str(field.TU) == 'Your name'
+        # A field's partial name identifies it to scripts and submissions.
+        assert str(field.T) == 'name\x00'
+        titles = []
+        item = pdf.Root.Outlines.get('/First')
+        while item is not None:
+            titles.append(str(item.Title))
+            item = item.get('/Next')
+        assert titles[:2] == ['Introduction', 'Get help']
+        assert str(pdf.docinfo['/Title']) == 'Annual report'
+
+
+async def test_stored_description_reaches_alt_without_control_characters(tmp_path):
+    from tests.test_figure_descriptions import FIGURE_STRUCTURE, _figure_alts, _figure_pdf
+
+    output = tmp_path / 'tagged.pdf'
+    await tagger.tag_pdf(
+        input_path=_figure_pdf(tmp_path / 'in.pdf'), output_path=output,
+        structure_json=FIGURE_STRUCTURE,
+        alt_texts=[{'figure_index': 0, 'text': 'A gray square\x00\n', 'status': 'approved'}],
+    )
+    assert _figure_alts(output) == ['A gray square']
+
+
+def test_a_kid_widget_named_from_its_field_name_has_no_control_characters():
+    from app.services.form_fields import name_widget_field
+
+    with pikepdf.new() as pdf:
+        field = pdf.make_indirect(pikepdf.Dictionary(FT=pikepdf.Name.Btn, T=pikepdf.String('Agree\x00')))
+        widget = pdf.make_indirect(pikepdf.Dictionary(Subtype=pikepdf.Name.Widget, Parent=field))
+        field.Kids = pikepdf.Array([widget])
+        name_widget_field(widget)
+        assert str(field.TU) == 'Agree'
+        assert str(field.T) == 'Agree\x00'
+
+
+@pytest.mark.parametrize('where', ['info', 'xmp'])
+def test_document_title_from_author_metadata_has_no_control_characters(tmp_path, where):
+    from app.pipeline.document_title import select_document_title
+
+    with pikepdf.new() as pdf:
+        pdf.add_blank_page()
+        if where == 'info':
+            pdf.docinfo['/Title'] = pikepdf.String('Annual report\x00')
+        else:
+            with pdf.open_metadata() as metadata:
+                metadata['dc:title'] = 'Annual report\x0b'
+        decision = select_document_title(None, {'elements': []}, 'scan.pdf', source_pdf=pdf)
+    assert decision['title'] == 'Annual report'
+
+
+async def test_a_stored_structure_keeps_no_control_characters_in_author_text(tmp_path):
+    source, output = tmp_path / 'source.pdf', tmp_path / 'output.pdf'
+    figure_author(source, alt='')
+    # A structure saved before author text was cleaned when read.
+    stored = {'elements': [dict(type='figure', figure_index=0, page=0, bbox=dict(l=20, b=20, r=70, t=70),
+                                author_alt='Graduation cap\x00', author_actual_text='Cap\x00')]}
+    await tagger.tag_pdf(source, output, stored)
+    with pikepdf.open(output) as pdf:
+        figure = _first_struct_elem(pdf.Root.StructTreeRoot, 'Figure')
+        assert (str(figure.Alt), str(figure.ActualText)) == ('Graduation cap', 'Cap')

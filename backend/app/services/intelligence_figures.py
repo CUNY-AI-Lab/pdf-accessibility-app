@@ -351,6 +351,18 @@ def _finalize_figure_result(
     return _normalize_figure_result(figure_index=figure_index, raw=raw)
 
 
+def _confirmed_alone(result: dict[str, object]) -> bool:
+    """A confident batch decision to hide or replace a figure, which the
+    single-figure review confirms before it stands. The batch prompt favours
+    hiding "redundant child details" and has hidden charts and text headings
+    that the single-figure prompt describes."""
+    suggested_action = str(result.get("suggested_action") or "").strip()
+    return confidence_label(result.get("confidence")) != "low" and (
+        suggested_action in {"mark_decorative", "reclassify_region"}
+        or bool(result.get("is_decorative"))
+    )
+
+
 def _requires_single_figure_followup(result: dict[str, object]) -> bool:
     suggested_action = str(result.get("suggested_action") or "").strip() or "manual_only"
     confidence = confidence_label(result.get("confidence"))
@@ -358,6 +370,8 @@ def _requires_single_figure_followup(result: dict[str, object]) -> bool:
     if confidence == "low":
         return True
     if suggested_action == "manual_only":
+        return True
+    if _confirmed_alone(result):
         return True
     if suggested_action == "set_alt_text" and not usable_description(alt_text):
         return True
@@ -471,9 +485,11 @@ async def generate_figure_intelligence(
                         {"type": "text", "text": (
                             "Describe this retained figure for a screen reader. A screenshot of "
                             "a form, toolbar or palette is a static image. No tagged replacement "
-                            "carries its information. Return set_alt_text with a grounded "
-                            "description, mark_decorative only for decoration, or manual_only "
-                            "if you cannot read it. Do not propose reclassification.\n"
+                            "carries its information, so text, a list, code or a form control "
+                            "in it is described too: what it is, its subject and its key "
+                            "content. Return set_alt_text with a grounded description, "
+                            "mark_decorative only for decoration, or manual_only only if the "
+                            "crop is illegible. Do not propose reclassification.\n"
                             + FIGURE_DESCRIPTION_RULES
                         )},
                         context_json_part(unit.to_prompt_dict()),
@@ -633,6 +649,17 @@ async def generate_figures_intelligence(
                         and followup.get("suggested_action") in {"set_alt_text", "manual_only"}
                         and not usable_description(str(followup.get("alt_text") or ""))
                     ):
+                        followup = previous
+                    if (
+                        previous is not None
+                        and _confirmed_alone(previous)
+                        and followup.get("suggested_action") in {"set_alt_text", "manual_only"}
+                        and not usable_description(str(followup.get("alt_text") or ""))
+                    ):
+                        # The single review describes what the batch would hide;
+                        # when it cannot describe the figure, the batch's decision
+                        # to hide or replace it stands (its kind may be one the
+                        # review cannot name, such as text or code).
                         followup = previous
                     if (
                         previous is not None

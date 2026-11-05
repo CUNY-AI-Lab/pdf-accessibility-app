@@ -21,6 +21,64 @@ from app.pipeline.structure import FigureInfo
 from app.pipeline.tagger import tag_pdf
 
 PLACEHOLDERS = ["[Could not determine figure semantics]", "[Generation failed: timeout]", ""]
+# What authoring tools leave as alt text when the author wrote none.
+FILE_NAMES = [
+    "C:\\Users\\staff\\Dropbox\\Logos\\logo.vector.emf",
+    "C:\\Users\\staff\\AppData\\Local\\Temp\\Content.MSO\\9C346620.tmp",
+    "C:\\Users\\staff\\My Pictures\\campus visit",
+    "/Users/staff/Pictures/campus photo.jpg",
+    "https://images.example.org/covers/51ul2TNszfL.jpg",
+    "cid:image001.png@01D7D71D.04B80070",
+    "Screen Shot 2020-01-01 at 10.00.00 AM.png",
+    "IMG_7191",
+    "DSC0001",
+    "PXL_20240101_120000",
+    "top_bw_150",
+    "P817TB2#y1",
+    "Simpleicons_Business_ascendant-bars-graphic\x00",
+    "Description: image001\x00",
+    "www.example.edu/files/2013/02/",
+]
+# Short alt texts that describe something, however briefly.
+SHORT_DESCRIPTIONS = [
+    "Logo",
+    "CUNY seal",
+    "Figure 3",
+    "QR code",
+    "COVID-19",
+    "H2O",
+    "3D",
+    "E=mc2",
+    "www.cuny.edu",
+    "perplexity.ai",
+    "@HunterSchoolofEd",
+    "Fig. 2.1",
+    "Before/after",
+    "1/2/2024",
+    "9/11 memorial",
+    "Map of NYC/NJ/CT region",
+    "Ph.D. program logo",
+    "St. John's",
+    "#1 in the nation",
+    "CUNYfirst ID # field 1",
+    "Twitter logo with handle @HC_SOE",
+]
+
+
+@pytest.mark.parametrize("text", FILE_NAMES)
+def test_a_file_name_is_not_alt_text(text):
+    from app.pipeline.tagger_semantics import is_file_name_alt_text, is_placeholder_alt_text
+
+    assert is_file_name_alt_text(text)
+    assert is_placeholder_alt_text(text)
+
+
+@pytest.mark.parametrize("text", SHORT_DESCRIPTIONS)
+def test_short_alt_text_is_kept(text):
+    from app.pipeline.tagger_semantics import is_file_name_alt_text, is_placeholder_alt_text
+
+    assert not is_file_name_alt_text(text)
+    assert not is_placeholder_alt_text(text)
 
 
 def _figure_pdf(path: Path) -> Path:
@@ -156,7 +214,7 @@ def test_described_and_decorative_figures_keep_their_decision(generated, caption
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("placeholder", PLACEHOLDERS[:2])
+@pytest.mark.parametrize("placeholder", PLACEHOLDERS[:2] + FILE_NAMES[:1])
 async def test_tag_pdf_never_writes_a_placeholder_as_alt(tmp_path, placeholder):
     output = tmp_path / "tagged.pdf"
 
@@ -220,7 +278,9 @@ def _assess(output: Path, alt_entries: list[dict]):
     )
 
 
-@pytest.mark.parametrize("alt", ["[Could not determine figure semantics]", None, "  "])
+@pytest.mark.parametrize(
+    "alt", ["[Could not determine figure semantics]", None, "  ", "IMG_7191.jpeg"]
+)
 def test_fidelity_holds_a_figure_a_screen_reader_cannot_describe(tmp_path, alt):
     output = _pdf_with_figure_alt(tmp_path / "out.pdf", alt)
 

@@ -400,8 +400,9 @@ async def generate_alt_text(
 
 FIGURE_RECOVERY_FEEDBACK = """This region remains a figure in the accessible PDF.
 No tagged table or form carries its content. Supply alt_text describing the visible
-crop even if it looks like a table, form, screenshot, or part of a page layout.
-For a table, describe its subject, headers and legible key information briefly.
+crop even if it looks like text, a list, code, a table, a form, a screenshot, or part
+of a page layout. For text, a list or code, say what it is, its subject and its key
+content briefly. For a table, describe its subject, headers and legible key information briefly.
 For a form or screenshot, describe visible controls and state; for a photo,
 describe visible subjects without inferring identities. Return set_alt_text with
 a nonempty description, not reclassify_region. If the crop is truly empty or

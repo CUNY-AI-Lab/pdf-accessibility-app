@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 from app.config import get_settings
+from app.pipeline.fonts.encoding import _standard_encoding_over_winansi
 from app.pipeline.fonts.names import _strip_subset_prefix
 from app.pipeline.fonts.programs import (
     _ghostscript_type1_descriptor,
@@ -152,19 +153,38 @@ def _embed_system_fonts_sync(
         if not isinstance(descriptor, pikepdf.Dictionary):
             stats["fonts_unsupported"] += 1
             return False
+        symbolic = int(descriptor.get("/Flags") or 0) & 4
         if fontfile_key == "/FontFile2" and font_dict.get("/Subtype") in (
             pikepdf.Name("/Type1"), pikepdf.Name("/MMType1"),
         ):
-            # A TrueType program requires a TrueType dictionary. Make Type 1's
-            # implicit StandardEncoding explicit before changing the subtype.
+            # A TrueType program requires a TrueType dictionary. A Type 1
+            # font's implicit base is StandardEncoding; state the same glyph
+            # names over WinAnsiEncoding, as PDF/UA requires of TrueType.
             encoding = font_dict.get("/Encoding")
-            if encoding is None:
+            restated = (
+                None
+                if symbolic
+                else _standard_encoding_over_winansi(encoding, implicit_standard=True)
+            )
+            if restated is not None:
+                font_dict["/Encoding"] = restated
+            elif encoding is None:
                 font_dict["/Encoding"] = pikepdf.Name("/StandardEncoding")
             elif isinstance(encoding, pikepdf.Dictionary) and "/BaseEncoding" not in encoding:
                 encoding = pikepdf.Dictionary(encoding)
                 encoding["/BaseEncoding"] = pikepdf.Name("/StandardEncoding")
                 font_dict["/Encoding"] = encoding
             font_dict["/Subtype"] = pikepdf.Name("/TrueType")
+        elif (
+            fontfile_key == "/FontFile2"
+            and font_dict.get("/Subtype") == pikepdf.Name("/TrueType")
+            and not symbolic
+        ):
+            restated = _standard_encoding_over_winansi(
+                font_dict.get("/Encoding"), implicit_standard=False
+            )
+            if restated is not None:
+                font_dict["/Encoding"] = restated
         if fontfile_key == "/FontFile2" and font_dict.get("/Subtype") == pikepdf.Name("/TrueType"):
             _derive_truetype_widths(font_dict, font_bytes)
             font_bytes, _, _ = _align_truetype_advances(font_dict, font_bytes)

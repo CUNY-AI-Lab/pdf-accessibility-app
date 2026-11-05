@@ -350,8 +350,10 @@ async def test_continuation_uses_original_headers_before_model_decision(tmp_path
     elements = []
     for page in range(2):
         part = tmp_path / f"p{page}.pdf"
+        # The second page's rows do not repeat the header row.
+        rows = ROWS if page == 0 else [["Delta", "four", "fourth"], *ROWS[1:]]
         element = _fixture(
-            part, ROWS, headers={(0, c): "Column" for c in range(3)} if page == 0 else None
+            part, rows, headers={(0, c): "Column" for c in range(3)} if page == 0 else None
         )["elements"][0]
         with pikepdf.open(part) as piece:
             source = piece.pages[0]
@@ -378,7 +380,7 @@ async def test_continuation_uses_original_headers_before_model_decision(tmp_path
         assert len(table.K) == 6
         assert all(c.S == "/TH" for c in table.K[0].K)
         assert all(c.S == "/TD" for c in table.K[3].K)
-    assert result.table_intelligence_audit[0]["status"] == "preserved_existing_headers"
+    assert result.table_intelligence_audit[0]["status"] == "joined_previous_table"
 
 
 async def test_table_decision_from_page_review_is_not_lost_on_order_confirmation(
@@ -421,3 +423,64 @@ async def test_table_decision_from_page_review_is_not_lost_on_order_confirmation
     assert not remaining and len(specs) == 1
     result = await tagger.tag_pdf(source, tmp_path / "after.pdf", proposed, [], language="en")
     assert result.table_intelligence_audit[0]["status"] == "applied_headers"
+
+
+@pytest.mark.parametrize("kind", ["artifact", "org_chart", "figure"])
+async def test_a_kind_nothing_applies_is_audited_not_dropped(tmp_path, monkeypatch, kind):
+    before, after, result, proposed, queued = await output(
+        tmp_path, monkeypatch, dict(suggested_action="reclassify_region", resolved_kind=kind)
+    )
+    assert queued == []
+    assert [d["resolved_kind"] for d in proposed["elements"][0]["table_llm_decisions"]] == [kind]
+    (entry,) = result.table_intelligence_audit
+    assert (entry["table_review_id"], entry["resolved_kind"], entry["status"]) == (
+        "review-0",
+        kind,
+        "unsupported_kind",
+    )
+    # The table is tagged as it would be with no decision.
+    assert screen_reader_text(before, markdown=True) == screen_reader_text(after, markdown=True)
+
+
+async def test_pretag_keeps_an_unsupported_kind_for_the_audit(tmp_path, monkeypatch):
+    from app.config import Settings
+    from app.pipeline import orchestrator
+    from app.services import intelligence_tables
+
+    source = tmp_path / "input.pdf"
+    structure = _fixture(source, ROWS)
+
+    async def request(**kwargs):
+        return dict(action="reclassify_region", resolved_kind="artifact"), {}
+
+    class Client:
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(intelligence_tables, "request_llm_json_with_response", request)
+    monkeypatch.setattr(orchestrator, "_make_pretag_llm_client", lambda *a: Client())
+    queued, audit = await orchestrator._apply_pretag_table_intelligence(
+        job=SimpleNamespace(
+            input_path=str(source), output_path=None, original_filename="input.pdf"
+        ),
+        settings=Settings(llm_api_key="check-only", llm_base_url="http://127.0.0.1:8000/v1"),
+        structure_json=structure,
+    )
+    assert audit["unsupported_kind_count"] == 1
+    assert audit.get("queued_count", 0) == 0 and not audit["applied"]
+    result = await tagger.tag_pdf(source, tmp_path / "after.pdf", queued, [], language="en")
+    assert [
+        (d["table_review_id"], d["resolved_kind"], d["status"])
+        for d in result.table_intelligence_audit
+    ] == [("review-0", "artifact", "unsupported_kind")]
+
+
+def test_an_unsupported_kind_keeps_the_review_id_it_answered(tmp_path):
+    structure = _fixture(tmp_path / "input.pdf", ROWS)
+    assert "review_id" not in structure["elements"][0]
+    item = dict(
+        table_review_id="review-0", suggested_action="reclassify_region", resolved_kind="artifact"
+    )
+    proposed, queued = queue_table_decisions(structure, [item])
+    assert queued == []
+    assert proposed["elements"][0]["review_id"] == "review-0"

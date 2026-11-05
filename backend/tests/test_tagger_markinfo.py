@@ -7,6 +7,7 @@ from app.pipeline.tagger import (
     StructTreeBuilder,
     _allocate_fragment_mcid,
     _complete_table_grid_cells,
+    _save_pdf_for_viewer_compatibility,
     _table_summary_text,
     tag_pdf,
 )
@@ -100,6 +101,79 @@ async def test_tag_pdf_saves_linearized_output_and_sanitizes_leaf_bookmarks(tmp_
         first_bookmark = pdf.Root["/Outlines"]["/First"]
         assert str(first_bookmark["/Title"]) == "Accessible Heading"
         assert "/Count" not in first_bookmark
+
+
+def _write_sparse_object_stream_pdf(path: Path, highest: int = 400) -> None:
+    """One page whose catalog, page tree and page are in an object stream,
+    with most object numbers below ``highest`` unused, as in a form saved
+    again by Acrobat."""
+    compressed = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>",
+    }
+    index, body = b"", b""
+    for number, data in compressed.items():
+        index += b"%d %d " % (number, len(body))
+        body += data + b"\n"
+    content = b"0 0 m 100 100 l S"
+    xref = highest + 1
+    out = bytearray(b"%PDF-1.7\n")
+    offsets = {}
+    for number, data in (
+        (4, b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content)),
+        (
+            5,
+            b"<< /Type /ObjStm /N %d /First %d /Length %d >>\nstream\n%s%s\nendstream"
+            % (len(compressed), len(index), len(index + body), index, body),
+        ),
+        (highest, b"<< /Producer (sparse) >>"),
+    ):
+        offsets[number] = len(out)
+        out += b"%d 0 obj\n%s\nendobj\n" % (number, data)
+    offsets[xref] = len(out)
+    position = {number: slot for slot, number in enumerate(compressed)}
+    rows = bytearray()
+    for number in range(xref + 1):
+        if number in position:
+            rows += bytes([2]) + (5).to_bytes(2, "big") + position[number].to_bytes(2, "big")
+        elif number in offsets:
+            rows += bytes([1]) + offsets[number].to_bytes(2, "big") + bytes(2)
+        else:
+            rows += bytes([0]) + bytes(2) + (65535 if number == 0 else 0).to_bytes(2, "big")
+    out += (
+        b"%d 0 obj\n<< /Type /XRef /Size %d /W [1 2 2] /Root 1 0 R /Info %d 0 R /Length %d >>\n"
+        b"stream\n%s\nendstream\nendobj\nstartxref\n%d\n%%%%EOF\n"
+        % (xref, xref + 1, highest, len(rows), bytes(rows), offsets[xref])
+    )
+    path.write_bytes(bytes(out))
+
+
+def test_linearized_save_keeps_objects_created_after_reading(tmp_path):
+    source = tmp_path / "sparse.pdf"
+    output = tmp_path / "saved.pdf"
+    _write_sparse_object_stream_pdf(source)
+    content = b"/Artifact BMC 0 0 m 100 100 l S EMC"
+    with pikepdf.open(source) as pdf:
+        assert len(pdf.objects) < 0.5 * max(obj.objgen[0] for obj in pdf.objects)
+        root = pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.StructTreeRoot))
+        root.K = pikepdf.Array(
+            pdf.make_indirect(
+                pikepdf.Dictionary(Type=pikepdf.Name.StructElem, S=pikepdf.Name.P, P=root)
+            )
+            for _ in range(150)
+        )
+        pdf.Root.StructTreeRoot = root
+        pdf.pages[0].Contents = pdf.make_stream(content)
+        _save_pdf_for_viewer_compatibility(pdf, output)
+
+    with pikepdf.open(output) as saved:
+        assert saved.is_linearized
+        kids = saved.Root.StructTreeRoot.K
+        assert len(kids) == 150
+        assert all(isinstance(kid, pikepdf.Dictionary) and kid.S == "/P" for kid in kids)
+        assert saved.pages[0].Contents.read_bytes() == content
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["saved.pdf", "sparse.pdf"]
 
 
 def _build_ocr_form_text_pdf(

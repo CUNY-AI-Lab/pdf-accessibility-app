@@ -2,6 +2,7 @@
 
 import logging
 from dataclasses import dataclass, field
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -134,7 +135,11 @@ from app.pipeline.tagger_content_geometry import (
     _text_runs_look_like_hidden_ocr_layer as _text_runs_look_like_hidden_ocr_layer,
 )
 from app.pipeline.tagger_content_geometry import _update_text_pos as _update_text_pos
-from app.pipeline.tagger_figure_text import _figure_text_elements, _recover_figure_text_owners
+from app.pipeline.tagger_figure_text import (
+    _figure_text_elements,
+    _figures_on_plain_ground,
+    _recover_figure_text_owners,
+)
 from app.pipeline.tagger_geometry import BLANK_PAGE_MAX_INK_RATIO as BLANK_PAGE_MAX_INK_RATIO
 from app.pipeline.tagger_geometry import (
     BLANK_PAGE_NONWHITE_THRESHOLD as BLANK_PAGE_NONWHITE_THRESHOLD,
@@ -204,6 +209,9 @@ from app.pipeline.tagger_link_labels import (
 from app.pipeline.tagger_normalization import FILE_NAME_TITLE_RE as FILE_NAME_TITLE_RE
 from app.pipeline.tagger_normalization import OFFICE_TITLE_PREFIX_RE as OFFICE_TITLE_PREFIX_RE
 from app.pipeline.tagger_normalization import PLACEHOLDER_TITLE_RE as PLACEHOLDER_TITLE_RE
+from app.pipeline.tagger_normalization import (
+    _clean_author_text_in_place as _clean_author_text_in_place,
+)
 from app.pipeline.tagger_normalization import (
     _is_placeholder_document_title as _is_placeholder_document_title,
 )
@@ -278,8 +286,11 @@ from app.pipeline.tagger_structure import _source_key as _source_key
 from app.pipeline.tagger_table_intelligence import _apply_model_table_headers, _model_table_layout
 from app.pipeline.tagger_table_readability import _mark_unreadable_tables
 from app.pipeline.tagger_table_structure import (
+    _continued_table,
     _finish_table_structure,
+    _mark_table_continuation,
     _plan_external_table_headers,
+    _table_review_id,
 )
 from app.pipeline.tagger_tables import _clean_table_summary_text as _clean_table_summary_text
 from app.pipeline.tagger_tables import _complete_table_grid_cells as _complete_table_grid_cells
@@ -289,7 +300,7 @@ from app.pipeline.tagger_tables import _numeric_table_text as _numeric_table_tex
 from app.pipeline.tagger_tables import _painted_table_rules as _painted_table_rules
 from app.pipeline.tagger_tables import _set_list_numbering_attr as _set_list_numbering_attr
 from app.pipeline.tagger_tables import _table_summary_text as _table_summary_text
-from app.services.pdf_objects import pdf_dictionary
+from app.services.pdf_objects import author_text, pdf_dictionary
 from app.services.pdf_objects import pdf_text as pdf_text
 from app.services.thread_work import to_thread
 
@@ -317,6 +328,8 @@ class TaggingResult:
     unowned_words_by_page: list[dict[str, int]] = field(default_factory=list)
     table_intelligence_audit: list[dict[str, Any]] = field(default_factory=list)
     table_readability: list[dict[str, Any]] = field(default_factory=list)
+    # Tables tagged as rows of the table they continue on the page before.
+    tables_joined: list[dict[str, Any]] = field(default_factory=list)
     author_structure_audit: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -467,6 +480,11 @@ async def tag_pdf(
                 author_evidence = {}
             enriched = apply_author_structure(structure_json, author_evidence) if author_evidence else structure_json
             elements = _elements_in_user_space(enriched.get("elements", []), frames)
+            # A structure stored before author text was cleaned on reading.
+            for elem in elements:
+                for field in ("author_alt", "author_actual_text"):
+                    if field in elem:
+                        elem[field] = author_text(elem[field])
             source_figure_alt_lookup = {
                 e["figure_index"]: e.get("author_alt") or e.get("author_actual_text")
                 for e in elements if e.get("type") == "figure"
@@ -492,6 +510,7 @@ async def tag_pdf(
             tags_added += 1
 
             # 3. Set document title
+            _clean_author_text_in_place(pdf)
             title = _set_document_title(pdf, structure_json, original_filename, pdf_path=input_path)
             title_set = bool(title)
             _set_pdfua_identification(pdf)
@@ -517,9 +536,9 @@ async def tag_pdf(
                 if status == "rejected" or bool(alt.get("decorative")):
                     decorative_figures.add(fig_idx)
                     continue
-                text = alt.get("text")
-                if isinstance(text, str) and not is_placeholder_alt_text(text):
-                    alt_lookup[fig_idx] = text.strip()
+                text = author_text(alt.get("text"))
+                if not is_placeholder_alt_text(text):
+                    alt_lookup[fig_idx] = text
 
             for fig_idx, source_alt in source_figure_alt_lookup.items():
                 if _is_weak_figure_alt_text(source_alt):
@@ -554,14 +573,28 @@ async def tag_pdf(
                     stream_starts.add(len(eligible_ops))
                     eligible_ops.extend(ops)
                 glyphs = [g for op in eligible_ops for g in op.glyphs]
-                table_readability.extend(_mark_unreadable_tables(page_elems, glyphs))
+                table_readability.extend(
+                    _mark_unreadable_tables(page_elems, glyphs, frames[page_index].rotation // 90)
+                )
+                continued = (
+                    _continued_table(
+                        pages_elements.get(page_index - 1, []),
+                        page_elems,
+                        (frames[page_index - 1], frames[page_index]),
+                    )
+                    if page_index
+                    else None
+                )
                 for elem in page_elems:
                     if elem.get("type") == "table":
+                        # The model reviewed this page's part of a continued
+                        # table alone; the table it continues decides.
+                        continues = continued[0] if continued and elem is continued[1] else None
                         elem["_layout_table"] = (
                             None
                             if elem.get("_table_readability")
                             else (
-                                _model_table_layout(elem)
+                                _model_table_layout(elem, continues)
                                 or _layout_table_plan(
                                     elem,
                                     page_elems,
@@ -583,6 +616,8 @@ async def tag_pdf(
                     [g for op in eligible_ops for g in op.glyphs],
                     page,
                 )
+                if continued:
+                    _mark_table_continuation(*continued, page_elems)
                 diagnostic = {"page": page_index, "before": 0, "after": 0}
                 owners = _word_owners(
                     dict(enumerate(eligible_ops)),
@@ -669,7 +704,15 @@ async def tag_pdf(
                         stream_starts.add(len(measured_ops))
                         measured_ops.extend(ops)
                     measured = dict(enumerate(measured_ops))
-                    recovered = _figure_text_elements(page_elems, measured, decorative_figures, set(alt_lookup))
+                    recovered = _figure_text_elements(
+                        page_elems,
+                        measured,
+                        decorative_figures,
+                        set(alt_lookup),
+                        plain_ground=partial(
+                            _figures_on_plain_ground, input_path, page_index, frames[page_index]
+                        ),
+                    )
                     _prepare_link_targets(page, builder, recovered)
                     page_elems.extend(recovered)
                     recovered_indices = set(range(len(page_elems) - len(recovered), len(page_elems)))
@@ -809,6 +852,16 @@ async def tag_pdf(
                 for e in elements
             )
             table_intelligence_audit = _apply_model_table_headers(builder, pages_elements)
+            tables_joined = [
+                {
+                    "page": elem["page"] + 1,
+                    "table_review_id": _table_review_id(elem),
+                    "continues_page": elem["_continues_table"]["page"] + 1,
+                    "continues_table_review_id": _table_review_id(elem["_continues_table"]),
+                }
+                for elem in elements
+                if elem.get("_joined_table")
+            ]
             builder.finalize()
 
             # 6. Add bookmarks from headings
@@ -884,6 +937,7 @@ async def tag_pdf(
             unowned_words_by_page=unowned_words_by_page,
             table_intelligence_audit=table_intelligence_audit,
             table_readability=table_readability,
+            tables_joined=tables_joined,
             author_structure_audit=author_structure_audit,
         )
 
