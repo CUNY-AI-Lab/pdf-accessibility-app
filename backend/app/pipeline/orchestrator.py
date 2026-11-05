@@ -1377,6 +1377,7 @@ async def _apply_pretag_table_intelligence(
     confirmed_count = 0
     set_headers_count = 0
     recorded_count = 0
+    confirmed_no_headers_count = 0
     for index, element in enumerate(elements):
         if not isinstance(element, dict) or element.get("type") != "table":
             continue
@@ -1385,14 +1386,28 @@ async def _apply_pretag_table_intelligence(
         if not approved:
             continue
         action = str(approved.get("suggested_action") or "").strip()
-        if action == "confirm_current_headers":
-            if not any(
-                c.get(f)
-                for c in element.get("cells", [])
-                for f in ("is_header", "column_header", "row_header")
-            ):
+        headerless = not any(
+            c.get(f)
+            for c in element.get("cells", [])
+            for f in ("is_header", "column_header", "row_header")
+        )
+        if action == "confirm_current_headers" and headerless:
+            # With the schema stated, the model answers "this is not a data
+            # table" as a confident confirmation of headers it lacks, where it
+            # used to reclassify the region as a layout grid. Apply that
+            # layout. Only high-confidence confirmations are approved (see
+            # should_auto_apply_table_intelligence); others leave it held.
+            approved = {
+                **approved,
+                "suggested_action": "reclassify_region",
+                "resolved_kind": "layout_grid",
+                "confirmed_no_headers": True,
+            }
+            action = "reclassify_region"
+            if not queue_table_decision(element, approved):
                 continue
-        elif not queue_table_decision(element, approved):
+            confirmed_no_headers_count += 1
+        elif action != "confirm_current_headers" and not queue_table_decision(element, approved):
             if unsupported_region_kind(approved):
                 element["review_id"] = review_id
                 recorded_count += 1
@@ -1416,6 +1431,7 @@ async def _apply_pretag_table_intelligence(
             set_headers_count += 1
 
     audit["unsupported_kind_count"] = recorded_count
+    audit["confirmed_no_headers_layout_count"] = confirmed_no_headers_count
     if applied_count <= 0:
         audit["reason"] = "no_matching_structure_elements"
         if recorded_count:

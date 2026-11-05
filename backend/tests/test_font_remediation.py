@@ -1869,6 +1869,74 @@ async def test_pretag_table_confirmation_of_no_headers_asks_about_the_table_alon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("confidence", "laid_out"), [("high", True), ("medium", False)])
+async def test_pretag_confident_confirmation_of_no_headers_lays_the_table_out(
+    monkeypatch, tmp_path, confidence, laid_out
+):
+    """A table's own answer confirming headers it lacks, given with high
+    confidence, is the model saying it is not a data table: it becomes a
+    layout grid. A less confident one leaves the table without a decision."""
+
+    target = {
+        "table_review_id": "review-names",
+        "page": 1,
+        "bbox": {"l": 10, "t": 20, "r": 100, "b": 60},
+        "num_rows": 2,
+        "num_cols": 3,
+        "risk_score": 1.0,
+        "risk_reasons": ["missing_docling_simple_headers"],
+        "header_rows": [],
+        "row_header_columns": [],
+    }
+
+    async def _fake_generate_page(**kwargs):
+        return [
+            {"table_review_id": t["table_review_id"], "suggested_action": "manual_only"}
+            for t in kwargs["targets"]
+        ]
+
+    async def _fake_generate(**kwargs):
+        return {
+            "table_review_id": kwargs["target"]["table_review_id"],
+            "confidence": confidence,
+            "suggested_action": "confirm_current_headers",
+            "reason": "A flat list of names; no headers are needed.",
+        }
+
+    element = {
+        "review_id": "review-names",
+        "type": "table",
+        "page": 0,
+        "num_rows": 2,
+        "num_cols": 3,
+        "cells": [{"row": r, "col": c, "text": f"Name {r}{c}"} for r in range(2) for c in range(3)],
+    }
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence_for_page", _fake_generate_page)
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence", _fake_generate)
+    updated, audit = await _apply_pretag_table_intelligence(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_table_intelligence=True),
+        structure_json={"elements": [element]},
+        targets=[target],
+    )
+
+    (table,) = updated["elements"]
+    if laid_out:
+        (decision,) = table["table_llm_decisions"]
+        assert decision["suggested_action"] == "reclassify_region"
+        assert decision["resolved_kind"] == "layout_grid"
+        assert audit["confirmed_no_headers_layout_count"] == 1
+    else:
+        assert "table_llm_decisions" not in table
+        assert not audit.get("confirmed_no_headers_layout_count")
+
+
+@pytest.mark.asyncio
 async def test_pretag_table_intelligence_uses_pretag_timeout_override(monkeypatch, tmp_path):
     async def _fake_generate(**kwargs):
         await asyncio.sleep(2)
