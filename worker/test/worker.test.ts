@@ -424,6 +424,56 @@ describe("review", () => {
     expect(after.steps.find((step) => step.step_name === "tagging")?.status).toBe("complete");
   });
 
+  /** A finished job with an edit queued against it, plus the download path. */
+  async function editQueued(): Promise<string> {
+    const id = await reviewable();
+    const edited = await api(`/jobs/${id}/applied-changes/1/edit`, {
+      method: "POST",
+      headers: { origin: ORIGIN, "content-type": "application/json" },
+      body: JSON.stringify({ text: "Enrollment by year" }),
+    });
+    expect(edited.status).toBe(200);
+    return id;
+  }
+
+  async function expectResultKept(id: string, notice: string): Promise<void> {
+    const after = await job(id);
+    expect(after.status).toBe("manual_remediation");
+    expect(after.error).toBeNull();
+    expect(after.notice).toBe(notice);
+    expect(after.steps.every((step) => step.status === "complete")).toBe(true);
+    expect((await api(`/jobs/${id}/download`)).status).toBe(200);
+  }
+
+  it("keeps the finished result when the runner reports that a review failed", async () => {
+    const id = await editQueued();
+    const task = await claim();
+    if (task === null) throw new Error("no review");
+    const failed = await runner(`/tasks/${id}/fail`, { method: "POST", lease: task.lease, body: JSON.stringify({ error: "internal error" }) });
+    expect(failed.status).toBe(204);
+    await expectResultKept(id, MESSAGES.reviewNotApplied);
+  });
+
+  it("keeps the finished result when a review's runner goes quiet twice", async () => {
+    const id = await editQueued();
+    let now = Date.now();
+    for (let attempt = 0; attempt < LIMITS.attempts; attempt += 1) {
+      expect(await jobBoard(env).claim(now)).not.toBeNull();
+      now += LIMITS.leaseMs + 1;
+      await jobBoard(env).sweep(now);
+    }
+    await expectResultKept(id, MESSAGES.reviewNotApplied);
+  });
+
+  it("keeps the finished result when sign-in runs out before a review is claimed", async () => {
+    const id = await editQueued();
+    await runInDurableObject(jobBoard(env), (_board, state) => {
+      state.storage.sql.exec("UPDATE jobs SET gateway_exp = ? WHERE id = ?", Date.now() + 60_000, id);
+    });
+    expect(await claim()).toBeNull();
+    await expectResultKept(id, MESSAGES.reviewSignInEnding);
+  });
+
   it("runs an undo after a re-render that was already under way", async () => {
     const id = await reviewable();
     await api(`/jobs/${id}/review-tasks/7/resolve`, { method: "POST", headers: { origin: ORIGIN } });
@@ -718,6 +768,37 @@ describe("attempt artifacts and durable deletion", () => {
     expect(await env.FILES.get("jobs/interrupted-upload/input.pdf")).toBeNull();
     expect((await board.markUploadStored("interrupted-upload")).ok).toBe(false);
     await board.abandonUpload("interrupted-upload", Date.now());
+  });
+
+  it("clears an abandoned upload completely, so nothing is left to retry", async () => {
+    const board = jobBoard(env);
+    await board.reserveUpload("closed-tab", Date.now());
+    await env.FILES.put("jobs/closed-tab/input.pdf", PDF);
+    await board.sweep(Date.now() + LIMITS.leaseMs);
+    const left = await runInDurableObject(board, (_board, state) =>
+      ["uploads", "upload_writes", "cleanup"].map((table) => state.storage.sql.exec(`SELECT COUNT(*) AS n FROM ${table}`).one()["n"]),
+    );
+    expect(left).toEqual([0, 0, 0]);
+    expect(await env.FILES.get("jobs/closed-tab/input.pdf")).toBeNull();
+  });
+
+  it("keeps a reservation that is still receiving bytes past one reservation period", async () => {
+    const board = jobBoard(env);
+    const now = Date.now();
+    await board.reserveUpload("slow-link", now);
+    expect(await board.renewUpload("slow-link", now + LIMITS.leaseMs - 1)).toBe(true);
+    await board.sweep(now + LIMITS.leaseMs + 1);
+    expect((await board.markUploadStored("slow-link")).ok).toBe(true);
+    const created = await board.createJob({ id: "slow-link", owner: alice, originalFilename: "x.pdf", fileSizeBytes: 1, gatewayJwt: "token", gatewayExpiresAt: now + 24 * 3600_000, now: now + LIMITS.leaseMs + 2 });
+    expect(created.admission.ok).toBe(true);
+  });
+
+  it("does not renew a reservation that has already expired", async () => {
+    const board = jobBoard(env);
+    const now = Date.now();
+    await board.reserveUpload("stalled", now);
+    expect(await board.renewUpload("stalled", now + LIMITS.leaseMs)).toBe(false);
+    await board.abandonUpload("stalled", now + LIMITS.leaseMs);
   });
 
   it("rechecks credential lifetime after upload and never admits an expired reservation", async () => {
