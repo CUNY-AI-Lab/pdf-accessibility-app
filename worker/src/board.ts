@@ -57,6 +57,9 @@ export const MESSAGES = {
   interrupted: "Processing was interrupted twice. Upload the PDF again.",
   deadline: "Processing took longer than the time limit, so it was stopped.",
   inconsistent: "This PDF's processing record was inconsistent, so it was stopped. Upload the PDF again.",
+  reviewNotApplied: "This change could not be applied, so the earlier result was kept. Try the change again.",
+  reviewSignInEnding:
+    "Your sign-in ended before this change could be applied, so the earlier result was kept. Sign in again and make the change again.",
 };
 
 const jobRowSchema = z.object({
@@ -155,7 +158,7 @@ export interface NewJob {
   now: number;
 }
 
-export type Admission = { ok: true } | { ok: false; reason: "per_person" | "global" | "sign_in_ending" };
+export type Admission = { ok: true } | { ok: false; reason: "per_person" | "global" | "sign_in_ending" | "upload_expired" };
 
 /** The runner's view of a task, in its wire names (backend/app/runner/client.py). */
 export type ClaimedTask = {
@@ -412,7 +415,7 @@ export class JobBoard extends DurableObject<Env> {
     const now = Math.max(job.now, Date.now());
     const reservation = this.sql.exec("SELECT expires, state FROM uploads WHERE id = ?", job.id).toArray()[0];
     if (reservation === undefined || z.object({ expires: z.number() }).parse(reservation).expires <= now) {
-      return { admission: { ok: false, reason: "sign_in_ending" }, record: null };
+      return { admission: { ok: false, reason: "upload_expired" }, record: null };
     }
     if (this.sql.exec("SELECT prefix FROM cleanup WHERE prefix = ?", `jobs/${job.id}/`).toArray().length > 0) {
       return { admission: { ok: false, reason: "global" }, record: null };
@@ -829,6 +832,17 @@ export class JobBoard extends DurableObject<Env> {
     this.sql.exec("INSERT INTO upload_writes VALUES (?, ?)", id, `jobs/${id}/`);
   }
 
+  /**
+   * Keep a reservation alive while its upload is still sending bytes. False
+   * means the reservation has expired and the upload must stop.
+   */
+  renewUpload(id: string, now: number): boolean {
+    const row = this.sql.exec("SELECT expires FROM uploads WHERE id = ? AND state = 'receiving'", id).toArray()[0];
+    if (row === undefined || z.object({ expires: z.number() }).parse(row).expires <= now) return false;
+    this.sql.exec("UPDATE uploads SET expires = ? WHERE id = ?", now + LIMITS.leaseMs, id);
+    return true;
+  }
+
   markUploadStored(id: string): QueueResult {
     const row = this.sql.exec("SELECT state FROM uploads WHERE id = ?", id).toArray()[0];
     if (row === undefined) return { ok: false, status: 409, detail: "Upload reservation expired" };
@@ -923,18 +937,45 @@ export class JobBoard extends DurableObject<Env> {
     return true;
   }
 
+  /**
+   * The published result a review task started from, when the job can return
+   * to it. A review publishes nothing until it completes, so the files and
+   * saved state of that result are still current when the review fails.
+   */
+  private priorResult(row: JobRow): { status: string; steps: Step[] } | null {
+    if (row.task_kind !== "review" || row.status !== "processing" || row.prior_json === null) return null;
+    const prior = priorSchema.safeParse(JSON.parse(row.prior_json));
+    return prior.success && OUTPUT_READY_STATUSES.includes(prior.data.status) ? prior.data : null;
+  }
+
   private failRow(row: JobRow, error: string, reason: FailureReason, now: number): void {
     guardTaskTransition(row, "end");
-    guardJobTransition(row, "failed");
+    const prior = this.priorResult(row);
     const before = parseSteps(row.steps_json);
+    // The event below reports the task that failed, whichever result the job keeps.
     const steps = failSteps(before, error, now);
-    this.sql.exec(
-      "UPDATE jobs SET status = 'failed', error = ?, steps_json = ?, updated_at = ? WHERE id = ?",
-      error,
-      JSON.stringify(steps),
-      now,
-      row.id,
-    );
+    if (prior === null) {
+      guardJobTransition(row, "failed");
+      this.sql.exec(
+        "UPDATE jobs SET status = 'failed', error = ?, steps_json = ?, updated_at = ? WHERE id = ?",
+        error,
+        JSON.stringify(steps),
+        now,
+        row.id,
+      );
+    } else {
+      // A change that could not be applied must not take away the result the
+      // person already has: return to it, as a refused review does.
+      guardJobTransition(row, prior.status);
+      this.sql.exec(
+        "UPDATE jobs SET status = ?, error = NULL, steps_json = ?, notice = ?, updated_at = ? WHERE id = ?",
+        prior.status,
+        JSON.stringify(prior.steps),
+        reason === "sign_in_ending" ? MESSAGES.reviewSignInEnding : MESSAGES.reviewNotApplied,
+        now,
+        row.id,
+      );
+    }
     this.sql.exec("UPDATE jobs SET pending_review_json = NULL WHERE id = ?", row.id);
     this.endTask(row.id, now);
     // The error is the person's message and may name their document; the
@@ -987,6 +1028,10 @@ export class JobBoard extends DurableObject<Env> {
       guardUploadTransition(z.object({ state: z.string() }).parse(state).state, "abandoned");
       this.requestCleanup(`jobs/${id}/`, now);
       this.sql.exec("DELETE FROM uploads WHERE id = ?", id);
+      // An upload renews its reservation while bytes arrive, so an expired
+      // one has no live writer. Its write marker would otherwise hold this
+      // cleanup, and the alarm that retries it, open for good.
+      this.sql.exec("DELETE FROM upload_writes WHERE id = ?", id);
     }
     for (const row of this.rows("SELECT * FROM jobs WHERE updated_at <= ?", now - LIMITS.retentionMs)) {
       this.requestCleanup(`jobs/${row.id}/`, now);

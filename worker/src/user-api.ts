@@ -20,6 +20,8 @@ import type { Person } from "./identity";
 import { appliedChanges, figureChanges, fileKey, jobResponse, readView, reviewTasks } from "./views";
 
 export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+/** How often an upload in progress renews its reservation; well inside the reservation period. */
+const UPLOAD_RENEW_MS = 30_000;
 
 const DETAILS = {
   notFound: "Job not found",
@@ -31,6 +33,7 @@ const DETAILS = {
     "You already have too many queued or processing jobs. Wait for current jobs to finish before uploading more PDFs.",
   global: "The server is already processing the maximum number of PDFs. Try again after current jobs finish.",
   signInEnding: "Your sign-in ends soon. Sign in again, then upload the PDF.",
+  uploadExpired: "The upload did not finish in time. Try again.",
 };
 
 const ACTION_REPLIES = {
@@ -220,10 +223,16 @@ async function upload(request: Request, env: Env, person: Person, now: number): 
   const pump = (async () => {
     try {
       await writer.write(head);
+      let renewed = Date.now();
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
         await writer.write(value);
+        // A large PDF on a slow connection outlasts one reservation period.
+        if (Date.now() - renewed >= UPLOAD_RENEW_MS) {
+          renewed = Date.now();
+          if (!(await board.renewUpload(id, renewed))) throw new Error("upload reservation expired");
+        }
       }
       await writer.close();
     } catch (error) {
@@ -243,6 +252,8 @@ async function upload(request: Request, env: Env, person: Person, now: number): 
   }
 
   try {
+    // Storing the last bytes can take a while; admission needs a live reservation.
+    await board.renewUpload(id, Date.now());
     const stored = await board.markUploadStored(id);
     if (!stored.ok) {
       await board.abandonUpload(id, Date.now());
@@ -268,9 +279,10 @@ async function upload(request: Request, env: Env, person: Person, now: number): 
   }
 }
 
-function refused(reason: "per_person" | "global" | "sign_in_ending"): Response {
+function refused(reason: "per_person" | "global" | "sign_in_ending" | "upload_expired"): Response {
   if (reason === "per_person") return detail(429, DETAILS.perPerson);
   if (reason === "global") return detail(503, DETAILS.global);
+  if (reason === "upload_expired") return detail(400, DETAILS.uploadExpired);
   return detail(401, DETAILS.signInEnding);
 }
 
