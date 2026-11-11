@@ -1,105 +1,301 @@
-"""Step 5: Write PDF/UA accessibility tags using pikepdf.
+"""Step 5: orchestrate PDF/UA tagging; retain the historical tagger imports."""
 
-Builds a real StructTreeRoot with StructElems for headings, paragraphs,
-tables, lists, and figures. Inserts BDC/EMC marked content operators into
-page content streams and constructs the ParentTree NumberTree.
-
-Uses position-based matching to correlate content stream operations with
-Docling's bounding box data, so it handles multi-column layouts and
-non-sequential content stream ordering.
-"""
-
-import asyncio
-import copy
-import dataclasses
 import logging
-import math
-import mimetypes
-import re
-import unicodedata
-from collections import Counter
 from dataclasses import dataclass, field
-from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import pikepdf
-from docling_core.types.doc.page import TextCellUnit
 from docling_parse.pdf_parser import DoclingPdfParser
 from PIL import Image
 
-from app.pipeline.element_text import accounts_for, readable
-from app.pipeline.language import normalize_lang_tag as _normalize_lang_tag
+from app.pipeline.author_structure import apply_author_structure, read_author_structure
+from app.pipeline.element_text import accounts_for as accounts_for
+from app.pipeline.element_text import readable as readable
+from app.pipeline.fonts.resources import TAGGER_RESOURCES as TAGGER_RESOURCES
+from app.pipeline.fonts.resources import _has_embedded_font as _has_embedded_font
+from app.pipeline.fonts.resources import _iter_pdf_fonts as _iter_pdf_fonts
+from app.pipeline.form_xobjects import unique_form_instances
 from app.pipeline.page_frame import PageFrame
-from app.pipeline.page_glyphs import MeasuredGlyph, MeasuredTextOp, PdfGlyphReader, union_bbox
-from app.pipeline.pdf_repair import add_missing_icc_components
+from app.pipeline.page_glyphs import MeasuredGlyph as MeasuredGlyph
+from app.pipeline.page_glyphs import MeasuredTextOp as MeasuredTextOp
+from app.pipeline.page_glyphs import PdfGlyphReader
+from app.pipeline.page_glyphs import union_bbox as union_bbox
+from app.pipeline.pdf_repair import add_missing_icc_components as add_missing_icc_components
 from app.pipeline.pdfium_text import PdfiumText
+from app.pipeline.reading_order import choose_order as choose_order
+from app.pipeline.tagger_annotations import (
+    _build_docling_parse_page_hyperlinks as _build_docling_parse_page_hyperlinks,
+)
+from app.pipeline.tagger_annotations import (
+    _build_docling_parse_page_widgets as _build_docling_parse_page_widgets,
+)
+from app.pipeline.tagger_annotations import (
+    _build_docling_parse_page_words as _build_docling_parse_page_words,
+)
+from app.pipeline.tagger_annotations import (
+    _ensure_annotation_baseline as _ensure_annotation_baseline,
+)
+from app.pipeline.tagger_annotations import (
+    _extract_docling_parse_text_cells as _extract_docling_parse_text_cells,
+)
+from app.pipeline.tagger_annotations import _get_docling_parse_page as _get_docling_parse_page
+from app.pipeline.tagger_annotations import _infer_annotation_contents as _infer_annotation_contents
+from app.pipeline.tagger_annotations import _prepare_link_targets as _prepare_link_targets
+from app.pipeline.tagger_annotations import (
+    _prune_incidental_annotations as _prune_incidental_annotations,
+)
+from app.pipeline.tagger_annotations import _tag_generic_annotations as _tag_generic_annotations
+from app.pipeline.tagger_annotations import _tag_link_annotations as _tag_link_annotations
+from app.pipeline.tagger_annotations import _tag_widget_annotations as _tag_widget_annotations
+from app.pipeline.tagger_annotations import _widget_label_order as _widget_label_order
+from app.pipeline.tagger_bookmarks import APPENDIX_BOOKMARK_KEY_RE as APPENDIX_BOOKMARK_KEY_RE
+from app.pipeline.tagger_bookmarks import NUMERIC_BOOKMARK_KEY_RE as NUMERIC_BOOKMARK_KEY_RE
+from app.pipeline.tagger_bookmarks import TOC_TRAILING_PAGE_RE as TOC_TRAILING_PAGE_RE
+from app.pipeline.tagger_bookmarks import _add_bookmarks as _add_bookmarks
+from app.pipeline.tagger_bookmarks import _bookmark_plan_entries as _bookmark_plan_entries
+from app.pipeline.tagger_bookmarks import _bookmark_section_key as _bookmark_section_key
+from app.pipeline.tagger_bookmarks import _clean_bookmark_label as _clean_bookmark_label
+from app.pipeline.tagger_bookmarks import (
+    _combine_bookmark_source_entries as _combine_bookmark_source_entries,
+)
+from app.pipeline.tagger_bookmarks import (
+    _docling_heading_bookmark_entries as _docling_heading_bookmark_entries,
+)
+from app.pipeline.tagger_bookmarks import _heading_bookmark_entries as _heading_bookmark_entries
+from app.pipeline.tagger_bookmarks import (
+    _maybe_synthesize_title_bookmark as _maybe_synthesize_title_bookmark,
+)
+from app.pipeline.tagger_bookmarks import (
+    _native_toc_bookmark_entries as _native_toc_bookmark_entries,
+)
+from app.pipeline.tagger_bookmarks import (
+    _sanitize_outline_leaf_counts as _sanitize_outline_leaf_counts,
+)
+from app.pipeline.tagger_bookmarks import (
+    _select_heading_bookmark_target as _select_heading_bookmark_target,
+)
+from app.pipeline.tagger_bookmarks import (
+    _sort_heading_bookmark_entries as _sort_heading_bookmark_entries,
+)
+from app.pipeline.tagger_bookmarks import _toc_bookmark_entries as _toc_bookmark_entries
+from app.pipeline.tagger_content import _ARTIFACT_MARK as _ARTIFACT_MARK
+from app.pipeline.tagger_content import _PASSTHROUGH_MARK as _PASSTHROUGH_MARK
+from app.pipeline.tagger_content import PreparedContent as PreparedContent
+from app.pipeline.tagger_content import _allocate_fragment_mcid as _allocate_fragment_mcid
+from app.pipeline.tagger_content import (
+    _artifact_properties_for_element as _artifact_properties_for_element,
+)
+from app.pipeline.tagger_content import _DeferredFigureText
+from app.pipeline.tagger_content import _figure_of as _figure_of
+from app.pipeline.tagger_content import _fragment_tag_for_element as _fragment_tag_for_element
+from app.pipeline.tagger_content import _instruction_paints_content as _instruction_paints_content
+from app.pipeline.tagger_content import (
+    _is_full_page_scan_image_region as _is_full_page_scan_image_region,
+)
+from app.pipeline.tagger_content import _make_bdc as _make_bdc
+from app.pipeline.tagger_content import _make_bmc_artifact as _make_bmc_artifact
+from app.pipeline.tagger_content import (
+    _make_clipped_image_figure_instructions as _make_clipped_image_figure_instructions,
+)
+from app.pipeline.tagger_content import _make_emc as _make_emc
+from app.pipeline.tagger_content import _page_reading_order as _page_reading_order
+from app.pipeline.tagger_content import _prepare_content_stream as _prepare_content_stream
+from app.pipeline.tagger_content import _remap_word_owners as _remap_word_owners
+from app.pipeline.tagger_content import (
+    _resolved_figure_alt_for_tagging as _resolved_figure_alt_for_tagging,
+)
+from app.pipeline.tagger_content import _rewrite_content_stream as _rewrite_content_stream
+from app.pipeline.tagger_content import _scan_figure_overlay_targets as _scan_figure_overlay_targets
+from app.pipeline.tagger_content_geometry import ContentRegion as ContentRegion
+from app.pipeline.tagger_content_geometry import FormInvocation as FormInvocation
+from app.pipeline.tagger_content_geometry import TextShowRun as TextShowRun
+from app.pipeline.tagger_content_geometry import (
+    _apply_measured_geometry as _apply_measured_geometry,
+)
+from app.pipeline.tagger_content_geometry import (
+    _extract_content_regions as _extract_content_regions,
+)
+from app.pipeline.tagger_content_geometry import (
+    _extract_form_invocations as _extract_form_invocations,
+)
+from app.pipeline.tagger_content_geometry import _extract_text_show_runs as _extract_text_show_runs
+from app.pipeline.tagger_content_geometry import _is_ocr_form_xobject as _is_ocr_form_xobject
+from app.pipeline.tagger_content_geometry import (
+    _measured_by_instruction as _measured_by_instruction,
+)
+from app.pipeline.tagger_content_geometry import _page_content_bbox as _page_content_bbox
+from app.pipeline.tagger_content_geometry import (
+    _split_text_ops_across_targets as _split_text_ops_across_targets,
+)
+from app.pipeline.tagger_content_geometry import _strip_existing_markers as _strip_existing_markers
+from app.pipeline.tagger_content_geometry import (
+    _text_runs_look_like_hidden_ocr_layer as _text_runs_look_like_hidden_ocr_layer,
+)
+from app.pipeline.tagger_content_geometry import _update_text_pos as _update_text_pos
+from app.pipeline.tagger_figure_text import _figure_text_elements, _recover_figure_text_owners
+from app.pipeline.tagger_geometry import BLANK_PAGE_MAX_INK_RATIO as BLANK_PAGE_MAX_INK_RATIO
+from app.pipeline.tagger_geometry import (
+    BLANK_PAGE_NONWHITE_THRESHOLD as BLANK_PAGE_NONWHITE_THRESHOLD,
+)
+from app.pipeline.tagger_geometry import BOOKMARK_SPACED_CAPS_RE as BOOKMARK_SPACED_CAPS_RE
+from app.pipeline.tagger_geometry import CONTENT_PAINT_OPERATORS as CONTENT_PAINT_OPERATORS
+from app.pipeline.tagger_geometry import IDENTITY as IDENTITY
+from app.pipeline.tagger_geometry import LINK_SAFE_MAX_CHARS as LINK_SAFE_MAX_CHARS
+from app.pipeline.tagger_geometry import LINK_SAFE_MAX_WORDS as LINK_SAFE_MAX_WORDS
+from app.pipeline.tagger_geometry import LINK_TEXT_ELEMENT_TYPES as LINK_TEXT_ELEMENT_TYPES
+from app.pipeline.tagger_geometry import OCR_NOISE_ONLY_OPERATORS as OCR_NOISE_ONLY_OPERATORS
+from app.pipeline.tagger_geometry import PATH_CONSTRUCTION_OPERATORS as PATH_CONSTRUCTION_OPERATORS
+from app.pipeline.tagger_geometry import PATH_PAINTING_OPERATORS as PATH_PAINTING_OPERATORS
+from app.pipeline.tagger_geometry import TEXT_SHOW_OPERATORS as TEXT_SHOW_OPERATORS
+from app.pipeline.tagger_geometry import WEAK_FIGURE_ALT_RE as WEAK_FIGURE_ALT_RE
+from app.pipeline.tagger_geometry import ContentTarget as ContentTarget
+from app.pipeline.tagger_geometry import _as_positive_int as _as_positive_int
+from app.pipeline.tagger_geometry import _bbox_area as _bbox_area
+from app.pipeline.tagger_geometry import _bbox_center as _bbox_center
+from app.pipeline.tagger_geometry import _bbox_from_center as _bbox_from_center
+from app.pipeline.tagger_geometry import _bbox_from_points as _bbox_from_points
+from app.pipeline.tagger_geometry import _bbox_intersection as _bbox_intersection
+from app.pipeline.tagger_geometry import _bbox_intersection_box as _bbox_intersection_box
+from app.pipeline.tagger_geometry import _bbox_iou as _bbox_iou
+from app.pipeline.tagger_geometry import _coerce_int as _coerce_int
+from app.pipeline.tagger_geometry import _collapse_spaced_caps as _collapse_spaced_caps
+from app.pipeline.tagger_geometry import _containment_ratio as _containment_ratio
+from app.pipeline.tagger_geometry import _decode_pdf_text_operand as _decode_pdf_text_operand
+from app.pipeline.tagger_geometry import _element_boxes as _element_boxes
+from app.pipeline.tagger_geometry import _expand_bbox as _expand_bbox
+from app.pipeline.tagger_geometry import _extract_text_from_operands as _extract_text_from_operands
+from app.pipeline.tagger_geometry import _glyph_key as _glyph_key
+from app.pipeline.tagger_geometry import _lookup_xobject as _lookup_xobject
+from app.pipeline.tagger_geometry import _mat_multiply as _mat_multiply
+from app.pipeline.tagger_geometry import _matrix_tuple as _matrix_tuple
+from app.pipeline.tagger_geometry import _normalize_annotation_rect as _normalize_annotation_rect
+from app.pipeline.tagger_geometry import _normalize_text as _normalize_text
+from app.pipeline.tagger_geometry import _normalize_title_like_text as _normalize_title_like_text
+from app.pipeline.tagger_geometry import _obj_key as _obj_key
+from app.pipeline.tagger_geometry import _rect_array_to_bbox as _rect_array_to_bbox
+from app.pipeline.tagger_geometry import _rect_to_bbox as _rect_to_bbox
+from app.pipeline.tagger_geometry import _region_bbox as _region_bbox
+from app.pipeline.tagger_geometry import _resolve_dictionary as _resolve_dictionary
+from app.pipeline.tagger_geometry import _safe_float as _safe_float
+from app.pipeline.tagger_geometry import _table_cell_bbox as _table_cell_bbox
+from app.pipeline.tagger_geometry import _transform_point as _transform_point
+from app.pipeline.tagger_layout_tables import CONTENTS, _layout_table_plan
+from app.pipeline.tagger_link_labels import (
+    _best_annotation_source_element as _best_annotation_source_element,
+)
+from app.pipeline.tagger_link_labels import _infer_link_contents as _infer_link_contents
+from app.pipeline.tagger_link_labels import (
+    _infer_widget_accessible_name as _infer_widget_accessible_name,
+)
+from app.pipeline.tagger_link_labels import (
+    _is_safe_inferred_link_label as _is_safe_inferred_link_label,
+)
+from app.pipeline.tagger_link_labels import (
+    _visible_link_contents_from_page_elements as _visible_link_contents_from_page_elements,
+)
+from app.pipeline.tagger_link_labels import (
+    _visible_link_contents_from_page_hyperlinks as _visible_link_contents_from_page_hyperlinks,
+)
+from app.pipeline.tagger_link_labels import (
+    _visible_link_contents_from_page_words as _visible_link_contents_from_page_words,
+)
+from app.pipeline.tagger_normalization import FILE_NAME_TITLE_RE as FILE_NAME_TITLE_RE
+from app.pipeline.tagger_normalization import OFFICE_TITLE_PREFIX_RE as OFFICE_TITLE_PREFIX_RE
+from app.pipeline.tagger_normalization import PLACEHOLDER_TITLE_RE as PLACEHOLDER_TITLE_RE
+from app.pipeline.tagger_normalization import (
+    _is_placeholder_document_title as _is_placeholder_document_title,
+)
+from app.pipeline.tagger_normalization import (
+    _normalize_embedded_file_specs as _normalize_embedded_file_specs,
+)
+from app.pipeline.tagger_normalization import (
+    _normalize_heading_hierarchy as _normalize_heading_hierarchy,
+)
+from app.pipeline.tagger_normalization import (
+    _normalize_media_clip_data_dicts as _normalize_media_clip_data_dicts,
+)
+from app.pipeline.tagger_normalization import (
+    _normalize_optional_content_configs as _normalize_optional_content_configs,
+)
+from app.pipeline.tagger_normalization import (
+    _normalize_type1_font_charsets as _normalize_type1_font_charsets,
+)
+from app.pipeline.tagger_normalization import _remove_dynamic_xfa as _remove_dynamic_xfa
+from app.pipeline.tagger_normalization import _reset_xmp_metadata as _reset_xmp_metadata
+from app.pipeline.tagger_normalization import (
+    _resolve_document_language as _resolve_document_language,
+)
+from app.pipeline.tagger_normalization import (
+    _save_pdf_for_viewer_compatibility as _save_pdf_for_viewer_compatibility,
+)
+from app.pipeline.tagger_normalization import _set_document_title as _set_document_title
+from app.pipeline.tagger_normalization import _set_pdfua_identification as _set_pdfua_identification
+from app.pipeline.tagger_ownership import LIST_LABEL_MAX_LINE_HEIGHTS as LIST_LABEL_MAX_LINE_HEIGHTS
+from app.pipeline.tagger_ownership import NEARBY_LINE_HEIGHTS as NEARBY_LINE_HEIGHTS
+from app.pipeline.tagger_ownership import SCAN_PICTURE_MIN_PAGE_SHARE as SCAN_PICTURE_MIN_PAGE_SHARE
+from app.pipeline.tagger_ownership import UNOWNED_MARGIN_BAND as UNOWNED_MARGIN_BAND
+from app.pipeline.tagger_ownership import WORD_MARGIN as WORD_MARGIN
+from app.pipeline.tagger_ownership import _axis_gap as _axis_gap
+from app.pipeline.tagger_ownership import _best_bbox_match as _best_bbox_match
+from app.pipeline.tagger_ownership import _column_overlap as _column_overlap
+from app.pipeline.tagger_ownership import _content_targets as _content_targets
+from app.pipeline.tagger_ownership import _fallback_reading_order as _fallback_reading_order
+from app.pipeline.tagger_ownership import _ocr_cell_rule_words as _ocr_cell_rule_words
+from app.pipeline.tagger_ownership import _owner_of as _owner_of
+from app.pipeline.tagger_ownership import _owner_of_glyphs as _owner_of_glyphs
+from app.pipeline.tagger_ownership import _page_has_hidden_text as _page_has_hidden_text
+from app.pipeline.tagger_ownership import _page_vertical_rules as _page_vertical_rules
+from app.pipeline.tagger_ownership import _recover_unowned_words as _recover_unowned_words
+from app.pipeline.tagger_ownership import _upright as _upright
+from app.pipeline.tagger_ownership import _word_break as _word_break
+from app.pipeline.tagger_ownership import _word_lines as _word_lines
+from app.pipeline.tagger_ownership import _word_owners as _word_owners
+from app.pipeline.tagger_semantics import FORMULA_GREEK_WORDS as FORMULA_GREEK_WORDS
+from app.pipeline.tagger_semantics import FORMULA_MULTI_LETTER_WORDS as FORMULA_MULTI_LETTER_WORDS
+from app.pipeline.tagger_semantics import FORMULA_SUBSCRIPTS as FORMULA_SUBSCRIPTS
+from app.pipeline.tagger_semantics import FORMULA_SUPERSCRIPTS as FORMULA_SUPERSCRIPTS
+from app.pipeline.tagger_semantics import FORMULA_SYMBOL_WORDS as FORMULA_SYMBOL_WORDS
+from app.pipeline.tagger_semantics import GLYPH_TEXT_ELEMENT_TYPES as GLYPH_TEXT_ELEMENT_TYPES
+from app.pipeline.tagger_semantics import _attach_glyph_text as _attach_glyph_text
+from app.pipeline.tagger_semantics import _element_accessible_text as _element_accessible_text
+from app.pipeline.tagger_semantics import _element_actual_text as _element_actual_text
+from app.pipeline.tagger_semantics import _elements_in_user_space as _elements_in_user_space
+from app.pipeline.tagger_semantics import _formula_alt_text as _formula_alt_text
+from app.pipeline.tagger_semantics import _is_weak_figure_alt_text as _is_weak_figure_alt_text
+from app.pipeline.tagger_semantics import _items_in_user_space as _items_in_user_space
+from app.pipeline.tagger_semantics import _mcr_page_index as _mcr_page_index
+from app.pipeline.tagger_semantics import _source_figure_alt_lookup as _source_figure_alt_lookup
+from app.pipeline.tagger_semantics import (
+    _source_figure_alt_texts_by_page as _source_figure_alt_texts_by_page,
+)
+from app.pipeline.tagger_semantics import _split_formula_symbol_runs as _split_formula_symbol_runs
+from app.pipeline.tagger_semantics import _spoken_formula_exponent as _spoken_formula_exponent
+from app.pipeline.tagger_semantics import is_placeholder_alt_text as is_placeholder_alt_text
+from app.pipeline.tagger_structure import StructTreeBuilder as StructTreeBuilder
+from app.pipeline.tagger_structure import _source_key as _source_key
+from app.pipeline.tagger_table_intelligence import _apply_model_table_headers, _model_table_layout
+from app.pipeline.tagger_table_readability import _mark_unreadable_tables
+from app.pipeline.tagger_table_structure import (
+    _finish_table_structure,
+    _plan_external_table_headers,
+)
+from app.pipeline.tagger_tables import _clean_table_summary_text as _clean_table_summary_text
+from app.pipeline.tagger_tables import _complete_table_grid_cells as _complete_table_grid_cells
+from app.pipeline.tagger_tables import _infer_table_headers as _infer_table_headers
+from app.pipeline.tagger_tables import _list_numbering_name as _list_numbering_name
+from app.pipeline.tagger_tables import _numeric_table_text as _numeric_table_text
+from app.pipeline.tagger_tables import _painted_table_rules as _painted_table_rules
+from app.pipeline.tagger_tables import _set_list_numbering_attr as _set_list_numbering_attr
+from app.pipeline.tagger_tables import _table_summary_text as _table_summary_text
+from app.services.pdf_objects import pdf_dictionary
+from app.services.pdf_objects import pdf_text as pdf_text
+from app.services.thread_work import to_thread
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants and result dataclass
-# ──────────────────────────────────────────────────────────────────────────────
 
-IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
-
-BLANK_PAGE_NONWHITE_THRESHOLD = 245
-BLANK_PAGE_MAX_INK_RATIO = 0.001
-OCR_NOISE_ONLY_OPERATORS = frozenset({
-    "Do", "re", "W*", "n", "INLINE IMAGE", "w", "m", "l", "S",
-})
-LINK_TEXT_ELEMENT_TYPES = frozenset({
-    "heading",
-    "paragraph",
-    "list_item",
-    "caption",
-    "note",
-    "code",
-    "formula",
-    "reference",
-    "bib_entry",
-    "toc_caption",
-    "toc_item",
-    "toc_item_table",
-})
-TEXT_SHOW_OPERATORS = frozenset({"Tj", "TJ", "'", '"'})
-CONTENT_PAINT_OPERATORS = frozenset({
-    "Tj",
-    "TJ",
-    "'",
-    '"',
-    "Do",
-    "f",
-    "F",
-    "f*",
-    "S",
-    "s",
-    "B",
-    "B*",
-    "b",
-    "b*",
-    "sh",
-    "INLINE IMAGE",
-})
-# Path construction, clipping, and painting operators: a path object runs
-# from its first construction operator to its painting operator and is
-# marked as a whole.
-PATH_CONSTRUCTION_OPERATORS = frozenset({"m", "l", "c", "v", "y", "h", "re", "W", "W*"})
-PATH_PAINTING_OPERATORS = frozenset({"S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n"})
-LINK_SAFE_MAX_CHARS = 160
-LINK_SAFE_MAX_WORDS = 18
-TOC_TRAILING_PAGE_RE = re.compile(
-    r"(?:\.{2,}\s*|(?:\.\s*){2,}|\s{2,}|\t+)(?:\d+|[ivxlcdm]+)\s*$|(?:\s+)(?:\d+)\s*$",
-    re.IGNORECASE,
-)
-APPENDIX_BOOKMARK_KEY_RE = re.compile(r"^(appendix\s+[a-z0-9]+(?:\.\d+)*)\b", re.IGNORECASE)
-NUMERIC_BOOKMARK_KEY_RE = re.compile(r"^(\d+(?:\.\d+)*)\b")
-BOOKMARK_SPACED_CAPS_RE = re.compile(r"\b(?:[A-Z]\s+){2,}[A-Z](?:\s+\d+)*\b")
-WEAK_FIGURE_ALT_RE = re.compile(
-    r"^(?:element\s+\d+|figure\s*\d*|image\s*\d*|graphic\s*\d*|picture\s*\d*|illustration\s*\d*|decorative)$",
-    re.IGNORECASE,
-)
 @dataclass
 class TaggingResult:
     output_path: Path
@@ -115,4111 +311,13 @@ class TaggingResult:
     decorative_figures_artifacted: int = 0
     bookmarks_added: int = 0
     title_set: bool = False
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Shared pikepdf helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def _obj_key(obj) -> tuple[int, int] | None:
-    """Return the (objgen) identity tuple for a pikepdf indirect object.
-
-    Returns None for direct (inline) objects — they have no object number and
-    ``obj.objgen`` raises. Genuine errors (malformed references) are logged at
-    debug so unexpected failures are traceable without noise.
-    """
-    try:
-        obj_num, gen_num = obj.objgen
-        if isinstance(obj_num, int) and isinstance(gen_num, int) and obj_num > 0:
-            return obj_num, gen_num
-    except Exception as exc:
-        logger.debug("_obj_key: could not read objgen on %r: %s", type(obj).__name__, exc)
-        return None
-    return None
-
-
-def _resolve_dictionary(obj):
-    """Resolve a pikepdf reference to a Dictionary (or dict-like) object."""
-    if obj is None:
-        return None
-    try:
-        if isinstance(obj, pikepdf.Dictionary):
-            return obj
-        if hasattr(obj, "keys") and hasattr(obj, "get"):
-            return obj
-        return obj.get_object()
-    except Exception:
-        return None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Graphics state helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _mat_multiply(a: tuple, b: tuple) -> tuple:
-    """Multiply two 3x3 affine matrices in PDF format (a,b,c,d,e,f)."""
-    a1, b1, c1, d1, e1, f1 = a
-    a2, b2, c2, d2, e2, f2 = b
-    return (
-        a1 * a2 + b1 * c2,
-        a1 * b2 + b1 * d2,
-        c1 * a2 + d1 * c2,
-        c1 * b2 + d1 * d2,
-        e1 * a2 + f1 * c2 + e2,
-        e1 * b2 + f1 * d2 + f2,
-    )
-
-
-def _transform_point(mat: tuple, x: float, y: float) -> tuple[float, float]:
-    """Transform point (x,y) by affine matrix (a,b,c,d,e,f)."""
-    a, b, c, d, e, f = mat
-    return (a * x + c * y + e, b * x + d * y + f)
-
-
-def _safe_float(val) -> float:
-    """Safely convert a pikepdf operand to float."""
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return 0.0
-
-
-def _coerce_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _normalize_text(text: str) -> str:
-    """Lowercase and collapse non-word characters for fuzzy text matching."""
-    if not text:
-        return ""
-    text = text.lower()
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[^\w\s]", "", text)
-    return text.strip()
-
-
-def _collapse_spaced_caps(text: Any) -> str:
-    collapsed = " ".join(str(text or "").split()).strip()
-    if not collapsed:
-        return ""
-
-    def repl(match: re.Match[str]) -> str:
-        tokens = match.group(0).split()
-        letters = [token for token in tokens if len(token) == 1 and token.isalpha() and token.isupper()]
-        suffix = tokens[len(letters):]
-        result = "".join(letters)
-        if suffix:
-            result = " ".join([result, *suffix])
-        return result
-
-    return BOOKMARK_SPACED_CAPS_RE.sub(repl, collapsed)
-
-
-def _normalize_title_like_text(text: Any) -> str:
-    return _normalize_text(_collapse_spaced_caps(text))
-
-
-def _decode_pdf_text_operand(value: Any) -> str:
-    """Decode a content stream text operand into a best-effort string."""
-    if isinstance(value, pikepdf.String):
-        text = str(value)
-    elif isinstance(value, bytes):
-        text = value.decode("latin-1", errors="ignore")
-    elif isinstance(value, (int, float)):
-        return ""
-    else:
-        text = str(value) if value is not None else ""
-
-    if "\x00" in text:
-        without_nuls = text.replace("\x00", "")
-        if without_nuls.strip():
-            text = without_nuls
-    return "".join(
-        char if char in "\n\r\t" or ord(char) >= 32 else " "
-        for char in text
-    )
-
-
-def _extract_text_from_operands(op: str, operands: list[Any]) -> str:
-    """Extract visible text from Tj/TJ/'/\" operators."""
-    if op == "Tj":
-        return _decode_pdf_text_operand(operands[0]) if operands else ""
-    if op == "TJ" and operands:
-        arr = operands[0]
-        if isinstance(arr, pikepdf.Array):
-            # pikepdf gives TJ position adjustments as int or Decimal.
-            return "".join(
-                _decode_pdf_text_operand(item)
-                for item in arr
-                if not isinstance(item, (int, float, Decimal))
-            )
-        return _decode_pdf_text_operand(arr)
-    if op == "'":
-        return _decode_pdf_text_operand(operands[0]) if operands else ""
-    if op == '"' and len(operands) >= 3:
-        return _decode_pdf_text_operand(operands[2])
-    return ""
-
-
-def _rect_to_bbox(rect: Any) -> dict[str, float] | None:
-    """Convert a docling-parse BoundingRectangle into {l,b,r,t}."""
-    if not rect or not hasattr(rect, "model_dump"):
-        return None
-    data = rect.model_dump()
-    xs = [
-        _safe_float(data.get("r_x0")),
-        _safe_float(data.get("r_x1")),
-        _safe_float(data.get("r_x2")),
-        _safe_float(data.get("r_x3")),
-    ]
-    ys = [
-        _safe_float(data.get("r_y0")),
-        _safe_float(data.get("r_y1")),
-        _safe_float(data.get("r_y2")),
-        _safe_float(data.get("r_y3")),
-    ]
-    return {
-        "l": min(xs),
-        "b": min(ys),
-        "r": max(xs),
-        "t": max(ys),
-    }
-
-
-def _bbox_from_points(xs: list[float], ys: list[float]) -> dict[str, float] | None:
-    """Build a bbox from point lists."""
-    if not xs or not ys:
-        return None
-    return {
-        "l": min(xs),
-        "b": min(ys),
-        "r": max(xs),
-        "t": max(ys),
-    }
-
-
-def _bbox_from_center(cx: float, cy: float, width: float, height: float) -> dict[str, float]:
-    """Build a bbox from center and dimensions."""
-    w = max(width, 1.0)
-    h = max(height, 1.0)
-    return {
-        "l": cx - w / 2,
-        "b": cy - h / 2,
-        "r": cx + w / 2,
-        "t": cy + h / 2,
-    }
-
-
-def _rect_array_to_bbox(rect: Any) -> dict[str, float] | None:
-    """Convert a PDF /Rect array into a bbox dict."""
-    if not isinstance(rect, pikepdf.Array) or len(rect) < 4:
-        return None
-    try:
-        x0 = float(rect[0])
-        y0 = float(rect[1])
-        x1 = float(rect[2])
-        y1 = float(rect[3])
-    except Exception:
-        return None
-    left = min(x0, x1)
-    bottom = min(y0, y1)
-    right = max(x0, x1)
-    top = max(y0, y1)
-    if right <= left or top <= bottom:
-        return None
-    return {
-        "l": left,
-        "b": bottom,
-        "r": right,
-        "t": top,
-    }
-
-
-def _normalize_annotation_rect(annotation: pikepdf.Object) -> bool:
-    """Canonicalize annotation /Rect coordinates when producers wrote them reversed."""
-    try:
-        bbox = _rect_array_to_bbox(annotation.get("/Rect"))
-    except Exception:
-        return False
-    if not bbox:
-        return False
-    normalized = [bbox["l"], bbox["b"], bbox["r"], bbox["t"]]
-    try:
-        current = [float(annotation["/Rect"][idx]) for idx in range(4)]
-    except Exception:
-        current = []
-    if current == normalized:
-        return False
-    annotation["/Rect"] = pikepdf.Array(normalized)
-    return True
-
-
-def _region_bbox(region: "ContentRegion") -> dict[str, float] | None:
-    """Return explicit region bbox when available."""
-    return region.bbox
-
-
-def _bbox_tuple(bbox: dict[str, float]) -> tuple[float, float, float, float]:
-    """Convert bbox dict to an (l,b,r,t) tuple."""
-    return (bbox["l"], bbox["b"], bbox["r"], bbox["t"])
-
-
-def _bbox_area(bbox: dict[str, float] | None) -> float:
-    """Compute bbox area."""
-    if not bbox:
-        return 0.0
-    return max(0.0, bbox["r"] - bbox["l"]) * max(0.0, bbox["t"] - bbox["b"])
-
-
-def _bbox_intersection(a: dict[str, float] | None, b: dict[str, float] | None) -> float:
-    """Compute intersection area between bboxes."""
-    if not a or not b:
-        return 0.0
-    x0 = max(a["l"], b["l"])
-    y0 = max(a["b"], b["b"])
-    x1 = min(a["r"], b["r"])
-    y1 = min(a["t"], b["t"])
-    if x1 <= x0 or y1 <= y0:
-        return 0.0
-    return (x1 - x0) * (y1 - y0)
-
-
-def _bbox_intersection_box(
-    a: dict[str, float] | None,
-    b: dict[str, float] | None,
-) -> dict[str, float] | None:
-    """Return the intersection bbox, if any."""
-    if not a or not b:
-        return None
-    x0 = max(a["l"], b["l"])
-    y0 = max(a["b"], b["b"])
-    x1 = min(a["r"], b["r"])
-    y1 = min(a["t"], b["t"])
-    if x1 <= x0 or y1 <= y0:
-        return None
-    return {"l": x0, "b": y0, "r": x1, "t": y1}
-
-
-def _bbox_iou(a: dict[str, float] | None, b: dict[str, float] | None) -> float:
-    """Compute intersection-over-union score."""
-    inter = _bbox_intersection(a, b)
-    if inter <= 0:
-        return 0.0
-    union = _bbox_area(a) + _bbox_area(b) - inter
-    return inter / union if union > 0 else 0.0
-
-
-def _containment_ratio(inner: dict[str, float] | None, outer: dict[str, float] | None) -> float:
-    """Compute how much of inner lies inside outer."""
-    inter = _bbox_intersection(inner, outer)
-    inner_area = _bbox_area(inner)
-    if inner_area <= 0:
-        return 0.0
-    return inter / inner_area
-
-
-def _expand_bbox(bbox: dict[str, float], margin: float) -> dict[str, float]:
-    """Expand bbox by a scalar margin."""
-    return {
-        "l": bbox["l"] - margin,
-        "b": bbox["b"] - margin,
-        "r": bbox["r"] + margin,
-        "t": bbox["t"] + margin,
-    }
-
-
-def _element_boxes(item: dict[str, Any]) -> list[dict[str, float]]:
-    """Every box an element occupies on the page. Docling gives a paragraph
-    that continues in another column one box for each part."""
-    return [
-        box
-        for box in (item.get("bbox"), *(item.get("extra_bboxes") or ()))
-        if isinstance(box, dict)
-    ]
-
-
-@dataclass(frozen=True)
-class ContentTarget:
-    """A box content can belong to: one of a text or artifact element's
-    boxes, or a table cell. Targets of the same element (or cell) are the
-    same owner."""
-
-    elem_idx: int
-    cell_key: tuple[int, int] | None = None
-    box: dict[str, float] = field(default_factory=dict, compare=False, hash=False)
-    cell: dict | None = field(default=None, compare=False, hash=False)
-
-
-def _content_targets(elements: list[dict]) -> list[ContentTarget]:
-    """Every box text can belong to: each cell of a table with cells, and
-    each box of a text or artifact element (a table without cells is read
-    as text)."""
-    targets: list[ContentTarget] = []
-    for idx, elem in enumerate(elements):
-        elem_type = elem.get("type")
-        cells = [cell for cell in elem.get("cells") or [] if isinstance(cell, dict)]
-        if elem_type == "table" and cells:
-            for cell in cells:
-                box = _table_cell_bbox(elem, cell)
-                if box is not None:
-                    key = (
-                        _as_positive_int(cell.get("row", 0), default=0),
-                        _as_positive_int(cell.get("col", 0), default=0),
-                    )
-                    targets.append(ContentTarget(idx, key, box, cell))
-        elif elem_type in LINK_TEXT_ELEMENT_TYPES or elem_type in {"artifact", "table"}:
-            targets.extend(ContentTarget(idx, None, box) for box in _element_boxes(elem))
-    return targets
-
-
-def _upright(box: dict[str, float], turn: int) -> dict[str, float]:
-    """A user-space box turned so that text running `turn` quarter turns
-    counterclockwise (see MeasuredGlyph.turn) runs left to right."""
-    left, bottom, right, top = box["l"], box["b"], box["r"], box["t"]
-    if turn == 1:
-        return {"l": bottom, "b": -right, "r": top, "t": -left}
-    if turn == 2:
-        return {"l": -right, "b": -top, "r": -left, "t": -bottom}
-    if turn == 3:
-        return {"l": -top, "b": left, "r": -bottom, "t": right}
-    return box
-
-
-def _owner_of(
-    box: dict[str, float], targets: list[ContentTarget], turn: int = 0
-) -> ContentTarget | None:
-    """The target content belongs to: one whose box holds the middle of the
-    content's height and at least half of its width, as element text takes
-    the words its boxes hold at least half of (see pdfium_text). Glyph boxes
-    run from the font's descent to its ascent, taller than the ink Docling
-    draws its boxes around, so height is judged by the middle. Of several
-    (nested boxes, such as line numbers inside a paragraph's box), the
-    smallest. Height and width are the text's own, for text that runs
-    `turn` quarter turns from left to right."""
-    box = _upright(box, turn)
-    middle = (box["b"] + box["t"]) / 2
-    width = box["r"] - box["l"]
-    best: ContentTarget | None = None
-    best_area = math.inf
-    for target in targets:
-        target_box = _upright(target.box, turn)
-        if not target_box["b"] <= middle <= target_box["t"]:
-            continue
-        if width > 0:
-            overlap = min(box["r"], target_box["r"]) - max(box["l"], target_box["l"])
-            share = max(overlap, 0.0) / width
-        else:
-            share = 1.0 if target_box["l"] <= box["l"] <= target_box["r"] else 0.0
-        area = _bbox_area(target_box)
-        if share >= 0.5 and area < best_area:
-            best, best_area = target, area
-    return best
-
-
-# pdfminer's word rule (LAParams.word_margin): characters farther apart than
-# this share of the larger one's size are separate words.
-WORD_MARGIN = 0.1
-
-
-def _glyph_key(glyph: MeasuredGlyph) -> tuple:
-    box = glyph.bbox
-    return (glyph.text, *(round(box[side], 2) for side in "lbrt"))
-
-
-def _word_break(before: dict[str, float], after: dict[str, float]) -> bool:
-    """Whether a word ends between two glyphs drawn one after the other: the
-    second is on another line, or past the first by more than WORD_MARGIN of
-    its size, or well back from it."""
-    if not after["b"] <= (before["b"] + before["t"]) / 2 <= after["t"]:
-        return True
-    size = max(before["r"] - before["l"], before["t"] - before["b"])
-    gap = after["l"] - before["r"]
-    return gap > WORD_MARGIN * size or gap < -size
-
-
-def _word_owners(
-    measured: dict[int, MeasuredTextOp], targets: list[ContentTarget]
-) -> dict[tuple, ContentTarget | None]:
-    """Each glyph's owner, decided for its whole word (see _owner_of), as
-    element text takes whole words: a box that stops short of a word's last
-    letters, or of a "%" drawn on its own, still holds them. Words are the
-    glyphs in drawing order, broken at white space and by _word_break. A
-    space glyph (some PDFs draw every word space) goes with the word before
-    it, or the first word if none precedes it, so the words around it stay
-    apart when read. Words and boxes are judged in the direction the text
-    runs, as a page drawn sideways for /Rotate runs up."""
-    words: list[list[MeasuredGlyph]] = []
-    spaces: list[tuple[MeasuredGlyph, int]] = []
-    previous: MeasuredGlyph | None = None
-    for idx in sorted(measured):
-        for glyph in measured[idx].glyphs:
-            if not glyph.text.strip():
-                spaces.append((glyph, len(words) - 1))
-                previous = None
-                continue
-            if (
-                previous is None
-                or previous.turn != glyph.turn
-                or _word_break(
-                    _upright(previous.bbox, glyph.turn), _upright(glyph.bbox, glyph.turn)
-                )
-            ):
-                words.append([])
-            words[-1].append(glyph)
-            previous = glyph
-    owners: dict[tuple, ContentTarget | None] = {}
-    word_owner: list[ContentTarget | None] = []
-    for word in words:
-        owner = _owner_of(union_bbox(glyph.bbox for glyph in word), targets, word[0].turn)
-        word_owner.append(owner)
-        for glyph in word:
-            owners[_glyph_key(glyph)] = owner
-    for glyph, word_index in spaces:
-        if word_owner:
-            owners[_glyph_key(glyph)] = word_owner[max(word_index, 0)]
-    return owners
-
-
-def _owner_of_glyphs(
-    glyphs: list[MeasuredGlyph], word_owners: dict[tuple, ContentTarget | None]
-) -> ContentTarget | None:
-    """The owner most of these glyphs' words have."""
-    counts = Counter(word_owners.get(_glyph_key(glyph)) for glyph in glyphs if glyph.text.strip())
-    if not counts:
-        counts = Counter(word_owners.get(_glyph_key(glyph)) for glyph in glyphs)
-    return counts.most_common(1)[0][0] if counts else None
-
-
-def _best_bbox_match(
-    target_bbox: dict[str, float] | None,
-    items: list[dict[str, Any]] | None,
-    *,
-    margin: float = 6.0,
-) -> dict[str, Any] | None:
-    """Return the best bbox-overlap match for a target region."""
-    if not target_bbox or not items:
-        return None
-
-    expanded_bbox = _expand_bbox(target_bbox, margin)
-    best_item: dict[str, Any] | None = None
-    best_score = 0.0
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for bbox in _element_boxes(item):
-            overlap = _bbox_intersection(target_bbox, bbox)
-            relaxed_overlap = _bbox_intersection(expanded_bbox, bbox)
-            score = max(
-                _bbox_iou(target_bbox, bbox),
-                _containment_ratio(target_bbox, bbox),
-                _containment_ratio(bbox, target_bbox),
-            )
-            if overlap <= 0 and relaxed_overlap <= 0 and score < 0.5:
-                continue
-            if score > best_score:
-                best_item = item
-                best_score = score
-    return best_item
-
-
-def _resolve_document_language(structure_json: dict[str, Any], explicit_language: str | None) -> str:
-    """Resolve the best available document-level language tag for tagging."""
-    structure_language = _normalize_lang_tag(structure_json.get("language"))
-    if structure_language:
-        return structure_language
-    explicit = _normalize_lang_tag(explicit_language)
-    return explicit or "en"
-
-
-def _as_positive_int(value: Any, default: int = 1) -> int:
-    """Best-effort positive integer coercion."""
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
-
-
-def _normalize_heading_hierarchy(elements: list[dict]) -> None:
-    """Close skipped heading levels while keeping the nesting: each heading
-    ends the open sections at its level or deeper and goes one below the
-    section still open, so the outline starts at H1, an H4 right after an H2
-    becomes an H3, and headings at one level stay siblings (H1, H2, H5, H5
-    become H1, H2, H3, H3, not a staircase)."""
-    headings = [el for el in elements if el.get("type") == "heading"]
-    if not headings:
-        return
-
-    sorted_headings = sorted(
-        headings,
-        key=lambda h: (
-            _as_positive_int(h.get("page", 0), default=0),
-            -_safe_float((h.get("bbox") or {}).get("t", 0.0)),
-            _safe_float((h.get("bbox") or {}).get("l", 0.0)),
-        ),
-    )
-    # The open sections, outermost first: (level given, level assigned).
-    open_sections: list[tuple[int, int]] = []
-    for heading in sorted_headings:
-        level = _as_positive_int(heading.get("level", 1), default=1)
-        while open_sections and open_sections[-1][0] >= level:
-            open_sections.pop()
-        assigned = min(6, open_sections[-1][1] + 1 if open_sections else 1)
-        open_sections.append((level, assigned))
-        heading["level"] = assigned
-
-
-def _visible_link_contents_from_page_elements(
-    annotation: pikepdf.Object,
-    page_elements: list[dict[str, Any]] | None,
-) -> tuple[str, str]:
-    """Infer link contents from overlapping visible text on the same page."""
-    if not page_elements:
-        return "", ""
-    try:
-        annotation_bbox = _rect_array_to_bbox(annotation.get("/Rect"))
-    except Exception:
-        annotation_bbox = None
-    if not annotation_bbox:
-        return "", ""
-
-    best_text = ""
-    best_score = 0.0
-    best_element_type = ""
-    best_element_bbox: dict[str, float] | None = None
-    expanded_bbox = _expand_bbox(annotation_bbox, 6.0)
-    for element in page_elements:
-        if not isinstance(element, dict):
-            continue
-        elem_type = str(element.get("type") or "").strip()
-        if elem_type not in LINK_TEXT_ELEMENT_TYPES:
-            continue
-        text = " ".join(_element_accessible_text(element).split()).strip()
-        if not text:
-            continue
-        for element_bbox in _element_boxes(element):
-            overlap = _bbox_intersection(annotation_bbox, element_bbox)
-            relaxed_overlap = _bbox_intersection(expanded_bbox, element_bbox)
-            score = max(
-                _bbox_iou(annotation_bbox, element_bbox),
-                _containment_ratio(annotation_bbox, element_bbox),
-                _containment_ratio(element_bbox, annotation_bbox),
-            )
-            if overlap <= 0 and relaxed_overlap <= 0 and score < 0.5:
-                continue
-            if score > best_score or (
-                math.isclose(score, best_score) and len(text) > len(best_text)
-            ):
-                best_text = text
-                best_score = score
-                best_element_type = elem_type
-                best_element_bbox = element_bbox
-
-    if not best_text:
-        return "", ""
-    if not _is_safe_inferred_link_label(
-        best_text,
-        annotation_bbox=annotation_bbox,
-        source_bbox=best_element_bbox,
-        source_type=best_element_type,
-    ):
-        return "", ""
-
-    return best_text, best_element_type
-
-
-def _visible_link_contents_from_page_words(
-    annotation: pikepdf.Object,
-    page_words: list[dict[str, Any]] | None,
-) -> tuple[str, dict[str, float] | None]:
-    """Infer link contents from overlapping word boxes on the same page."""
-    if not page_words:
-        return "", None
-    try:
-        annotation_bbox = _rect_array_to_bbox(annotation.get("/Rect"))
-    except Exception:
-        annotation_bbox = None
-    if not annotation_bbox:
-        return "", None
-
-    expanded_bbox = _expand_bbox(annotation_bbox, 3.0)
-    y_center = (annotation_bbox["b"] + annotation_bbox["t"]) / 2.0
-    y_tolerance = max(6.0, (annotation_bbox["t"] - annotation_bbox["b"]) * 1.25)
-    matched_words: list[tuple[float, float, str, dict[str, float]]] = []
-
-    for word in page_words:
-        if not isinstance(word, dict):
-            continue
-        bbox = word.get("bbox")
-        if not isinstance(bbox, dict):
-            continue
-        text = " ".join(
-            str(word.get("display_text") or word.get("text") or "").split()
-        ).strip()
-        if not text:
-            continue
-
-        overlap = _bbox_intersection(annotation_bbox, bbox)
-        relaxed_overlap = _bbox_intersection(expanded_bbox, bbox)
-        score = max(
-            _bbox_iou(annotation_bbox, bbox),
-            _containment_ratio(annotation_bbox, bbox),
-            _containment_ratio(bbox, annotation_bbox),
-        )
-        word_y = (float(bbox.get("b", 0.0)) + float(bbox.get("t", 0.0))) / 2.0
-        if abs(word_y - y_center) > y_tolerance and relaxed_overlap <= 0:
-            continue
-        if overlap <= 0 and relaxed_overlap <= 0 and score < 0.5:
-            continue
-        matched_words.append((word_y, float(bbox.get("l", 0.0)), text, bbox))
-
-    if not matched_words:
-        return "", None
-
-    matched_words.sort(key=lambda item: (-item[0], item[1]))
-    parts = [text for _, _, text, _ in matched_words if text]
-    if not parts:
-        return "", None
-
-    xs = [float(bbox["l"]) for _, _, _, bbox in matched_words] + [
-        float(bbox["r"]) for _, _, _, bbox in matched_words
-    ]
-    ys = [float(bbox["b"]) for _, _, _, bbox in matched_words] + [
-        float(bbox["t"]) for _, _, _, bbox in matched_words
-    ]
-    return " ".join(parts).strip(), _bbox_from_points(xs, ys)
-
-
-def _visible_link_contents_from_page_hyperlinks(
-    annotation: pikepdf.Object,
-    page_hyperlinks: list[dict[str, Any]] | None,
-) -> tuple[str, dict[str, float] | None]:
-    """Infer link contents from docling-parse hyperlink metadata when present."""
-    try:
-        annotation_bbox = _rect_array_to_bbox(annotation.get("/Rect"))
-    except Exception:
-        annotation_bbox = None
-    matched = _best_bbox_match(annotation_bbox, page_hyperlinks, margin=6.0)
-    if not matched:
-        return "", None
-
-    for key in ("widget_text", "widget_description"):
-        text = " ".join(str(matched.get(key) or "").split()).strip()
-        if text:
-            return text, matched.get("bbox")
-    return "", matched.get("bbox")
-
-
-def _is_safe_inferred_link_label(
-    text: str,
-    *,
-    annotation_bbox: dict[str, float] | None,
-    source_bbox: dict[str, float] | None = None,
-    source_type: str = "",
-) -> bool:
-    normalized = " ".join(str(text or "").split()).strip()
-    if not normalized:
-        return False
-    words = [word for word in normalized.split(" ") if word]
-    if len(normalized) > LINK_SAFE_MAX_CHARS or len(words) > LINK_SAFE_MAX_WORDS:
-        return False
-    if re.search(r"[.!?]\s+[A-Z]", normalized):
-        return False
-    if not any(char.isalpha() for char in normalized):
-        return False
-    if not annotation_bbox or not source_bbox:
-        return True
-
-    ann_width = max(float(annotation_bbox["r"]) - float(annotation_bbox["l"]), 1.0)
-    src_width = max(float(source_bbox["r"]) - float(source_bbox["l"]), 1.0)
-    ann_height = max(float(annotation_bbox["t"]) - float(annotation_bbox["b"]), 1.0)
-    src_height = max(float(source_bbox["t"]) - float(source_bbox["b"]), 1.0)
-    ann_area = ann_width * ann_height
-    src_area = src_width * src_height
-
-    if source_type in {"paragraph", "word"} and (
-        src_width > ann_width * 2.5 or src_area > ann_area * 4.0
-    ):
-        return False
-
-    if source_type == "paragraph":
-        if normalized.endswith((".", "!", "?")) and len(words) > 6:
-            return False
-    return True
-
-
-def _infer_link_contents(
-    annotation: pikepdf.Object,
-    page_elements: list[dict[str, Any]] | None = None,
-    page_words: list[dict[str, Any]] | None = None,
-    page_hyperlinks: list[dict[str, Any]] | None = None,
-) -> str:
-    """Create a useful /Contents description for link annotations."""
-    try:
-        existing = str(annotation.get("/Contents", "")).strip()
-    except Exception:
-        existing = ""
-
-    try:
-        action = annotation.get("/A")
-        uri = str(action.get("/URI", "")).strip() if action is not None and hasattr(action, "get") else ""
-    except Exception:
-        uri = ""
-    try:
-        dest = annotation.get("/Dest")
-        has_dest = bool(dest)
-    except Exception:
-        has_dest = False
-
-    try:
-        annotation_bbox = _rect_array_to_bbox(annotation.get("/Rect"))
-    except Exception:
-        annotation_bbox = None
-
-    visible_text = ""
-    visible_type = ""
-    hyperlink_text, hyperlink_bbox = _visible_link_contents_from_page_hyperlinks(
-        annotation,
-        page_hyperlinks,
-    )
-    if hyperlink_text and _is_safe_inferred_link_label(
-        hyperlink_text,
-        annotation_bbox=annotation_bbox,
-        source_bbox=hyperlink_bbox,
-        source_type="hyperlink",
-    ):
-        visible_text = hyperlink_text
-        visible_type = "hyperlink"
-
-    if not visible_text:
-        word_text, word_bbox = _visible_link_contents_from_page_words(annotation, page_words)
-        if word_text and _is_safe_inferred_link_label(
-            word_text,
-            annotation_bbox=annotation_bbox,
-            source_bbox=word_bbox,
-            source_type="word",
-        ):
-            visible_text = word_text
-            visible_type = "word"
-
-    if not visible_text:
-        visible_text, visible_type = _visible_link_contents_from_page_elements(annotation, page_elements)
-    existing_is_generated = (
-        not existing
-        or existing == "Link"
-        or existing == "Link to destination"
-        or (uri and existing == f"Link to {uri}")
-        or (has_dest and existing.startswith("Link to "))
-    )
-    if visible_text and existing_is_generated:
-        if uri and existing == f"Link to {uri}" and visible_type != "hyperlink":
-            return existing
-        return visible_text
-    if existing:
-        return existing
-
-    try:
-        if action is not None and hasattr(action, "get"):
-            if uri:
-                return f"Link to {uri}"
-    except Exception:
-        pass
-
-    try:
-        dest = annotation.get("/Dest")
-        if dest:
-            return "Link to destination"
-    except Exception:
-        pass
-
-    return "Link"
-
-
-def _infer_widget_accessible_name(
-    annotation: pikepdf.Object,
-    page_widgets: list[dict[str, Any]] | None = None,
-) -> str:
-    """Infer a widget accessible name from matched docling-parse widget metadata."""
-    try:
-        annotation_bbox = _rect_array_to_bbox(annotation.get("/Rect"))
-    except Exception:
-        annotation_bbox = None
-    matched = _best_bbox_match(annotation_bbox, page_widgets, margin=6.0)
-    if not matched:
-        return ""
-
-    for key in ("description", "field_name", "text"):
-        value = " ".join(str(matched.get(key) or "").split()).strip()
-        if value and len(value) <= 200:
-            return value
-    return ""
-
-
-def _best_annotation_source_element(
-    annotation: pikepdf.Object,
-    page_elements: list[dict[str, Any]] | None,
-    *,
-    allowed_types: frozenset[str],
-    margin: float = 6.0,
-) -> dict[str, Any] | None:
-    """Find the visible structure-json element that contains an annotation."""
-    if not page_elements:
-        return None
-    try:
-        annotation_bbox = _rect_array_to_bbox(annotation.get("/Rect"))
-    except Exception:
-        annotation_bbox = None
-    if not annotation_bbox:
-        return None
-
-    candidates = [
-        element
-        for element in page_elements
-        if isinstance(element, dict) and str(element.get("type") or "") in allowed_types
-    ]
-    return _best_bbox_match(annotation_bbox, candidates, margin=margin)
-
-
-def _clean_bookmark_label(text: Any) -> str:
-    label = " ".join(str(text or "").split()).strip()
-    if not label:
-        return ""
-    label = TOC_TRAILING_PAGE_RE.sub("", label).rstrip(" .\t")
-    return label.strip()
-
-
-def _bookmark_section_key(text: Any) -> str:
-    label = _clean_bookmark_label(text)
-    if not label:
-        return ""
-
-    appendix_match = APPENDIX_BOOKMARK_KEY_RE.match(label)
-    if appendix_match:
-        return re.sub(r"\s+", " ", appendix_match.group(1).lower()).strip()
-
-    numeric_match = NUMERIC_BOOKMARK_KEY_RE.match(label)
-    if numeric_match:
-        return numeric_match.group(1)
-
-    return ""
-
-
-def _heading_bookmark_entries(headings: list[dict], page_count: int) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-    for order_index, heading in enumerate(headings):
-        text = _clean_bookmark_label(heading.get("text"))
-        if not text:
-            continue
-        try:
-            page_index = int(heading.get("page_index", -1))
-        except (TypeError, ValueError):
-            page_index = -1
-        if not 0 <= page_index < page_count:
-            continue
-        entries.append({
-            "text": text,
-            "page_index": page_index,
-            "level": max(1, min(6, _as_positive_int(heading.get("level", 1), default=1))),
-            "order_index": order_index,
-        })
-    return entries
-
-
-def _docling_heading_bookmark_entries(
-    elements: list[dict[str, Any]] | None,
-    page_count: int,
-    *,
-    selected_only: bool = False,
-) -> list[dict[str, Any]]:
-    if not elements:
-        return []
-
-    entries: list[dict[str, Any]] = []
-    for order_index, element in enumerate(elements):
-        if not isinstance(element, dict) or element.get("type") != "heading":
-            continue
-        if selected_only and not bool(element.get("bookmark_include")):
-            continue
-        text = _clean_bookmark_label(
-            element.get("bookmark_text_override") or element.get("text")
-        )
-        if not text:
-            continue
-        try:
-            page_index = int(element.get("page", -1))
-        except (TypeError, ValueError):
-            page_index = -1
-        if not 0 <= page_index < page_count:
-            continue
-        entries.append({
-            "text": text,
-            "page_index": page_index,
-            "level": max(1, min(6, _as_positive_int(element.get("level", 1), default=1))),
-            "order_index": order_index,
-        })
-    return entries
-
-
-def _sort_heading_bookmark_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(
-        entries,
-        key=lambda entry: (
-            _coerce_int(entry.get("page_index", -1), default=-1),
-            int(entry.get("order_index", 0) or 0),
-            _normalize_text(entry.get("text")),
-        ),
-    )
-
-
-def _maybe_synthesize_title_bookmark(
-    heading_entries: list[dict[str, Any]],
-    document_title: str | None,
-    toc_entries: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    if toc_entries or not heading_entries or not document_title:
-        return heading_entries
-
-    normalized_title = _normalize_title_like_text(document_title)
-    if not normalized_title:
-        return heading_entries
-
-    first_page_entries = [
-        entry for entry in heading_entries
-        if _coerce_int(entry.get("page_index", -1), default=-1) == 0
-    ]
-    if len(first_page_entries) < 2:
-        return heading_entries
-
-    fragment_indexes: list[int] = []
-    for index, entry in enumerate(first_page_entries[:4]):
-        normalized_entry = _normalize_title_like_text(entry.get("text"))
-        if not normalized_entry:
-            continue
-        if normalized_entry == normalized_title:
-            return heading_entries
-        if normalized_entry in normalized_title:
-            fragment_indexes.append(index)
-
-    if len(fragment_indexes) < 2:
-        return heading_entries
-
-    title_entry = {
-        "text": _collapse_spaced_caps(document_title),
-        "page_index": 0,
-        "level": 1,
-        "order_index": -1,
-    }
-
-    filtered_entries: list[dict[str, Any]] = []
-    for entry in heading_entries:
-        if _coerce_int(entry.get("page_index", -1), default=-1) != 0:
-            filtered_entries.append(entry)
-            continue
-        normalized_entry = _normalize_title_like_text(entry.get("text"))
-        if normalized_entry and normalized_entry in normalized_title and normalized_entry != normalized_title:
-            continue
-        filtered_entries.append(entry)
-
-    return [title_entry, *filtered_entries]
-
-
-def _select_heading_bookmark_target(
-    label: str,
-    heading_entries: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    normalized_label = _normalize_title_like_text(label)
-    if not normalized_label:
-        return None
-
-    for entry in heading_entries:
-        normalized_heading = _normalize_title_like_text(entry.get("text"))
-        if normalized_heading == normalized_label:
-            return entry
-
-    return None
-
-
-def _toc_bookmark_entries(
-    elements: list[dict[str, Any]] | None,
-    heading_entries: list[dict[str, Any]],
-    page_count: int,
-) -> list[dict[str, Any]]:
-    if not elements:
-        return []
-
-    captioned_groups = {
-        str(element.get("toc_group_ref"))
-        for element in elements
-        if isinstance(element, dict)
-        and element.get("type") == "toc_caption"
-        and element.get("toc_group_ref") is not None
-    }
-
-    entries: list[dict[str, Any]] = []
-    seen: set[tuple[str, int]] = set()
-
-    for element in elements:
-        if not isinstance(element, dict):
-            continue
-        elem_type = str(element.get("type") or "").strip()
-        if elem_type not in {"toc_caption", "toc_item", "toc_item_table"}:
-            continue
-
-        label = _clean_bookmark_label(element.get("text"))
-        if not label:
-            continue
-        if not re.search(r"[A-Za-z]", label):
-            continue
-
-        if elem_type == "toc_caption":
-            try:
-                page_index = int(element.get("page", 0))
-            except (TypeError, ValueError):
-                page_index = 0
-            if not 0 <= page_index < page_count:
-                page_index = 0
-            source_page_index = page_index
-            level = 1
-        else:
-            captioned_group = str(element.get("toc_group_ref")) in captioned_groups
-            target = _select_heading_bookmark_target(label, heading_entries)
-            if target is None:
-                try:
-                    page_index = int(element.get("page", 0))
-                except (TypeError, ValueError):
-                    page_index = 0
-                if not 0 <= page_index < page_count:
-                    page_index = 0
-                source_page_index = page_index
-                base_level = 1
-            else:
-                page_index = target["page_index"]
-                try:
-                    source_page_index = int(element.get("page", page_index))
-                except (TypeError, ValueError):
-                    source_page_index = page_index
-                if not 0 <= source_page_index < page_count:
-                    source_page_index = page_index
-                base_level = max(1, min(6, _as_positive_int(target.get("level", 1), default=1)))
-            level = base_level + 1 if captioned_group else base_level
-
-        key = (_normalize_text(label), page_index)
-        if key in seen:
-            continue
-        seen.add(key)
-        entries.append({
-            "text": label,
-            "page_index": page_index,
-            "source_page_index": source_page_index,
-            "level": max(1, min(6, level)),
-            "section_key": _bookmark_section_key(label),
-        })
-
-    return entries
-
-
-def _native_toc_bookmark_entries(
-    native_toc: dict[str, Any] | None,
-    heading_entries: list[dict[str, Any]],
-    page_count: int,
-) -> list[dict[str, Any]]:
-    """Build bookmark entries from docling-parse's native TOC tree when available."""
-    if not isinstance(native_toc, dict):
-        return []
-
-    children = native_toc.get("children")
-    if not isinstance(children, list) or not children:
-        return []
-
-    entries: list[dict[str, Any]] = []
-    seen: set[tuple[str, int]] = set()
-
-    def _walk(nodes: list[dict[str, Any]], depth: int) -> None:
-        for node in nodes:
-            if not isinstance(node, dict):
-                continue
-            label = _clean_bookmark_label(node.get("text"))
-            if not label:
-                continue
-
-            target = _select_heading_bookmark_target(label, heading_entries)
-            if target is None:
-                _walk(node.get("children") or [], depth + 1)
-                continue
-
-            page_index = target["page_index"]
-            if not 0 <= int(page_index) < page_count:
-                _walk(node.get("children") or [], depth + 1)
-                continue
-
-            key = (_normalize_text(label), int(page_index))
-            if key not in seen:
-                seen.add(key)
-                entries.append({
-                    "text": label,
-                    "page_index": int(page_index),
-                    "source_page_index": int(page_index),
-                    "level": max(1, min(6, depth)),
-                })
-
-            _walk(node.get("children") or [], depth + 1)
-
-    _walk(children, 1)
-    return entries
-
-
-def _combine_bookmark_source_entries(
-    primary_entries: list[dict[str, Any]],
-    secondary_entries: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Merge bookmark entry sources while preserving primary ordering."""
-    combined = list(primary_entries)
-    seen = {
-        (_normalize_text(entry.get("text")), _coerce_int(entry.get("page_index", -1), default=-1))
-        for entry in primary_entries
-        if entry.get("text")
-    }
-    seen_section_keys = {
-        str(entry.get("section_key") or "").strip()
-        for entry in primary_entries
-        if str(entry.get("section_key") or "").strip()
-    }
-
-    for entry in secondary_entries:
-        text_key = (
-            _normalize_text(entry.get("text")),
-            _coerce_int(entry.get("page_index", -1), default=-1),
-        )
-        section_key = str(entry.get("section_key") or "").strip()
-        if text_key in seen:
-            continue
-        if section_key and section_key in seen_section_keys:
-            continue
-        combined.append(entry)
-        seen.add(text_key)
-        if section_key:
-            seen_section_keys.add(section_key)
-
-    return combined
-
-
-def _bookmark_plan_entries(
-    bookmark_plan: list[dict[str, Any]] | None,
-    page_count: int,
-) -> list[dict[str, Any]]:
-    if not isinstance(bookmark_plan, list):
-        return []
-
-    entries: list[dict[str, Any]] = []
-    seen: set[tuple[str, int]] = set()
-    for order_index, plan_entry in enumerate(bookmark_plan):
-        if not isinstance(plan_entry, dict):
-            continue
-        text = " ".join(str(plan_entry.get("text") or "").split()).strip()
-        if not text:
-            continue
-        page_index = _coerce_int(plan_entry.get("page_index", -1), default=-1)
-        if not 0 <= page_index < page_count:
-            continue
-        level = max(1, min(6, _as_positive_int(plan_entry.get("level", 1), default=1)))
-        key = (_normalize_text(text), page_index)
-        if key in seen:
-            continue
-        seen.add(key)
-        entries.append({
-            "text": text,
-            "page_index": page_index,
-            "source_page_index": page_index,
-            "level": level,
-            "order_index": order_index,
-        })
-    return entries
-
-
-def _complete_table_grid_cells(
-    cells: Any,
-    *,
-    num_rows: int,
-    num_cols: int,
-) -> list[dict]:
-    """Return explicit table cells plus empty TD placeholders for uncovered slots."""
-    if not isinstance(cells, list):
-        return []
-    if num_rows <= 0 or num_cols <= 0:
-        return []
-
-    normalized: list[dict] = []
-    for cell in cells:
-        if not isinstance(cell, dict):
-            continue
-        row = _as_positive_int(cell.get("row", 0), default=0)
-        col = _as_positive_int(cell.get("col", 0), default=0)
-        row_span = _as_positive_int(cell.get("row_span", 1), default=1)
-        col_span = _as_positive_int(cell.get("col_span", 1), default=1)
-        if row >= num_rows or col >= num_cols:
-            continue
-        normalized.append(dict(cell, row=row, col=col, row_span=row_span, col_span=col_span))
-
-    rows: dict[int, list[dict]] = {}
-    covered_by_rowspans: dict[int, set[int]] = {row: set() for row in range(num_rows)}
-    for cell in normalized:
-        row = _as_positive_int(cell.get("row", 0), default=0)
-        col = _as_positive_int(cell.get("col", 0), default=0)
-        if row >= num_rows or col >= num_cols:
-            continue
-        row_span = min(_as_positive_int(cell.get("row_span", 1), default=1), num_rows - row)
-        col_span = min(_as_positive_int(cell.get("col_span", 1), default=1), num_cols - col)
-        cell["row_span"] = row_span
-        cell["col_span"] = col_span
-        rows.setdefault(row, []).append(cell)
-        for span_row in range(row + 1, row + row_span):
-            covered_by_rowspans.setdefault(span_row, set()).update(range(col, col + col_span))
-
-    completed: list[dict] = []
-    for row in range(num_rows):
-        occupied = set(covered_by_rowspans.get(row, set()))
-        row_cells = sorted(rows.get(row, []), key=lambda item: _as_positive_int(item.get("col", 0), default=0))
-        for cell in row_cells:
-            col = _as_positive_int(cell.get("col", 0), default=0)
-            col_span = min(_as_positive_int(cell.get("col_span", 1), default=1), num_cols - col)
-            occupied.update(range(col, col + col_span))
-            completed.append(cell)
-        for col in range(num_cols):
-            if col in occupied:
-                continue
-            completed.append({
-                "row": row,
-                "col": col,
-                "row_span": 1,
-                "col_span": 1,
-                "text": "",
-                "is_header": False,
-                "_generated_empty": True,
-            })
-            occupied.add(col)
-
-    return sorted(
-        completed,
-        key=lambda item: (
-            _as_positive_int(item.get("row", 0), default=0),
-            _as_positive_int(item.get("col", 0), default=0),
-        ),
-    )
-
-
-def _clean_table_summary_text(value: Any) -> str:
-    return " ".join(str(value or "").split()).strip()[:500]
-
-
-def _table_summary_text(table_data: dict, *, num_rows: int, num_cols: int) -> str:
-    """Build a factual table summary from explicit extraction metadata."""
-    candidates = [
-        table_data.get("table_summary"),
-        table_data.get("summary"),
-    ]
-    if bool(table_data.get("table_llm_confirmed")):
-        candidates.append(table_data.get("table_llm_summary"))
-    candidates.append(table_data.get("caption"))
-
-    content_summary = ""
-    for candidate in candidates:
-        content_summary = _clean_table_summary_text(candidate)
-        if content_summary:
-            break
-
-    dimensions_summary = ""
-    if num_rows > 0 and num_cols > 0:
-        row_label = "row" if num_rows == 1 else "rows"
-        col_label = "column" if num_cols == 1 else "columns"
-        dimensions_summary = f"Table with {num_rows} {row_label} and {num_cols} {col_label}."
-
-    if content_summary and dimensions_summary:
-        if content_summary.lower().startswith("table with "):
-            return content_summary
-        return f"{dimensions_summary} {content_summary}"
-    return content_summary or dimensions_summary
-
-
-def _list_numbering_name(marker: Any, *, enumerated: bool = False) -> str | None:
-    text = str(marker or "").strip()
-    token = text.strip("()[]{}.:")
-
-    if enumerated or re.match(r"^\d+", token):
-        return "Decimal"
-
-    roman_re = r"^(?=[ivxlcdm]+$)[ivxlcdm]+$"
-    if re.match(roman_re, token, flags=re.IGNORECASE):
-        return "UpperRoman" if token.isupper() else "LowerRoman"
-
-    if len(token) == 1 and token.isalpha():
-        return "UpperAlpha" if token.isupper() else "LowerAlpha"
-
-    if text in {"-", "*", "+"} or (len(text) == 1 and ord(text) in {0x2022, 0x25CF}):
-        return "Disc"
-    if len(text) == 1 and ord(text) in {0x25E6, 0x25CB}:
-        return "Circle"
-    if len(text) == 1 and ord(text) in {0x25AA, 0x25A0}:
-        return "Square"
-
-    return None
-
-
-def _set_list_numbering_attr(
-    list_elem: pikepdf.Object,
-    marker: Any,
-    *,
-    enumerated: bool = False,
-) -> None:
-    numbering = _list_numbering_name(marker, enumerated=enumerated)
-    if not numbering:
-        return
-
-    attrs = list_elem.get("/A")
-    if not isinstance(attrs, pikepdf.Dictionary):
-        attrs = pikepdf.Dictionary({"/O": pikepdf.Name("/List")})
-        list_elem["/A"] = attrs
-    elif attrs.get("/O") is None:
-        attrs["/O"] = pikepdf.Name("/List")
-
-    if attrs.get("/ListNumbering") is None:
-        attrs["/ListNumbering"] = pikepdf.Name(f"/{numbering}")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Content region extraction — positions from content streams
-# ──────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class ContentRegion:
-    """A region in the content stream with its computed page position."""
-    kind: str  # "text", "image", or "passthrough"
-    start_idx: int  # index into instructions list
-    end_idx: int  # exclusive end index
-    instructions: list  # the actual instructions
-    cx: float = 0.0  # center x in page coordinates
-    cy: float = 0.0  # center y in page coordinates
-    width: float = 0.0
-    height: float = 0.0
-    xobject_name: str = ""  # for image regions
-    bbox: dict[str, float] | None = None  # {l,b,r,t}
-    text: str = ""
-    ctm: tuple[float, float, float, float, float, float] = IDENTITY
-
-
-@dataclass
-class TextShowRun:
-    """A positioned text-showing operation inside a text object."""
-
-    instruction_idx: int
-    segment_start_idx: int
-    segment_end_idx: int
-    cx: float
-    cy: float
-    bbox: dict[str, float]
-    text: str = ""
-    render_mode: int = 0
-
-
-@dataclass
-class OcrFormInvocation:
-    """An OCR form XObject invocation preserved at page level and tagged inside the form."""
-
-    xobject_name: str
-    stream: pikepdf.Object
-    start_idx: int
-    end_idx: int
-    instructions: list
-    initial_ctm: tuple[float, float, float, float, float, float] = IDENTITY
-
-
-def _update_text_pos(pos, first_text_pos, last_text_pos):
-    """Track first and last text positions in a block."""
-    if first_text_pos is None:
-        first_text_pos = pos
-    last_text_pos = pos
-    return first_text_pos, last_text_pos
-
-
-def _extract_content_regions(
-    instructions: list,
-    content_owner,
-    *,
-    initial_ctm: tuple[float, float, float, float, float, float] = IDENTITY,
-) -> list[ContentRegion]:
-    """Walk a content stream tracking graphics state to extract positioned regions.
-
-    Returns a list of ContentRegion objects, each representing either a text
-    block (BT..ET) or an image placement (Do), with approximate page coordinates
-    computed from the CTM and text matrix.
-    """
-    regions = []
-    ctm = initial_ctm
-    ctm_stack = []
-    font_size = 12.0
-
-    i = 0
-    while i < len(instructions):
-        instr = instructions[i]
-        op = str(instr.operator)
-
-        # ── Graphics state operators ──
-        if op == "q":
-            ctm_stack.append(ctm)
-        elif op == "Q":
-            if ctm_stack:
-                ctm = ctm_stack.pop()
-        elif op == "cm":
-            operands = list(instr.operands) if hasattr(instr, "operands") else []
-            if len(operands) >= 6:
-                m = tuple(_safe_float(x) for x in operands[:6])
-                ctm = _mat_multiply(m, ctm)
-
-        # ── Text block ──
-        elif op == "BT":
-            bt_start = i
-            bt_block = [instr]
-            text_matrix = IDENTITY
-            first_text_pos = None
-            last_text_pos = None
-            block_font_size = font_size
-            text_chunks: list[str] = []
-            xs: list[float] = []
-            ys: list[float] = []
-            i += 1
-
-            while i < len(instructions):
-                inner = instructions[i]
-                inner_op = str(inner.operator)
-                bt_block.append(inner)
-
-                if inner_op == "ET":
-                    i += 1
-                    break
-
-                inner_ops = list(inner.operands) if hasattr(inner, "operands") else []
-
-                if inner_op == "Tm" and len(inner_ops) >= 6:
-                    text_matrix = tuple(_safe_float(x) for x in inner_ops[:6])
-                    pos = _transform_point(ctm, text_matrix[4], text_matrix[5])
-                    xs.append(pos[0])
-                    ys.append(pos[1])
-                    first_text_pos, last_text_pos = _update_text_pos(
-                        pos, first_text_pos, last_text_pos,
-                    )
-
-                elif inner_op in ("Td", "TD") and len(inner_ops) >= 2:
-                    tx, ty = _safe_float(inner_ops[0]), _safe_float(inner_ops[1])
-                    text_matrix = (
-                        text_matrix[0], text_matrix[1],
-                        text_matrix[2], text_matrix[3],
-                        text_matrix[4] + tx, text_matrix[5] + ty,
-                    )
-                    pos = _transform_point(ctm, text_matrix[4], text_matrix[5])
-                    xs.append(pos[0])
-                    ys.append(pos[1])
-                    first_text_pos, last_text_pos = _update_text_pos(
-                        pos, first_text_pos, last_text_pos,
-                    )
-
-                elif inner_op == "T*":
-                    text_matrix = (
-                        text_matrix[0], text_matrix[1],
-                        text_matrix[2], text_matrix[3],
-                        text_matrix[4], text_matrix[5] - block_font_size * 1.2,
-                    )
-                    pos = _transform_point(ctm, text_matrix[4], text_matrix[5])
-                    xs.append(pos[0])
-                    ys.append(pos[1])
-                    first_text_pos, last_text_pos = _update_text_pos(
-                        pos, first_text_pos, last_text_pos,
-                    )
-
-                elif inner_op == "Tf" and len(inner_ops) >= 2:
-                    block_font_size = abs(_safe_float(inner_ops[1])) or 12.0
-                    font_size = block_font_size
-
-                elif inner_op in ("Tj", "TJ", "'", '"'):
-                    if first_text_pos is None:
-                        pos = _transform_point(ctm, text_matrix[4], text_matrix[5])
-                        xs.append(pos[0])
-                        ys.append(pos[1])
-                        first_text_pos, last_text_pos = pos, pos
-                    chunk = _extract_text_from_operands(inner_op, inner_ops)
-                    if chunk:
-                        text_chunks.append(chunk)
-
-                i += 1
-
-            # Compute approximate center and bbox of text block
-            if first_text_pos and last_text_pos:
-                cx = (first_text_pos[0] + last_text_pos[0]) / 2
-                cy = (first_text_pos[1] + last_text_pos[1]) / 2
-                h = abs(first_text_pos[1] - last_text_pos[1]) + block_font_size
-            elif first_text_pos:
-                cx, cy = first_text_pos
-                h = block_font_size
-            else:
-                cx, cy, h = 0, 0, 0
-
-            text = _normalize_text(" ".join(text_chunks))
-            bbox = _bbox_from_points(xs, ys)
-            if bbox:
-                # Expand bbox to include approximate glyph extents.
-                text_width_guess = max(block_font_size * 0.5 * max(len(text), 1), block_font_size * 2)
-                if bbox["r"] - bbox["l"] < block_font_size * 0.5:
-                    bbox["r"] = bbox["l"] + text_width_guess
-                bbox["t"] += block_font_size
-                bbox["b"] -= block_font_size * 0.2
-            else:
-                bbox = _bbox_from_center(cx, cy, block_font_size * max(len(text), 1), h or block_font_size)
-
-            regions.append(ContentRegion(
-                kind="text",
-                start_idx=bt_start,
-                end_idx=i,
-                instructions=bt_block,
-                cx=cx,
-                cy=cy,
-                width=max(0.0, bbox["r"] - bbox["l"]) if bbox else 0.0,
-                height=max(0.0, bbox["t"] - bbox["b"]) if bbox else h,
-                bbox=bbox,
-                text=text,
-            ))
-            continue  # already incremented i
-
-        # ── Image/XObject placement ──
-        elif op == "Do":
-            operands = list(instr.operands) if hasattr(instr, "operands") else []
-            if operands:
-                name = str(operands[0])
-                is_image = False
-                try:
-                    resources = content_owner.get("/Resources", {})
-                    xobjects = resources.get("/XObject", {})
-                    xobj = xobjects.get(name)
-                    if xobj is not None and hasattr(xobj, "get"):
-                        is_image = xobj.get("/Subtype") == pikepdf.Name("/Image")
-                except Exception:
-                    pass
-
-                if is_image:
-                    x0, y0 = _transform_point(ctm, 0, 0)
-                    x1, y1 = _transform_point(ctm, 1, 1)
-                    bbox = {
-                        "l": min(x0, x1),
-                        "b": min(y0, y1),
-                        "r": max(x0, x1),
-                        "t": max(y0, y1),
-                    }
-                    regions.append(ContentRegion(
-                        kind="image",
-                        start_idx=i,
-                        end_idx=i + 1,
-                        instructions=[instr],
-                        cx=(x0 + x1) / 2,
-                        cy=(y0 + y1) / 2,
-                        width=abs(x1 - x0),
-                        height=abs(y1 - y0),
-                        xobject_name=name,
-                        bbox=bbox,
-                        ctm=ctm,
-                    ))
-
-        i += 1
-
-    return regions
-
-
-def _page_content_bbox(content_owner) -> dict[str, float] | None:
-    """Return the visible content box for a page or form stream owner."""
-    for key in ("/MediaBox", "/CropBox", "/BBox"):
-        try:
-            bbox = _rect_array_to_bbox(content_owner.get(key))
-        except Exception:
-            bbox = None
-        if bbox:
-            return bbox
-    return None
-
-
-def _extract_text_show_runs(
-    instructions: list,
-    *,
-    initial_ctm: tuple[float, float, float, float, float, float] = IDENTITY,
-) -> list[TextShowRun]:
-    """Extract positioned text-showing operations inside text objects.
-
-    OCRmyPDF-style pages can contain one giant BT..ET block with hundreds of
-    positioned word draws.  The coarser region extractor intentionally treats
-    that as one text block; this helper preserves the finer anchors when the
-    tag writer needs to recover semantic coverage.
-    """
-    runs: list[TextShowRun] = []
-    ctm = initial_ctm
-    ctm_stack = []
-    text_matrix = IDENTITY
-    in_text = False
-    segment_start_idx = 0
-    font_size = 12.0
-    render_mode = 0
-
-    for idx, instr in enumerate(instructions):
-        op = str(instr.operator)
-        operands = list(instr.operands) if hasattr(instr, "operands") else []
-
-        if op == "q":
-            ctm_stack.append(ctm)
-        elif op == "Q":
-            ctm = ctm_stack.pop() if ctm_stack else initial_ctm
-        elif op == "cm" and len(operands) >= 6:
-            m = tuple(_safe_float(x) for x in operands[:6])
-            ctm = _mat_multiply(m, ctm)
-
-        if op == "BT":
-            in_text = True
-            text_matrix = IDENTITY
-            segment_start_idx = idx + 1
-            continue
-        if op == "ET":
-            in_text = False
-            segment_start_idx = idx + 1
-            continue
-        if not in_text:
-            continue
-
-        if op == "Tf" and len(operands) >= 2:
-            font_size = abs(_safe_float(operands[1])) or font_size
-        elif op == "Tr" and operands:
-            render_mode = _coerce_int(operands[0], default=render_mode)
-        elif op == "Tm" and len(operands) >= 6:
-            text_matrix = tuple(_safe_float(x) for x in operands[:6])
-        elif op in ("Td", "TD") and len(operands) >= 2:
-            tx, ty = _safe_float(operands[0]), _safe_float(operands[1])
-            text_matrix = (
-                text_matrix[0], text_matrix[1],
-                text_matrix[2], text_matrix[3],
-                text_matrix[4] + tx, text_matrix[5] + ty,
-            )
-        elif op == "T*":
-            text_matrix = (
-                text_matrix[0], text_matrix[1],
-                text_matrix[2], text_matrix[3],
-                text_matrix[4], text_matrix[5] - font_size * 1.2,
-            )
-        elif op in TEXT_SHOW_OPERATORS:
-            text = _extract_text_from_operands(op, operands)
-            x, y = _transform_point(ctm, text_matrix[4], text_matrix[5])
-            width_guess = max(font_size * 0.45 * max(len(text.strip()), 1), font_size)
-            p0 = _transform_point(ctm, text_matrix[4], text_matrix[5] - font_size * 0.25)
-            p1 = _transform_point(ctm, text_matrix[4] + width_guess, text_matrix[5] + font_size * 1.05)
-            bbox = {
-                "l": min(p0[0], p1[0]),
-                "b": min(p0[1], p1[1]),
-                "r": max(p0[0], p1[0]),
-                "t": max(p0[1], p1[1]),
-            }
-            runs.append(TextShowRun(
-                instruction_idx=idx,
-                segment_start_idx=segment_start_idx,
-                segment_end_idx=idx + 1,
-                cx=x,
-                cy=y,
-                bbox=bbox,
-                text=text,
-                render_mode=render_mode,
-            ))
-            segment_start_idx = idx + 1
-
-    return runs
-
-
-def _measured_by_instruction(
-    instructions: list, measured_ops: list[MeasuredTextOp] | None
-) -> dict[int, MeasuredTextOp] | None:
-    """Pair each text-showing instruction with pdfminer's measurement of it
-    (see page_glyphs). None, with a warning, when the stream was not measured
-    or its text operators do not line up one to one with the measured ones;
-    the estimated positions then stand."""
-    op_indices = [
-        idx for idx, instr in enumerate(instructions) if str(instr.operator) in TEXT_SHOW_OPERATORS
-    ]
-    if measured_ops is None or len(op_indices) != len(measured_ops):
-        logger.warning(
-            "No measured text for %s text operators (%s measured); using estimated positions",
-            len(op_indices),
-            "none" if measured_ops is None else len(measured_ops),
-        )
-        return None
-    return dict(zip(op_indices, measured_ops, strict=True))
-
-
-def _split_text_ops_across_targets(
-    instructions: list,
-    measured: dict[int, MeasuredTextOp],
-    word_owners: dict[tuple, ContentTarget | None],
-) -> tuple[list, dict[int, MeasuredTextOp], list[int]]:
-    """Split each Tj or TJ whose glyphs have more than one owner (see
-    _word_owners) into consecutive TJs, one per owner, so each can be tagged
-    on its own. A string is cut between glyph codes where the owner changes,
-    as opendataloader-pdf does for a string that crosses table cells; a
-    number (a position adjustment) stays with the string before it.
-    Rendering is unchanged: the text position carries over from one TJ to
-    the next.
-
-    Returns the new instructions, their measurements, and for each original
-    instruction index (and one past the end) its new index, so positions
-    found before the split can be moved."""
-    new_instructions: list = []
-    new_measured: dict[int, MeasuredTextOp] = {}
-    new_index: list[int] = []
-    for idx, instr in enumerate(instructions):
-        new_index.append(len(new_instructions))
-        op = measured.get(idx)
-        operator = str(instr.operator)
-        owners = (
-            [word_owners.get(_glyph_key(glyph)) for glyph in op.glyphs]
-            if op is not None and operator in ("Tj", "TJ") and instr.operands
-            else []
-        )
-        if len(set(owners)) < 2:
-            if op is not None:
-                new_measured[len(new_instructions)] = op
-            new_instructions.append(instr)
-            continue
-        array = list(instr.operands[0]) if operator == "TJ" else [instr.operands[0]]
-        drawn: dict[int, list[tuple[MeasuredGlyph, ContentTarget | None]]] = {}
-        for glyph, owner in zip(op.glyphs, owners, strict=True):
-            drawn.setdefault(glyph.element, []).append((glyph, owner))
-        # The array in pieces: a number or undrawn string as it is, a drawn
-        # string cut where its glyphs' owner changes. Each piece keeps its
-        # glyphs, their code spans moved to the piece's start.
-        pieces: list[tuple[object, list[MeasuredGlyph], ContentTarget | None]] = []
-        for element_index, item in enumerate(array):
-            glyphs = drawn.get(element_index)
-            if not glyphs:
-                pieces.append((item, [], None))
-                continue
-            data = bytes(item)
-            cut, run, run_owner = 0, [], glyphs[0][1]
-            for glyph, owner in glyphs:
-                if owner != run_owner:
-                    pieces.append((pikepdf.String(data[cut : glyph.code[0]]), run, run_owner))
-                    cut, run, run_owner = glyph.code[0], [], owner
-                start, stop = glyph.code
-                run.append(dataclasses.replace(glyph, code=(start - cut, stop - cut)))
-            pieces.append((pikepdf.String(data[cut:]), run, run_owner))
-        groups: list[list[tuple[object, list[MeasuredGlyph], ContentTarget | None]]] = [[]]
-        group_owner: ContentTarget | None = None
-        for piece in pieces:
-            _, glyphs, owner = piece
-            if glyphs and any(member[1] for member in groups[-1]) and owner != group_owner:
-                groups.append([])
-            groups[-1].append(piece)
-            if glyphs:
-                group_owner = owner
-        for group in groups:
-            new_measured[len(new_instructions)] = MeasuredTextOp(
-                glyphs=[
-                    dataclasses.replace(glyph, element=position)
-                    for position, (_, glyphs, _) in enumerate(group)
-                    for glyph in glyphs
-                ]
-            )
-            new_instructions.append(
-                pikepdf.ContentStreamInstruction(
-                    [pikepdf.Array([item for item, _, _ in group])], pikepdf.Operator("TJ")
-                )
-            )
-    new_index.append(len(new_instructions))
-    return new_instructions, new_measured, new_index
-
-
-def _apply_measured_geometry(
-    regions: list[ContentRegion],
-    runs: list[TextShowRun],
-    measured: dict[int, MeasuredTextOp],
-) -> None:
-    """Give text runs and text regions the text and positions pdfminer
-    measured in place of the estimates above."""
-    for run in runs:
-        op = measured.get(run.instruction_idx)
-        if op is None or (bbox := op.bbox) is None:
-            continue
-        run.bbox = bbox
-        run.cx, run.cy = _bbox_center(bbox)
-        run.text = op.text
-
-    for region in regions:
-        if region.kind != "text":
-            continue
-        inside = [
-            op
-            for idx, op in sorted(measured.items())
-            if region.start_idx <= idx < region.end_idx and op.glyphs
-        ]
-        if not inside:
-            continue
-        bbox = union_bbox(op.bbox for op in inside)
-        region.bbox = bbox
-        region.cx, region.cy = _bbox_center(bbox)
-        region.width = bbox["r"] - bbox["l"]
-        region.height = bbox["t"] - bbox["b"]
-        region.text = _normalize_text(" ".join(op.text for op in inside))
-
-
-def _text_runs_look_like_hidden_ocr_layer(runs: list[TextShowRun]) -> bool:
-    if not runs:
-        return False
-    hidden = sum(1 for run in runs if run.render_mode == 3)
-    return hidden / max(len(runs), 1) >= 0.8
-
-
-def _table_cell_bbox(table: dict, cell: dict) -> dict[str, float] | None:
-    """The cell's own box when the structure step has one (Docling's, fitted
-    to the cell text); otherwise an even share of the table's box."""
-    if isinstance(cell.get("bbox"), dict):
-        return cell["bbox"]
-    table_bbox = table.get("bbox")
-    if not isinstance(table_bbox, dict):
-        return None
-    num_rows = _as_positive_int(table.get("num_rows", 0), default=0)
-    num_cols = _as_positive_int(table.get("num_cols", 0), default=0)
-    if num_rows <= 0 or num_cols <= 0:
-        return None
-
-    left = _safe_float(table_bbox.get("l"))
-    bottom = _safe_float(table_bbox.get("b"))
-    right = _safe_float(table_bbox.get("r"))
-    top = _safe_float(table_bbox.get("t"))
-    if right <= left or top <= bottom:
-        return None
-
-    row = _as_positive_int(cell.get("row", 0), default=0)
-    col = _as_positive_int(cell.get("col", 0), default=0)
-    row_span = _as_positive_int(cell.get("row_span", 1), default=1)
-    col_span = _as_positive_int(cell.get("col_span", 1), default=1)
-    if row >= num_rows or col >= num_cols:
-        return None
-
-    row_h = (top - bottom) / num_rows
-    col_w = (right - left) / num_cols
-    return {
-        "l": left + col * col_w,
-        "r": left + min(num_cols, col + col_span) * col_w,
-        "t": top - row * row_h,
-        "b": top - min(num_rows, row + row_span) * row_h,
-    }
-
-
-def _matrix_tuple(value: Any) -> tuple[float, float, float, float, float, float]:
-    if isinstance(value, pikepdf.Array) and len(value) >= 6:
-        return tuple(_safe_float(item) for item in value[:6])
-    if isinstance(value, (list, tuple)) and len(value) >= 6:
-        return tuple(_safe_float(item) for item in value[:6])
-    return IDENTITY
-
-
-def _lookup_xobject(resources, name: str) -> pikepdf.Object | None:
-    if resources is None or not hasattr(resources, "get"):
-        return None
-    xobjects = resources.get("/XObject")
-    if xobjects is None or not hasattr(xobjects, "get"):
-        return None
-    try:
-        return xobjects.get(name) or xobjects.get(pikepdf.Name(name))
-    except Exception:
-        return None
-
-
-def _is_ocr_form_xobject(name: str, xobject: Any) -> bool:
-    if not name.startswith("/OCR"):
-        return False
-    try:
-        return xobject is not None and xobject.get("/Subtype") == pikepdf.Name("/Form")
-    except Exception:
-        return False
-
-
-def _try_extract_ocr_form_invocation(
-    instructions: list,
-    start_idx: int,
-    resources,
-    current_ctm: tuple[float, float, float, float, float, float],
-) -> OcrFormInvocation | None:
-    if start_idx < 0 or start_idx >= len(instructions):
-        return None
-
-    instr = instructions[start_idx]
-    op = str(instr.operator)
-
-    if op == "Do":
-        operands = list(instr.operands) if hasattr(instr, "operands") else []
-        if not operands:
-            return None
-        name = str(operands[0])
-        xobject = _lookup_xobject(resources, name)
-        if not _is_ocr_form_xobject(name, xobject):
-            return None
-        form_matrix = _matrix_tuple(xobject.get("/Matrix")) if hasattr(xobject, "get") else IDENTITY
-        return OcrFormInvocation(
-            xobject_name=name,
-            stream=xobject,
-            start_idx=start_idx,
-            end_idx=start_idx + 1,
-            instructions=[instr],
-            initial_ctm=_mat_multiply(form_matrix, current_ctm),
-        )
-
-    if op != "q":
-        return None
-
-    depth = 0
-    j = start_idx
-    temp_ctm = current_ctm
-    form_name = ""
-    form_stream = None
-    do_count = 0
-    do_ctm = current_ctm
-    allowed_ops = {"q", "Q", "cm", "Do"}
-
-    while j < len(instructions):
-        inner = instructions[j]
-        inner_op = str(inner.operator)
-        if inner_op not in allowed_ops:
-            return None
-
-        if inner_op == "q":
-            depth += 1
-        elif inner_op == "Q":
-            depth -= 1
-            if depth == 0:
-                break
-            if depth < 0:
-                return None
-        elif inner_op == "cm":
-            inner_ops = list(inner.operands) if hasattr(inner, "operands") else []
-            if len(inner_ops) >= 6:
-                temp_ctm = _mat_multiply(tuple(_safe_float(x) for x in inner_ops[:6]), temp_ctm)
-        elif inner_op == "Do":
-            operands = list(inner.operands) if hasattr(inner, "operands") else []
-            if not operands:
-                return None
-            name = str(operands[0])
-            xobject = _lookup_xobject(resources, name)
-            if not _is_ocr_form_xobject(name, xobject):
-                return None
-            do_count += 1
-            if do_count > 1:
-                return None
-            form_name = name
-            form_stream = xobject
-            do_ctm = temp_ctm
-
-        j += 1
-
-    if depth != 0 or do_count != 1 or form_stream is None:
-        return None
-
-    form_matrix = _matrix_tuple(form_stream.get("/Matrix")) if hasattr(form_stream, "get") else IDENTITY
-    return OcrFormInvocation(
-        xobject_name=form_name,
-        stream=form_stream,
-        start_idx=start_idx,
-        end_idx=j + 1,
-        instructions=instructions[start_idx : j + 1],
-        initial_ctm=_mat_multiply(form_matrix, do_ctm),
-    )
-
-
-def _extract_ocr_form_invocations(page: pikepdf.Page, instructions: list) -> list[OcrFormInvocation]:
-    resources = page.get("/Resources", {}) if hasattr(page, "get") else {}
-    invocations: list[OcrFormInvocation] = []
-    seen_streams: set[tuple[int, int] | tuple[str, int]] = set()
-    ctm = IDENTITY
-    ctm_stack: list[tuple[float, float, float, float, float, float]] = []
-
-    i = 0
-    while i < len(instructions):
-        invocation = _try_extract_ocr_form_invocation(instructions, i, resources, ctm)
-        if invocation is not None:
-            key = _obj_key(invocation.stream)
-            normalized_key: tuple[int, int] | tuple[str, int]
-            normalized_key = key if key is not None else ("direct", id(invocation.stream))
-            if normalized_key not in seen_streams:
-                invocations.append(invocation)
-                seen_streams.add(normalized_key)
-            i = invocation.end_idx
-            continue
-
-        instr = instructions[i]
-        op = str(instr.operator)
-        if op == "q":
-            ctm_stack.append(ctm)
-        elif op == "Q":
-            if ctm_stack:
-                ctm = ctm_stack.pop()
-        elif op == "cm":
-            operands = list(instr.operands) if hasattr(instr, "operands") else []
-            if len(operands) >= 6:
-                ctm = _mat_multiply(tuple(_safe_float(x) for x in operands[:6]), ctm)
-        i += 1
-
-    return invocations
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Spatial matching — correlate content regions with Docling elements
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _bbox_center(bbox: dict) -> tuple[float, float]:
-    """Get center point of a Docling bounding box {l, b, r, t}."""
-    return (
-        (bbox["l"] + bbox["r"]) / 2,
-        (bbox["b"] + bbox["t"]) / 2,
-    )
-
-
-def _distance(x1: float, y1: float, x2: float, y2: float) -> float:
-    """Euclidean distance between two points."""
-    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
-
-
-def _get_docling_parse_page(parser_doc: Any | None, page_index: int) -> Any | None:
-    """Return a docling-parse page object for a 0-indexed page, if available."""
-    if parser_doc is None:
-        return None
-
-    page_no = page_index + 1  # docling-parse is 1-indexed
-    try:
-        if page_no > parser_doc.number_of_pages():
-            return None
-        return parser_doc.get_page(page_no)
-    except Exception:
-        return None
-
-
-def _extract_docling_parse_text_cells(page: Any, unit: TextCellUnit) -> list[dict]:
-    """Extract normalized text cells from a docling-parse page."""
-    cells: list[dict] = []
-    try:
-        iterator = page.iterate_cells(unit)
-    except Exception:
-        return cells
-
-    for cell in iterator:
-        bbox = _rect_to_bbox(cell.rect)
-        if not bbox:
-            continue
-        raw_text = " ".join(str(getattr(cell, "text", "") or getattr(cell, "orig", "")).split()).strip()
-        text = _normalize_text(raw_text)
-        cells.append({
-            "bbox": bbox,
-            "display_text": raw_text,
-            "text": text,
-            "index": _as_positive_int(getattr(cell, "index", len(cells) + 1), default=len(cells) + 1),
-        })
-    return cells
-
-
-def _build_docling_parse_page_words(
-    parser_doc: Any | None,
-    page_index: int,
-    cache: dict[int, list[dict]],
-) -> list[dict]:
-    """Extract word-level text cells from docling-parse for one page."""
-    if parser_doc is None:
-        return []
-    if page_index in cache:
-        return cache[page_index]
-
-    page = _get_docling_parse_page(parser_doc, page_index)
-    if page is None:
-        cache[page_index] = []
-        return []
-
-    words = _extract_docling_parse_text_cells(page, TextCellUnit.WORD)
-    cache[page_index] = words
-    return words
-
-
-def _build_docling_parse_page_hyperlinks(
-    parser_doc: Any | None,
-    page_index: int,
-    cache: dict[int, list[dict]],
-) -> list[dict]:
-    """Extract hyperlink rectangles and metadata from docling-parse for one page."""
-    if parser_doc is None:
-        return []
-    if page_index in cache:
-        return cache[page_index]
-
-    page = _get_docling_parse_page(parser_doc, page_index)
-    if page is None:
-        cache[page_index] = []
-        return []
-
-    hyperlinks: list[dict] = []
-    for link in getattr(page, "hyperlinks", []) or []:
-        bbox = _rect_to_bbox(getattr(link, "rect", None))
-        if not bbox:
-            continue
-        hyperlinks.append({
-            "bbox": bbox,
-            "uri": str(getattr(link, "uri", "") or "").strip(),
-            "widget_text": " ".join(str(getattr(link, "widget_text", "") or "").split()).strip(),
-            "widget_description": " ".join(str(getattr(link, "widget_description", "") or "").split()).strip(),
-            "index": _as_positive_int(getattr(link, "index", len(hyperlinks) + 1), default=len(hyperlinks) + 1),
-        })
-
-    cache[page_index] = hyperlinks
-    return hyperlinks
-
-
-def _build_docling_parse_page_widgets(
-    parser_doc: Any | None,
-    page_index: int,
-    cache: dict[int, list[dict]],
-) -> list[dict]:
-    """Extract widget rectangles and metadata from docling-parse for one page."""
-    if parser_doc is None:
-        return []
-    if page_index in cache:
-        return cache[page_index]
-
-    page = _get_docling_parse_page(parser_doc, page_index)
-    if page is None:
-        cache[page_index] = []
-        return []
-
-    widgets: list[dict] = []
-    for widget in getattr(page, "widgets", []) or []:
-        bbox = _rect_to_bbox(getattr(widget, "rect", None))
-        if not bbox:
-            continue
-        widgets.append({
-            "bbox": bbox,
-            "field_name": " ".join(str(getattr(widget, "widget_field_name", "") or "").split()).strip(),
-            "description": " ".join(str(getattr(widget, "widget_description", "") or "").split()).strip(),
-            "text": " ".join(str(getattr(widget, "widget_text", "") or "").split()).strip(),
-            "field_type": str(getattr(widget, "widget_field_type", "") or "").strip(),
-            "index": _as_positive_int(getattr(widget, "index", len(widgets) + 1), default=len(widgets) + 1),
-        })
-
-    cache[page_index] = widgets
-    return widgets
-
-
-def _source_key(source_element: dict[str, Any]) -> Any:
-    """The structure element an element's content goes to: its own, or, for
-    text Docling continues on a later page, the one it continues
-    (continued_ref, see structure)."""
-    return source_element.get("continued_ref") or id(source_element)
-
-
-class StructTreeBuilder:
-    """Manages MCID allocation, StructElem creation, and ParentTree construction."""
-
-    def __init__(self, pdf: pikepdf.Pdf, doc_lang: str = "en"):
-        self.pdf = pdf
-        self.doc_lang = doc_lang.lower().strip()
-        self.struct_tree_root = None
-        self.doc_elem = None
-        self._content_owner_mcid_counter: dict[tuple[Any, ...], int] = {}
-        self._content_owner_entries: dict[
-            tuple[Any, ...],
-            dict[str, Any],
-        ] = {}
-        self._content_owner_order = 0
-        self._struct_parents_counter = 0
-        self._object_parent_entries: list[tuple[pikepdf.Object, pikepdf.Object]] = []
-        self._source_element_structs: dict[Any, pikepdf.Object] = {}
-        self._headings: list[dict] = []
-        self._struct_elems_created = 0
-        # The reading-order position (see _elements_in_user_space) of the
-        # element whose content is being tagged, and that of each element
-        # added to /Document, so a page's elements can be put in reading
-        # order (see order_page_kids).
-        self.reading_order: int | None = None
-        self._reading_order_of: dict[tuple[int, int], int] = {}
-        self._list_cache: dict[str, tuple[pikepdf.Object, pikepdf.Object | None]] = {}
-        self._note_counter = 0
-        self._table_counter = 0
-        self._fragmented_table_cache: dict[int, dict[tuple[int, int], pikepdf.Object]] = {}
-        self._toc_cache: dict[str, pikepdf.Object] = {}
-
-    def setup(self):
-        """Create StructTreeRoot and Document element."""
-        self.struct_tree_root = self.pdf.make_indirect(pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/StructTreeRoot"),
-            "/K": pikepdf.Array([]),
-            "/ParentTree": self.pdf.make_indirect(pikepdf.Dictionary({
-                "/Nums": pikepdf.Array([]),
-            })),
-        }))
-        self.pdf.Root["/StructTreeRoot"] = self.struct_tree_root
-
-        self.doc_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/Document"),
-            "/P": self.struct_tree_root,
-            "/K": pikepdf.Array([]),
-        }))
-        self.struct_tree_root["/K"] = pikepdf.Array([self.doc_elem])
-
-    def _content_owner_key(self, owner: pikepdf.Object) -> tuple[Any, ...]:
-        key = _obj_key(owner)
-        if key is not None:
-            return ("obj", *key)
-        return ("direct", id(owner))
-
-    def _alloc_mcid(self, owner: pikepdf.Object) -> int:
-        """Allocate a new MCID for one content stream owner."""
-        owner_key = self._content_owner_key(owner)
-        mcid = self._content_owner_mcid_counter.get(owner_key, 0)
-        self._content_owner_mcid_counter[owner_key] = mcid + 1
-        return mcid
-
-    def _alloc_struct_parent_key(self) -> int:
-        """Allocate a StructParent key for ParentTree entries."""
-        key = self._struct_parents_counter
-        self._struct_parents_counter += 1
-        return key
-
-    def _register_mcid(
-        self,
-        *,
-        owner: pikepdf.Object,
-        page_index: int,
-        mcid: int,
-        elem: pikepdf.Object,
-    ) -> None:
-        """Register an MCID-to-StructElem mapping for one page or form stream owner."""
-        owner_key = self._content_owner_key(owner)
-        entry = self._content_owner_entries.get(owner_key)
-        if entry is None:
-            entry = {
-                "owner": owner,
-                "page_index": page_index,
-                "mcids": [],
-                "order": self._content_owner_order,
-            }
-            self._content_owner_entries[owner_key] = entry
-            self._content_owner_order += 1
-        entry["mcids"].append((mcid, elem))
-
-    def _make_mcr(
-        self,
-        mcid: int,
-        page_ref: pikepdf.Object,
-        *,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> pikepdf.Dictionary:
-        """Create a Marked Content Reference (MCR) dictionary."""
-        mcr = pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/MCR"),
-            "/Pg": page_ref,
-            "/MCID": mcid,
-        })
-        if stream_owner is not None and _obj_key(stream_owner) != _obj_key(page_ref):
-            mcr["/Stm"] = stream_owner
-        return mcr
-
-    def _append_child(self, parent: pikepdf.Object, child: pikepdf.Object):
-        """Append a child element to a parent's /K array."""
-        if parent == self.doc_elem and self.reading_order is not None:
-            self._reading_order_of[child.objgen] = self.reading_order
-        parent_k = parent.get("/K")
-        if isinstance(parent_k, pikepdf.Array):
-            parent_k.append(child)
-        elif parent_k is not None:
-            parent["/K"] = pikepdf.Array([parent_k, child])
-        else:
-            parent["/K"] = pikepdf.Array([child])
-
-    def order_page_kids(self, start: int) -> None:
-        """Put the elements added to /Document since position ``start`` (one
-        page's) in reading order. The content stream draws them in whatever
-        order its producer chose; Docling orders them as they are read. An
-        element without a position keeps its place after the one before it.
-        """
-        kids = self.doc_elem.get("/K")
-        if not isinstance(kids, pikepdf.Array) or len(kids) - start < 2:
-            return
-        page_kids = [kids[i] for i in range(start, len(kids))]
-        keys: list[float] = []
-        for kid in page_kids:
-            order = self._reading_order_of.get(kid.objgen)
-            keys.append(order if order is not None else (keys[-1] if keys else -1))
-        ordered = [kid for _key, _i, kid in sorted(zip(keys, range(len(keys)), page_kids))]
-        self.doc_elem["/K"] = pikepdf.Array([kids[i] for i in range(start)] + ordered)
-
-    def _struct_elem_for_mcid(self, owner: pikepdf.Object, mcid: int) -> pikepdf.Object | None:
-        owner_key = self._content_owner_key(owner)
-        entry = self._content_owner_entries.get(owner_key)
-        if not entry:
-            return None
-        for registered_mcid, elem in entry["mcids"]:
-            if registered_mcid == mcid:
-                return elem
-        return None
-
-    def remember_source_element(
-        self,
-        source_element: dict[str, Any],
-        owner: pikepdf.Object,
-        mcid: int,
-    ) -> None:
-        """Remember which StructElem represents a structure-json element."""
-        elem = self._struct_elem_for_mcid(owner, mcid)
-        if elem is not None:
-            self._source_element_structs[_source_key(source_element)] = elem
-
-    def source_element_struct(self, source_element: dict[str, Any] | None) -> pikepdf.Object | None:
-        if source_element is None:
-            return None
-        return self._source_element_structs.get(_source_key(source_element))
-
-    def add_mcr_to_struct_elem(
-        self,
-        elem: pikepdf.Object,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        *,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        """Append another marked-content reference to an existing StructElem."""
-        owner = stream_owner or page_ref
-        mcid = self._alloc_mcid(owner)
-        mcr = self._make_mcr(mcid, page_ref, stream_owner=stream_owner)
-        kids = elem.get("/K")
-        if isinstance(kids, pikepdf.Array):
-            kids.append(mcr)
-        elif kids is not None:
-            elem["/K"] = pikepdf.Array([kids, mcr])
-        else:
-            elem["/K"] = mcr
-        self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=elem)
-        return mcid
-
-    def _add_struct_elem(
-        self,
-        struct_type: str,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        parent: pikepdf.Object | None = None,
-        alt_text: str | None = None,
-        lang: str | None = None,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        """Create a StructElem and return its MCID."""
-        if parent is None:
-            parent = self.doc_elem
-
-        owner = stream_owner or page_ref
-        mcid = self._alloc_mcid(owner)
-
-        elem_dict = {
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name(f"/{struct_type}"),
-            "/P": parent,
-            "/K": self._make_mcr(mcid, page_ref, stream_owner=stream_owner),
-        }
-        if alt_text:
-            elem_dict["/Alt"] = pikepdf.String(alt_text)
-        if lang and lang.lower().strip() != self.doc_lang:
-            elem_dict["/Lang"] = pikepdf.String(lang)
-
-        elem = self.pdf.make_indirect(pikepdf.Dictionary(elem_dict))
-        self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=elem)
-        self._append_child(parent, elem)
-        self._struct_elems_created += 1
-        return mcid
-
-    def add_heading(
-        self, level: int, page_index: int, page_ref: pikepdf.Object,
-        text: str, lang: str | None = None, stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        level = max(1, min(6, level))
-        mcid = self._add_struct_elem(
-            f"H{level}",
-            page_index,
-            page_ref,
-            lang=lang,
-            stream_owner=stream_owner,
-        )
-        self._headings.append({"level": level, "text": text, "page_index": page_index})
-        return mcid
-
-    def add_paragraph(
-        self, page_index: int, page_ref: pikepdf.Object,
-        lang: str | None = None,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        return self._add_struct_elem("P", page_index, page_ref, lang=lang, stream_owner=stream_owner)
-
-    def add_figure(
-        self,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        alt_text: str | None = None,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        return self._add_struct_elem(
-            "Figure",
-            page_index,
-            page_ref,
-            alt_text=alt_text,
-            stream_owner=stream_owner,
-        )
-
-    def add_code(
-        self,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        lang: str | None = None,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        return self._add_struct_elem("Code", page_index, page_ref, lang=lang, stream_owner=stream_owner)
-
-    def add_formula(
-        self,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        alt_text: str | None = None,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        return self._add_struct_elem(
-            "Formula",
-            page_index,
-            page_ref,
-            alt_text=alt_text,
-            stream_owner=stream_owner,
-        )
-
-    def add_note(
-        self,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        *,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        owner = stream_owner or page_ref
-        mcid = self._alloc_mcid(owner)
-        self._note_counter += 1
-        note_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/Note"),
-            "/P": self.doc_elem,
-            "/ID": pikepdf.String(f"note-{self._note_counter}"),
-            "/K": self._make_mcr(mcid, page_ref, stream_owner=stream_owner),
-        }))
-        self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=note_elem)
-        self._append_child(self.doc_elem, note_elem)
-        self._struct_elems_created += 1
-        return mcid
-
-    def add_caption(
-        self,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        *,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        return self._add_struct_elem(
-            "Caption",
-            page_index,
-            page_ref,
-            stream_owner=stream_owner,
-        )
-
-    def add_reference(
-        self,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        *,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        return self._add_struct_elem(
-            "Reference",
-            page_index,
-            page_ref,
-            stream_owner=stream_owner,
-        )
-
-    def add_bib_entry(
-        self,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        *,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        return self._add_struct_elem(
-            "BibEntry",
-            page_index,
-            page_ref,
-            stream_owner=stream_owner,
-        )
-
-    def _get_or_create_toc(self, toc_group_ref: str | None) -> pikepdf.Object:
-        if toc_group_ref and toc_group_ref in self._toc_cache:
-            return self._toc_cache[toc_group_ref]
-
-        toc_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/TOC"),
-            "/P": self.doc_elem,
-            "/K": pikepdf.Array([]),
-        }))
-        self._append_child(self.doc_elem, toc_elem)
-        self._struct_elems_created += 1
-        if toc_group_ref:
-            self._toc_cache[toc_group_ref] = toc_elem
-        return toc_elem
-
-    def add_toc_caption(
-        self,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        toc_group_ref: str | None,
-        *,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        toc_elem = self._get_or_create_toc(toc_group_ref)
-        owner = stream_owner or page_ref
-        mcid = self._alloc_mcid(owner)
-        caption_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/Caption"),
-            "/P": toc_elem,
-            "/K": self._make_mcr(mcid, page_ref, stream_owner=stream_owner),
-        }))
-        toc_k = toc_elem.get("/K")
-        if isinstance(toc_k, pikepdf.Array):
-            toc_elem["/K"] = pikepdf.Array([caption_elem, *list(toc_k)])
-        else:
-            toc_elem["/K"] = pikepdf.Array([caption_elem])
-        self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=caption_elem)
-        self._struct_elems_created += 1
-        return mcid
-
-    def add_toc_item(
-        self,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        toc_group_ref: str | None,
-        *,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        toc_elem = self._get_or_create_toc(toc_group_ref)
-        owner = stream_owner or page_ref
-        mcid = self._alloc_mcid(owner)
-        toci_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/TOCI"),
-            "/P": toc_elem,
-            "/K": self._make_mcr(mcid, page_ref, stream_owner=stream_owner),
-        }))
-        self._append_child(toc_elem, toci_elem)
-        self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=toci_elem)
-        self._struct_elems_created += 1
-        return mcid
-
-    def add_table(
-        self,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        table_data: dict,
-        *,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        """Add a Table StructElem with rows, cells, /ID on THs, and /Headers on TDs."""
-        self._table_counter += 1
-        table_n = self._table_counter
-        owner = stream_owner or page_ref
-        num_rows = _as_positive_int(table_data.get("num_rows", 0), default=0)
-        num_cols = _as_positive_int(table_data.get("num_cols", 0), default=0)
-
-        table_elem_dict: dict = {
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/Table"),
-            "/P": self.doc_elem,
-            "/K": pikepdf.Array([]),
-        }
-        table_summary = _table_summary_text(table_data, num_rows=num_rows, num_cols=num_cols)
-        if table_summary:
-            table_elem_dict["/A"] = pikepdf.Dictionary({
-                "/O": pikepdf.Name("/Table"),
-                "/Summary": pikepdf.String(table_summary),
-            })
-        table_elem = self.pdf.make_indirect(pikepdf.Dictionary(table_elem_dict))
-        self._append_child(self.doc_elem, table_elem)
-        self._struct_elems_created += 1
-
-        raw_cells = table_data.get("cells", [])
-        cells = _complete_table_grid_cells(raw_cells, num_rows=num_rows, num_cols=num_cols)
-
-        if not cells:
-            mcid = self._alloc_mcid(owner)
-            table_elem["/K"] = self._make_mcr(mcid, page_ref, stream_owner=stream_owner)
-            self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=table_elem)
-            return mcid
-
-        rows: dict[int, list[dict]] = {}
-        for cell in cells:
-            row_idx = cell.get("row", 0)
-            if row_idx not in rows:
-                rows[row_idx] = []
-            rows[row_idx].append(cell)
-
-        # Collected during the build pass so we can set /Headers on TDs
-        # after all TH /IDs have been assigned.
-        th_info: list[tuple[int, int, int, int, str]] = []
-        # (row, col, row_span, col_span, cell_id)
-        td_info: list[tuple[int, int, pikepdf.Object]] = []
-        # (row, col, cell_elem)
-
-        first_mcid = None
-        for row_idx in sorted(rows.keys()):
-            row_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-                "/Type": pikepdf.Name("/StructElem"),
-                "/S": pikepdf.Name("/TR"),
-                "/P": table_elem,
-                "/K": pikepdf.Array([]),
-            }))
-            table_elem["/K"].append(row_elem)
-            self._struct_elems_created += 1
-
-            for cell in sorted(rows[row_idx], key=lambda c: c.get("col", 0)):
-                cell_type = "TH" if cell.get("is_header", False) else "TD"
-                col_idx = _as_positive_int(cell.get("col", 0), default=0)
-                mcid = self._alloc_mcid(owner)
-                if first_mcid is None:
-                    first_mcid = mcid
-                cell_elem_dict: dict = {
-                    "/Type": pikepdf.Name("/StructElem"),
-                    "/S": pikepdf.Name(f"/{cell_type}"),
-                    "/P": row_elem,
-                    "/K": self._make_mcr(mcid, page_ref, stream_owner=stream_owner),
-                }
-                attrs = pikepdf.Dictionary({
-                    "/O": pikepdf.Name("/Table"),
-                })
-                row_span = _as_positive_int(cell.get("row_span", 1), default=1)
-                col_span = _as_positive_int(cell.get("col_span", 1), default=1)
-                if row_span > 1:
-                    attrs["/RowSpan"] = row_span
-                if col_span > 1:
-                    attrs["/ColSpan"] = col_span
-
-                scope = ""
-                if cell_type == "TH":
-                    scope = "/Column"
-                    if bool(cell.get("row_header", False)):
-                        scope = "/Row"
-                    elif bool(cell.get("column_header", False)):
-                        scope = "/Column"
-                    elif col_idx == 0:
-                        scope = "/Row"
-                    attrs["/Scope"] = pikepdf.Name(scope)
-
-                    # Assign a unique /ID so TD cells can reference it.
-                    cell_id = f"t{table_n}-r{row_idx}-c{col_idx}"
-                    cell_elem_dict["/ID"] = pikepdf.String(cell_id)
-                    th_info.append((row_idx, col_idx, row_span, col_span, cell_id))
-
-                if len(attrs) > 1:
-                    cell_elem_dict["/A"] = attrs
-
-                cell_elem = self.pdf.make_indirect(pikepdf.Dictionary(cell_elem_dict))
-                row_elem["/K"].append(cell_elem)
-                self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=cell_elem)
-                self._struct_elems_created += 1
-
-                if cell_type == "TD":
-                    td_info.append((row_idx, col_idx, cell_elem))
-
-        # Second pass: set /Headers on each TD pointing to applicable THs.
-        if th_info and td_info:
-            for td_row, td_col, td_elem in td_info:
-                header_ids: list[str] = []
-                for th_row, th_col, th_rspan, th_cspan, th_id in th_info:
-                    # Column header: TH spans TD's column and is above it
-                    if th_col <= td_col < th_col + th_cspan and th_row + th_rspan <= td_row:
-                        header_ids.append(th_id)
-                    # Row header: TH spans TD's row and is to the left
-                    elif th_row <= td_row < th_row + th_rspan and th_col + th_cspan <= td_col:
-                        header_ids.append(th_id)
-                if header_ids:
-                    td_attrs = td_elem.get("/A")
-                    if td_attrs is None:
-                        td_attrs = pikepdf.Dictionary({"/O": pikepdf.Name("/Table")})
-                        td_elem["/A"] = td_attrs
-                    td_attrs["/Headers"] = pikepdf.Array(
-                        [pikepdf.String(h) for h in header_ids],
-                    )
-
-        return first_mcid if first_mcid is not None else 0
-
-    def _ensure_fragmented_table(
-        self,
-        table_data: dict,
-    ) -> dict[tuple[int, int], pikepdf.Object]:
-        """Create a Table/TR/TH/TD skeleton for fragmented OCR cell MCRs."""
-        table_key = id(table_data)
-        cached = self._fragmented_table_cache.get(table_key)
-        if cached is not None:
-            return cached
-
-        num_rows = _as_positive_int(table_data.get("num_rows", 0), default=0)
-        num_cols = _as_positive_int(table_data.get("num_cols", 0), default=0)
-        raw_cells = table_data.get("cells", [])
-        cells = _complete_table_grid_cells(raw_cells, num_rows=num_rows, num_cols=num_cols)
-        if not cells:
-            self._fragmented_table_cache[table_key] = {}
-            return {}
-
-        self._table_counter += 1
-        table_n = self._table_counter
-        table_elem_dict: dict = {
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/Table"),
-            "/P": self.doc_elem,
-            "/K": pikepdf.Array([]),
-        }
-        table_summary = _table_summary_text(table_data, num_rows=num_rows, num_cols=num_cols)
-        if table_summary:
-            table_elem_dict["/A"] = pikepdf.Dictionary({
-                "/O": pikepdf.Name("/Table"),
-                "/Summary": pikepdf.String(table_summary),
-            })
-        table_elem = self.pdf.make_indirect(pikepdf.Dictionary(table_elem_dict))
-        self._append_child(self.doc_elem, table_elem)
-        self._struct_elems_created += 1
-
-        rows: dict[int, list[dict]] = {}
-        for cell in cells:
-            row_idx = _as_positive_int(cell.get("row", 0), default=0)
-            rows.setdefault(row_idx, []).append(cell)
-
-        cell_structs: dict[tuple[int, int], pikepdf.Object] = {}
-        th_info: list[tuple[int, int, int, int, str]] = []
-        td_info: list[tuple[int, int, pikepdf.Object]] = []
-
-        for row_idx in sorted(rows.keys()):
-            row_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-                "/Type": pikepdf.Name("/StructElem"),
-                "/S": pikepdf.Name("/TR"),
-                "/P": table_elem,
-                "/K": pikepdf.Array([]),
-            }))
-            table_elem["/K"].append(row_elem)
-            self._struct_elems_created += 1
-
-            for cell in sorted(rows[row_idx], key=lambda c: c.get("col", 0)):
-                col_idx = _as_positive_int(cell.get("col", 0), default=0)
-                cell_type = "TH" if cell.get("is_header", False) else "TD"
-                cell_elem_dict: dict = {
-                    "/Type": pikepdf.Name("/StructElem"),
-                    "/S": pikepdf.Name(f"/{cell_type}"),
-                    "/P": row_elem,
-                    "/K": pikepdf.Array([]),
-                }
-                attrs = pikepdf.Dictionary({"/O": pikepdf.Name("/Table")})
-                row_span = _as_positive_int(cell.get("row_span", 1), default=1)
-                col_span = _as_positive_int(cell.get("col_span", 1), default=1)
-                if row_span > 1:
-                    attrs["/RowSpan"] = row_span
-                if col_span > 1:
-                    attrs["/ColSpan"] = col_span
-
-                if cell_type == "TH":
-                    scope = "/Column"
-                    if bool(cell.get("row_header", False)):
-                        scope = "/Row"
-                    elif bool(cell.get("column_header", False)):
-                        scope = "/Column"
-                    elif col_idx == 0:
-                        scope = "/Row"
-                    attrs["/Scope"] = pikepdf.Name(scope)
-                    cell_id = f"t{table_n}-r{row_idx}-c{col_idx}"
-                    cell_elem_dict["/ID"] = pikepdf.String(cell_id)
-                    th_info.append((row_idx, col_idx, row_span, col_span, cell_id))
-
-                if len(attrs) > 1:
-                    cell_elem_dict["/A"] = attrs
-
-                cell_elem = self.pdf.make_indirect(pikepdf.Dictionary(cell_elem_dict))
-                row_elem["/K"].append(cell_elem)
-                cell_structs[(row_idx, col_idx)] = cell_elem
-                self._struct_elems_created += 1
-
-                if cell_type == "TD":
-                    td_info.append((row_idx, col_idx, cell_elem))
-
-        if th_info and td_info:
-            for td_row, td_col, td_elem in td_info:
-                header_ids: list[str] = []
-                for th_row, th_col, th_rspan, th_cspan, th_id in th_info:
-                    if th_col <= td_col < th_col + th_cspan and th_row + th_rspan <= td_row:
-                        header_ids.append(th_id)
-                    elif th_row <= td_row < th_row + th_rspan and th_col + th_cspan <= td_col:
-                        header_ids.append(th_id)
-                if header_ids:
-                    td_attrs = td_elem.get("/A")
-                    if td_attrs is None:
-                        td_attrs = pikepdf.Dictionary({"/O": pikepdf.Name("/Table")})
-                        td_elem["/A"] = td_attrs
-                    td_attrs["/Headers"] = pikepdf.Array(
-                        [pikepdf.String(h) for h in header_ids],
-                    )
-
-        self._fragmented_table_cache[table_key] = cell_structs
-        return cell_structs
-
-    def add_table_cell_fragment(
-        self,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        table_data: dict,
-        cell: dict,
-        *,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> tuple[str, int] | None:
-        """Append one fragmented OCR marked-content run to a table cell."""
-        cell_structs = self._ensure_fragmented_table(table_data)
-        row_idx = _as_positive_int(cell.get("row", 0), default=0)
-        col_idx = _as_positive_int(cell.get("col", 0), default=0)
-        cell_elem = cell_structs.get((row_idx, col_idx))
-        if cell_elem is None:
-            return None
-
-        mcid = self.add_mcr_to_struct_elem(
-            cell_elem,
-            page_index,
-            page_ref,
-            stream_owner=stream_owner,
-        )
-        tag = "TH" if cell.get("is_header", False) else "TD"
-        return tag, mcid
-
-    def add_list_item(
-        self,
-        page_index: int,
-        page_ref: pikepdf.Object,
-        list_group_ref: str | None,
-        parent_list_group_ref: str | None = None,
-        marker: Any = None,
-        enumerated: bool = False,
-        *,
-        stream_owner: pikepdf.Object | None = None,
-    ) -> int:
-        """Add a single list item to a list group, creating the list on first use.
-
-        List items sharing the same list_group_ref are grouped under a single
-        /L StructElem. The list is created lazily on the first item and reused
-        for subsequent items in the same group.
-
-        For nested lists, parent_list_group_ref identifies the enclosing list
-        group. The nested /L is attached as a child of the parent list's most
-        recent /LI element, producing the PDF structure::
-
-            /L (outer)
-              /LI
-                /LBody …
-                /L (nested)      ← attached here
-                  /LI
-                    /LBody …
-        """
-        if list_group_ref and list_group_ref in self._list_cache:
-            list_elem, _ = self._list_cache[list_group_ref]
-        else:
-            list_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-                "/Type": pikepdf.Name("/StructElem"),
-                "/S": pikepdf.Name("/L"),
-                "/K": pikepdf.Array([]),
-            }))
-
-            # Determine where to attach this /L element.
-            # If it belongs to a nested list, place it inside the parent
-            # list's most recent /LI; otherwise attach to the document root.
-            attach_parent = self.doc_elem
-            if parent_list_group_ref and parent_list_group_ref in self._list_cache:
-                _, parent_last_li = self._list_cache[parent_list_group_ref]
-                if parent_last_li is not None:
-                    attach_parent = parent_last_li
-
-            list_elem["/P"] = attach_parent
-            self._append_child(attach_parent, list_elem)
-            self._struct_elems_created += 1
-            if list_group_ref:
-                self._list_cache[list_group_ref] = (list_elem, None)
-        _set_list_numbering_attr(list_elem, marker, enumerated=enumerated)
-
-        li_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/LI"),
-            "/P": list_elem,
-            "/K": pikepdf.Array([]),
-        }))
-        list_elem["/K"].append(li_elem)
-        self._struct_elems_created += 1
-
-        # Track the most recent LI so nested lists can attach to it.
-        if list_group_ref and list_group_ref in self._list_cache:
-            self._list_cache[list_group_ref] = (
-                self._list_cache[list_group_ref][0],
-                li_elem,
-            )
-
-        owner = stream_owner or page_ref
-        mcid = self._alloc_mcid(owner)
-        lbody_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/LBody"),
-            "/P": li_elem,
-            "/K": self._make_mcr(mcid, page_ref, stream_owner=stream_owner),
-        }))
-        li_elem["/K"].append(lbody_elem)
-        self._register_mcid(owner=owner, page_index=page_index, mcid=mcid, elem=lbody_elem)
-        self._struct_elems_created += 1
-
-        return mcid
-
-    def add_link_annotation(
-        self,
-        page_ref: pikepdf.Object,
-        annotation: pikepdf.Object,
-        parent: pikepdf.Object | None = None,
-    ) -> bool:
-        """Attach a /Link StructElem to an existing link annotation via OBJR."""
-        try:
-            if annotation.get("/Subtype") != pikepdf.Name("/Link"):
-                return False
-            if not getattr(annotation, "is_indirect", False):
-                return False
-        except Exception:
-            return False
-
-        if parent is None:
-            parent = self.doc_elem
-        # ActualText replaces an element's whole subtree for a screen reader,
-        # so it would hide the link; the parent reads from its glyphs instead.
-        if "/ActualText" in parent:
-            del parent["/ActualText"]
-        annotation["/P"] = page_ref
-        if not str(annotation.get("/Contents", "")).strip():
-            annotation["/Contents"] = pikepdf.String(_infer_link_contents(annotation))
-
-        link_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/Link"),
-            "/P": parent,
-            "/Pg": page_ref,
-            "/K": pikepdf.Dictionary({
-                "/Type": pikepdf.Name("/OBJR"),
-                "/Obj": annotation,
-                "/Pg": page_ref,
-            }),
-        }))
-        self._append_child(parent, link_elem)
-        self._object_parent_entries.append((annotation, link_elem))
-        self._struct_elems_created += 1
-        return True
-
-    def add_widget_annotation(self, page_ref: pikepdf.Object, annotation: pikepdf.Object) -> bool:
-        """Attach a /Form StructElem to a widget annotation via OBJR."""
-        try:
-            if annotation.get("/Subtype") != pikepdf.Name("/Widget"):
-                return False
-            if not getattr(annotation, "is_indirect", False):
-                return False
-        except Exception:
-            return False
-
-        annotation["/P"] = page_ref
-
-        form_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/Form"),
-            "/P": self.doc_elem,
-            "/Pg": page_ref,
-            "/K": pikepdf.Dictionary({
-                "/Type": pikepdf.Name("/OBJR"),
-                "/Obj": annotation,
-                "/Pg": page_ref,
-            }),
-        }))
-        self._append_child(self.doc_elem, form_elem)
-        self._object_parent_entries.append((annotation, form_elem))
-        self._struct_elems_created += 1
-        return True
-
-    def add_generic_annotation(self, page_ref: pikepdf.Object, annotation: pikepdf.Object) -> bool:
-        """Attach a generic /Annot StructElem to a non-link, non-widget annotation."""
-        try:
-            subtype = annotation.get("/Subtype")
-            if subtype in (pikepdf.Name("/Link"), pikepdf.Name("/Widget"), pikepdf.Name("/PrinterMark")):
-                return False
-            if not getattr(annotation, "is_indirect", False):
-                return False
-        except Exception:
-            return False
-
-        annotation["/P"] = page_ref
-
-        annot_elem = self.pdf.make_indirect(pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/Annot"),
-            "/P": self.doc_elem,
-            "/Pg": page_ref,
-            "/K": pikepdf.Dictionary({
-                "/Type": pikepdf.Name("/OBJR"),
-                "/Obj": annotation,
-                "/Pg": page_ref,
-            }),
-        }))
-        self._append_child(self.doc_elem, annot_elem)
-        self._object_parent_entries.append((annotation, annot_elem))
-        self._struct_elems_created += 1
-        return True
-
-    def finalize(self):
-        """Build the ParentTree NumberTree and set StructParents on content owners."""
-        parent_tree_nums = pikepdf.Array([])
-
-        owner_entries = sorted(
-            self._content_owner_entries.values(),
-            key=lambda entry: (int(entry["page_index"]), int(entry["order"])),
-        )
-        for entry in owner_entries:
-            owner = entry["owner"]
-            struct_parents_idx = self._alloc_struct_parent_key()
-            owner["/StructParents"] = struct_parents_idx
-
-            mcid_entries = entry["mcids"]
-            elem_array = pikepdf.Array([])
-            for _mcid, elem in sorted(mcid_entries, key=lambda x: x[0]):
-                elem_array.append(elem if elem is not None else pikepdf.Null())
-
-            parent_tree_nums.append(struct_parents_idx)
-            parent_tree_nums.append(self.pdf.make_indirect(elem_array))
-
-        for annotation, elem in self._object_parent_entries:
-            struct_parent_key = self._alloc_struct_parent_key()
-            annotation["/StructParent"] = struct_parent_key
-            parent_tree_nums.append(struct_parent_key)
-            parent_tree_nums.append(elem)
-
-        parent_tree = self.pdf.make_indirect(pikepdf.Dictionary({
-            "/Nums": parent_tree_nums,
-        }))
-        self.struct_tree_root["/ParentTree"] = parent_tree
-        self.struct_tree_root["/ParentTreeNextKey"] = self._struct_parents_counter
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Content stream rewriting — position-based
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _strip_existing_markers(instructions: list) -> list:
-    """Remove existing BDC/BMC/EMC markers from content stream instructions."""
-    stripped = []
-    depth = 0
-    for instr in instructions:
-        op = str(instr.operator) if hasattr(instr, 'operator') else ""
-        if op in ("BDC", "BMC"):
-            depth += 1
-        elif op == "EMC":
-            if depth > 0:
-                depth -= 1
-        else:
-            stripped.append(instr)
-    return stripped
-
-
-def _instruction_paints_content(instr: Any) -> bool:
-    op = str(instr.operator) if hasattr(instr, "operator") else ""
-    return op in CONTENT_PAINT_OPERATORS
-
-
-def _artifact_properties_for_element(elem: dict | None) -> pikepdf.Dictionary | None:
-    if not isinstance(elem, dict):
-        return None
-
-    artifact_type = str(elem.get("artifact_type") or "").strip().lower()
-    properties = pikepdf.Dictionary()
-    if artifact_type == "page_header":
-        properties["/Type"] = pikepdf.Name("/Pagination")
-        properties["/Subtype"] = pikepdf.Name("/Header")
-        properties["/Attached"] = pikepdf.Array([pikepdf.Name("/Top")])
-    elif artifact_type == "page_footer":
-        properties["/Type"] = pikepdf.Name("/Pagination")
-        properties["/Subtype"] = pikepdf.Name("/Footer")
-        properties["/Attached"] = pikepdf.Array([pikepdf.Name("/Bottom")])
-    elif artifact_type in {"layout", "decorative", "decoration"}:
-        properties["/Type"] = pikepdf.Name("/Layout")
-    elif artifact_type == "background":
-        properties["/Type"] = pikepdf.Name("/Background")
-    elif artifact_type == "page":
-        properties["/Type"] = pikepdf.Name("/Page")
-
-    bbox = elem.get("bbox")
-    if isinstance(bbox, dict):
-        try:
-            rect = [
-                float(bbox["l"]),
-                float(bbox["b"]),
-                float(bbox["r"]),
-                float(bbox["t"]),
-            ]
-        except (KeyError, TypeError, ValueError):
-            rect = []
-        if len(rect) == 4 and rect[2] > rect[0] and rect[3] > rect[1]:
-            properties["/BBox"] = pikepdf.Array(rect)
-
-    return properties if len(properties) else None
-
-
-def _fragment_tag_for_element(elem: dict) -> str | None:
-    elem_type = elem.get("type", "")
-    if elem_type == "heading":
-        level = _as_positive_int(elem.get("level", 1), default=1)
-        return f"H{max(1, min(6, level))}"
-    if elem_type == "figure":
-        return "Figure"
-    if elem_type == "list_item":
-        return "LBody"
-    if elem_type == "code":
-        return "Code"
-    if elem_type == "formula":
-        return "Formula"
-    if elem_type == "note":
-        return "Note"
-    if elem_type == "reference":
-        return "Reference"
-    if elem_type == "bib_entry":
-        return "BibEntry"
-    if elem_type == "caption":
-        return "Caption"
-    if elem_type == "toc_caption":
-        return "Caption"
-    if elem_type in {"toc_item", "toc_item_table"}:
-        return "TOCI"
-    if elem_type == "paragraph":
-        return "P"
-    return None
-
-
-def _allocate_fragment_mcid(
-    builder: StructTreeBuilder,
-    elem: dict,
-    page_index: int,
-    page_ref: pikepdf.Object,
-    alt_lookup: dict[int, str],
-    decorative_figures: set[int],
-    *,
-    stream_owner: pikepdf.Object | None = None,
-) -> tuple[str, int, str | None] | None:
-    """Allocate an MCID for one fragmented content run."""
-    tag = _fragment_tag_for_element(elem)
-    if tag is None:
-        return None
-
-    existing_elem = builder.source_element_struct(elem)
-    if existing_elem is not None:
-        mcid = builder.add_mcr_to_struct_elem(
-            existing_elem,
-            page_index,
-            page_ref,
-            stream_owner=stream_owner,
-        )
-        return tag, mcid, None
-
-    elem_type = elem.get("type", "")
-    elem_lang = elem.get("lang")
-    # A formula's glyphs are often a math font's, which a screen reader
-    # cannot read, so its text is always its /ActualText.
-    actual_text = (
-        _element_accessible_text(elem) if elem_type == "formula" else _element_actual_text(elem)
-    ) or None
-
-    if elem_type == "heading":
-        mcid = builder.add_heading(
-            _as_positive_int(elem.get("level", 1), default=1),
-            page_index,
-            page_ref,
-            _element_accessible_text(elem),
-            lang=elem_lang,
-            stream_owner=stream_owner,
-        )
-    elif elem_type == "figure":
-        fig_idx = elem.get("figure_index")
-        if fig_idx in decorative_figures:
-            return None
-        alt = (
-            alt_lookup.get(fig_idx)
-            or elem.get("caption")
-            or elem.get("text")
-        )
-        if isinstance(alt, str):
-            alt = alt.strip()
-        mcid = builder.add_figure(
-            page_index,
-            page_ref,
-            alt_text=alt or None,
-            stream_owner=stream_owner,
-        )
-        actual_text = None
-    elif elem_type == "list_item":
-        mcid = builder.add_list_item(
-            page_index,
-            page_ref,
-            elem.get("list_group_ref"),
-            parent_list_group_ref=elem.get("parent_list_group_ref"),
-            marker=elem.get("marker"),
-            enumerated=bool(elem.get("enumerated", False)),
-            stream_owner=stream_owner,
-        )
-    elif elem_type == "code":
-        mcid = builder.add_code(
-            page_index,
-            page_ref,
-            lang=elem_lang,
-            stream_owner=stream_owner,
-        )
-    elif elem_type == "formula":
-        formula_alt = _formula_alt_text(actual_text or _element_accessible_text(elem))
-        mcid = builder.add_formula(
-            page_index,
-            page_ref,
-            alt_text=formula_alt or None,
-            stream_owner=stream_owner,
-        )
-    elif elem_type == "note":
-        mcid = builder.add_note(
-            page_index,
-            page_ref,
-            stream_owner=stream_owner,
-        )
-    elif elem_type == "reference":
-        mcid = builder.add_reference(
-            page_index,
-            page_ref,
-            stream_owner=stream_owner,
-        )
-    elif elem_type == "bib_entry":
-        mcid = builder.add_bib_entry(
-            page_index,
-            page_ref,
-            stream_owner=stream_owner,
-        )
-    elif elem_type == "caption":
-        mcid = builder.add_caption(
-            page_index,
-            page_ref,
-            stream_owner=stream_owner,
-        )
-    elif elem_type == "toc_caption":
-        mcid = builder.add_toc_caption(
-            page_index,
-            page_ref,
-            elem.get("toc_group_ref"),
-            stream_owner=stream_owner,
-        )
-    elif elem_type in {"toc_item", "toc_item_table"}:
-        mcid = builder.add_toc_item(
-            page_index,
-            page_ref,
-            elem.get("toc_group_ref"),
-            stream_owner=stream_owner,
-        )
-    else:
-        mcid = builder.add_paragraph(
-            page_index,
-            page_ref,
-            lang=elem_lang,
-            stream_owner=stream_owner,
-        )
-
-    builder.remember_source_element(elem, stream_owner or page_ref, mcid)
-    if actual_text and elem_type != "formula":
-        # An element's text covers all of its fragments. On the first
-        # fragment's marked content it would be read, and then the later
-        # fragments' own glyphs would be read again.
-        struct_elem = builder.source_element_struct(elem)
-        if struct_elem is not None:
-            struct_elem["/ActualText"] = pikepdf.String(actual_text)
-            actual_text = None
-    return tag, mcid, actual_text
-
-
-def _is_full_page_scan_image_region(
-    region: ContentRegion,
-    content_owner,
-    elements: list[dict],
-) -> bool:
-    if region.kind != "image" or not region.bbox:
-        return False
-    if not any(
-        elem.get("type") in LINK_TEXT_ELEMENT_TYPES and isinstance(elem.get("bbox"), dict)
-        for elem in elements
-    ):
-        return False
-    content_bbox = _page_content_bbox(content_owner)
-    if not content_bbox:
-        return False
-    return (
-        _containment_ratio(region.bbox, content_bbox) >= 0.85
-        and _containment_ratio(content_bbox, region.bbox) >= 0.85
-    )
-
-
-def _resolved_figure_alt_for_tagging(elem: dict, alt_lookup: dict[int, str]) -> str:
-    fig_idx = elem.get("figure_index")
-    alt = (
-        alt_lookup.get(fig_idx)
-        or elem.get("caption")
-        or elem.get("text")
-    )
-    if not isinstance(alt, str):
-        return ""
-    alt = " ".join(alt.split()).strip()
-    if _is_weak_figure_alt_text(alt):
-        return ""
-    return alt
-
-
-def _scan_figure_overlay_targets(
-    regions: list[ContentRegion],
-    elements: list[dict],
-    content_owner,
-    alt_lookup: dict[int, str],
-    decorative_figures: set[int],
-) -> tuple[list[tuple[ContentRegion, int]], set[int]]:
-    """Find figure elements that can be represented by clipped full-page scan pixels."""
-    overlay_targets: list[tuple[ContentRegion, int]] = []
-    decorative_covered: set[int] = set()
-    figure_elements = [
-        (elem_idx, elem)
-        for elem_idx, elem in enumerate(elements)
-        if elem.get("type") == "figure" and isinstance(elem.get("bbox"), dict)
-    ]
-    if not figure_elements:
-        return overlay_targets, decorative_covered
-
-    full_page_images = [
-        region
-        for region in regions
-        if _is_full_page_scan_image_region(region, content_owner, elements)
-    ]
-    if not full_page_images:
-        return overlay_targets, decorative_covered
-
-    for elem_idx, elem in figure_elements:
-        fig_idx = elem.get("figure_index")
-        elem_bbox = elem.get("bbox")
-        if not isinstance(elem_bbox, dict):
-            continue
-
-        best_region: ContentRegion | None = None
-        best_containment = 0.0
-        for region in full_page_images:
-            containment = _containment_ratio(elem_bbox, region.bbox)
-            if containment > best_containment:
-                best_containment = containment
-                best_region = region
-        if best_region is None or best_containment < 0.95:
-            continue
-
-        if fig_idx in decorative_figures:
-            decorative_covered.add(elem_idx)
-            continue
-
-        if not _resolved_figure_alt_for_tagging(elem, alt_lookup):
-            continue
-        overlay_targets.append((best_region, elem_idx))
-
-    return overlay_targets, decorative_covered
-
-
-def _make_clipped_image_figure_instructions(
-    region: ContentRegion,
-    elem: dict,
-    builder: StructTreeBuilder,
-    page_index: int,
-    page_ref: pikepdf.Object,
-    alt_lookup: dict[int, str],
-    decorative_figures: set[int],
-    *,
-    stream_owner: pikepdf.Object | None = None,
-) -> list[pikepdf.ContentStreamInstruction]:
-    """Reuse an existing scan image with a clip path for one real figure region."""
-    elem_bbox = elem.get("bbox")
-    clip_bbox = _bbox_intersection_box(elem_bbox, region.bbox if isinstance(elem_bbox, dict) else None)
-    if not clip_bbox:
-        return []
-    if clip_bbox["r"] - clip_bbox["l"] <= 1.0 or clip_bbox["t"] - clip_bbox["b"] <= 1.0:
-        return []
-    if not _resolved_figure_alt_for_tagging(elem, alt_lookup):
-        return []
-
-    allocated = _allocate_fragment_mcid(
-        builder,
-        elem,
-        page_index,
-        page_ref,
-        alt_lookup,
-        decorative_figures,
-        stream_owner=stream_owner,
-    )
-    if allocated is None:
-        return []
-    tag, mcid, _actual_text = allocated
-    if tag != "Figure":
-        return []
-
-    return [
-        _make_bdc("Figure", mcid),
-        pikepdf.ContentStreamInstruction([], pikepdf.Operator("q")),
-        pikepdf.ContentStreamInstruction(
-            [
-                clip_bbox["l"],
-                clip_bbox["b"],
-                clip_bbox["r"] - clip_bbox["l"],
-                clip_bbox["t"] - clip_bbox["b"],
-            ],
-            pikepdf.Operator("re"),
-        ),
-        pikepdf.ContentStreamInstruction([], pikepdf.Operator("W")),
-        pikepdf.ContentStreamInstruction([], pikepdf.Operator("n")),
-        pikepdf.ContentStreamInstruction(list(region.ctm), pikepdf.Operator("cm")),
-        pikepdf.ContentStreamInstruction(
-            [pikepdf.Name(region.xobject_name)],
-            pikepdf.Operator("Do"),
-        ),
-        pikepdf.ContentStreamInstruction([], pikepdf.Operator("Q")),
-        _make_emc(),
-    ]
-
-
-def _element_accessible_text(elem: dict) -> str:
-    return str(
-        elem.get("actual_text")
-        or elem.get("resolved_text")
-        or elem.get("semantic_text_hint")
-        or elem.get("glyph_text")
-        or readable(str(elem.get("text") or ""))
-    ).strip()
-
-
-# Element types whose text is read as /ActualText; a formula's is its alt
-# text, which stays Docling's.
-GLYPH_TEXT_ELEMENT_TYPES = LINK_TEXT_ELEMENT_TYPES - {"formula"}
-
-
-def _elements_in_user_space(elements: list[dict], frames: list[PageFrame]) -> list[dict]:
-    """Copies of the structure elements with their boxes moved from Docling's
-    page frame into PDF user space (see page_frame), where the tagger
-    measures the page's content."""
-    converted = []
-    for order, element in enumerate(elements):
-        element = copy.deepcopy(element)
-        element["reading_order"] = order
-        page = element.get("page")
-        if isinstance(page, int) and 0 <= page < len(frames):
-            frame = frames[page]
-            for owner in [element, *(element.get("cells") or [])]:
-                if isinstance(owner.get("bbox"), dict):
-                    owner["bbox"] = frame.to_user_space(owner["bbox"])
-            if element.get("extra_bboxes"):
-                element["extra_bboxes"] = [
-                    frame.to_user_space(box) for box in element["extra_bboxes"]
-                ]
-        converted.append(element)
-    return converted
-
-
-def _items_in_user_space(items: list[dict], frame: PageFrame) -> list[dict]:
-    """docling-parse's lines, words, links, or widgets, their boxes moved from
-    Docling's page frame into PDF user space."""
-    return [
-        {**item, "bbox": frame.to_user_space(item["bbox"])}
-        if isinstance(item.get("bbox"), dict)
-        else item
-        for item in items
-    ]
-
-
-def _attach_glyph_text(pages_elements: dict[int, list[dict]], pdfium_text: PdfiumText) -> None:
-    """Give each text element, and each table cell, a ``glyph_text`` when the
-    text pdfium extracts inside its boxes accounts for the structure step's
-    text: the PDF's own characters and word breaks, which
-    _element_accessible_text (and a table cell's /ActualText) prefer to
-    Docling's text (see element_text)."""
-    for page_index, elements in pages_elements.items():
-        for elem in elements:
-            boxes = [elem.get("bbox"), *elem.get("extra_bboxes", [])]
-            if elem.get("type") in GLYPH_TEXT_ELEMENT_TYPES and isinstance(boxes[0], dict):
-                raw = pdfium_text.in_boxes(page_index, boxes)
-                text = readable(raw)
-                if accounts_for(text, str(elem.get("text") or "")):
-                    elem["glyph_text"] = text
-                    if text != unicodedata.normalize("NFC", raw):
-                        # The glyphs read differently (an accent drawn as its
-                        # own glyph after the letter): the readable text is
-                        # a correction.
-                        elem["resolved_text"] = elem.get("resolved_text") or text
-            if elem.get("type") == "table":
-                for cell in elem.get("cells") or []:
-                    if isinstance(cell, dict) and (box := _table_cell_bbox(elem, cell)):
-                        text = readable(pdfium_text.in_boxes(page_index, [box]))
-                        if accounts_for(text, str(cell.get("text") or "")):
-                            cell["glyph_text"] = text
-
-
-def _element_actual_text(elem: dict) -> str | None:
-    """Text to read instead of the element's glyphs: only a correction the
-    structure or AI steps made deliberately (a letter-spaced heading read as
-    a word). Otherwise the glyphs, tagged to the element, are what a screen
-    reader reads, as the Tagged PDF Best Practice Guide asks."""
-    text = elem.get("actual_text") or elem.get("resolved_text") or elem.get("semantic_text_hint")
-    return str(text).strip() or None if text else None
-
-
-FORMULA_GREEK_WORDS = {
-    "Α": "alpha",
-    "α": "alpha",
-    "Β": "beta",
-    "β": "beta",
-    "Γ": "gamma",
-    "γ": "gamma",
-    "Δ": "delta",
-    "δ": "delta",
-    "Ε": "epsilon",
-    "ε": "epsilon",
-    "Ζ": "zeta",
-    "ζ": "zeta",
-    "Η": "eta",
-    "η": "eta",
-    "Θ": "theta",
-    "θ": "theta",
-    "Ι": "iota",
-    "ι": "iota",
-    "Κ": "kappa",
-    "κ": "kappa",
-    "Λ": "lambda",
-    "λ": "lambda",
-    "Μ": "mu",
-    "μ": "mu",
-    "Ν": "nu",
-    "ν": "nu",
-    "Ξ": "xi",
-    "ξ": "xi",
-    "Ο": "omicron",
-    "ο": "omicron",
-    "Π": "pi",
-    "π": "pi",
-    "Ρ": "rho",
-    "ρ": "rho",
-    "Σ": "sigma",
-    "σ": "sigma",
-    "ς": "sigma",
-    "Τ": "tau",
-    "τ": "tau",
-    "Υ": "upsilon",
-    "υ": "upsilon",
-    "Φ": "phi",
-    "φ": "phi",
-    "Χ": "chi",
-    "χ": "chi",
-    "Ψ": "psi",
-    "ψ": "psi",
-    "Ω": "omega",
-    "ω": "omega",
-}
-FORMULA_SYMBOL_WORDS = {
-    "=": "equals",
-    "+": "plus",
-    "±": "plus or minus",
-    "×": "times",
-    "·": "times",
-    "∙": "times",
-    "÷": "divided by",
-    "/": "over",
-    "≈": "approximately",
-    "≠": "not equal to",
-    "≤": "less than or equal to",
-    "≥": "greater than or equal to",
-    "<": "less than",
-    ">": "greater than",
-    "∑": "sum",
-    "∫": "integral",
-    "√": "square root",
-    "∞": "infinity",
-    "∂": "partial",
-    "∇": "nabla",
-    "→": "maps to",
-    "←": "from",
-    "↔": "if and only if",
-    "⇒": "implies",
-    "⇔": "if and only if",
-}
-FORMULA_SUPERSCRIPTS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾", "0123456789+-=()")
-FORMULA_SUBSCRIPTS = str.maketrans("₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎", "0123456789+-=()")
-FORMULA_MULTI_LETTER_WORDS = {
-    "sin",
-    "cos",
-    "tan",
-    "cot",
-    "sec",
-    "csc",
-    "log",
-    "ln",
-    "exp",
-    "lim",
-    "max",
-    "min",
-    "sup",
-    "inf",
-    "det",
-    "mod",
-    "gcd",
-    "lcm",
-    "sub",
-    "sum",
-    "alpha",
-    "beta",
-    "gamma",
-    "delta",
-    "epsilon",
-    "zeta",
-    "eta",
-    "theta",
-    "iota",
-    "kappa",
-    "lambda",
-    "mu",
-    "nu",
-    "xi",
-    "omicron",
-    "pi",
-    "rho",
-    "sigma",
-    "tau",
-    "upsilon",
-    "phi",
-    "chi",
-    "psi",
-    "omega",
-}
-
-
-def _spoken_formula_exponent(value: str) -> str:
-    compact = value.strip()
-    if compact == "2":
-        return "squared"
-    if compact == "3":
-        return "cubed"
-    return f"to the power of {compact}"
-
-
-def _split_formula_symbol_runs(text: str) -> str:
-    def repl(match: re.Match[str]) -> str:
-        token = match.group(0)
-        if token.lower() in FORMULA_MULTI_LETTER_WORDS:
-            return token
-        return " ".join(token)
-
-    return re.sub(r"\b[A-Za-z]{2,3}\b", repl, text)
-
-
-def _formula_alt_text(text: str | None) -> str:
-    spoken = str(text or "").strip()
-    if not spoken:
-        return ""
-
-    for symbol, word in FORMULA_GREEK_WORDS.items():
-        spoken = spoken.replace(symbol, f" {word} ")
-
-    spoken = re.sub(
-        r"([A-Za-z0-9\)])\s*\^\s*\{?([A-Za-z0-9+\-]+)\}?",
-        lambda match: f"{match.group(1)} {_spoken_formula_exponent(match.group(2))}",
-        spoken,
-    )
-    spoken = re.sub(
-        r"([A-Za-z0-9\)])([⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾]+)",
-        lambda match: f"{match.group(1)} {_spoken_formula_exponent(match.group(2).translate(FORMULA_SUPERSCRIPTS))}",
-        spoken,
-    )
-    spoken = re.sub(
-        r"([A-Za-z0-9\)])\s*_\s*\{?([A-Za-z0-9+\-]+)\}?",
-        lambda match: f"{match.group(1)} sub {match.group(2)}",
-        spoken,
-    )
-    spoken = re.sub(
-        r"([A-Za-z0-9\)])([₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎]+)",
-        lambda match: f"{match.group(1)} sub {match.group(2).translate(FORMULA_SUBSCRIPTS)}",
-        spoken,
-    )
-
-    for symbol, word in FORMULA_SYMBOL_WORDS.items():
-        spoken = spoken.replace(symbol, f" {word} ")
-
-    spoken = spoken.replace("{", " ").replace("}", " ")
-    spoken = _split_formula_symbol_runs(spoken)
-    return re.sub(r"\s+", " ", spoken).strip()
-
-
-def _make_bdc(
-    struct_type: str,
-    mcid: int,
-    *,
-    actual_text: str | None = None,
-) -> pikepdf.ContentStreamInstruction:
-    attributes = pikepdf.Dictionary({"/MCID": mcid})
-    normalized_actual_text = str(actual_text or "").strip()
-    if normalized_actual_text:
-        attributes["/ActualText"] = pikepdf.String(normalized_actual_text)
-    return pikepdf.ContentStreamInstruction(
-        [pikepdf.Name(f"/{struct_type}"), attributes],
-        pikepdf.Operator("BDC"),
-    )
-
-
-def _make_emc() -> pikepdf.ContentStreamInstruction:
-    return pikepdf.ContentStreamInstruction([], pikepdf.Operator("EMC"))
-
-
-def _figure_of(
-    region: ContentRegion,
-    elements: list[dict],
-    content_owner,
-) -> int | None:
-    """The figure an image belongs to: the one whose box and the image's
-    overlap by at least half of the smaller of the two (an image cropped to
-    the figure, or a figure made of several images). A full-page scan
-    behind a page's text belongs to none."""
-    box = _region_bbox(region)
-    if not box or _is_full_page_scan_image_region(region, content_owner, elements):
-        return None
-    best: int | None = None
-    best_share = 0.5
-    for idx, elem in enumerate(elements):
-        figure_box = elem.get("bbox")
-        if elem.get("type") != "figure" or not isinstance(figure_box, dict):
-            continue
-        smaller = min(_bbox_area(box), _bbox_area(figure_box))
-        share = _bbox_intersection(box, figure_box) / smaller if smaller > 0 else 0.0
-        if share >= best_share:
-            best, best_share = idx, share
-    return best
-
-
-_ARTIFACT_MARK = "artifact"
-_PASSTHROUGH_MARK = "passthrough"
-
-
-def _rewrite_content_stream(
-    pdf: pikepdf.Pdf,
-    content_owner,
-    page_index: int,
-    elements: list[dict],
-    builder: StructTreeBuilder,
-    page_ref: pikepdf.Object,
-    alt_lookup: dict[int, str],
-    decorative_figures: set[int] | None = None,
-    *,
-    initial_ctm: tuple[float, float, float, float, float, float] = IDENTITY,
-    stream_owner: pikepdf.Object | None = None,
-    passthrough_regions: list[ContentRegion] | None = None,
-    measured_ops: list[MeasuredTextOp] | None = None,
-) -> set[int]:
-    """Mark a content stream's content for the elements it belongs to.
-
-    Each text-showing unit (a TJ string, or a whole Tj) belongs to the text
-    element or table cell holding at least half of it (see _owner_of), TJs
-    being split where the owner changes; each image belongs to the figure it
-    overlaps (see _figure_of). Consecutive content with one owner is one
-    marked-content sequence. Everything else that paints is an artifact, a
-    path object wrapped whole; OCR form calls pass through unmarked, to be
-    tagged inside the form. Returns the indices of the elements tagged."""
-    try:
-        instructions = list(pikepdf.parse_content_stream(content_owner))
-    except Exception as e:
-        logger.warning(f"Could not parse content stream for page {page_index}: {e}")
-        return set()
-
-    instructions = _strip_existing_markers(instructions)
-    if not instructions:
-        return set()
-
-    decorative_figures = decorative_figures or set()
-    passthrough_regions = passthrough_regions or []
-    targets = _content_targets(elements)
-    measured = _measured_by_instruction(instructions, measured_ops)
-    word_owners: dict[tuple, ContentTarget | None] = {}
-    if measured is not None:
-        word_owners = _word_owners(measured, targets)
-        instructions, measured, new_index = _split_text_ops_across_targets(
-            instructions, measured, word_owners
-        )
-        passthrough_regions = [
-            dataclasses.replace(
-                region, start_idx=new_index[region.start_idx], end_idx=new_index[region.end_idx]
-            )
-            for region in passthrough_regions
-        ]
-    regions = _extract_content_regions(instructions, content_owner, initial_ctm=initial_ctm)
-    text_runs = _extract_text_show_runs(instructions, initial_ctm=initial_ctm)
-    if measured is not None:
-        _apply_measured_geometry(regions, text_runs, measured)
-
-    mark_by_idx: dict[int, ContentTarget | int | str] = {}
-    for run in text_runs:
-        op = measured.get(run.instruction_idx) if measured is not None else None
-        owner = (
-            _owner_of_glyphs(op.glyphs, word_owners)
-            if op is not None and op.glyphs
-            else _owner_of(run.bbox, targets)
-        )
-        for idx in range(run.segment_start_idx, run.segment_end_idx):
-            mark_by_idx[idx] = owner if owner is not None else _ARTIFACT_MARK
-    for region in regions:
-        if region.kind == "image":
-            figure = _figure_of(region, elements, content_owner)
-            for idx in range(region.start_idx, region.end_idx):
-                mark_by_idx[idx] = figure if figure is not None else _ARTIFACT_MARK
-    for region in passthrough_regions:
-        for idx in range(region.start_idx, region.end_idx):
-            mark_by_idx[idx] = _PASSTHROUGH_MARK
-
-    overlay_targets: list[tuple[ContentRegion, int]] = []
-    decorative_covered: set[int] = set()
-    if stream_owner is None and _text_runs_look_like_hidden_ocr_layer(text_runs):
-        overlay_targets, decorative_covered = _scan_figure_overlay_targets(
-            regions,
-            elements,
-            content_owner,
-            alt_lookup,
-            decorative_figures,
-        )
-    tagged: set[int] = set(decorative_covered)
-
-    new_instructions: list = []
-    active: ContentTarget | int | str | None = None
-    pending_path: list = []
-
-    def close_active() -> None:
-        nonlocal active
-        if active is not None:
-            new_instructions.append(_make_emc())
-            active = None
-
-    def open_mark(mark: ContentTarget | int | str) -> None:
-        """Open the marked content for a mark, or an artifact if no
-        structure element can hold it."""
-        nonlocal active
-        if mark == _ARTIFACT_MARK:
-            new_instructions.append(_make_bmc_artifact())
-            active = mark
-            return
-        elem_idx = mark if isinstance(mark, int) else mark.elem_idx
-        elem = elements[elem_idx]
-        builder.reading_order = elem.get("reading_order")
-        if elem.get("type") == "artifact":
-            new_instructions.append(_make_bmc_artifact(elem))
-            active = mark
-            return
-        allocated: tuple[str, int, str | None] | None = None
-        if isinstance(mark, ContentTarget) and mark.cell is not None:
-            cell = builder.add_table_cell_fragment(
-                page_index, page_ref, elem, mark.cell, stream_owner=stream_owner
-            )
-            allocated = (*cell, None) if cell is not None else None
-        else:
-            allocated = _allocate_fragment_mcid(
-                builder,
-                elem,
-                page_index,
-                page_ref,
-                alt_lookup,
-                decorative_figures,
-                stream_owner=stream_owner,
-            )
-        if allocated is None:
-            new_instructions.append(_make_bmc_artifact())
-            active = _ARTIFACT_MARK
-            return
-        tag, mcid, actual_text = allocated
-        new_instructions.append(_make_bdc(tag, mcid, actual_text=actual_text))
-        tagged.add(elem_idx)
-        active = mark
-
-    def flush_path(painted: bool) -> None:
-        if painted:
-            new_instructions.append(_make_bmc_artifact())
-            new_instructions.extend(pending_path)
-            new_instructions.append(_make_emc())
-        else:
-            new_instructions.extend(pending_path)
-        pending_path.clear()
-
-    for idx, instr in enumerate(instructions):
-        mark = mark_by_idx.get(idx)
-        if mark != active:
-            close_active()
-            if mark is not None and mark != _PASSTHROUGH_MARK:
-                open_mark(mark)
-        if mark is not None:
-            new_instructions.append(instr)
-            continue
-        op = str(instr.operator)
-        if op in PATH_CONSTRUCTION_OPERATORS or (pending_path and op in PATH_PAINTING_OPERATORS):
-            pending_path.append(instr)
-            if op in PATH_PAINTING_OPERATORS:
-                flush_path(painted=op != "n")
-            continue
-        if pending_path:
-            flush_path(painted=False)
-        if _instruction_paints_content(instr):
-            new_instructions.extend([_make_bmc_artifact(), instr, _make_emc()])
-        else:
-            new_instructions.append(instr)
-
-    if pending_path:
-        flush_path(painted=False)
-    close_active()
-    for source_region, elem_idx in overlay_targets:
-        builder.reading_order = elements[elem_idx].get("reading_order")
-        overlay = _make_clipped_image_figure_instructions(
-            source_region,
-            elements[elem_idx],
-            builder,
-            page_index,
-            page_ref,
-            alt_lookup,
-            decorative_figures,
-            stream_owner=stream_owner,
-        )
-        if overlay:
-            new_instructions.extend(overlay)
-            tagged.add(elem_idx)
-
-    try:
-        new_stream = pikepdf.unparse_content_stream(new_instructions)
-        if isinstance(content_owner, pikepdf.Page):
-            content_owner["/Contents"] = pdf.make_stream(new_stream)
-        else:
-            content_owner.write(new_stream)
-    except Exception as e:
-        logger.error(f"Failed to write content stream for page {page_index}: {e}")
-        return set()
-
-    return tagged
-
-
-def _make_bmc_artifact(
-    elem: dict | None = None,
-) -> pikepdf.ContentStreamInstruction:
-    properties = _artifact_properties_for_element(elem)
-    if properties:
-        return pikepdf.ContentStreamInstruction(
-            [pikepdf.Name("/Artifact"), properties],
-            pikepdf.Operator("BDC"),
-        )
-    return pikepdf.ContentStreamInstruction(
-        [pikepdf.Name("/Artifact")], pikepdf.Operator("BMC"),
-    )
-
-
-def _is_weak_figure_alt_text(text: Any) -> bool:
-    normalized = " ".join(str(text or "").split()).strip()
-    if not normalized:
-        return True
-    if normalized.startswith("[") and normalized.endswith("]"):
-        return True
-    return bool(WEAK_FIGURE_ALT_RE.fullmatch(normalized))
-
-
-def _mcr_page_index(
-    node: Any,
-    page_index_by_key: dict[tuple[int, int], int],
-) -> int | None:
-    if isinstance(node, pikepdf.Dictionary):
-        page_ref = node.get("/Pg")
-        page_key = _obj_key(page_ref)
-        if page_key is not None and page_key in page_index_by_key:
-            return page_index_by_key[page_key]
-        kids = node.get("/K")
-        if kids is not None:
-            return _mcr_page_index(kids, page_index_by_key)
-        return None
-    if isinstance(node, pikepdf.Array):
-        for child in node:
-            page_index = _mcr_page_index(child, page_index_by_key)
-            if page_index is not None:
-                return page_index
-    return None
-
-
-def _source_figure_alt_texts_by_page(pdf: pikepdf.Pdf) -> dict[int, list[str]]:
-    """Collect existing meaningful Figure /Alt text by page order."""
-    struct_root = pdf.Root.get("/StructTreeRoot")
-    if not isinstance(struct_root, pikepdf.Dictionary):
-        return {}
-
-    page_index_by_key = {
-        key: page_index
-        for page_index, page in enumerate(pdf.pages)
-        if (key := _obj_key(page.obj)) is not None
-    }
-    alts_by_page: dict[int, list[str]] = {}
-
-    def _walk(node: Any) -> None:
-        if isinstance(node, pikepdf.Dictionary):
-            if node.get("/S") == pikepdf.Name("/Figure"):
-                alt = " ".join(str(node.get("/Alt") or "").split()).strip()
-                if alt and not _is_weak_figure_alt_text(alt):
-                    page_index = _mcr_page_index(node, page_index_by_key)
-                    if page_index is not None:
-                        alts_by_page.setdefault(page_index, []).append(alt)
-            kids = node.get("/K")
-            if kids is not None:
-                _walk(kids)
-        elif isinstance(node, pikepdf.Array):
-            for child in node:
-                _walk(child)
-
-    _walk(struct_root.get("/K"))
-    return alts_by_page
-
-
-def _source_figure_alt_lookup(pdf: pikepdf.Pdf, elements: list[dict]) -> dict[int, str]:
-    """Map source tagged figure alt text to current Docling figures by page-local order."""
-    alts_by_page = _source_figure_alt_texts_by_page(pdf)
-    if not alts_by_page:
-        return {}
-
-    assigned_by_page: dict[int, int] = {}
-    lookup: dict[int, str] = {}
-    for elem in elements:
-        if elem.get("type") != "figure":
-            continue
-        fig_idx = elem.get("figure_index")
-        page_index = elem.get("page")
-        if not isinstance(fig_idx, int) or not isinstance(page_index, int):
-            continue
-        source_alts = alts_by_page.get(page_index, [])
-        offset = assigned_by_page.get(page_index, 0)
-        if offset >= len(source_alts):
-            continue
-        lookup[fig_idx] = source_alts[offset]
-        assigned_by_page[page_index] = offset + 1
-    return lookup
+    reading_order_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    # Zero-based page index and unclaimed word counts (including words
+    # deliberately left hidden); exact Artifact owners are already claimed.
+    unowned_words_by_page: list[dict[str, int]] = field(default_factory=list)
+    table_intelligence_audit: list[dict[str, Any]] = field(default_factory=list)
+    table_readability: list[dict[str, Any]] = field(default_factory=list)
+    author_structure_audit: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _render_page_ink_ratio(pdf_path: Path, page_number: int) -> float | None:
@@ -4264,8 +362,9 @@ def _should_artifact_nonsemantic_page_content(
     has_image_xobject = False
     xobjects = {}
     try:
-        resources = page.get("/Resources", {})
-        xobjects = resources.get("/XObject", {}) or {}
+        resources = pdf_dictionary(page.get("/Resources"))
+        if resources is not None:
+            xobjects = pdf_dictionary(resources.get("/XObject")) or {}
     except Exception:
         xobjects = {}
 
@@ -4306,6 +405,14 @@ def _should_artifact_nonsemantic_page_content(
         if ink_ratio is not None and ink_ratio <= BLANK_PAGE_MAX_INK_RATIO:
             return True
 
+    # A page can paint an opaque white background with arbitrary path
+    # operators. Exact zero ink is positive evidence even outside OCR's
+    # usual operator pattern; nonblank pages retain their Figure hold.
+    if ink_ratio is None and meaningful_ops:
+        ink_ratio = _render_page_ink_ratio(input_path, page_index + 1)
+        if ink_ratio == 0.0:
+            return True
+
     return (
         bool(meaningful_ops)
         and all(op in OCR_NOISE_ONLY_OPERATORS for op in meaningful_ops)
@@ -4317,808 +424,9 @@ def _should_artifact_nonsemantic_page_content(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Document metadata
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _reset_xmp_metadata(pdf: pikepdf.Pdf):
-    """Drop source XMP metadata to avoid carrying malformed metadata packets."""
-    try:
-        if "/Metadata" in pdf.Root:
-            del pdf.Root["/Metadata"]
-    except Exception as e:
-        logger.warning(f"Could not reset existing metadata stream: {e}")
-
-
-def _set_document_title(pdf: pikepdf.Pdf, structure_json: dict, original_filename: str):
-    """Set the document title in XMP metadata and enable title display."""
-    existing_title = None
-    try:
-        if "/Title" in pdf.docinfo:
-            existing_title = str(pdf.docinfo["/Title"]).strip()
-    except Exception:
-        pass
-
-    title = existing_title or structure_json.get("title")
-    if not title and original_filename:
-        title = Path(original_filename).stem.replace("_", " ").replace("-", " ")
-    if not title:
-        title = "Untitled Document"
-
-    try:
-        pdf.docinfo["/Title"] = pikepdf.String(title)
-    except Exception as e:
-        logger.warning(f"Could not set Info dictionary title: {e}")
-
-    try:
-        with pdf.open_metadata() as meta:
-            meta["{http://purl.org/dc/elements/1.1/}title"] = title
-    except Exception as e:
-        logger.warning(f"Could not set XMP title: {e}")
-
-    if "/ViewerPreferences" not in pdf.Root:
-        pdf.Root["/ViewerPreferences"] = pikepdf.Dictionary()
-    pdf.Root["/ViewerPreferences"]["/DisplayDocTitle"] = True
-
-    return title
-
-
-def _set_pdfua_identification(pdf: pikepdf.Pdf):
-    """Set PDF/UA identification metadata in XMP."""
-    try:
-        with pdf.open_metadata() as meta:
-            meta.register_xml_namespace("http://www.aiim.org/pdfua/ns/id/", "pdfuaid")
-            meta["{http://www.aiim.org/pdfua/ns/id/}part"] = "1"
-    except Exception as e:
-        logger.warning(f"Could not set PDF/UA identification metadata: {e}")
-
-
-def _normalize_optional_content_configs(pdf: pikepdf.Pdf) -> int:
-    """Normalize optional content configs to satisfy PDF/UA syntax requirements."""
-    ocprops = pdf.Root.get("/OCProperties")
-    if not isinstance(ocprops, pikepdf.Dictionary):
-        return 0
-
-    changes = 0
-
-    def _normalize_config(config, default_name: str) -> None:
-        nonlocal changes
-        if not isinstance(config, pikepdf.Dictionary):
-            return
-
-        try:
-            name = str(config.get("/Name", "")).strip()
-        except Exception:
-            name = ""
-        if not name:
-            config["/Name"] = pikepdf.String(default_name)
-            changes += 1
-        if "/AS" in config:
-            del config["/AS"]
-            changes += 1
-
-    _normalize_config(ocprops.get("/D"), "Default")
-
-    configs = ocprops.get("/Configs")
-    if isinstance(configs, pikepdf.Array):
-        for idx, config in enumerate(configs):
-            _normalize_config(config, f"Optional Content Config {idx + 1}")
-
-    return changes
-
-
-def _remove_dynamic_xfa(pdf: pikepdf.Pdf) -> bool:
-    """Strip dynamic XFA packets from AcroForm dictionaries."""
-    acroform = pdf.Root.get("/AcroForm")
-    if not isinstance(acroform, pikepdf.Dictionary):
-        return False
-    if "/XFA" not in acroform:
-        return False
-    del acroform["/XFA"]
-    return True
-
-
-def _normalize_embedded_file_specs(pdf: pikepdf.Pdf) -> int:
-    """Ensure embedded file specs carry non-empty F/UF filename keys."""
-    names = pdf.Root.get("/Names")
-    if not isinstance(names, pikepdf.Dictionary):
-        return 0
-
-    embedded_files = names.get("/EmbeddedFiles")
-    if not isinstance(embedded_files, pikepdf.Dictionary):
-        return 0
-
-    changes = 0
-
-    def _string_or_empty(value) -> str:
-        if value is None:
-            return ""
-        try:
-            text = str(value).strip()
-        except Exception:
-            return ""
-        return "" if text == "None" else text
-
-    def _walk_name_tree(node) -> list[tuple[str, pikepdf.Object]]:
-        results: list[tuple[str, pikepdf.Object]] = []
-        if not isinstance(node, pikepdf.Dictionary):
-            return results
-        kids = node.get("/Kids")
-        if isinstance(kids, pikepdf.Array):
-            for kid in kids:
-                results.extend(_walk_name_tree(kid))
-        names_array = node.get("/Names")
-        if isinstance(names_array, pikepdf.Array):
-            for idx in range(0, len(names_array) - 1, 2):
-                results.append((str(names_array[idx]), names_array[idx + 1]))
-        return results
-
-    for entry_name, file_spec in _walk_name_tree(embedded_files):
-        if not isinstance(file_spec, pikepdf.Dictionary):
-            continue
-        ef = file_spec.get("/EF")
-        if not isinstance(ef, pikepdf.Dictionary) or len(ef) == 0:
-            continue
-
-        candidate = ""
-        for value in (
-            file_spec.get("/UF"),
-            file_spec.get("/F"),
-            entry_name,
-            file_spec.get("/Desc"),
-            "attachment",
-        ):
-            candidate = _string_or_empty(value)
-            if candidate:
-                break
-        if not candidate:
-            candidate = "attachment"
-
-        if not _string_or_empty(file_spec.get("/F")):
-            file_spec["/F"] = pikepdf.String(candidate)
-            changes += 1
-        if not _string_or_empty(file_spec.get("/UF")):
-            file_spec["/UF"] = pikepdf.String(candidate)
-            changes += 1
-
-    return changes
-
-
-def _normalize_type1_font_charsets(pdf: pikepdf.Pdf) -> int:
-    """Remove stale CharSet entries from embedded Type1 font descriptors.
-
-    CharSet is optional. When present but incomplete it triggers PDF/UA font
-    failures, especially on subset fonts carried through OCR or producer
-    pipelines. Removing an invalid CharSet is safer than keeping incorrect
-    glyph metadata.
-    """
-    seen_resources: set[tuple[int, int]] = set()
-    seen_fonts: set[tuple[int, int]] = set()
-    seen_appearances: set[tuple[int, int]] = set()
-    changes = 0
-
-    def _is_mapping_like(obj) -> bool:
-        return isinstance(obj, pikepdf.Dictionary) or (hasattr(obj, "keys") and hasattr(obj, "get"))
-
-    def _has_embedded_font(descriptor) -> bool:
-        if not isinstance(descriptor, pikepdf.Dictionary):
-            return False
-        return any(
-            key in descriptor
-            for key in (
-                pikepdf.Name("/FontFile"),
-                pikepdf.Name("/FontFile2"),
-                pikepdf.Name("/FontFile3"),
-            )
-        )
-
-    def _walk_resources(resources) -> None:
-        nonlocal changes
-        resources = _resolve_dictionary(resources)
-        if not _is_mapping_like(resources):
-            return
-        resources_key = _obj_key(resources)
-        if resources_key and resources_key in seen_resources:
-            return
-        if resources_key:
-            seen_resources.add(resources_key)
-
-        fonts = _resolve_dictionary(resources.get("/Font"))
-        if _is_mapping_like(fonts):
-            for _, font_obj in fonts.items():
-                font_dict = _resolve_dictionary(font_obj)
-                if not _is_mapping_like(font_dict):
-                    continue
-                font_key = _obj_key(font_dict)
-                if font_key and font_key in seen_fonts:
-                    continue
-                if font_key:
-                    seen_fonts.add(font_key)
-
-                subtype = font_dict.get("/Subtype")
-                if subtype not in (pikepdf.Name("/Type1"), pikepdf.Name("/MMType1")):
-                    continue
-                descriptor = _resolve_dictionary(font_dict.get("/FontDescriptor"))
-                if not _has_embedded_font(descriptor):
-                    continue
-                if isinstance(descriptor, pikepdf.Dictionary) and pikepdf.Name("/CharSet") in descriptor:
-                    del descriptor[pikepdf.Name("/CharSet")]
-                    changes += 1
-
-        xobjects = _resolve_dictionary(resources.get("/XObject"))
-        if not _is_mapping_like(xobjects):
-            return
-        for _, xobject in xobjects.items():
-            xobject_dict = _resolve_dictionary(xobject)
-            if not _is_mapping_like(xobject_dict):
-                continue
-            if xobject_dict.get("/Subtype") != pikepdf.Name("/Form"):
-                continue
-            _walk_resources(xobject_dict.get("/Resources"))
-
-    def _walk_appearance_object(obj) -> None:
-        appearance_obj = _resolve_dictionary(obj)
-        if not _is_mapping_like(appearance_obj):
-            return
-        appearance_key = _obj_key(appearance_obj)
-        if appearance_key and appearance_key in seen_appearances:
-            return
-        if appearance_key:
-            seen_appearances.add(appearance_key)
-
-        _walk_resources(appearance_obj.get("/Resources"))
-        for key in ("/N", "/R", "/D"):
-            child = appearance_obj.get(key)
-            if child is not None:
-                _walk_appearance_object(child)
-
-    for page in pdf.pages:
-        _walk_resources(page.get("/Resources"))
-        annots = page.get("/Annots")
-        if isinstance(annots, pikepdf.Array):
-            for annot in annots:
-                ap = _resolve_dictionary(annot.get("/AP")) if hasattr(annot, "get") else None
-                if isinstance(ap, pikepdf.Dictionary):
-                    for key in ("/N", "/R", "/D"):
-                        child = ap.get(key)
-                        if child is not None:
-                            _walk_appearance_object(child)
-
-    acroform = _resolve_dictionary(pdf.Root.get("/AcroForm"))
-    if _is_mapping_like(acroform):
-        _walk_resources(acroform.get("/DR"))
-
-    return changes
-
-
-def _normalize_media_clip_data_dicts(pdf: pikepdf.Pdf) -> int:
-    """Backfill syntax-critical CT/Alt entries on media clip data dictionaries."""
-    changes = 0
-    seen_indirect: set[tuple[int, int]] = set()
-
-    def _string_or_empty(value) -> str:
-        if value is None:
-            return ""
-        try:
-            text = str(value).strip()
-        except Exception:
-            return ""
-        if text == "None":
-            return ""
-        if text.startswith("/"):
-            text = text[1:]
-        return re.sub(
-            r"#([0-9A-Fa-f]{2})",
-            lambda match: chr(int(match.group(1), 16)),
-            text,
-        )
-
-    def _is_mapping(obj) -> bool:
-        return isinstance(obj, (pikepdf.Dictionary, pikepdf.Stream))
-
-    def _derive_media_clip_label(media_clip) -> str:
-        label = _string_or_empty(media_clip.get("/N"))
-        if label:
-            return label
-        data = media_clip.get("/D")
-        if _is_mapping(data):
-            for key in ("/UF", "/F", "/Desc"):
-                label = _string_or_empty(data.get(key))
-                if label:
-                    return label
-        return "Embedded media"
-
-    def _derive_media_clip_type(media_clip) -> str | None:
-        data = media_clip.get("/D")
-        if not _is_mapping(data):
-            return "application/octet-stream"
-        try:
-            if data.get("/Subtype") == pikepdf.Name("/Form"):
-                return None
-        except Exception:
-            pass
-
-        subtype = _string_or_empty(data.get("/Subtype"))
-        if "/" in subtype:
-            return subtype
-
-        for key in ("/UF", "/F", "/Desc"):
-            guess = _string_or_empty(data.get(key))
-            if not guess:
-                continue
-            guessed_type, _ = mimetypes.guess_type(guess)
-            if guessed_type:
-                return guessed_type
-
-        ef = data.get("/EF")
-        if _is_mapping(ef):
-            for key in ("/UF", "/F"):
-                embedded_stream = ef.get(key)
-                if not _is_mapping(embedded_stream):
-                    continue
-                stream_subtype = _string_or_empty(embedded_stream.get("/Subtype"))
-                if "/" in stream_subtype:
-                    return stream_subtype
-
-        return "application/octet-stream"
-
-    active_direct_refs: list[tuple[int, object]] = []
-    stack: list[tuple[object | None, tuple[int, object] | None]] = [(pdf.Root, None)]
-
-    def _is_active_direct_ref(candidate: object, candidate_id: int) -> bool:
-        for active_id, active_obj in active_direct_refs:
-            if candidate_id == active_id:
-                return True
-            try:
-                if candidate == active_obj:
-                    return True
-            except Exception:
-                continue
-        return False
-
-    while stack:
-        obj, exit_mode = stack.pop()
-        if exit_mode is not None:
-            direct_id, _direct_ref = exit_mode
-            active_direct_refs = [
-                (active_id, active_obj)
-                for active_id, active_obj in active_direct_refs
-                if active_id != direct_id
-            ]
-            continue
-        if obj is None:
-            continue
-
-        indirect_key = _obj_key(obj)
-        if indirect_key:
-            if indirect_key in seen_indirect:
-                continue
-            seen_indirect.add(indirect_key)
-        elif isinstance(obj, (pikepdf.Array, pikepdf.Dictionary, pikepdf.Stream)):
-            direct_id = id(obj)
-            if _is_active_direct_ref(obj, direct_id):
-                continue
-            active_direct_refs.append((direct_id, obj))
-            stack.append((None, (direct_id, obj)))
-
-        if isinstance(obj, pikepdf.Array):
-            for item in reversed(list(obj)):
-                stack.append((item, None))
-            continue
-        if not _is_mapping(obj):
-            continue
-
-        try:
-            is_media_clip_data = obj.get("/S") == pikepdf.Name("/MCD")
-        except Exception:
-            is_media_clip_data = False
-
-        if is_media_clip_data:
-            ct_value = _derive_media_clip_type(obj)
-            if ct_value and not _string_or_empty(obj.get("/CT")):
-                obj["/CT"] = pikepdf.String(ct_value)
-                changes += 1
-            alt = obj.get("/Alt")
-            if not isinstance(alt, pikepdf.Array) or len(alt) < 2:
-                obj["/Alt"] = pikepdf.Array([
-                    pikepdf.String(""),
-                    pikepdf.String(_derive_media_clip_label(obj)),
-                ])
-                changes += 1
-
-        for _, value in reversed(list(obj.items())):
-            stack.append((value, None))
-
-    return changes
-
-
-def _add_bookmarks(
-    pdf: pikepdf.Pdf,
-    headings: list[dict],
-    elements: list[dict[str, Any]] | None = None,
-    bookmark_plan: list[dict[str, Any]] | None = None,
-    native_toc: dict[str, Any] | None = None,
-    document_title: str | None = None,
-):
-    """Build bookmarks from TOC semantics when available, else fall back to headings."""
-    page_count = len(pdf.pages)
-    plan_entries = _bookmark_plan_entries(bookmark_plan, page_count)
-    heading_entries = _docling_heading_bookmark_entries(elements, page_count)
-    selected_heading_entries = _docling_heading_bookmark_entries(
-        elements,
-        page_count,
-        selected_only=True,
-    )
-    if not heading_entries:
-        heading_entries = _heading_bookmark_entries(headings, page_count)
-    native_toc_entries = _native_toc_bookmark_entries(native_toc, heading_entries, page_count)
-    toc_entries = _toc_bookmark_entries(elements, heading_entries, page_count)
-    if plan_entries:
-        bookmark_entries = plan_entries
-    elif native_toc_entries:
-        bookmark_entries = native_toc_entries
-    elif toc_entries:
-        bookmark_entries = _combine_bookmark_source_entries(toc_entries, selected_heading_entries)
-    else:
-        bookmark_entries = _sort_heading_bookmark_entries(
-            _maybe_synthesize_title_bookmark(heading_entries, document_title, [])
-        )
-    if not bookmark_entries:
-        return 0
-
-    items = [pikepdf.OutlineItem(entry["text"], entry["page_index"]) for entry in bookmark_entries]
-    if not items:
-        return 0
-
-    root_items = []
-    stack: list[tuple[int, pikepdf.OutlineItem]] = []
-
-    for entry, item in zip(bookmark_entries, items, strict=True):
-        level = entry["level"]
-
-        while stack and stack[-1][0] >= level:
-            stack.pop()
-
-        if stack:
-            stack[-1][1].children.append(item)
-        else:
-            root_items.append(item)
-
-        stack.append((level, item))
-
-    try:
-        with pdf.open_outline() as outline:
-            outline.root.extend(root_items)
-    except Exception as e:
-        logger.warning(f"Could not add bookmarks: {e}")
-        return 0
-
-    return len(items)
-
-
-def _sanitize_outline_leaf_counts(pdf: pikepdf.Pdf) -> int:
-    """Remove explicit /Count 0 from bookmark leaves for stricter viewer compatibility."""
-    outlines = pdf.Root.get("/Outlines")
-    if not isinstance(outlines, pikepdf.Dictionary):
-        return 0
-
-    changed = 0
-    seen: set[tuple[int, int]] = set()
-
-    def _walk(item) -> None:
-        nonlocal changed
-        while isinstance(item, pikepdf.Dictionary):
-            item_key = _obj_key(item)
-            if item_key is not None:
-                if item_key in seen:
-                    return
-                seen.add(item_key)
-
-            first = item.get("/First")
-            if isinstance(first, pikepdf.Dictionary):
-                _walk(first)
-            else:
-                try:
-                    has_zero_count = int(item.get("/Count")) == 0
-                except (TypeError, ValueError):
-                    has_zero_count = False
-                if has_zero_count and "/Count" in item:
-                    del item["/Count"]
-                    changed += 1
-
-            next_item = item.get("/Next")
-            if not isinstance(next_item, pikepdf.Dictionary):
-                return
-            item = next_item
-
-    _walk(outlines.get("/First"))
-    return changed
-
-
-def _save_pdf_for_viewer_compatibility(pdf: pikepdf.Pdf, output_path: Path) -> None:
-    """Save linearized output when possible; fall back to a normal save."""
-    add_missing_icc_components(pdf)
-    tmp_path = output_path.with_name(f"{output_path.name}.tmp")
-    tmp_path.unlink(missing_ok=True)
-    try:
-        pdf.save(str(tmp_path), linearize=True)
-    except Exception as exc:
-        tmp_path.unlink(missing_ok=True)
-        logger.warning("Could not save linearized PDF %s: %s", output_path.name, exc)
-        pdf.save(str(output_path))
-    else:
-        tmp_path.replace(output_path)
-
-
-def _tag_link_annotations(
-    page: pikepdf.Page,
-    page_ref: pikepdf.Object,
-    builder: StructTreeBuilder,
-    page_elements: list[dict[str, Any]] | None = None,
-    docling_page_words: list[dict[str, Any]] | None = None,
-    docling_page_hyperlinks: list[dict[str, Any]] | None = None,
-) -> int:
-    """Tag link annotations as /Link struct elements using OBJR."""
-    annots = page.get("/Annots")
-    if not isinstance(annots, pikepdf.Array):
-        return 0
-
-    has_link_annotation = False
-    tagged = 0
-    for idx, annotation in enumerate(annots):
-        try:
-            if annotation.get("/Subtype") != pikepdf.Name("/Link"):
-                continue
-        except Exception:
-            continue
-        has_link_annotation = True
-        _normalize_annotation_rect(annotation)
-        current_contents = str(annotation.get("/Contents", "")).strip()
-        inferred_contents = _infer_link_contents(
-            annotation,
-            page_elements,
-            page_words=docling_page_words,
-            page_hyperlinks=docling_page_hyperlinks,
-        )
-        if inferred_contents and inferred_contents != current_contents:
-            annotation["/Contents"] = pikepdf.String(inferred_contents)
-
-        if not getattr(annotation, "is_indirect", False):
-            try:
-                annotation = builder.pdf.make_indirect(pikepdf.Dictionary(annotation))
-                annots[idx] = annotation
-            except Exception:
-                continue
-
-        parent_element = _best_annotation_source_element(
-            annotation,
-            page_elements,
-            allowed_types=LINK_TEXT_ELEMENT_TYPES,
-        )
-        parent_struct = builder.source_element_struct(parent_element)
-        if builder.add_link_annotation(page_ref, annotation, parent=parent_struct):
-            tagged += 1
-
-    if has_link_annotation:
-        page["/Tabs"] = pikepdf.Name("/S")
-
-    return tagged
-
-
-def _tag_widget_annotations(
-    page: pikepdf.Page,
-    page_ref: pikepdf.Object,
-    builder: StructTreeBuilder,
-    docling_page_widgets: list[dict[str, Any]] | None = None,
-) -> int:
-    """Tag widget annotations as /Form struct elements using OBJR."""
-    annots = page.get("/Annots")
-    if not isinstance(annots, pikepdf.Array):
-        return 0
-
-    tagged = 0
-    for idx, annotation in enumerate(annots):
-        try:
-            if annotation.get("/Subtype") != pikepdf.Name("/Widget"):
-                continue
-        except Exception:
-            continue
-
-        _normalize_annotation_rect(annotation)
-        if not str(annotation.get("/TU", "")).strip():
-            inferred_name = _infer_widget_accessible_name(annotation, docling_page_widgets)
-            if inferred_name:
-                annotation["/TU"] = pikepdf.String(inferred_name)
-
-        if not getattr(annotation, "is_indirect", False):
-            try:
-                annotation = builder.pdf.make_indirect(pikepdf.Dictionary(annotation))
-                annots[idx] = annotation
-            except Exception:
-                continue
-
-        if builder.add_widget_annotation(page_ref, annotation):
-            tagged += 1
-
-    return tagged
-
-
-def _tag_generic_annotations(
-    page: pikepdf.Page,
-    page_ref: pikepdf.Object,
-    builder: StructTreeBuilder,
-) -> int:
-    """Tag non-link, non-widget annotations as /Annot struct elements using OBJR."""
-    annots = page.get("/Annots")
-    if not isinstance(annots, pikepdf.Array):
-        return 0
-
-    tagged = 0
-    for idx, annotation in enumerate(annots):
-        try:
-            subtype = annotation.get("/Subtype")
-            if subtype in (
-                pikepdf.Name("/Link"),
-                pikepdf.Name("/TrapNet"),
-                pikepdf.Name("/Widget"),
-                pikepdf.Name("/PrinterMark"),
-            ):
-                continue
-        except Exception:
-            continue
-
-        _normalize_annotation_rect(annotation)
-        if not getattr(annotation, "is_indirect", False):
-            try:
-                annotation = builder.pdf.make_indirect(pikepdf.Dictionary(annotation))
-                annots[idx] = annotation
-            except Exception:
-                continue
-
-        if builder.add_generic_annotation(page_ref, annotation):
-            tagged += 1
-
-    return tagged
-
-
-def _prune_incidental_annotations(page: pikepdf.Page) -> int:
-    """Remove annotation subtypes that PDF/UA does not permit as accessible content."""
-    annots = page.get("/Annots")
-    if not isinstance(annots, pikepdf.Array) or len(annots) == 0:
-        return 0
-
-    filtered = pikepdf.Array()
-    removed = 0
-    incidental_subtypes = {
-        pikepdf.Name("/TrapNet"),
-        pikepdf.Name("/PrinterMark"),
-    }
-
-    for annotation in annots:
-        try:
-            if annotation.get("/Subtype") in incidental_subtypes:
-                removed += 1
-                continue
-        except Exception:
-            pass
-        filtered.append(annotation)
-
-    if removed == 0:
-        return 0
-
-    if len(filtered) == 0:
-        try:
-            del page["/Annots"]
-        except Exception:
-            page["/Annots"] = pikepdf.Array()
-    else:
-        page["/Annots"] = filtered
-
-    return removed
-
-
-def _infer_annotation_contents(
-    annotation: pikepdf.Object,
-    subtype: pikepdf.Object | None,
-) -> str:
-    """Generate a meaningful /Contents string based on annotation subtype."""
-    subtype_str = str(subtype) if subtype else ""
-
-    # Markup annotations
-    if subtype_str == "/Highlight":
-        return "Highlighted text"
-    if subtype_str == "/StrikeOut":
-        return "Strikethrough text"
-    if subtype_str == "/Underline":
-        return "Underlined text"
-    if subtype_str == "/Squiggly":
-        return "Squiggly-underlined text"
-
-    # Text note — extract user comment if present
-    if subtype_str in ("/Text", "/Note"):
-        try:
-            contents = str(annotation.get("/Contents", "")).strip()
-            if contents:
-                return contents
-        except Exception:
-            pass
-        return "Text note"
-
-    # Free text annotation
-    if subtype_str == "/FreeText":
-        try:
-            contents = str(annotation.get("/Contents", "")).strip()
-            if contents:
-                return contents
-        except Exception:
-            pass
-        return "Free text annotation"
-
-    # File attachment — extract filename
-    if subtype_str == "/FileAttachment":
-        try:
-            fs = annotation.get("/FS")
-            if fs is not None and hasattr(fs, "get"):
-                filename = str(fs.get("/UF") or fs.get("/F") or "").strip()
-                if filename:
-                    return f"File attachment: {filename}"
-        except Exception:
-            pass
-        return "File attachment"
-
-    # Stamp
-    if subtype_str == "/Stamp":
-        try:
-            name = str(annotation.get("/Name", "")).strip().lstrip("/")
-            if name:
-                return f"Stamp: {name}"
-        except Exception:
-            pass
-        return "Stamp annotation"
-
-    # Caret (insertion point)
-    if subtype_str == "/Caret":
-        return "Insertion mark"
-
-    # Ink (freehand drawing)
-    if subtype_str == "/Ink":
-        return "Freehand drawing"
-
-    # Fallback — use cleaned subtype name
-    if subtype_str.startswith("/"):
-        return f"{subtype_str[1:]} annotation"
-    return "Annotation"
-
-
-def _ensure_annotation_baseline(page: pikepdf.Page):
-    """Apply baseline PDF/UA annotation requirements on a page."""
-    _prune_incidental_annotations(page)
-    annots = page.get("/Annots")
-    if not isinstance(annots, pikepdf.Array) or len(annots) == 0:
-        return
-
-    page["/Tabs"] = pikepdf.Name("/S")
-
-    for annotation in annots:
-        try:
-            _normalize_annotation_rect(annotation)
-            subtype = annotation.get("/Subtype")
-            if subtype == pikepdf.Name("/Widget"):
-                continue
-            if str(annotation.get("/Contents", "")).strip():
-                continue
-            if subtype == pikepdf.Name("/Link"):
-                annotation["/Contents"] = pikepdf.String(_infer_link_contents(annotation))
-            else:
-                annotation["/Contents"] = pikepdf.String(
-                    _infer_annotation_contents(annotation, subtype)
-                )
-        except Exception:
-            continue
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Main entry point
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 async def tag_pdf(
     input_path: Path,
@@ -5130,7 +438,7 @@ async def tag_pdf(
 ) -> TaggingResult:
     """Write PDF/UA structure tags into the PDF."""
 
-    def _tag():
+    def _tag(input_path: Path):
         tags_added = 0
         parser_doc = None
         docling_parse_word_cache: dict[int, list[dict]] = {}
@@ -5152,15 +460,28 @@ async def tag_pdf(
             pikepdf.open(str(input_path)) as pdf,
         ):
             frames = [PageFrame.of(page) for page in pdfium_text.document]
-            elements = _elements_in_user_space(structure_json.get("elements", []), frames)
-            source_figure_alt_lookup = _source_figure_alt_lookup(pdf, elements)
+            try:
+                author_evidence = read_author_structure(input_path)
+            except Exception:
+                logger.warning("Could not read source semantics before tagging", exc_info=True)
+                author_evidence = {}
+            enriched = apply_author_structure(structure_json, author_evidence) if author_evidence else structure_json
+            elements = _elements_in_user_space(enriched.get("elements", []), frames)
+            source_figure_alt_lookup = {
+                e["figure_index"]: e.get("author_alt") or e.get("author_actual_text")
+                for e in elements if e.get("type") == "figure"
+                and isinstance(e.get("figure_index"), int)
+                and (e.get("author_alt") or e.get("author_actual_text"))
+            }
 
             # 1. Mark PDF as tagged
             if "/MarkInfo" not in pdf.Root:
-                pdf.Root["/MarkInfo"] = pikepdf.Dictionary({
-                    "/Marked": True,
-                    "/Suspects": False,
-                })
+                pdf.Root["/MarkInfo"] = pikepdf.Dictionary(
+                    {
+                        "/Marked": True,
+                        "/Suspects": False,
+                    }
+                )
             else:
                 pdf.Root["/MarkInfo"]["/Marked"] = True
                 pdf.Root["/MarkInfo"]["/Suspects"] = False
@@ -5171,8 +492,7 @@ async def tag_pdf(
             tags_added += 1
 
             # 3. Set document title
-            _reset_xmp_metadata(pdf)
-            title = _set_document_title(pdf, structure_json, original_filename)
+            title = _set_document_title(pdf, structure_json, original_filename, pdf_path=input_path)
             title_set = bool(title)
             _set_pdfua_identification(pdf)
             _normalize_optional_content_configs(pdf)
@@ -5198,18 +518,17 @@ async def tag_pdf(
                     decorative_figures.add(fig_idx)
                     continue
                 text = alt.get("text")
-                if isinstance(text, str) and text.strip():
+                if isinstance(text, str) and not is_placeholder_alt_text(text):
                     alt_lookup[fig_idx] = text.strip()
 
             for fig_idx, source_alt in source_figure_alt_lookup.items():
                 if _is_weak_figure_alt_text(source_alt):
                     continue
-                if fig_idx in decorative_figures or _is_weak_figure_alt_text(alt_lookup.get(fig_idx)):
+                if source_alt:
                     decorative_figures.discard(fig_idx)
                     alt_lookup[fig_idx] = source_alt
 
             # Group elements by page
-            _normalize_heading_hierarchy([elem for elem in elements if not elem.get("continuation")])
             pages_elements: dict[int, list[dict]] = {}
             for elem in elements:
                 pg = elem.get("page", 0)
@@ -5217,6 +536,90 @@ async def tag_pdf(
                     pages_elements[pg] = []
                 pages_elements[pg].append(elem)
             _attach_glyph_text(pages_elements, pdfium_text)
+            table_readability = []
+            reading_order_diagnostics = []
+            unowned_words_by_page = []
+            page_owners = {}
+            nonsemantic_pages = set()
+            for page_index, page in enumerate(pdf.pages):
+                page_elems = pages_elements.setdefault(page_index, [])
+                nonsemantic = not page_elems and _should_artifact_nonsemantic_page_content(
+                    input_path, page, page_index
+                )
+                if nonsemantic:
+                    nonsemantic_pages.add(page_index)
+                _prepare_link_targets(page, builder, page_elems)
+                eligible_ops, stream_starts = [], set()
+                for ops in glyph_reader.page(page_index).ops.values():
+                    stream_starts.add(len(eligible_ops))
+                    eligible_ops.extend(ops)
+                glyphs = [g for op in eligible_ops for g in op.glyphs]
+                table_readability.extend(_mark_unreadable_tables(page_elems, glyphs))
+                for elem in page_elems:
+                    if elem.get("type") == "table":
+                        elem["_layout_table"] = (
+                            None
+                            if elem.get("_table_readability")
+                            else (
+                                _model_table_layout(elem)
+                                or _layout_table_plan(
+                                    elem,
+                                    page_elems,
+                                    contents_context=any(
+                                        CONTENTS.fullmatch(
+                                            " ".join(str(e.get("text") or "").split())
+                                        )
+                                        for e in pages_elements.get(page_index - 1, [])
+                                        if e.get("type") in {"heading", "paragraph", "toc_caption"}
+                                    ),
+                                )
+                            )
+                        )
+                _plan_external_table_headers(
+                    page_elems, [g for op in eligible_ops for g in op.glyphs]
+                )
+                _infer_table_headers(
+                    page_elems,
+                    [g for op in eligible_ops for g in op.glyphs],
+                    page,
+                )
+                diagnostic = {"page": page_index, "before": 0, "after": 0}
+                owners = _word_owners(
+                    dict(enumerate(eligible_ops)),
+                    _content_targets(page_elems),
+                    elements=None if nonsemantic else page_elems,
+                    frame=frames[page_index],
+                    scanned=_page_has_hidden_text(page),
+                    diagnostic=diagnostic,
+                    stream_starts=stream_starts,
+                    vertical_rules=_page_vertical_rules(page),
+                )
+                for index, elem in enumerate(page_elems):
+                    if elem.get("fallback"):
+                        elem["page"] = page_index
+                        elem["_docling_order"] = index
+                # Fallback anchors supply their initial logical position. The
+                # same recovered ownership then informs both vote and rewrite.
+                before = list(page_elems)
+                page_elems.sort(key=lambda elem: elem["reading_order"])
+                _remap_word_owners(owners, before, page_elems)
+                reading_order_diagnostics.append(
+                    _page_reading_order(
+                        page,
+                        page_index,
+                        page_elems,
+                        glyph_reader.page(page_index).ops,
+                        frames[page_index],
+                        decorative_figures,
+                        word_owners=owners,
+                    )
+                )
+                page_owners[page_index] = owners
+                unowned_words_by_page.append(diagnostic)
+            elements = [elem for pg in sorted(pages_elements) for elem in pages_elements[pg]]
+            _normalize_heading_hierarchy(
+                [elem for elem in elements if not elem.get("continuation")]
+            )
 
             figures_tagged = 0
             headings_tagged = 0
@@ -5230,85 +633,108 @@ async def tag_pdf(
                 page_elems = pages_elements.get(page_index, [])
                 page_glyphs = glyph_reader.page(page_index)
                 page_words = _items_in_user_space(
-                    _build_docling_parse_page_words(parser_doc, page_index, docling_parse_word_cache),
+                    _build_docling_parse_page_words(
+                        parser_doc, page_index, docling_parse_word_cache
+                    ),
                     frames[page_index],
                 )
                 page_hyperlinks = _items_in_user_space(
-                    _build_docling_parse_page_hyperlinks(parser_doc, page_index, docling_parse_hyperlink_cache),
+                    _build_docling_parse_page_hyperlinks(
+                        parser_doc, page_index, docling_parse_hyperlink_cache
+                    ),
                     frames[page_index],
                 )
                 page_widgets = _items_in_user_space(
-                    _build_docling_parse_page_widgets(parser_doc, page_index, docling_parse_widget_cache),
+                    _build_docling_parse_page_widgets(
+                        parser_doc, page_index, docling_parse_widget_cache
+                    ),
                     frames[page_index],
                 )
+                _ensure_annotation_baseline(page)
                 page["/Tabs"] = pikepdf.Name("/S")
                 page_tagged_elements: list[dict] = []
                 first_page_kid = len(builder.doc_elem.get("/K") or [])
-                if page_elems:
-                    try:
-                        raw_page_instructions = list(pikepdf.parse_content_stream(page))
-                    except Exception:
-                        raw_page_instructions = []
-                    ocr_form_invocations = _extract_ocr_form_invocations(
-                        page,
-                        _strip_existing_markers(raw_page_instructions),
-                    )
-                    ocr_passthrough_regions = [
-                        ContentRegion(
-                            kind="passthrough",
-                            start_idx=invocation.start_idx,
-                            end_idx=invocation.end_idx,
-                            instructions=invocation.instructions,
-                            xobject_name=invocation.xobject_name,
-                        )
-                        for invocation in ocr_form_invocations
-                    ]
-                    matched_page_indices = _rewrite_content_stream(
-                        pdf, page, page_index, page_elems,
-                        builder, page.obj, alt_lookup,
-                        decorative_figures=decorative_figures,
-                        passthrough_regions=ocr_passthrough_regions,
-                        measured_ops=page_glyphs.ops.get(()),
-                    )
-                    page_tagged_elements.extend(
-                        page_elems[idx]
-                        for idx in sorted(matched_page_indices)
-                        if 0 <= idx < len(page_elems)
-                    )
-
-                    remaining_elems = [
-                        elem
-                        for idx, elem in enumerate(page_elems)
-                        if idx not in matched_page_indices
-                    ]
-                    for invocation in ocr_form_invocations:
-                        if not remaining_elems:
-                            break
-                        matched_form_indices = _rewrite_content_stream(
+                nonsemantic_page = page_index in nonsemantic_pages
+                has_words = any(op.glyphs for ops in page_glyphs.ops.values() for op in ops)
+                has_semantics = any(
+                    elem.get("type") in {"figure", "artifact"}
+                    or elem.get("text")
+                    or any(cell.get("text") for cell in elem.get("cells") or [])
+                    for elem in page_elems
+                )
+                if not nonsemantic_page and (has_semantics or has_words):
+                    page_word_owners = page_owners[page_index]
+                    measured_ops, stream_starts = [], set()
+                    for ops in page_glyphs.ops.values():
+                        stream_starts.add(len(measured_ops))
+                        measured_ops.extend(ops)
+                    measured = dict(enumerate(measured_ops))
+                    recovered = _figure_text_elements(page_elems, measured, decorative_figures, set(alt_lookup))
+                    _prepare_link_targets(page, builder, recovered)
+                    page_elems.extend(recovered)
+                    recovered_indices = set(range(len(page_elems) - len(recovered), len(page_elems)))
+                    _recover_figure_text_owners(page_word_owners, _word_owners(
+                        measured,
+                        [target for target in _content_targets(page_elems)
+                         if target.elem_idx in recovered_indices],
+                        stream_starts=stream_starts,
+                    ))
+                    deferred_figure_text = _DeferredFigureText()
+                    def rewrite(owner, path=(), initial_ctm=IDENTITY, ancestors=frozenset()):
+                        try:
+                            instructions = _strip_existing_markers(
+                                list(pikepdf.parse_content_stream(owner)), owner.get("/Resources")
+                            )
+                        except pikepdf.PdfError as exc:
+                            logger.warning(
+                                "Could not parse content on page %s: %s", page_index, exc
+                            )
+                            return set()
+                        forms = _extract_form_invocations(owner, instructions)
+                        passthrough = [
+                            ContentRegion(
+                                kind="passthrough",
+                                start_idx=form.start_idx,
+                                end_idx=form.end_idx,
+                                instructions=form.instructions,
+                                xobject_name=form.xobject_name,
+                            )
+                            for form in forms
+                        ]
+                        matched = _rewrite_content_stream(
                             pdf,
-                            invocation.stream,
+                            owner,
                             page_index,
-                            remaining_elems,
+                            page_elems,
                             builder,
                             page.obj,
                             alt_lookup,
                             decorative_figures=decorative_figures,
-                            initial_ctm=invocation.initial_ctm,
-                            stream_owner=invocation.stream,
-                            measured_ops=page_glyphs.ops.get(
-                                (invocation.xobject_name.lstrip("/"),)
-                            ),
+                            initial_ctm=initial_ctm,
+                            stream_owner=None if not path else owner,
+                            passthrough_regions=passthrough,
+                            measured_ops=page_glyphs.ops.get(path),
+                            word_owners=page_word_owners,
+                            deferred_figure_text=deferred_figure_text,
                         )
-                        page_tagged_elements.extend(
-                            remaining_elems[idx]
-                            for idx in sorted(matched_form_indices)
-                            if 0 <= idx < len(remaining_elems)
-                        )
-                        remaining_elems = [
-                            elem
-                            for idx, elem in enumerate(remaining_elems)
-                            if idx not in matched_form_indices
-                        ]
+                        for form in forms:
+                            if form.stream.objgen in ancestors:
+                                continue
+                            matched.update(
+                                rewrite(
+                                    form.stream,
+                                    (*path, form.xobject_name.lstrip("/")),
+                                    _mat_multiply(form.initial_ctm, initial_ctm),
+                                    ancestors | {form.stream.objgen},
+                                )
+                            )
+                        return matched
+
+                    matched_page_indices = rewrite(page)
+                    deferred_figure_text.finish(pdf, builder, page_index, page.obj)
+                    page_tagged_elements.extend(
+                        page_elems[idx] for idx in sorted(matched_page_indices)
+                    )
 
                     seen_page_element_ids: set[int] = set()
                     for elem in page_tagged_elements:
@@ -5320,25 +746,52 @@ async def tag_pdf(
                         if t == "figure":
                             if elem.get("figure_index") in decorative_figures:
                                 decorative_figures_artifacted += 1
-                            else:
+                            elif not elem.get("_figure_text_box"):
                                 figures_tagged += 1
                         elif t == "heading":
                             headings_tagged += 1
                         elif t == "table":
-                            tables_tagged += 1
+                            if layout := elem.get("_layout_table"):
+                                lists_tagged += sum(
+                                    len(b["groups"]) for b in layout["blocks"] if b["role"] == "L"
+                                )
+                            else:
+                                tables_tagged += 1
                         elif t == "list_item":
                             lists_tagged += 1
-                elif _should_artifact_nonsemantic_page_content(input_path, page, page_index):
-                    _rewrite_content_stream(
-                        pdf, page, page_index, [],
-                        builder, page.obj, alt_lookup,
-                        decorative_figures=decorative_figures,
-                        measured_ops=page_glyphs.ops.get(()),
-                    )
+                else:
+                    if nonsemantic_page:
+                        _rewrite_content_stream(
+                            pdf,
+                            page,
+                            page_index,
+                            [],
+                            builder,
+                            page.obj,
+                            alt_lookup,
+                            decorative_figures=decorative_figures,
+                            measured_ops=page_glyphs.ops.get(()),
+                        )
+                    else:
+                        # A nonblank page with no extracted text/layout can be
+                        # outlined text. Preserve it as an undescribed Figure,
+                        # rather than falsely declaring meaningful ink an
+                        # Artifact. Validation keeps the description/OCR review
+                        # requirement visible while all its paint is marked.
+                        instructions = _strip_existing_markers(
+                            list(pikepdf.parse_content_stream(page)), page.get("/Resources")
+                        )
+                        if any(_instruction_paints_content(op) for op in instructions):
+                            mcid = builder.add_figure(page_index, page.obj, alt_text=None)
+                            page["/Contents"] = pdf.make_stream(pikepdf.unparse_content_stream([
+                                _make_bdc("Figure", mcid), *instructions, _make_emc(),
+                            ]))
+                            figures_tagged += 1
 
+                # Widgets participate in page order; links and other OBJRs
+                # are attached after ordering. Finalize before adding bookmarks.
+                _tag_widget_annotations(page, page.obj, builder, page_widgets, page_tagged_elements)
                 builder.order_page_kids(first_page_kid)
-                builder.reading_order = None
-                _ensure_annotation_baseline(page)
                 links_tagged += _tag_link_annotations(
                     page,
                     page.obj,
@@ -5347,26 +800,63 @@ async def tag_pdf(
                     page_words,
                     page_hyperlinks,
                 )
-                _tag_widget_annotations(page, page.obj, builder, page_widgets)
                 annotations_tagged += _tag_generic_annotations(page, page.obj, builder)
 
             # 5. Finalize structure tree
+            tables_tagged -= _finish_table_structure(builder, pages_elements)
+            headings_tagged -= sum(
+                e.get("type") == "heading" and bool(e.get("_table_header_recovered"))
+                for e in elements
+            )
+            table_intelligence_audit = _apply_model_table_headers(builder, pages_elements)
             builder.finalize()
 
             # 6. Add bookmarks from headings
             bookmarks_added = _add_bookmarks(
                 pdf,
-                builder._headings,
-                [elem for elem in elements if not elem.get("continuation")],
+                builder.headings,
+                [
+                    elem
+                    for elem in elements
+                    if not elem.get("continuation") and not elem.get("_table_header_recovered")
+                ],
                 structure_json.get("bookmark_plan"),
                 structure_json.get("native_toc"),
                 structure_json.get("title"),
             )
             _sanitize_outline_leaf_counts(pdf)
 
+            # Count actual emitted nodes, separately from proposed evidence matches.
+            author_structure_audit = []
+            for elem in elements:
+                if elem.get("type") == "table":
+                    emitted = builder._fragmented_table_cache.get(id(elem), {})
+                    for cell in elem.get("cells", []):
+                        node = emitted.get((cell.get("row", 0), cell.get("col", 0)))
+                        if cell.get("author_header") and node is not None and node.get("/S") == "/TH":
+                            author_structure_audit.append({
+                                "kind": "TH", "page": elem["page"], "row": cell.get("row"),
+                                "col": cell.get("col"), "scope": str(node.A.Scope), "text": cell.get("text"),
+                            })
+                elif elem.get("type") == "figure":
+                    node = builder.source_element_struct(elem)
+                    if node is not None and node.get("/S") == "/Figure":
+                        for field, pdf_key in (("author_alt", "/Alt"), ("author_actual_text", "/ActualText")):
+                            if elem.get(field) and str(node.get(pdf_key) or "") == elem[field]:
+                                author_structure_audit.append({"kind": field, "page": elem["page"],
+                                                               "figure_index": elem.get("figure_index"), "value": elem[field]})
+                elif elem.get("author_heading_level"):
+                    node = builder.source_element_struct(elem)
+                    if node is not None and node.get("/S") == f"/H{elem['author_heading_level']}":
+                        author_structure_audit.append({"kind": "heading_level", "page": elem["page"], "level": elem["level"]})
+            for entry in enriched.get("author_structure_audit", []):
+                if entry["kind"] == "title" and str(pdf.docinfo.get("/Title")) == entry["value"]:
+                    author_structure_audit.append(entry)
+                elif entry["kind"] == "language" and str(pdf.Root.get("/Lang")) == entry["value"]:
+                    author_structure_audit.append(entry)
             _save_pdf_for_viewer_compatibility(pdf, output_path)
 
-        total_tags = tags_added + builder._struct_elems_created
+        total_tags = tags_added + builder.struct_elems_created
         logger.info(
             f"Tagged PDF saved: {output_path.name} "
             f"({total_tags} tags, {headings_tagged} headings, "
@@ -5380,7 +870,7 @@ async def tag_pdf(
             output_path=output_path,
             tags_added=total_tags,
             lang_set=True,
-            struct_elems_created=builder._struct_elems_created,
+            struct_elems_created=builder.struct_elems_created,
             figures_tagged=figures_tagged,
             headings_tagged=headings_tagged,
             tables_tagged=tables_tagged,
@@ -5390,6 +880,15 @@ async def tag_pdf(
             decorative_figures_artifacted=decorative_figures_artifacted,
             bookmarks_added=bookmarks_added,
             title_set=title_set,
+            reading_order_diagnostics=reading_order_diagnostics,
+            unowned_words_by_page=unowned_words_by_page,
+            table_intelligence_audit=table_intelligence_audit,
+            table_readability=table_readability,
+            author_structure_audit=author_structure_audit,
         )
 
-    return await asyncio.to_thread(_tag)
+    def _tag_with_forms():
+        with unique_form_instances(input_path) as tagging_input:
+            return _tag(tagging_input)
+
+    return await to_thread(_tag_with_forms)

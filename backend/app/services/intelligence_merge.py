@@ -6,8 +6,8 @@ from typing import Any
 from app.services.document_intelligence_models import DocumentModel
 from app.services.intelligence_normalize import (
     normalize_reading_order_intelligence,
-    normalize_table_intelligence,
 )
+from app.services.table_decisions import has_headers, header_selection
 
 MODEL_PROVENANCE = "model_remediation_intelligence"
 
@@ -121,31 +121,12 @@ def apply_suspicious_text_intelligence(document: DocumentModel, intelligence: di
 def apply_table_overlay(
     document: DocumentModel, intelligence: dict[str, Any]
 ) -> tuple[DocumentModel, list[int]]:
-    normalized = normalize_table_intelligence(intelligence)
-    result = deepcopy(document)
-    affected_pages: set[int] = set()
-    confidence = float(normalized["confidence"])
-
-    for table_update in normalized["proposed_table_updates"]:
-        page = result.page(int(table_update["page"]))
-        if page is None:
-            continue
-        for table in page.tables:
-            if table.table_review_id != str(table_update["table_review_id"]):
-                continue
-            header_rows = set(int(value) for value in table_update["header_rows"])
-            row_header_columns = set(int(value) for value in table_update["row_header_columns"])
-            table.header_rows = sorted(header_rows)
-            table.row_header_columns = sorted(row_header_columns)
-            for cell in table.cells:
-                cell.column_header = cell.row in header_rows
-                cell.row_header = cell.col in row_header_columns
-                cell.is_header = cell.column_header or cell.row_header
-            _update_table_metadata(table, confidence=confidence)
-            affected_pages.add(page.page_number)
-            break
-
-    return result, sorted(affected_pages)
+    # A display overlay follows the same additive guard as automatic tagging.
+    items = [
+        {**item, "suggested_action": "set_table_headers"}
+        for item in intelligence.get("proposed_table_updates", []) if isinstance(item, dict)
+    ]
+    return apply_table_intelligence(document, items)
 
 
 def apply_table_intelligence(document: DocumentModel, intelligence_items: list[dict[str, Any]]) -> tuple[DocumentModel, list[int]]:
@@ -177,12 +158,21 @@ def apply_table_intelligence(document: DocumentModel, intelligence_items: list[d
             if table.table_review_id != table_review_id:
                 continue
             if str(item.get("suggested_action") or "").strip() == "set_table_headers":
+                snapshot = table.to_dict()
+                if has_headers(snapshot):
+                    continue
+                selected = header_selection(snapshot, item)
+                if not selected:
+                    continue
+                scopes = {(c["row"], c["col"]): scope for c, scope in selected}
                 table.header_rows = sorted(header_rows)
                 table.row_header_columns = sorted(row_header_columns)
                 for cell in table.cells:
-                    cell.column_header = cell.row in header_rows
-                    cell.row_header = cell.col in row_header_columns
-                    cell.is_header = cell.column_header or cell.row_header
+                    scope = scopes.get((cell.row, cell.col))
+                    if scope:
+                        cell.column_header = scope == "Column"
+                        cell.row_header = scope == "Row"
+                        cell.is_header = True
             _update_table_metadata(table, confidence=confidence)
             affected_pages.add(page.page_number)
             break

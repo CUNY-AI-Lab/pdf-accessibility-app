@@ -213,8 +213,6 @@ what needs manual work, validation results, and generated alt text for review.
 
 ### 6. Code health
 
-- Mark placeholder alt text as unapproved in the database, not only in the
-  tagger.
 - Split `pipeline/orchestrator.py` and `pipeline/tagger.py` along pipeline
   stage boundaries, in steps that each keep the suite green.
 

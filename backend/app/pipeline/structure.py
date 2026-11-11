@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
 import logging
 import re
 import subprocess
 from dataclasses import dataclass, field
+from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.config import get_settings
+from app.pipeline.docling_io import (
+    DoclingConversion,
+    LocalDoclingConversion,
+)
+from app.pipeline.docling_io import (
+    _docling_serve_request as _docling_serve_request,
+)
+from app.pipeline.docling_io import (
+    _is_retryable_docling_serve_error as _is_retryable_docling_serve_error,
+)
+from app.pipeline.document_title import select_document_title
 from app.pipeline.language import (
     detect_language as _detect_language,
 )
@@ -20,6 +31,7 @@ from app.pipeline.language import (
     normalize_lang_tag as _normalize_lang_tag,
 )
 from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
+from app.services.thread_work import to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +52,6 @@ TOC_GROUP_HEADING_EXCLUDE = {
     "page",
     "lists",
 }
-DOCLING_SERVE_REQUEST_ATTEMPTS = 3
-DOCLING_SERVE_RETRY_DELAY_SECONDS = 2.0
-DOCLING_SERVE_RETRY_STATUS_CODES = {502, 503, 504}
 
 
 @dataclass
@@ -52,6 +61,7 @@ class FigureInfo:
     caption: str | None = None
     page: int | None = None
     bbox: dict | None = None
+    classification: str | None = None
 
 
 @dataclass
@@ -65,62 +75,41 @@ class StructureResult:
     figures_count: int = 0
 
 
-def _is_retryable_docling_serve_error(exc: Exception) -> bool:
-    import httpx
+def ensure_figure_images(
+    pdf_path: Path, structure: dict, figures: list[FigureInfo], figures_dir: Path,
+) -> list[FigureInfo]:
+    """Keep a candidate for every extracted figure, even if Docling omitted its image.
 
-    return isinstance(
-        exc,
-        (
-            httpx.ConnectError,
-            httpx.ConnectTimeout,
-            httpx.PoolTimeout,
-            httpx.ReadTimeout,
-            httpx.RemoteProtocolError,
-        ),
-    )
+    A missing crop must not silently remove a figure from semantic analysis.
+    Render it from the source page, or retain a missing-path candidate so its
+    unresolved description remains visible to the review and release checks.
+    """
+    from app.services.pdf_preview import render_bbox_preview_png_bytes
 
-
-async def _docling_serve_request(
-    client: Any,
-    method: str,
-    url: str,
-    *,
-    attempts: int = DOCLING_SERVE_REQUEST_ATTEMPTS,
-    retry_delay: float = DOCLING_SERVE_RETRY_DELAY_SECONDS,
-    **kwargs: Any,
-):
-    for attempt in range(1, attempts + 1):
+    by_index = {figure.index: figure for figure in figures}
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    for elem in structure.get("elements", []):
+        index, page = elem.get("figure_index"), elem.get("page")
+        if elem.get("type") != "figure" or not isinstance(index, int):
+            continue
+        figure = by_index.get(index)
+        if figure is None:
+            figure = FigureInfo(
+                index=index, path=figures_dir / f"figure_{index}.png",
+                page=page, bbox=elem.get("bbox"), caption=elem.get("caption"),
+            )
+            by_index[index] = figure
+        if figure.path.is_file() or not isinstance(page, int) or page < 0:
+            continue
+        if not isinstance(figure.bbox, dict):
+            continue
         try:
-            response = await client.request(method, url, **kwargs)
-        except Exception as exc:
-            if attempt >= attempts or not _is_retryable_docling_serve_error(exc):
-                raise
-            logger.warning(
-                "docling-serve %s request failed on attempt %d/%d: %s; retrying",
-                method.upper(),
-                attempt,
-                attempts,
-                exc,
-            )
-            await asyncio.sleep(retry_delay)
-            continue
-
-        if (
-            response.status_code in DOCLING_SERVE_RETRY_STATUS_CODES
-            and attempt < attempts
-        ):
-            logger.warning(
-                "docling-serve %s request returned HTTP %d on attempt %d/%d; retrying",
-                method.upper(),
-                response.status_code,
-                attempt,
-                attempts,
-            )
-            await asyncio.sleep(retry_delay)
-            continue
-        return response
-
-    raise RuntimeError("docling-serve request retries were exhausted")
+            figure.path.write_bytes(render_bbox_preview_png_bytes(
+                pdf_path, page + 1, figure.bbox, highlight=False, crop_margin_points=0,
+            ))
+        except Exception:
+            logger.warning("Could not recover figure %s crop", index, exc_info=True)
+    return sorted(by_index.values(), key=lambda figure: figure.index)
 
 
 def _normalize_native_toc(node: Any) -> dict[str, Any] | None:
@@ -320,7 +309,9 @@ def _normalize_docling_elements(doc_dict: dict) -> list[dict]:
         elements_before = len(elements)
         # Docling uses 1-based page numbers; convert to 0-based for pikepdf
         page = (prov[0]["page_no"] - 1) if prov else 0
-        text = item.get("text", item.get("orig", ""))
+        # Without formula enrichment Docling gives a formula text "" and keeps
+        # what the page shows in orig; an empty text falls back to orig.
+        text = item.get("text") or item.get("orig") or ""
         bbox = _extract_bbox(prov)
 
         # Docling may provide per-element language via Watson NLP metadata
@@ -1147,6 +1138,12 @@ def _extract_title_from_docling(
     pdf_path: Path | None = None,
 ) -> str | None:
     """Extract a document title from Docling, rejecting common caption false positives."""
+    if pdf_path:
+        decision = select_document_title(
+            pdf_path, {"elements": elements or [], "title": doc_dict.get("title")}, pdf_path.name,
+        )
+        if decision["source"] not in {"filename", "text"}:
+            return decision["title"]
     for item in doc_dict.get("texts", []):
         if not isinstance(item, dict) or item.get("label") != "title":
             continue
@@ -1246,6 +1243,20 @@ def _repair_pdf_with_ghostscript(
     return output_path.exists() and output_path.stat().st_size > 0
 
 
+def _picture_classification(picture: dict) -> str | None:
+    """Retain Docling's existing prediction, without requesting another model."""
+    predictions = ((picture.get("meta") or {}).get("classification") or {}).get("predictions") or []
+    if not predictions:
+        for annotation in picture.get("annotations") or []:
+            if annotation.get("kind") == "classification":
+                predictions = annotation.get("predicted_classes") or []
+                break
+    if predictions:
+        prediction = max(predictions, key=lambda item: float(item.get("confidence") or 0))
+        return str(prediction.get("class_name") or "").strip().lower() or None
+    return "chart" if picture.get("label") == "chart" else None
+
+
 def _save_docling_figures(doc_dict: dict, figures_dir: Path) -> list[FigureInfo]:
     """Save an image of each figure Docling found, for alt text: the figure's
     own image when Docling returns one, else a crop of its page image."""
@@ -1278,7 +1289,8 @@ def _save_docling_figures(doc_dict: dict, figures_dir: Path) -> list[FigureInfo]
         if picture_uri.startswith("data:image/"):
             fig_path.write_bytes(base64.b64decode(picture_uri.split(",", 1)[1]))
             figures.append(
-                FigureInfo(index=i, path=fig_path, caption=caption, page=page_no - 1, bbox=bbox)
+                FigureInfo(index=i, path=fig_path, caption=caption, page=page_no - 1, bbox=bbox,
+                           classification=_picture_classification(pic))
             )
             continue
 
@@ -1332,6 +1344,7 @@ def _save_docling_figures(doc_dict: dict, figures_dir: Path) -> list[FigureInfo]
                 caption=caption,
                 page=page_no - 1,  # Convert to 0-based
                 bbox=bbox,
+                classification=_picture_classification(pic),
             ))
         else:
             logger.warning(
@@ -1346,6 +1359,19 @@ def _save_docling_figures(doc_dict: dict, figures_dir: Path) -> list[FigureInfo]
     return figures
 
 
+def docling_table_cell_matching(classification_type: str | None) -> bool:
+    """Whether Docling should match table cells to the PDF's own text cells.
+
+    Matching keeps a well-made PDF's cells, so it stays on for digital and
+    mixed documents. On fully scanned documents the text cells come from OCR
+    and often merge columns; measured on olmOCR-Bench, turning matching off
+    there raised the scanned tables category from 58.2% to 61.3% (41 tests
+    fixed, 10 broken) at a cost of 0.016 TEDS on the scanned CUNY round
+    trip, while on born-digital documents it cost 0.06 TEDS.
+    """
+    return classification_type not in {"scanned", "ocr_scan"}
+
+
 async def _convert_via_docling_serve(
     pdf_path: Path,
     job_dir: Path,
@@ -1354,6 +1380,7 @@ async def _convert_via_docling_serve(
     ocr_engine: str = "rapidocr",
     token: str = "",
     include_figure_images: bool = True,
+    table_cell_matching: bool = True,
 ) -> tuple[dict, list[FigureInfo]]:
     """Send PDF to a docling-serve instance and return (doc_dict, figures).
 
@@ -1361,16 +1388,13 @@ async def _convert_via_docling_serve(
     the same Docling ``export_to_dict()`` structure as the local converter.
     Figure images are cropped from embedded page renders using bbox data.
     """
-    import time
-
     import httpx
 
     base_url = base_url.rstrip("/")
-    submit_url = f"{base_url}/v1/convert/file/async"
 
     auth_headers = {"Authorization": f"Bearer {token}"} if token else {}
 
-    # Per-request timeout: generous but bounded; total timeout enforced by the polling loop
+    # The conversion owns one deadline across submission, polling, and fetch.
     per_request_timeout = httpx.Timeout(min(timeout, 120.0), connect=30.0)
     async with httpx.AsyncClient(timeout=per_request_timeout) as client:
         pdf_bytes = pdf_path.read_bytes()
@@ -1386,65 +1410,20 @@ async def _convert_via_docling_serve(
             # style; without it every heading comes back as level 1.
             "do_pdf_heading_hierarchy": "true",
         }
+        if not table_cell_matching:
+            data["table_cell_matching"] = "false"
         if include_figure_images:
             data.update({
                 "image_export_mode": "embedded",
                 "include_images": "true",
                 "images_scale": "2.0",
             })
-        resp = await _docling_serve_request(
-            client,
-            "POST",
-            submit_url,
+        result_data = await DoclingConversion().run(
+            client, base_url, timeout,
             headers=auth_headers,
             files={"files": (pdf_path.name, pdf_bytes, "application/pdf")},
             data=data,
         )
-        resp.raise_for_status()
-        task_id = resp.json()["task_id"]
-        logger.info("docling-serve task submitted: %s", task_id)
-
-        # Poll for completion
-        poll_url = f"{base_url}/v1/status/poll/{task_id}"
-        start = time.monotonic()
-        while True:
-            elapsed = time.monotonic() - start
-            if elapsed > timeout:
-                raise TimeoutError(
-                    f"docling-serve task {task_id} did not complete within {timeout}s"
-                )
-            await asyncio.sleep(2)
-            poll_resp = await _docling_serve_request(
-                client,
-                "GET",
-                poll_url,
-                headers=auth_headers,
-            )
-            poll_resp.raise_for_status()
-            poll_data = poll_resp.json()
-            status = poll_data.get("task_status")
-            if status == "success":
-                logger.info(
-                    "docling-serve task %s completed in %.1fs",
-                    task_id,
-                    time.monotonic() - start,
-                )
-                break
-            if status == "failure":
-                raise RuntimeError(
-                    f"docling-serve task {task_id} failed: "
-                    f"{poll_data.get('error_message', 'unknown')}"
-                )
-
-        # Fetch result
-        result_resp = await _docling_serve_request(
-            client,
-            "GET",
-            f"{base_url}/v1/result/{task_id}",
-            headers=auth_headers,
-        )
-        result_resp.raise_for_status()
-        result_data = result_resp.json()
 
     doc_dict = result_data["document"]["json_content"]
     processing_time = result_data.get("processing_time")
@@ -1461,10 +1440,11 @@ async def extract_structure(
     job_dir: Path,
     *,
     include_figure_images: bool = True,
+    table_cell_matching: bool = True,
 ) -> StructureResult:
     """Extract document structure using Docling.
 
-    Priority: docling-serve → local Docling.
+    Use docling-serve when configured, otherwise local Docling.
     """
     settings = get_settings()
     use_docling_serve = bool(settings.docling_serve_url)
@@ -1479,17 +1459,15 @@ async def extract_structure(
             settings.docling_serve_ocr_engine,
             settings.docling_serve_token,
             include_figure_images,
+            table_cell_matching=table_cell_matching,
         )
         processed_pdf_path = pdf_path
     else:
         def _convert():
             try:
-                from docling.datamodel.base_models import InputFormat
-                from docling.datamodel.pipeline_options import (
-                    PdfPipelineOptions,
-                    RapidOcrOptions,
-                )
-                from docling.document_converter import DocumentConverter, PdfFormatOption
+                base_models = import_module("docling.datamodel.base_models")
+                pipeline_options_module = import_module("docling.datamodel.pipeline_options")
+                document_converter = import_module("docling.document_converter")
             except ImportError:
                 raise RuntimeError(
                     "Local Docling is not installed. Either set DOCLING_SERVE_URL to use "
@@ -1498,37 +1476,28 @@ async def extract_structure(
                 )
 
             def _convert_one(path: Path):
-                pipeline_options = PdfPipelineOptions(
+                pipeline_options = pipeline_options_module.PdfPipelineOptions(
                     generate_picture_images=include_figure_images,
                     images_scale=2.0,
                     do_picture_classification=True,
                     do_table_structure=True,
-                    ocr_options=RapidOcrOptions(backend="torch"),
+                    ocr_options=pipeline_options_module.RapidOcrOptions(backend="torch"),
                 )
-                converter = DocumentConverter(
+                pipeline_options.table_structure_options.do_cell_matching = (
+                    table_cell_matching
+                )
+                converter = document_converter.DocumentConverter(
                     format_options={
-                        InputFormat.PDF: PdfFormatOption(
+                        base_models.InputFormat.PDF: document_converter.PdfFormatOption(
                             pipeline_options=pipeline_options,
                         ),
                     }
                 )
                 return converter.convert(str(path))
 
-            source_pdf = pdf_path
-            result_processed_pdf_path = source_pdf
-            repaired_pdf = job_dir / "repaired_input.pdf"
-            try:
-                conv_result = _convert_one(source_pdf)
-            except Exception:
-                if _repair_pdf_with_ghostscript(source_pdf, repaired_pdf):
-                    logger.warning(
-                        "Docling failed on %s; retrying structure extraction with Ghostscript-repaired file",
-                        source_pdf.name,
-                    )
-                    conv_result = _convert_one(repaired_pdf)
-                    result_processed_pdf_path = repaired_pdf
-                else:
-                    raise
+            conv_result, result_processed_pdf_path = LocalDoclingConversion().run(
+                _convert_one, _repair_pdf_with_ghostscript, pdf_path, job_dir / "repaired_input.pdf",
+            )
 
             doc = conv_result.document
             doc_dict = doc.export_to_dict()
@@ -1556,13 +1525,14 @@ async def extract_structure(
                                 caption=caption,
                                 page=(element.prov[0].page_no - 1) if element.prov else None,
                                 bbox=_extract_bbox(element.prov) if getattr(element, "prov", None) else None,
+                                classification=_picture_classification(dict_pictures[i]) if i < len(dict_pictures) else None,
                             ))
                     except Exception as e:
                         logger.warning(f"Failed to extract figure {i}: {e}")
 
             return doc_dict, figures, result_processed_pdf_path
 
-        doc_dict, figures, processed_pdf_path = await asyncio.to_thread(_convert)
+        doc_dict, figures, processed_pdf_path = await to_thread(_convert)
 
     # Normalize into elements array and infer heading levels
     elements = _normalize_docling_elements(doc_dict)
@@ -1571,8 +1541,12 @@ async def extract_structure(
     elements = _expand_toc_item_tables(elements)
     elements = _rebuild_toc_with_docling_parse(elements, toc_source_pdf)
     title = _extract_title_from_docling(doc_dict, elements, pdf_path=pdf_path)
+    title_evidence = await to_thread(
+        select_document_title, toc_source_pdf, {"title": title, "elements": elements}, pdf_path.name,
+    )
+    title = title_evidence["title"]
     document_language = _infer_document_language(elements, title)
-    native_toc = await asyncio.to_thread(_extract_native_toc_from_pdf, toc_source_pdf)
+    native_toc = await to_thread(_extract_native_toc_from_pdf, toc_source_pdf)
 
     page_count = len(doc_dict.get("pages", {}))
     figures_count = len(figures)
@@ -1583,6 +1557,7 @@ async def extract_structure(
         "source": str(pdf_path.name),
         "page_count": page_count,
         "title": title,
+        "title_evidence": title_evidence,
         "language": document_language,
         "elements": elements,
         "figures_count": figures_count,

@@ -3,7 +3,7 @@ from pathlib import Path
 import pikepdf
 import pytest
 
-from app.pipeline.orchestrator import _parse_tounicode_map
+from app.pipeline.fonts.encoding import _parse_tounicode_map
 from app.services.font_unicode_override import apply_unicode_override_to_context
 from tests.fixtures import TEST_SAMPLE_PDF
 
@@ -51,7 +51,9 @@ def _append_form_xobject_page(pdf_path: Path, output_path: Path, text: str) -> s
         form["/Type"] = pikepdf.Name("/XObject")
         form["/Subtype"] = pikepdf.Name("/Form")
         form["/BBox"] = pikepdf.Array([0, 0, 200, 50])
-        form["/Resources"] = pikepdf.Dictionary({"/Font": pikepdf.Dictionary({font_name: font_dict})})
+        form["/Resources"] = pikepdf.Dictionary(
+            {"/Font": pikepdf.Dictionary({font_name: font_dict})}
+        )
 
         xobjects = _resolve_object(page_resources.get("/XObject"))
         if not isinstance(xobjects, pikepdf.Dictionary):

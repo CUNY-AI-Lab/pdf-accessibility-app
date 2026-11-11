@@ -4,6 +4,13 @@ from pathlib import Path
 
 import pikepdf
 
+from app.pipeline.fonts.encoding import (
+    _is_valid_unicode_text,
+    _parse_tounicode_map_details,
+    _raw_text_bytes,
+    _render_tounicode_cmap,
+)
+from app.pipeline.fonts.names import _base_font_name
 from app.services.font_actualtext import (
     _resolve_object,
     _resolve_target_stream_from_context,
@@ -18,36 +25,6 @@ SIMPLE_FONT_SUBTYPES = {
 }
 
 
-def _base_font_name(font_dict) -> str:
-    from app.pipeline.orchestrator import _base_font_name as _orchestrator_base_font_name
-
-    return _orchestrator_base_font_name(font_dict)
-
-
-def _is_valid_unicode_text(text: str) -> bool:
-    from app.pipeline.orchestrator import (
-        _is_valid_unicode_text as _orchestrator_is_valid_unicode_text,
-    )
-
-    return _orchestrator_is_valid_unicode_text(text)
-
-
-def _parse_tounicode_map_details(stream_obj):
-    from app.pipeline.orchestrator import (
-        _parse_tounicode_map_details as _orchestrator_parse_tounicode_map_details,
-    )
-
-    return _orchestrator_parse_tounicode_map_details(stream_obj)
-
-
-def _render_tounicode_cmap(mapping: dict[int, str], code_bytes: int) -> bytes:
-    from app.pipeline.orchestrator import (
-        _render_tounicode_cmap as _orchestrator_render_tounicode_cmap,
-    )
-
-    return _orchestrator_render_tounicode_cmap(mapping, code_bytes)
-
-
 def _font_resource_key(value) -> pikepdf.Name | None:
     if isinstance(value, pikepdf.Name):
         return value
@@ -60,38 +37,6 @@ def _font_resource_key(value) -> pikepdf.Name | None:
         return pikepdf.Name(raw)
     except Exception:
         return None
-
-
-def _raw_text_bytes(op: str, operands) -> bytes:
-    if op == "Tj" and operands:
-        try:
-            return bytes(operands[0])
-        except Exception:
-            return b""
-    if op == "TJ" and operands:
-        parts: list[bytes] = []
-        arr = operands[0]
-        if arr is not None:
-            try:
-                for item in arr:
-                    try:
-                        parts.append(bytes(item))
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-        return b"".join(parts)
-    if op == "'" and operands:
-        try:
-            return bytes(operands[0])
-        except Exception:
-            return b""
-    if op == '"' and len(operands) >= 3:
-        try:
-            return bytes(operands[2])
-        except Exception:
-            return b""
-    return b""
 
 
 def _resolve_target_font_details(pdf: pikepdf.Pdf, context_path: str) -> dict[str, object]:
@@ -116,7 +61,7 @@ def _resolve_target_font_details(pdf: pikepdf.Pdf, context_path: str) -> dict[st
         raise ValueError("Target content stream does not expose a font dictionary")
 
     current_font = None
-    for instruction in instructions[:text_operator_index + 1]:
+    for instruction in instructions[: text_operator_index + 1]:
         op = str(instruction.operator)
         operands = list(instruction.operands) if hasattr(instruction, "operands") else []
         if op == "Tf" and operands:
@@ -171,11 +116,7 @@ def _apply_unicode_override_to_font(
 
     existing_stream = _resolve_object(font_dict.get("/ToUnicode"))
     existing_map, _ = _parse_tounicode_map_details(existing_stream)
-    merged_map = {
-        code: text
-        for code, text in existing_map.items()
-        if _is_valid_unicode_text(text)
-    }
+    merged_map = {code: text for code, text in existing_map.items() if _is_valid_unicode_text(text)}
     merged_map[int(font_code)] = normalized
     font_dict[pikepdf.Name("/ToUnicode")] = pdf.make_stream(
         _render_tounicode_cmap(merged_map, 1),

@@ -13,7 +13,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +22,6 @@ import pikepdf
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.api.review import keep_applied_change
 from app.config import get_settings
 from app.models import AppliedChange, Base, Job, JobStep, ReviewTask
 from app.pipeline.classify import classify_pdf
@@ -38,8 +37,9 @@ from app.pipeline.structure import extract_structure
 from app.pipeline.tagger import tag_pdf
 from app.pipeline.validator import validate_pdf
 from app.services.file_storage import cleanup_job_files
-from app.services.job_manager import JobManager
 from app.services.llm_client import make_llm_client, track_llm_usage
+from app.services.pipeline_progress import NullProgress, ProgressReporter
+from app.services.review_state import transition_review
 from app.services.toc_intelligence import enhance_toc_structure_with_intelligence
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -1076,19 +1076,14 @@ async def _init_workflow_db(db_path: Path) -> tuple:
 async def _finalize_review_if_needed(
     job_id: str,
     session_maker: async_sessionmaker[AsyncSession],
-    settings,
-    job_manager: JobManager,
 ) -> None:
-    while True:
-        async with session_maker() as db:
-            job = await db.get(Job, job_id)
-            if not job:
-                return
-            if job.status == "processing":
-                pass
-            elif job.status not in {"complete", "manual_remediation"}:
-                return
-            change_result = await db.execute(
+    """Acknowledge finished benchmark decisions without scheduling another run."""
+    async with session_maker() as db:
+        job = await db.get(Job, job_id)
+        if job is None or job.status not in {"complete", "manual_remediation"}:
+            return
+        changes = (
+            await db.execute(
                 select(AppliedChange)
                 .where(
                     AppliedChange.job_id == job_id,
@@ -1097,14 +1092,13 @@ async def _finalize_review_if_needed(
                 )
                 .order_by(AppliedChange.created_at.asc())
             )
-            pending_changes = change_result.scalars().all()
-            if pending_changes:
-                for change in pending_changes:
-                    await keep_applied_change(job_id=job_id, change_id=change.id, db=db)
-                continue
+        ).scalars().all()
+        if not changes:
             return
-
-        await asyncio.sleep(0.1)
+        for change in changes:
+            await transition_review(db, change, "kept")
+        job.updated_at = datetime.now(UTC)
+        await db.commit()
 
 
 def benchmark_runner_for_profile(profile: str):
@@ -1145,7 +1139,7 @@ async def benchmark_one_workflow(
     run_dir: Path,
     settings,
     session_maker: async_sessionmaker[AsyncSession],
-    job_manager: JobManager,
+    job_manager: ProgressReporter,
 ) -> DocMetrics:
     started = time.perf_counter()
     pages, source_links, source_has_forms = _count_source_features(pdf_path)
@@ -1231,7 +1225,7 @@ async def benchmark_one_workflow(
 
         with track_llm_usage() as llm_usage:
             await run_pipeline(job_id, session_maker, settings, job_manager)
-            await _finalize_review_if_needed(job_id, session_maker, settings, job_manager)
+            await _finalize_review_if_needed(job_id, session_maker)
         llm_requests = llm_usage.request_count
         llm_prompt_tokens = llm_usage.prompt_tokens
         llm_completion_tokens = llm_usage.completion_tokens
@@ -2124,7 +2118,7 @@ async def main() -> None:
     settings = get_settings()
     workflow_db = out_dir / "workflow_benchmark.sqlite3"
     workflow_engine, workflow_session_maker = await _init_workflow_db(workflow_db)
-    workflow_job_manager = JobManager()
+    workflow_job_manager = NullProgress()
     runner = benchmark_runner_for_profile(args.profile)
 
     for idx, pdf in enumerate(pdfs, start=1):

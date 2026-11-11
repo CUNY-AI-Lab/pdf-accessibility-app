@@ -4,7 +4,6 @@ from pathlib import Path
 import pikepdf
 from PIL import Image
 
-from app.services.font_actualtext import apply_actualtext_to_context
 from app.services.pdf_operator_context import (
     extract_operator_text_context,
     extract_operator_visual_context,
@@ -61,6 +60,33 @@ def _replace_page_with_three_text_operators(pdf_path: Path, output_path: Path) -
         "root/document[0]/pages[0](1 0 obj PDPage)/contentStream[0]/"
         "operators[5]/usedGlyphs[0](Font Font 1 0 0 0 true)"
     )
+
+
+def _wrap_page_operator_in_actualtext(
+    pdf_path: Path,
+    output_path: Path,
+    operator_index: int,
+    actual_text: str,
+) -> None:
+    """Wrap one page operator in a /Span BDC carrying /ActualText, as other tools write it."""
+    with pikepdf.open(str(pdf_path)) as pdf:
+        page = pdf.pages[0]
+        instructions = list(pikepdf.parse_content_stream(page))
+        wrapped = [
+            *instructions[:operator_index],
+            pikepdf.ContentStreamInstruction(
+                [
+                    pikepdf.Name("/Span"),
+                    pikepdf.Dictionary({"/ActualText": pikepdf.String(actual_text)}),
+                ],
+                pikepdf.Operator("BDC"),
+            ),
+            instructions[operator_index],
+            pikepdf.ContentStreamInstruction([], pikepdf.Operator("EMC")),
+            *instructions[operator_index + 1 :],
+        ]
+        page["/Contents"] = pdf.make_stream(pikepdf.unparse_content_stream(wrapped))
+        pdf.save(str(output_path))
 
 
 def _replace_page_with_single_text_operator(pdf_path: Path, output_path: Path) -> str:
@@ -168,12 +194,7 @@ def test_extract_operator_context_handles_actualtext_wrapped_target(tmp_path):
     )
     wrapped_pdf = tmp_path / "three_text_ops_wrapped.pdf"
 
-    apply_actualtext_to_context(
-        input_pdf=source_pdf,
-        output_pdf=wrapped_pdf,
-        context_path=context_path,
-        actual_text="Wrapped replacement",
-    )
+    _wrap_page_operator_in_actualtext(source_pdf, wrapped_pdf, 5, "Wrapped replacement")
 
     context = extract_operator_text_context(
         pdf_path=wrapped_pdf,
@@ -197,12 +218,7 @@ def test_render_target_preview_png_bytes_handles_actualtext_wrapped_target(tmp_p
     )
     wrapped_pdf = tmp_path / "three_text_ops_wrapped.pdf"
 
-    apply_actualtext_to_context(
-        input_pdf=source_pdf,
-        output_pdf=wrapped_pdf,
-        context_path=context_path,
-        actual_text="Wrapped replacement",
-    )
+    _wrap_page_operator_in_actualtext(source_pdf, wrapped_pdf, 5, "Wrapped replacement")
 
     image_bytes = render_target_preview_png_bytes(wrapped_pdf, context_path)
 

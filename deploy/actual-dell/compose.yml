@@ -19,13 +19,12 @@ services:
       UPLOAD_DIR: /app/data/uploads
       PROCESSING_DIR: /app/data/processing
       OUTPUT_DIR: /app/data/output
-      DATABASE_URL: sqlite+aiosqlite:////app/data/unused.db
     volumes:
       # Working files for the task in hand; the runner removes them after.
       - runner_data:/app/data
       - runner_cache:/home/app/.cache
     healthcheck:
-      test: ["CMD-SHELL", "find /tmp/runner-alive -mmin -3 | grep -q ."]
+      test: ["CMD-SHELL", "find \"$${RUNNER_ALIVE_FILE}\" -mmin -3 | grep -q ."]
       interval: 60s
       timeout: 10s
       start_period: 60s

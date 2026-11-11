@@ -20,6 +20,26 @@ from app.pipeline.tagger import (
 )
 
 
+def test_parent_tree_preserves_null_mcid_slots_when_saved(tmp_path):
+    source = tmp_path / "null-parent-tree.pdf"
+    with pikepdf.new() as pdf:
+        page = pdf.add_blank_page()
+        builder = StructTreeBuilder(pdf)
+        builder.setup()
+        builder._register_mcid(owner=page.obj, page_index=0, mcid=0, elem=None)
+        builder._register_mcid(owner=page.obj, page_index=0, mcid=1, elem=builder.doc_elem)
+
+        builder.finalize()
+        pdf.save(source)
+
+    with pikepdf.open(source) as pdf:
+        nums = pdf.Root.StructTreeRoot.ParentTree.Nums
+        assert nums[0] == pdf.pages[0].StructParents
+        assert len(nums[1]) == 2
+        assert nums[1][0] is None
+        assert nums[1][1].objgen == pdf.Root.StructTreeRoot.K[0].objgen
+
+
 def test_normalize_annotation_rect_canonicalizes_reversed_coordinates():
     pdf = pikepdf.new()
     annotation = pdf.make_indirect(pikepdf.Dictionary({

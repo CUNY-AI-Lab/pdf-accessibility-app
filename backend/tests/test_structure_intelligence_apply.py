@@ -1,5 +1,4 @@
 from app.services.structure_intelligence_apply import (
-    applicable_actualtext_candidates,
     apply_reading_order_change,
     apply_table_change,
     can_accept_reading_order_change,
@@ -84,29 +83,3 @@ def test_can_accept_table_change_allows_confirm_current_headers():
         is True
     )
 
-
-def test_applicable_actualtext_candidates_filters_to_flagged_targets():
-    task_metadata = {
-        "font_review_targets": [
-            {"page": 2, "operator_index": 10, "font": "ABC"},
-        ]
-    }
-    suggestion = {
-        "actualtext_candidates": [
-            {"page": 2, "operator_index": 10, "font": "ABC", "proposed_actualtext": "Hello"},
-            {"page": 2, "operator_index": 11, "font": "ABC", "proposed_actualtext": "Skip"},
-        ]
-    }
-
-    candidates = applicable_actualtext_candidates(suggestion, task_metadata)
-
-    assert candidates == [
-        {
-            "page": 2,
-            "operator_index": 10,
-            "font": "ABC",
-            "proposed_actualtext": "Hello",
-            "confidence": None,
-            "reason": None,
-        }
-    ]

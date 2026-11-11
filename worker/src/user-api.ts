@@ -8,6 +8,7 @@ import {
   type AppliedChange,
   batchPartsSchema,
   type BatchParts,
+  DOCUMENT_HTML_FILE,
   editRequestSchema,
   OUTPUT_READY_STATUSES,
   type ReviewAction,
@@ -19,6 +20,8 @@ import type { Person } from "./identity";
 import { appliedChanges, figureChanges, fileKey, jobResponse, readView, reviewTasks } from "./views";
 
 export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+/** How often an upload in progress renews its reservation; well inside the reservation period. */
+const UPLOAD_RENEW_MS = 30_000;
 
 const DETAILS = {
   notFound: "Job not found",
@@ -30,6 +33,7 @@ const DETAILS = {
     "You already have too many queued or processing jobs. Wait for current jobs to finish before uploading more PDFs.",
   global: "The server is already processing the maximum number of PDFs. Try again after current jobs finish.",
   signInEnding: "Your sign-in ends soon. Sign in again, then upload the PDF.",
+  uploadExpired: "The upload did not finish in time. Try again.",
 };
 
 const ACTION_REPLIES = {
@@ -90,6 +94,13 @@ export async function handleApi(request: Request, env: Env, path: string, person
       if (!outputReady(job) || !job.files.includes("output.pdf")) return detail(404, "Accessible PDF not yet available");
       return file(env, job, "output.pdf", attachment(`accessible_${safeFilename(job.originalFilename)}`));
     }
+    if (route === "download/document.html") {
+      if (!outputReady(job) || !job.files.includes(DOCUMENT_HTML_FILE)) {
+        return detail(404, "Accessible HTML not yet available");
+      }
+      const stem = safeFilename(job.originalFilename).replace(/\.pdf$/i, "");
+      return file(env, job, DOCUMENT_HTML_FILE, attachment(`accessible_${stem}.html`));
+    }
     if (route === "download/report") {
       if (!outputReady(job) || !job.files.includes("views/report.json")) {
         return detail(404, "Validation report not yet available");
@@ -134,6 +145,11 @@ async function file(env: Env, job: JobRecord, name: string, disposition: string 
   if (object === null) return detail(404, "File not found");
   const headers = new Headers({ "cache-control": "private, no-store" });
   object.writeHttpMetadata(headers);
+  if (name === DOCUMENT_HTML_FILE) {
+    headers.set("content-type", "text/html; charset=utf-8");
+    headers.set("content-security-policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'");
+    headers.set("x-content-type-options", "nosniff");
+  }
   if (disposition !== null) headers.set("content-disposition", disposition);
   return new Response(object.body, { headers });
 }
@@ -201,43 +217,72 @@ async function upload(request: Request, env: Env, person: Person, now: number): 
 
   const id = crypto.randomUUID();
   const key = `jobs/${id}/input.pdf`;
+  await board.reserveUpload(id, Date.now());
   const stream = new FixedLengthStream(length);
   const writer = stream.writable.getWriter();
   const pump = (async () => {
-    await writer.write(head);
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      await writer.write(value);
+    try {
+      await writer.write(head);
+      let renewed = Date.now();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        await writer.write(value);
+        // A large PDF on a slow connection outlasts one reservation period.
+        if (Date.now() - renewed >= UPLOAD_RENEW_MS) {
+          renewed = Date.now();
+          if (!(await board.renewUpload(id, renewed))) throw new Error("upload reservation expired");
+        }
+      }
+      await writer.close();
+    } catch (error) {
+      await Promise.allSettled([writer.abort(error)]);
+      throw error;
     }
-    await writer.close();
   })();
-  try {
-    await Promise.all([env.FILES.put(key, stream.readable, { httpMetadata: { contentType: "application/pdf" } }), pump]);
-  } catch {
-    await env.FILES.delete(key);
+  const store = env.FILES.put(key, stream.readable, { httpMetadata: { contentType: "application/pdf" } }).catch(async (error) => {
+    await Promise.allSettled([reader.cancel(error), writer.abort(error)]);
+    throw error;
+  });
+  // Do not release the durable in-flight locator until both sides have stopped.
+  const transfers = await Promise.allSettled([store, pump]);
+  if (transfers.some((result) => result.status === "rejected")) {
+    await board.abandonUpload(id, Date.now());
     return detail(400, "The upload did not finish. Try again.");
   }
 
-  const created = await board.createJob({
-    id,
-    owner: person.subject,
-    originalFilename: filename,
-    fileSizeBytes: length,
-    gatewayJwt: person.gatewayJwt,
-    gatewayExpiresAt: person.gatewayExpiresAt,
-    now,
-  });
-  if (!created.admission.ok || created.record === null) {
-    await env.FILES.delete(key);
-    return refused(created.admission.ok ? "global" : created.admission.reason);
+  try {
+    // Storing the last bytes can take a while; admission needs a live reservation.
+    await board.renewUpload(id, Date.now());
+    const stored = await board.markUploadStored(id);
+    if (!stored.ok) {
+      await board.abandonUpload(id, Date.now());
+      return detail(stored.status, stored.detail);
+    }
+    const created = await board.createJob({
+      id,
+      owner: person.subject,
+      originalFilename: filename,
+      fileSizeBytes: length,
+      gatewayJwt: person.gatewayJwt,
+      gatewayExpiresAt: person.gatewayExpiresAt,
+      now: Date.now(),
+    });
+    if (!created.admission.ok || created.record === null) {
+      await board.abandonUpload(id, Date.now());
+      return refused(created.admission.ok ? "global" : created.admission.reason);
+    }
+    return json({ jobs: [jobResponse(created.record, true)] }, 201);
+  } catch {
+    await board.abandonUpload(id, Date.now());
+    return detail(503, "The upload could not be saved. Try again.");
   }
-  return json({ jobs: [jobResponse(created.record, true)] }, 201);
 }
 
-function refused(reason: "per_person" | "global" | "sign_in_ending"): Response {
+function refused(reason: "per_person" | "global" | "sign_in_ending" | "upload_expired"): Response {
   if (reason === "per_person") return detail(429, DETAILS.perPerson);
   if (reason === "global") return detail(503, DETAILS.global);
+  if (reason === "upload_expired") return detail(400, DETAILS.uploadExpired);
   return detail(401, DETAILS.signInEnding);
 }
 

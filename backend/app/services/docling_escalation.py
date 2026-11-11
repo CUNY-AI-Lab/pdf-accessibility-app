@@ -64,6 +64,10 @@ def _title_decision(structure: dict[str, Any]) -> dict[str, Any]:
             "signal": "",
         }
 
+    evidence = structure.get("title_evidence")
+    if isinstance(evidence, dict) and evidence.get("clear") and evidence.get("title") == title:
+        return {"decision": "docling", "reason": "clear_deterministic_title", "signal": title}
+
     title_key = _normalize_for_match(title)
     evidence = _early_title_evidence(structure)
     evidence_keys = [_normalize_for_match(candidate) for candidate in evidence]

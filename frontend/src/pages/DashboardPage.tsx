@@ -1,4 +1,6 @@
-import { useState } from "react";
+import type { JobStatus } from "../types";
+import { useMachine } from "../hooks/useMachine";
+import { filterTransition, type DashboardFilter } from "../state/modes";
 import { Link } from "react-router-dom";
 import { apiUrl } from "../api/client";
 import { useJobs } from "../api/jobs";
@@ -6,7 +8,7 @@ import JobCard from "../components/JobCard";
 import { pluralize } from "../utils/format";
 
 
-const FILTERS: { label: string; value: string | undefined }[] = [
+const FILTERS: { label: string; value: JobStatus | undefined }[] = [
   { label: "All", value: undefined },
   { label: "Queued", value: "queued" },
   { label: "Processing", value: "processing" },
@@ -16,7 +18,7 @@ const FILTERS: { label: string; value: string | undefined }[] = [
 ];
 
 export default function DashboardPage() {
-  const [filter, setFilter] = useState<string | undefined>(undefined);
+  const { state: filter, send: setFilter } = useMachine<DashboardFilter, DashboardFilter>(undefined, filterTransition);
   const { data, isLoading, error } = useJobs(filter);
 
   const hasCompletedJobs = data?.jobs.some(

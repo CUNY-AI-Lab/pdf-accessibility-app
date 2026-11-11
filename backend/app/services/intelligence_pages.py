@@ -146,4 +146,9 @@ async def generate_suspicious_text_intelligence(
         "confidence": confidence,
         "confidence_score": confidence_score,
         "blocks": enriched_blocks,
+        "table_intelligence": [
+            {**decision.to_dict(), "table_review_id": unit.unit_id, "page": unit.page}
+            for unit, decision in zip(units, decisions, strict=True)
+            if decision.unit_type == "table"
+        ],
     }

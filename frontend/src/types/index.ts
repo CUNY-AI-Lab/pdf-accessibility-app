@@ -1,11 +1,9 @@
-export type JobStatus =
-  | "queued"
-  | "processing"
-  | "manual_remediation"
-  | "complete"
-  | "failed";
+export const JOB_STATUSES = ["queued", "processing", "complete", "manual_remediation", "failed"] as const;
+export const TERMINAL_JOB_STATUSES = ["complete", "manual_remediation", "failed"] as const;
+export type TerminalJobStatus = (typeof TERMINAL_JOB_STATUSES)[number];
+export type JobStatus = (typeof JOB_STATUSES)[number];
 
-type StepStatus =
+export type StepStatus =
   | "pending"
   | "running"
   | "complete"
@@ -22,8 +20,8 @@ export type StepName =
   | "fidelity";
 
 export interface PipelineStep {
-  step_name: StepName;
-  status: StepStatus;
+  step_name: string;
+  status: string;
   started_at?: string;
   completed_at?: string;
   error?: string;
@@ -34,7 +32,7 @@ export interface Job {
   id: string;
   filename: string;
   original_filename: string;
-  status: JobStatus;
+  status: string;
   classification?: "scanned" | "digital" | "mixed" | "ocr_scan";
   ocr_language?: string;
   page_count?: number;
@@ -43,6 +41,8 @@ export interface Job {
   /** Why the last review action could not be applied, when it could not. */
   notice?: string | null;
   validation_compliant?: boolean | null;
+  /** The v2 Worker's current revision includes an accessible HTML document. */
+  has_html?: boolean;
   created_at: string;
   updated_at: string;
   steps: PipelineStep[];
@@ -55,7 +55,7 @@ export interface ReviewTask {
   detail: string;
   severity: "high" | "medium" | "low";
   blocking: boolean;
-  status: "pending_review" | "resolved";
+  status: string;
   source: string;
   metadata: Record<string, unknown>;
 }
@@ -66,7 +66,7 @@ export interface AppliedChange {
   title: string;
   detail: string;
   importance: "high" | "medium" | "low";
-  review_status: "pending_review" | "kept" | "undone";
+  review_status: string;
   reviewable: boolean;
   metadata: Record<string, unknown>;
   before: Record<string, unknown>;

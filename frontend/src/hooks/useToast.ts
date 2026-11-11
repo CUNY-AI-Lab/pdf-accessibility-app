@@ -3,10 +3,11 @@ import {
   createElement,
   useCallback,
   useContext,
-  useRef,
-  useState,
+  useEffect,
 } from "react";
 import type { ReactNode } from "react";
+import { useMachine } from "./useMachine";
+import { toastRegistry, toastTransition, type ToastState } from "../state/toast";
 
 interface Toast {
   message: string;
@@ -23,41 +24,24 @@ const ToastContext = createContext<ToastContextValue | null>(null);
 
 let nextId = 0;
 
-// Module-level callback so code outside React (e.g. QueryClient) can show toasts.
-let globalShowToast: ((message: string) => void) | null = null;
-
+const registry = toastRegistry();
 export function showToastGlobal(message: string) {
-  if (globalShowToast) {
-    globalShowToast(message);
-  } else {
-    console.error("[Toast]", message);
-  }
+  registry.show(message);
 }
 
 export function ToastProvider({ children }: { children: ReactNode }) {
-  const [toast, setToast] = useState<Toast | null>(null);
-  const timerRef = useRef<ReturnType<typeof setTimeout>>(null);
-
-  const dismissToast = useCallback(() => {
-    setToast(null);
-  }, []);
-
-  const showToast = useCallback(
-    (message: string) => {
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-      }
-      const id = ++nextId;
-      setToast({ message, id });
-      timerRef.current = setTimeout(() => {
-        setToast((current) => (current?.id === id ? null : current));
-      }, 5000);
-    },
-    [],
-  );
-
-  // Register the React-bound showToast as the global handler.
-  globalShowToast = showToast;
+  const { state, send } = useMachine<ToastState, Parameters<typeof toastTransition>[1]>({ status: "hidden" }, toastTransition);
+  const dismissToast = useCallback(() => { send({ type: "dismiss" }); }, [send]);
+  const showToast = useCallback((message: string) => {
+    send({ type: "show", id: ++nextId, message });
+  }, [send]);
+  useEffect(() => registry.register(showToast), [showToast]);
+  useEffect(() => {
+    if (state.status !== "visible") return;
+    const timer = setTimeout(() => send({ type: "expire", id: state.id }), 5000);
+    return () => clearTimeout(timer);
+  }, [state, send]);
+  const toast = state.status === "visible" ? { id: state.id, message: state.message } : null;
 
   return createElement(
     ToastContext.Provider,

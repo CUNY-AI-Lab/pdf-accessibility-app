@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 from app.models import Job
+from app.services.figure_decisions import normalize_figure_decision
 from app.services.intelligence_llm_utils import (
     context_json_part,
     page_preview_parts,
@@ -15,6 +16,7 @@ from app.services.intelligence_normalize import confidence_label, confidence_sco
 from app.services.llm_client import LlmClient
 from app.services.pdf_preview import render_bbox_preview_png_data_url
 from app.services.semantic_units import SemanticDecision, SemanticUnit
+from app.services.table_decisions import table_action
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +336,8 @@ async def adjudicate_semantic_unit(
         response_schema=SEMANTIC_DECISION_SCHEMA,
         cache_breakpoint_index=cache_breakpoint_index,
     )
+    if unit.unit_type == "figure":
+        parsed = normalize_figure_decision(parsed)
     missing_field = _missing_required_payload(parsed)
     if missing_field:
         repaired = await _repair_required_payload(
@@ -343,22 +347,25 @@ async def adjudicate_semantic_unit(
             missing_field=missing_field,
         )
         if isinstance(repaired, dict):
-            parsed = repaired
+            parsed = normalize_figure_decision(repaired) if unit.unit_type == "figure" else repaired
+    # Recorded table answers use action/decision as well as suggested_action.
+    # Keep this compatibility confined to table decisions.
+    is_table = unit.unit_type == "table" or parsed.get("unit_type") == "table"
+    action = table_action(parsed) if is_table else str(parsed.get("suggested_action") or "manual_only")
     return SemanticDecision(
         unit_id=unit.unit_id,
-        unit_type=unit.unit_type,
+        unit_type="table" if is_table else unit.unit_type,
         summary=str(parsed.get("summary") or "").strip(),
         confidence=confidence_label(parsed.get("confidence")),
         confidence_score=confidence_score(parsed.get("confidence")),
-        suggested_action=str(parsed.get("suggested_action") or "manual_only").strip()
-        or "manual_only",
-        reason=str(parsed.get("reason") or "").strip(),
+        suggested_action=action or "manual_only",
+        reason=str(parsed.get("reason") or parsed.get("explanation") or parsed.get("justification") or "").strip(),
         chosen_source=str(parsed.get("chosen_source") or "").strip() or None,
         resolved_text=str(parsed.get("resolved_text") or "").strip() or None,
         issue_type=str(parsed.get("issue_type") or "").strip() or None,
         should_block_accessibility=bool(parsed.get("should_block_accessibility", False)),
-        header_rows=_normalize_indices(parsed.get("header_rows")),
-        row_header_columns=_normalize_indices(parsed.get("row_header_columns")),
+        header_rows=parsed.get("header_rows", []) if is_table else _normalize_indices(parsed.get("header_rows")),
+        row_header_columns=parsed.get("row_header_columns", []) if is_table else _normalize_indices(parsed.get("row_header_columns")),
         accessible_label=str(parsed.get("accessible_label") or "").strip() or None,
         alt_text=str(parsed.get("alt_text") or "").strip() or None,
         resolved_kind=str(parsed.get("resolved_kind") or "").strip() or None,

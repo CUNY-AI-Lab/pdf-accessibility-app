@@ -1,10 +1,13 @@
 import pikepdf
+import pytest
 
 from app.pipeline.tagger import (
     StructTreeBuilder,
     _allocate_fragment_mcid,
     _formula_alt_text,
+    tag_pdf,
 )
+from tests.pdf_fixtures import helvetica
 
 
 def _builder() -> tuple[StructTreeBuilder, pikepdf.Object]:
@@ -76,3 +79,40 @@ def test_toc_table_elements_get_toci_tag():
     assert toc_elem.get("/S") == pikepdf.Name("/TOC")
     assert toc_elem["/K"][0].get("/S") == pikepdf.Name("/TOCI")
     assert tag == "TOCI"
+
+
+@pytest.mark.asyncio
+async def test_formula_without_structure_text_reads_its_own_glyphs(tmp_path):
+    source = tmp_path / "formula.pdf"
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(300, 200))
+    page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
+    page.Contents = pdf.make_stream(b"BT /F1 14 Tf 100 100 Td (E = mc2 + ab) Tj ET\n")
+    pdf.save(source)
+    output = tmp_path / "tagged.pdf"
+
+    await tag_pdf(
+        input_path=source,
+        output_path=output,
+        structure_json={
+            "title": "Formula",
+            "elements": [
+                {"type": "formula", "text": "", "page": 0, "bbox": {"l": 95, "b": 95, "r": 210, "t": 118}}
+            ],
+        },
+        alt_texts=[],
+        original_filename="formula.pdf",
+    )
+
+    def formulas(node):
+        if isinstance(node, pikepdf.Array):
+            return [found for child in node for found in formulas(child)]
+        if not isinstance(node, pikepdf.Dictionary):
+            return []
+        found = [node] if node.get("/S") == pikepdf.Name.Formula else []
+        return found + formulas(node.get("/K"))
+
+    with pikepdf.open(output) as tagged:
+        [formula] = formulas(tagged.Root.StructTreeRoot.K)
+        assert str(formula.get("/Alt")) == _formula_alt_text("E = mc2 + ab")
+        assert b"/ActualText" in tagged.pages[0].Contents.read_bytes()

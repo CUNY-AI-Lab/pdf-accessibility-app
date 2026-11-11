@@ -1,16 +1,3 @@
-FROM oven/bun:1.2.21 AS frontend-build
-
-ARG VITE_APP_BASE_PATH=/
-ENV VITE_APP_BASE_PATH=${VITE_APP_BASE_PATH}
-
-WORKDIR /app/frontend
-
-COPY frontend/package.json frontend/bun.lock ./
-RUN bun install --frozen-lockfile
-
-COPY frontend /app/frontend
-RUN bun run build
-
 FROM python:3.12-slim-bookworm
 
 # Set to "true" to include local Docling (adds ~2 GB for torch + models).
@@ -35,7 +22,8 @@ RUN apt-get update \
         default-jre-headless \
         fontconfig \
         fonts-dejavu-core \
-        fonts-liberation \
+        fonts-liberation2 \
+        fonts-urw-base35 \
         ghostscript \
         gnupg \
         libspatialindex-dev \
@@ -181,7 +169,6 @@ RUN if [ "$WITH_LOCAL_DOCLING" = "true" ]; then \
     && rm -f /tmp/preload_docling_models.py
 
 COPY backend/app /app/backend/app
-COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
 
 RUN mkdir -p /app/data/uploads /app/data/processing /app/data/output /app/data/debug /home/app/.cache \
     && rm -rf /app/backend/debug \
@@ -191,7 +178,7 @@ RUN mkdir -p /app/data/uploads /app/data/processing /app/data/output /app/data/d
 RUN /app/backend/.venv/bin/python /usr/local/libexec/check_ca_trust.py
 
 ENV PATH="/app/backend/.venv/bin:${PATH}" \
-    UVICORN_HOST=0.0.0.0 \
+    RUNNER_ALIVE_FILE=/tmp/runner-alive \
     HOME=/home/app \
     XDG_CACHE_HOME=/home/app/.cache \
     HF_HOME=/home/app/.cache/huggingface \
@@ -202,11 +189,9 @@ ENV PATH="/app/backend/.venv/bin:${PATH}" \
 
 USER app
 
-EXPOSE 8001
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
-    CMD wget -qO- http://127.0.0.1:8001/health || exit 1
+HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
+    CMD find "$RUNNER_ALIVE_FILE" -mmin -3 | grep -q .
 
 ENTRYPOINT ["tini", "--"]
 
-CMD ["uvicorn", "app.main:app", "--port", "8001"]
+CMD ["python", "-m", "app.runner"]

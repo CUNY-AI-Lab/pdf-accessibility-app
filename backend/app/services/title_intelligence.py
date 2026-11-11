@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.pipeline.document_title import _is_placeholder_document_title, select_document_title
 from app.pipeline.structure import _collapse_spaced_title_caps
 from app.services.intelligence_llm_utils import request_pdf_pages_json
 from app.services.llm_client import LlmClient
@@ -25,6 +26,7 @@ Decide the best document title for assistive metadata using early-page visible e
 
 Rules:
 - Use only visible evidence from the provided PDF pages and the structural candidates.
+- deterministic_title ranks first-page typography, usable XMP/Info, and the first H1. Keep its title when clear=true; adjudicate only ambiguous candidates.
 - Prefer the document's main title, not author lines, institutional boilerplate, dates, running headers, or filenames.
 - When the visible title is split across adjacent heading fragments, combine them into one natural title.
 - When adjacent title-block fragments together identify the document, include the identity-bearing fragments; do not drop a visible identifier solely because a descriptive phrase is more prominent.
@@ -80,6 +82,16 @@ async def enhance_document_title_with_intelligence(
     original_filename: str,
     llm_client: LlmClient,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    deterministic = select_document_title(pdf_path, structure_json, original_filename)
+    if deterministic["clear"]:
+        previous = structure_json.get("title")
+        structure_json["title"] = deterministic["title"]
+        structure_json["title_evidence"] = deterministic
+        return structure_json, {
+            "attempted": False, "applied": previous != deterministic["title"],
+            "reason": "clear_deterministic_title", "confidence": "high",
+            "title": deterministic["title"], "deterministic_title": deterministic,
+        }
     existing_title = _collapse_spaced_title_caps(structure_json.get("title"))
     candidates = _title_candidate_elements(structure_json)
     if not candidates and existing_title:
@@ -101,6 +113,7 @@ async def enhance_document_title_with_intelligence(
         "job_filename": original_filename,
         "title_candidates": candidates,
         "current_title": existing_title,
+        "deterministic_title": deterministic,
     }
     parsed = await request_pdf_pages_json(
         schema_name="title_decision",
@@ -116,18 +129,20 @@ async def enhance_document_title_with_intelligence(
     )
     confidence = str(parsed.get("confidence") or "").strip().lower()
     title = _collapse_spaced_title_caps(parsed.get("title"))
-    applied = confidence in {"high", "medium"} and bool(title)
+    applied = (confidence in {"high", "medium"} and bool(title)
+               and not _is_placeholder_document_title(title, original_filename))
     if applied:
         structure_json["title"] = title
-    elif existing_title:
-        structure_json["title"] = existing_title
+    else:
+        structure_json["title"] = deterministic["title"]
 
     return structure_json, {
         "attempted": True,
         "applied": applied,
         "reason": str(parsed.get("reason") or "").strip(),
         "confidence": confidence,
-        "title": title or existing_title,
+        "title": structure_json.get("title"),
+        "deterministic_title": deterministic,
         "retained_existing_title": bool(existing_title and not applied),
         "candidate_count": len(candidates),
     }

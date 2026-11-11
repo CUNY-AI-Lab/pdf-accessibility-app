@@ -11,10 +11,9 @@ from app.services.llm_client import make_llm_client_with_overrides
 from app.services.remediation_intelligence import generate_remediation_intelligence
 from app.services.structure_intelligence_apply import (
     apply_reading_order_change,
-    apply_table_change,
     can_accept_reading_order_change,
-    can_accept_table_change,
 )
+from app.services.table_decisions import queue_table_decisions
 
 READING_ORDER_NOOP_ACTIONS = {"confirm_current_order"}
 TABLE_NOOP_ACTIONS = {"confirm_current_headers"}
@@ -80,7 +79,7 @@ async def auto_apply_structure_tasks(
         for index, task in enumerate(review_tasks):
             if not isinstance(task, dict):
                 continue
-            if not bool(task.get("blocking")):
+            if not bool(task.get("blocking")) and task.get("task_type") != "table_semantics":
                 remaining_tasks.append(task)
                 continue
             task_type = str(task.get("task_type") or "")
@@ -130,6 +129,23 @@ async def auto_apply_structure_tasks(
             suggested_action = str(intelligence.get("suggested_action") or "").strip()
 
             if task_type == "reading_order":
+                page_intelligence = intelligence.get("page_text_intelligence") or {}
+                table_items = page_intelligence.get("table_intelligence") or []
+                next_structure, queued = queue_table_decisions(current_structure, table_items)
+                if queued:
+                    applied_specs.append({
+                        "task_index": index, "task_type": "table_semantics",
+                        "title": "Updated table interpretation",
+                        "detail": "Applied table decisions returned during page review.",
+                        "importance": "high",
+                        "metadata": {"table_intelligence": table_items},
+                        "before": {"structure_json": current_structure},
+                        "after": {"structure_json": next_structure},
+                        "undo_payload": {"kind": "structure_json", "structure_json": current_structure},
+                    })
+                    current_structure = next_structure
+
+            if task_type == "reading_order":
                 if suggested_action in READING_ORDER_NOOP_ACTIONS:
                     # model confirmed current structure; no review needed
                     continue
@@ -164,8 +180,9 @@ async def auto_apply_structure_tasks(
             if task_type == "table_semantics":
                 if suggested_action in TABLE_NOOP_ACTIONS:
                     continue
-                if can_accept_table_change(current_structure, intelligence):
-                    next_structure = apply_table_change(current_structure, intelligence)
+                items = intelligence.get("table_intelligence") or intelligence.get("proposed_table_updates") or []
+                next_structure, queued = queue_table_decisions(current_structure, items)
+                if queued:
                     if next_structure:
                         applied_specs.append(
                             {

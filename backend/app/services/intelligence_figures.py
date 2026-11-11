@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import json
 import logging
 import re
 from collections import defaultdict
@@ -16,6 +18,8 @@ from PIL import Image
 from app.config import get_settings
 from app.models import Job
 from app.pipeline.structure import FigureInfo
+from app.services.alt_text_cache import AltTextCache, request_input_hash, usable_description
+from app.services.figure_decisions import normalize_figure_decision
 from app.services.intelligence_llm_utils import (
     context_json_part,
     page_preview_parts,
@@ -36,6 +40,31 @@ _ALT_TEXT_GLOBAL_GATE_DEPTH: ContextVar[int] = ContextVar(
 _ALT_TEXT_GLOBAL_SEMAPHORE: asyncio.Semaphore | None = None
 _ALT_TEXT_GLOBAL_SEMAPHORE_LIMIT = 0
 _ALT_TEXT_GLOBAL_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
+
+FIGURE_DESCRIPTION_RULES = """Descriptions must be grounded only in visible crop content.
+Use page context and captions to decide semantics, but never copy document-only
+context, captions, filenames or inferred identities into alt_text. Follow each
+candidate's description_guidance. Describe only legible values; never invent them.
+A captioned or explicitly referenced image must not be marked decorative.
+"""
+
+
+def figure_description_guidance(classification: str | None) -> str:
+    kind = str(classification or "").lower().replace("_", " ").replace("-", " ")
+    if "flow" in kind or "diagram" in kind or "drawing" in kind or "structure" in kind:
+        return "Diagram: identify the components and their relationships, flow or sequence."
+    if any(word in kind.split() for word in ("chart", "graph", "plot", "heatmap")):
+        return "Chart: give the chart type, axes and units, main trend, and legible key values."
+    if "screenshot" in kind:
+        return "Screenshot: describe the relevant interface, visible state and legible controls or message."
+    if "photo" in kind or "natural image" in kind:
+        return "Photo: describe visible subjects, actions and setting; do not infer identities."
+    if "logo" in kind:
+        return "Logo: give the visible name and distinguishing design; do not infer an organization."
+    if "equation" in kind or "formula" in kind:
+        return "Equation image: transcribe the legible expression in speakable mathematical order."
+    return "Describe the visible information concisely and factually."
+
 
 FIGURE_BATCH_PROMPT = """You are reviewing multiple figure candidates from the same PDF page for accessibility.
 
@@ -61,6 +90,20 @@ Rules:
 - Use `manual_only` when the image purpose is unclear.
 - Do not start alt text with "Image of" or "Picture of".
 """
+
+FIGURE_BATCH_PROMPT += "\n" + FIGURE_DESCRIPTION_RULES
+
+FIGURE_DESCRIPTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "suggested_action": {"type": "string", "enum": ["set_alt_text", "mark_decorative", "manual_only"]},
+        "alt_text": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["suggested_action", "alt_text", "confidence", "reason"],
+}
 
 
 FIGURE_BATCH_SCHEMA: dict[str, Any] = {
@@ -124,6 +167,7 @@ def _image_data_url(path: Path) -> str:
 
 
 def _normalize_figure_result(*, figure_index: int, raw: dict[str, Any]) -> dict[str, object]:
+    raw = normalize_figure_decision(raw)
     confidence = confidence_label(raw.get("confidence"))
     suggested_action = str(raw.get("suggested_action") or "manual_only").strip() or "manual_only"
     resolved_kind = str(raw.get("resolved_kind") or "").strip() or None
@@ -162,6 +206,62 @@ def _manual_only_figure_result(*, figure_index: int, reason: str) -> dict[str, o
         "resolved_kind": None,
         "is_decorative": False,
     }
+
+
+class _CachedFigureRequest:
+    """Match cache entries against the request the JSON transport actually sends.
+
+    Only one-candidate batches use this adapter. Multi-candidate prompts and
+    semantic follow-ups have shared context and are never cached. Repaired
+    or format-fallback responses are not stored either.
+    """
+
+    def __init__(
+        self, client: LlmClient, cache: AltTextCache, figure: FigureInfo, prompt_version: str,
+    ):
+        self.client = client
+        self.model = client.model
+        self.base_url = getattr(client, "base_url", "")
+        self.cache = cache
+        self.figure_index = figure.index
+        with figure.path.open("rb") as image:
+            self.image_hash = hashlib.file_digest(image, "sha256").hexdigest()
+        self.prompt_version = prompt_version
+        self.input_hash: str | None = None
+        self.request_count = 0
+        self.cached = False
+
+    async def chat_completion(self, messages: list[dict], **kwargs) -> dict:
+        self.request_count += 1
+        request = await self.client.prepare_request(messages, **kwargs)
+        request.pop("model")
+        self.input_hash = request_input_hash(request)
+        description = self.cache.get(
+            self.image_hash, self.model, self.prompt_version, self.input_hash,
+        ) if self.input_hash else None
+        if description:
+            self.cached = True
+            decision = {
+                "figure_index": self.figure_index,
+                "suggested_action": "set_alt_text", "alt_text": description,
+                "confidence": "medium",
+                "summary": "Reused a description with identical model inputs.",
+                "reason": "Image, request payload, model and prompt version match the cache.",
+            }
+            return {"choices": [{"message": {
+                "content": json.dumps({"decisions": [decision]}),
+            }}]}
+        return await self.client.chat_completion(**request)
+
+    def store(self, decision: dict[str, object]) -> None:
+        text = str(decision.get("alt_text") or "").strip()
+        if (
+            self.request_count == 1 and not self.cached and self.input_hash
+            and decision.get("suggested_action") == "set_alt_text"
+            and decision.get("confidence") == "high" and not decision.get("is_decorative")
+            and usable_description(text)
+        ):
+            self.cache.put(self.image_hash, self.model, self.prompt_version, self.input_hash, text)
 
 
 def _bbox_area(bbox: dict[str, Any] | None) -> float:
@@ -236,6 +336,7 @@ def _finalize_figure_result(
     raw: dict[str, Any],
     figure_context: dict[str, Any] | None = None,
 ) -> dict[str, object]:
+    raw = normalize_figure_decision(raw)
     if _should_suppress_child_ui_alt(raw=raw, figure_context=figure_context):
         raw = {
             **raw,
@@ -258,7 +359,7 @@ def _requires_single_figure_followup(result: dict[str, object]) -> bool:
         return True
     if suggested_action == "manual_only":
         return True
-    if suggested_action == "set_alt_text" and not alt_text:
+    if suggested_action == "set_alt_text" and not usable_description(alt_text):
         return True
     return False
 
@@ -327,6 +428,7 @@ async def generate_figure_intelligence(
     reviewer_feedback: str | None = None,
     previous_intelligence: dict[str, Any] | None = None,
     figure_context: dict[str, Any] | None = None,
+    description_only: bool = False,
 ) -> dict[str, object]:
     unit = SemanticUnit(
         unit_id=f"figure-{figure.index}",
@@ -334,7 +436,8 @@ async def generate_figure_intelligence(
         page=int(figure.page) + 1 if isinstance(figure.page, int) and figure.page >= 0 else 1,
         accessibility_goal=(
             "Decide whether this candidate region is a meaningful standalone figure, decorative content, "
-            "or not really a figure at all for assistive technology."
+            "or not really a figure at all for assistive technology. "
+            + FIGURE_DESCRIPTION_RULES
         ),
         bbox=figure.bbox,
         nearby_context=[
@@ -346,6 +449,8 @@ async def generate_figure_intelligence(
         metadata={
             "extra_image_data_urls": [_image_data_url(figure.path)] if figure.path.exists() else [],
             "figure_index": figure.index,
+            "classification": figure.classification,
+            "description_guidance": figure_description_guidance(figure.classification),
             "reviewer_feedback": reviewer_feedback or "",
             "previous_intelligence": previous_intelligence or {},
         },
@@ -356,6 +461,28 @@ async def generate_figure_intelligence(
         job = SimpleNamespace(original_filename=original_filename)
     try:
         async with _alt_text_global_slot():
+            if description_only:
+                # The ordinary semantic prompt permits reclassification. That
+                # decision has already failed its coverage check; a screenshot
+                # of controls is still an image, not an interactive PDF form.
+                raw = await request_llm_json(
+                    llm_client=llm_client,
+                    content=[
+                        {"type": "text", "text": (
+                            "Describe this retained figure for a screen reader. A screenshot of "
+                            "a form, toolbar or palette is a static image. No tagged replacement "
+                            "carries its information. Return set_alt_text with a grounded "
+                            "description, mark_decorative only for decoration, or manual_only "
+                            "if you cannot read it. Do not propose reclassification.\n"
+                            + FIGURE_DESCRIPTION_RULES
+                        )},
+                        context_json_part(unit.to_prompt_dict()),
+                        {"type": "image_url", "image_url": {"url": _image_data_url(figure.path)}},
+                    ],
+                    schema_name="figure_description",
+                    response_schema=FIGURE_DESCRIPTION_SCHEMA,
+                )
+                return _normalize_figure_result(figure_index=figure.index, raw=raw)
             decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)
     except Exception as exc:
         logger.warning("Figure %s semantics failed: %s", figure.index, exc)
@@ -384,6 +511,8 @@ async def generate_figures_intelligence(
     llm_client: LlmClient,
     job: Job | Any | None = None,
     original_filename: str = "",
+    description_cache: AltTextCache | None = None,
+    prompt_version: str = "",
 ) -> list[dict[str, object]]:
     if not figures:
         return []
@@ -412,6 +541,8 @@ async def generate_figures_intelligence(
                             "caption": str(figure.caption or "").strip(),
                             "page": page,
                             "bbox": figure.bbox,
+                            "classification": figure.classification,
+                            "description_guidance": figure_description_guidance(figure.classification),
                             **page_context.get(figure.index, {}),
                         }
                         for figure in chunk
@@ -431,10 +562,20 @@ async def generate_figures_intelligence(
                                 {"type": "image_url", "image_url": {"url": _image_data_url(figure.path)}},
                             ]
                         )
+                # A multi-candidate batch exposes every candidate to all the
+                # others, so its context cannot be separated per figure.
+                cached_request = None
+                if description_cache is not None and len(chunk) == 1:
+                    try:
+                        cached_request = _CachedFigureRequest(
+                            llm_client, description_cache, chunk[0], prompt_version,
+                        )
+                    except OSError:
+                        pass
                 parsed: dict[str, Any] | None
                 try:
                     parsed = await request_llm_json(
-                        llm_client=llm_client,
+                        llm_client=cached_request or llm_client,
                         content=content,
                         schema_name="figure_batch_intelligence",
                         response_schema=FIGURE_BATCH_SCHEMA,
@@ -446,7 +587,13 @@ async def generate_figures_intelligence(
 
                 chunk_index_set = {figure.index for figure in chunk}
                 seen: set[int] = set()
-                for item in (parsed or {}).get("decisions") or []:
+                provisional: dict[int, dict[str, object]] = {}
+                items = (parsed or {}).get("decisions") or []
+                # Some providers return a single decision despite the array schema.
+                # Accept it only when it names a candidate in this request.
+                if not items and isinstance((parsed or {}).get("figure_index"), int):
+                    items = [parsed]
+                for item in items:
                     if not isinstance(item, dict):
                         continue
                     figure_index = item.get("figure_index")
@@ -458,20 +605,47 @@ async def generate_figures_intelligence(
                         raw=item,
                     )
                     if _requires_single_figure_followup(finalized):
+                        provisional[figure_index] = finalized
                         continue
+                    if cached_request is not None and cached_request.cached:
+                        finalized.update({
+                            "source": "cache", "cached": True, "prompt_version": prompt_version,
+                        })
                     page_results[figure_index] = finalized
                     seen.add(figure_index)
 
+                if cached_request is not None and chunk[0].index in seen:
+                    cached_request.store(page_results[chunk[0].index])
                 for figure in chunk:
                     if figure.index in seen:
                         continue
-                    page_results[figure.index] = await generate_figure_intelligence(
+                    followup = await generate_figure_intelligence(
                         figure=figure,
                         llm_client=llm_client,
                         job=job,
                         original_filename=original_filename,
                         figure_context=page_context.get(figure.index),
                     )
+                    previous = provisional.get(figure.index)
+                    if (
+                        previous is not None
+                        and usable_description(str(previous.get("alt_text") or ""))
+                        and followup.get("suggested_action") in {"set_alt_text", "manual_only"}
+                        and not usable_description(str(followup.get("alt_text") or ""))
+                    ):
+                        followup = previous
+                    if (
+                        previous is not None
+                        and usable_description(str(previous.get("alt_text") or ""))
+                        and followup.get("suggested_action") == "reclassify_region"
+                        and followup.get("resolved_kind") in {"table", "form_region"}
+                        and not usable_description(str(followup.get("alt_text") or ""))
+                    ):
+                        # Coverage is checked later. Keep the crop description in
+                        # case the proposed replacement carries no actual content.
+                        followup = {**followup, "alt_text": previous["alt_text"],
+                                    "description_source": "batch"}
+                    page_results[figure.index] = followup
             return page_results
 
     results: dict[int, dict[str, object]] = {}

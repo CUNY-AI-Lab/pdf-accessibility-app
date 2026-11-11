@@ -42,13 +42,17 @@ export default function ConfirmDialog({
 
   const handleClose = () => {
     // The close event fires when the dialog is dismissed via Escape or .close()
-    onCancel();
+    if (open && !confirmPending) onCancel();
   };
 
   return (
     <dialog
       ref={dialogRef}
       onClose={handleClose}
+      onCancel={(event) => {
+        event.preventDefault();
+        if (!confirmPending) onCancel();
+      }}
       className="
         rounded-xl border border-ink/10 bg-cream p-0 shadow-xl
         backdrop:bg-ink/30 backdrop:backdrop-blur-sm

@@ -6,7 +6,7 @@ import pikepdf
 import pytest
 
 from app.services.intelligence_llm_utils import (
-    JSON_SCHEMA_REFUSED_MODELS,
+    FORMAT_CAPABILITIES,
     apply_cache_breakpoint,
     extract_json_object,
     preferred_cache_breakpoint_index,
@@ -18,9 +18,9 @@ from app.services.intelligence_llm_utils import (
 
 @pytest.fixture(autouse=True)
 def _forget_json_schema_refusals():
-    JSON_SCHEMA_REFUSED_MODELS.clear()
+    FORMAT_CAPABILITIES.entries.clear()
     yield
-    JSON_SCHEMA_REFUSED_MODELS.clear()
+    FORMAT_CAPABILITIES.entries.clear()
 
 
 def test_extract_json_object_accepts_trailing_text_after_first_json_object():
@@ -31,6 +31,7 @@ def test_extract_json_object_accepts_trailing_text_after_first_json_object():
 
 class _SchemaFallbackLlm:
     model = "test-model"
+    base_url = "https://gateway.test/v1"
 
     def __init__(self):
         self.calls = []
@@ -39,7 +40,11 @@ class _SchemaFallbackLlm:
         self.calls.append(kwargs)
         response_format = kwargs.get("response_format") or {}
         if response_format.get("type") == "json_schema":
-            raise RuntimeError("json_schema unsupported")
+            request = httpx.Request("POST", self.base_url + "/chat/completions")
+            response = httpx.Response(400, request=request, json={"error": {
+                "code": "capability_unsupported", "message": "model does not support response_format json_schema",
+            }})
+            response.raise_for_status()
         return {"choices": [{"message": {"content": '{"summary":"ok"}'}}]}
 
 

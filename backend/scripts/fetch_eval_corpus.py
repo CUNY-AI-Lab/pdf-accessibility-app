@@ -14,6 +14,9 @@ Writes the layout the bench and scoring scripts read, under ``--bench``
   ``prepare_gold_roundtrip.py`` from their gold PDFs; a set with a
   ``scan_subset`` also gets an image-only variant (``cuny_rt_scan``) scored
   against the same gold.
+- Untagged sets (``cuny_untagged``) are public PDFs downloaded unchanged from
+  their URLs, a few seconds apart, and checked against their sha256. They
+  have no gold; ``outcome_report.py`` reads what the pipeline decided.
 
 Every file not read from a pinned dataset revision comes from the Lab's copy,
 the private repository CUNY-AI-Lab/pdf-accessibility-eval-data, and is
@@ -36,6 +39,7 @@ import random
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -46,6 +50,7 @@ MANIFEST = BACKEND / "eval" / "corpus.json"
 USER_AGENT = "CUNY AI Lab PDF accessibility evaluation (ailab@gc.cuny.edu)"
 LAB_COPY = "https://github.com/CUNY-AI-Lab/pdf-accessibility-eval-data"
 ADOBE_CANDIDATE = "adobe_ocr_autotag"
+DOWNLOAD_PAUSE_SECONDS = 10
 
 
 def sha256(path: Path) -> str:
@@ -164,6 +169,34 @@ def fetch_scorer(spec: dict, sources: Path) -> None:
     subprocess.run(["git", "-C", str(checkout), "checkout", "--quiet", spec["commit"]], check=True)
 
 
+def build_untagged(client: httpx.Client, spec: dict, bench: Path, sources: Path) -> None:
+    """An untagged set's PDFs, as published. Academic Works answers a burst
+    of downloads with a browser challenge (HTTP 403), so files are fetched
+    a few seconds apart; one that still fails can be saved by hand as
+    ``<sources>/<subset>/<name>.pdf`` and is checked like a download."""
+    cache = sources / spec["subset"]
+    out = bench / "bench_data" / "pdfs" / spec["subset"]
+    out.mkdir(parents=True, exist_ok=True)
+    missing = []
+    for document in spec["documents"]:
+        dest = cache / f"{document['name']}.pdf"
+        if not dest.exists():
+            time.sleep(DOWNLOAD_PAUSE_SECONDS)
+            try:
+                download(client, document["url"], dest)
+            except httpx.HTTPStatusError as error:
+                missing.append(
+                    f"{document['name']} ({error.response.status_code}): {document['url']}"
+                )
+                continue
+        shutil.copyfile(checked(dest, document["sha256"]), out / dest.name)
+    print(f"{spec['subset']}: {len(spec['documents']) - len(missing)} PDFs")
+    if missing:
+        raise SystemExit(
+            f"Not downloaded; save each as {cache}/<name>.pdf and run again:\n" + "\n".join(missing)
+        )
+
+
 def restore_adobe(wanted: set[str], bench: Path, lab: Path) -> None:
     """Adobe's results for these subsets, as the scorers read them, from the
     Lab's copy (``adobe/<subset>/``); they cost free-tier quota to remake."""
@@ -188,6 +221,7 @@ def main() -> None:
         *(subset["name"] for subset in corpus["olmocr_bench"]["subsets"]),
         "old_print",
         *roundtrip_names,
+        *(spec["subset"] for spec in corpus["untagged"]),
     ]
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--bench", type=Path, default=BACKEND / "data" / "eval" / "olmocr-bench")
@@ -200,6 +234,9 @@ def main() -> None:
         timeout=120, follow_redirects=True, headers={"User-Agent": USER_AGENT}
     ) as client:
         build_olmocr(client, corpus["olmocr_bench"], wanted, options.bench, options.sources)
+        for spec in corpus["untagged"]:
+            if spec["subset"] in wanted:
+                build_untagged(client, spec, options.bench, options.sources)
     fetch_scorer(corpus["scorers"]["opendataloader_bench"], options.sources)
     lab = lab_copy(options.sources)
     if "old_print" in wanted:

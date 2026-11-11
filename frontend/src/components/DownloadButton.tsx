@@ -3,7 +3,7 @@ import { apiUrl } from "../api/client";
 interface DownloadButtonProps {
   jobId: string;
   filename: string;
-  type?: "pdf" | "report";
+  type?: "pdf" | "report" | "html";
 }
 
 export default function DownloadButton({
@@ -11,13 +11,24 @@ export default function DownloadButton({
   filename,
   type = "pdf",
 }: DownloadButtonProps) {
+  const stem = filename.replace(/\.pdf$/i, "");
+  if (type === "html") {
+    return (
+      <a
+        href={apiUrl(`/jobs/${jobId}/download/document.html`)}
+        download={`accessible_${stem}.html`}
+        className="text-sm text-accent underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4"
+      >
+        Accessible HTML
+      </a>
+    );
+  }
   const href =
     type === "pdf"
       ? apiUrl(`/jobs/${jobId}/download`)
       : apiUrl(`/jobs/${jobId}/download/report.html`);
 
   const label = type === "pdf" ? "Download Accessible PDF" : "Download Report";
-  const stem = filename.replace(/\.pdf$/i, "");
 
   return (
     <a

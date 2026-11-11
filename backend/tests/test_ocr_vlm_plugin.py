@@ -27,6 +27,11 @@ MODEL_LINES = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _job_access_directory(monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIL_OCR_ACCESS_DIR", str(tmp_path))
+
+
 def _fenced(items) -> str:
     return "```json\n" + json.dumps(items) + "\n```"
 
@@ -68,7 +73,6 @@ def _answer(monkeypatch, status=200, answers=None, body=None):
     monkeypatch.setenv("CAIL_OCR_PAGE_SECONDS", "300")
     monkeypatch.setattr(ocr_vlm_plugin.httpx, "post", post)
     monkeypatch.setattr(ocr_vlm_plugin.time, "sleep", lambda seconds: None)
-    monkeypatch.setattr(ocr_vlm_plugin, "_credential_refused", False)
     return calls
 
 

@@ -7,7 +7,9 @@ import type { JobRecord } from "./board";
 import {
   type AppliedChange,
   appliedChangesSchema,
+  DOCUMENT_HTML_FILE,
   type JsonValue,
+  OUTPUT_READY_STATUSES,
   type ReviewTask,
   reviewTasksSchema,
   stepsSchema,
@@ -54,6 +56,7 @@ export function jobResponse(job: JobRecord, includeStepResults: boolean): JsonVa
     error: job.error,
     notice: job.notice,
     validation_compliant: job.validationCompliant,
+    has_html: OUTPUT_READY_STATUSES.includes(job.status) && job.files.includes(DOCUMENT_HTML_FILE),
     created_at: new Date(job.createdAt).toISOString(),
     updated_at: new Date(job.updatedAt).toISOString(),
     steps: stepsSchema

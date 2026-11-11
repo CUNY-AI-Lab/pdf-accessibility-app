@@ -1,9 +1,13 @@
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DEFAULT_LLM_MAX_REQUEST_BYTES = 2 * 1024 * 1024
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent  # pdf-accessibility-app/
 PLACEHOLDER_LLM_KEYS = {
@@ -19,9 +23,6 @@ LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1", "::1"}
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=BASE_DIR / ".env", extra="ignore")
 
-    # Database
-    database_url: str = f"sqlite+aiosqlite:///{BASE_DIR / 'data' / 'pdf_accessibility.db'}"
-
     # File storage
     upload_dir: Path = BASE_DIR / "data" / "uploads"
     processing_dir: Path = BASE_DIR / "data" / "processing"
@@ -36,6 +37,8 @@ class Settings(BaseSettings):
     # sample of page images.
     llm_page_candidate_batch_size: int = 12
     llm_bookmark_preview_pages: int = 4
+    # Includes base64 images, all prompt text, history and the response schema.
+    llm_max_request_bytes: int = Field(default=DEFAULT_LLM_MAX_REQUEST_BYTES, ge=64 * 1024)
     llm_timeout: int = 120
     llm_pretag_timeout: int = 45
     llm_pretag_fallback_timeout: int = 15
@@ -44,6 +47,8 @@ class Settings(BaseSettings):
     skip_alt_text_generation: bool = False
     alt_text_max_concurrency: int = 8
     alt_text_global_max_concurrency: int = 12
+    alt_text_cache_enabled: bool = True
+    alt_text_cache_dir: Path | None = None
     auto_apply_llm_font_map: bool = True
     auto_apply_grounded_text: bool = True
     auto_apply_table_intelligence: bool = True
@@ -96,36 +101,8 @@ class Settings(BaseSettings):
     max_upload_ocr_scan_total_image_pixels: int = 150_000_000
     max_upload_ocr_scan_image_heavy_pages: int = 25
     upload_image_heavy_page_min_pixels: int = 4_000_000
-    max_files_per_upload: int = 5
-    max_active_jobs_per_session: int = 3
-    max_active_jobs_global: int = 12
-    max_concurrent_jobs: int = 2
     ocrmypdf_jobs: int = 1
     ocrmypdf_max_image_mpixels: int = 75
-
-    # Job lifecycle
-    job_ttl_hours: int = 12
-
-    # Anonymous browser session
-    anonymous_session_cookie_name: str = "anon_session"
-    anonymous_session_csrf_cookie_name: str = "anon_session_csrf"
-    anonymous_session_cookie_max_age_hours: int = 24 * 30
-    anonymous_session_cookie_secure: bool = False
-    csrf_protection_enabled: bool = True
-
-    # CAIL identity (source-ready but opt-in until the gateway is activated)
-    cail_identity_required: bool = False
-    cail_identity_jwks: str = ""
-    cail_identity_issuer: str = "https://tools.ailab.gc.cuny.edu/cail-sso"
-    cail_identity_clock_tolerance_seconds: int = 60
-
-    # CORS
-    cors_allow_origins: str = (
-        "http://localhost:5173,"
-        "http://127.0.0.1:5173,"
-        "http://localhost:8080,"
-        "http://127.0.0.1:8080"
-    )
 
     # LLM retry
     llm_max_retries: int = 3
@@ -140,6 +117,21 @@ class Settings(BaseSettings):
     docling_serve_timeout: int = 300  # 5 min
     docling_serve_ocr_engine: str = "rapidocr"
 
+    # Table structure from a small local vision model (PaddleOCR-VL-1.5),
+    # text from the page (app/pipeline/table_model.py). Off unless a URL is
+    # set: an OpenAI-compatible endpoint on the pipeline host, never the
+    # Gateway. A table whose model grid does not align keeps Docling's.
+    table_model_url: str = ""
+    table_model_name: str = "paddleocr-vl-1.5"
+    table_model_timeout: float = 60.0
+    # The share of both texts that must align (born digital, then OCR'd
+    # pages, whose text aligns less reliably): measured best on the
+    # olmOCR-Bench tables categories.
+    table_model_min_coverage: float = 0.7
+    table_model_min_coverage_scan: float = 0.9
+    # On scans, read a cell as the model's text where it differs from the OCR
+    # text only by known OCR confusions (as /ActualText).
+    table_model_scan_text: bool = False
 
     # Runner (v2): pulls work from the Worker at runner_worker_url, which
     # relays each job's model calls with that person's Gateway credential.
@@ -149,11 +141,8 @@ class Settings(BaseSettings):
     runner_slots: int = 2
     runner_poll_seconds: float = 2.0
     runner_heartbeat_seconds: float = 30.0
-    # Touched on every claim loop, for the container's health check.
+    # Touched every 30 seconds while the runner is running, for its health check.
     runner_alive_file: str = ""
-
-    # Dev
-    debug: bool = False
 
     @model_validator(mode="after")
     def validate_llm_settings(self):
@@ -184,9 +173,22 @@ class Settings(BaseSettings):
 
 
 _settings: Settings | None = None
+_task_settings: ContextVar[Settings | None] = ContextVar("runner_settings", default=None)
+
+
+@contextmanager
+def task_settings(settings: Settings):
+    token = _task_settings.set(settings)
+    try:
+        yield
+    finally:
+        _task_settings.reset(token)
 
 
 def get_settings() -> Settings:
+    scoped = _task_settings.get()
+    if scoped is not None:
+        return scoped
     global _settings
     if _settings is None:
         _settings = Settings()

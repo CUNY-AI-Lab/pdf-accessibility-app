@@ -43,7 +43,7 @@ import pikepdf
 from app.pipeline.language import normalize_lang_tag
 from app.pipeline.tagger import _is_weak_figure_alt_text
 from app.services.intelligence_llm_utils import extract_message_json
-from app.services.llm_client import LlmClient
+from app.services.llm_client import LlmClient, track_llm_usage
 from app.services.structure_text import _standard_role, screen_reader_text
 
 GATEWAY = "https://tools.ailab.gc.cuny.edu/v1"
@@ -281,10 +281,16 @@ async def main() -> None:
         max_retries=2,
     )
     try:
-        for candidate_dir in options.candidates:
-            await score_candidate(options.gold, candidate_dir, client)
+        with track_llm_usage() as usage:
+            for candidate_dir in options.candidates:
+                await score_candidate(options.gold, candidate_dir, client)
     finally:
         await client.close()
+    # What the judge cost this run; cached judgments cost nothing.
+    print(
+        f"\njudge: {usage.request_count} requests, {usage.prompt_tokens} prompt"
+        f" and {usage.completion_tokens} completion tokens"
+    )
 
 
 if __name__ == "__main__":

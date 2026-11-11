@@ -6,7 +6,7 @@ import pikepdf
 import pytest
 
 from app.pipeline.pdf_repair import add_missing_icc_components
-from app.services.structure_text import screen_reader_text
+from app.services.structure_text import screen_reader_text, screen_reader_text_with_pages
 from tests.pdf_fixtures import helvetica
 
 
@@ -109,6 +109,59 @@ def test_table_structure_is_kept_as_html_in_markdown(tmp_path):
         "<table><thead><tr><th>Year</th><th>Price &amp; tax</th></tr></thead>"
         '<tbody><tr><td colspan="2">No sales</td></tr></tbody></table>'
     )
+
+
+def test_page_reading_keeps_paragraph_breaks_with_pages_only_on_content_references(tmp_path):
+    path = tmp_path / "references.pdf"
+    _tagged_pdf(path, figure_alt=None)
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        for node in pdf.Root.StructTreeRoot.K.K:
+            node.S = pikepdf.Name.P
+            node.K = pikepdf.Dictionary(Type=pikepdf.Name.MCR, Pg=node.Pg, MCID=int(node.K))
+            del node.Pg
+        pdf.save(path)
+    text, pages = screen_reader_text_with_pages(path)
+    assert text == screen_reader_text(path) == "Paragraph text\nText in figure"
+    assert pages == [text]
+
+
+def test_nested_mcids_are_read_from_inner_structure_references(tmp_path):
+    path = tmp_path / "nested.pdf"
+    _tagged_pdf(path, figure_alt=None)
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        page = pdf.pages[0]
+        page.Contents = pdf.make_stream(
+            b"/P <</MCID 99>> BDC\n" + page.Contents.read_bytes() + b"\nEMC"
+        )
+        pdf.save(path)
+    assert screen_reader_text(path) == "Paragraph text"
+
+
+def test_each_form_invocation_can_have_its_own_caller_mcid(tmp_path):
+    path = tmp_path / "form-callers.pdf"
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(300, 300))
+    form = pdf.make_stream(
+        b"/Span <</MCID 7>> BDC BT /F1 12 Tf 20 250 Td (Form text) Tj ET EMC"
+    )
+    form.Type = pikepdf.Name.XObject
+    form.Subtype = pikepdf.Name.Form
+    form.BBox = pikepdf.Array([0, 0, 300, 300])
+    form.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
+    page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Fx=form))
+    page.Contents = pdf.make_stream(
+        b"/P <</MCID 0>> BDC q /Fx Do Q EMC\n"
+        b"/P <</MCID 1>> BDC q 1 0 0 1 0 -50 cm /Fx Do Q EMC\n"
+    )
+    pdf.Root.StructTreeRoot = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name.StructTreeRoot,
+        K=pikepdf.Array([
+            pdf.make_indirect(pikepdf.Dictionary(S=pikepdf.Name.P, Pg=page.obj, K=mcid))
+            for mcid in (0, 1)
+        ]),
+    ))
+    pdf.save(path)
+    assert screen_reader_text(path) == "Form text\nForm text"
 
 
 def test_a_page_with_an_icc_profile_missing_its_component_count_is_read(tmp_path):

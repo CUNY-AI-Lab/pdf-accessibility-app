@@ -21,6 +21,24 @@ def is_better_validation(candidate, current) -> bool:
     if candidate_errors != current_errors:
         return candidate_errors < current_errors
 
+    # A partial font repair can remove many failed checks while the rule
+    # still fails on another font. Preserve that improvement, provided no
+    # rule gains failures (an aggregate total could hide a regression).
+    def counts(report):
+        result = {}
+        for violation in report.violations:
+            if violation.severity == "error":
+                key = violation.rule_id
+                count = getattr(violation, "count", 1)
+                weight = count if isinstance(count, int) and count > 0 else 1
+                result[key] = result.get(key, 0) + weight
+        return result
+
+    candidate_counts, current_counts = counts(candidate), counts(current)
+    if all(count <= current_counts.get(rule, 0) for rule, count in candidate_counts.items()):
+        if sum(candidate_counts.values()) < sum(current_counts.values()):
+            return True
+
     candidate_warnings = warning_count(candidate)
     current_warnings = warning_count(current)
     if candidate_warnings != current_warnings:

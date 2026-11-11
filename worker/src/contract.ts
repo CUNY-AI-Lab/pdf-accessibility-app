@@ -15,7 +15,11 @@ const jsonRecord = z.record(z.string(), jsonValue);
 export const PIPELINE_STEPS = ["classify", "ocr", "structure", "alt_text", "tagging", "validation", "fidelity"];
 export const RERUN_STEPS = ["tagging", "validation", "fidelity"];
 export const OUTPUT_READY_STATUSES = ["complete", "manual_remediation"];
+// Optional revision output; older runners omit it. Counterpart: backend/app/runner/views.py.
+export const DOCUMENT_HTML_FILE = "document.html";
 export const ACTIVE_STATUSES = ["queued", "processing"];
+export const jobStatusSchema = z.enum(["queued", "processing", "complete", "manual_remediation", "failed"]);
+export const terminalJobStatusSchema = z.enum(["complete", "manual_remediation", "failed"]);
 
 export const stepSchema = z.object({
   step_name: z.string(),
@@ -30,7 +34,7 @@ export const stepsSchema = z.array(stepSchema);
 
 /** The runner's rendering of v1's JobResponse; the Worker owns the other fields. */
 export const jobViewSchema = z.object({
-  status: z.string(),
+  status: jobStatusSchema,
   classification: z.string().nullable(),
   ocr_language: z.string().nullable(),
   page_count: z.number().int().nullable(),
@@ -53,7 +57,7 @@ export type ProgressEvent = z.infer<typeof progressEventSchema>;
 export const completeRequestSchema = z.union([
   z.object({ review_refused: z.string().max(2000), overrides_version: z.number().int().min(0) }),
   z.object({
-    job: jobViewSchema,
+    job: jobViewSchema.extend({ status: terminalJobStatusSchema }),
     figures: z.array(z.number().int().min(0)),
     previews: z.array(z.number().int().min(1)),
     files: z.array(z.string()),
@@ -122,7 +126,7 @@ export type ReviewAction = z.infer<typeof reviewActionSchema>;
 
 /** Files a runner may write for a revision. */
 export function isRunnerFileName(name: string): boolean {
-  return /^(?:views\/(?:review-tasks|applied-changes|figure-changes|report|batch-parts)\.json|report\.html|output\.pdf|state\.tar\.gz|figures\/\d{1,4}|previews\/\d{1,4})$/.test(
+  return name === DOCUMENT_HTML_FILE || /^(?:views\/(?:review-tasks|applied-changes|figure-changes|report|batch-parts)\.json|report\.html|output\.pdf|state\.tar\.gz|figures\/\d{1,4}|previews\/\d{1,4})$/.test(
     name,
   );
 }

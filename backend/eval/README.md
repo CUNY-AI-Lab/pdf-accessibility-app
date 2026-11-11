@@ -28,6 +28,7 @@ tests as `data/eval/olmocr-bench/<subset>.jsonl` and its PDFs in
 | `gold_rt` | 224 (11 documents) | structure round-trip | Well-tagged PDFs: seven from the PDF/UA Reference Suite 1.1, the Matterhorn Protocol 1.1, Ross Moore's tagged PDF/UA paper, a NOAA report, and a table set |
 | `cuny_rt` | 282 (19 documents) | structure round-trip | Well-tagged CUNY documents from [CUNY Academic Works](https://academicworks.cuny.edu/): five syllabi, two OER textbook chapters, three assignments, three lesson plans, two conference papers, lecture slides, a book chapter, a master's capstone, and a library newsletter |
 | `cuny_rt_scan` | 282 (19 documents) | structure round-trip | The `cuny_rt` documents as image-only scans (`scripts/synthetic_scan.py`), scored against the same tags |
+| `cuny_untagged` | 212 (17 documents) | outcomes, no gold | Public CUNY PDFs with no tags on their own pages: syllabi, book chapters and articles, slides, newsletters, a report, minutes; 9 are scans. Read by `scripts/outcome_report.py` |
 | `tables_s60_scan`, `multi_column_s60_scan`, `headers_footers_s60_scan` | 60 each | as their born-digital samples | The same pages as image-only scans under the same tests, which check text, order and tables and so hold for a scan too |
 | `multi_column`, `headers_footers`, `tables` | 231, 266, 188 | 884, 760, 1,022 | olmOCR-Bench's whole categories, the samples' sources: 3 to 4.5 times the samples' tests, for confidence intervals about 3 points wide instead of 5–6 |
 | `multi_column_scan`, `headers_footers_scan`, `tables_scan` | 231, 266, 188 | as their born-digital sets | The whole categories as image-only scans |
@@ -48,6 +49,34 @@ bibliography entries, or every slide text box as headings were dropped (about
 a third), as were near-duplicate revisions. Gold tags from the wild can
 still be imperfect (the newsletter marks a table's first column as row
 headers), which affects every candidate alike.
+
+## Untagged CUNY documents
+
+We assembled `cuny_untagged` (2026-10-31) to see whether the whole
+pipeline, with AI steps on, releases real CUNY documents or holds them for
+manual remediation, and why. It has no gold. `scripts/pipeline_bench.py`
+writes each run's outcome to its `run.json`, and
+`scripts/outcome_report.py` prints it.
+
+Eleven documents come from Academic Works, searched through its content
+API by kind (syllabus, article and book chapter, slides, newsletter and
+report, archival scan) and taken in rank order. Academic Works prepends a
+tagged cover sheet to most PDFs; a document qualified when no page after
+the cover sheet is tagged. Of the downloaded documents that qualified, 9 of
+11 are image-only scans, including a 2021 syllabus and a 2018 book
+chapter. After the first dozen downloads Academic Works answered most
+requests with a browser challenge (HTTP 403), even at one request a
+minute. We stopped there, short of the planned 20–25 documents and without
+born-digital articles or slides from Academic Works. The other six are
+public PDFs from campus websites with no structure tree at all, which we
+found by web search for syllabi, newsletters and slides. Most PDFs the
+search turned up (exported from Word, PowerPoint, Acrobat, Canva or recent
+macOS) were already tagged, and we left the tagged ones out.
+
+The PDFs are not committed. `corpus.json` lists each one's URL, landing
+page, kind and sha256. The fetcher downloads them a few seconds apart and
+names any it cannot fetch; save a missing file by hand as
+`data/eval/sources/cuny_untagged/<name>.pdf` and run it again.
 
 ## Gold PDFs
 

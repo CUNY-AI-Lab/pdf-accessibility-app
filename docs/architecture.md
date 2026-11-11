@@ -1,6 +1,6 @@
 # Architecture
 
-Updated: 2026-10-27
+Updated: 2026-10-30
 
 This app has two distinct layers:
 
@@ -43,16 +43,16 @@ flowchart TD
 
 ## Session boundary
 
-The product uses anonymous browser sessions instead of user accounts.
+The deployed app is for signed-in CUNY people. Doorway signs them in, checks
+Admission membership, and forwards signed identity tokens; the Worker verifies
+them and scopes every job, file, and review route to the signed-in subject.
+The runner on actual-dell runs each job's pipeline, and its model calls go
+through the Worker with the signed-in person's Gateway credential (see
+[Version 2](#version-2)). There are no anonymous sessions in the deployed app.
 
-- FastAPI middleware assigns an HTTP-only cookie to each browser
-- every job row is owned by a hash of that session token
-- list, detail, download, preview, SSE progress, and review routes are all scoped to the current browser session
-- jobs and their files are ephemeral and expire after `JOB_TTL_HOURS`, which defaults to `12`
-
-This keeps the app login-free while preventing one browser session from seeing another session's PDFs through the product API.
-It does not change the fact that semantic adjudication still uses the configured
-external LLM provider.
+Local development uses the same Worker and runner through
+`worker/dev/e2e.mjs`, with temporary signed identities and a dev Gateway
+using a personal key. Docker runs the runner only; it serves no HTTP routes.
 
 ## Version 2
 

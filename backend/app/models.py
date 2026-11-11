@@ -10,6 +10,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -175,3 +176,61 @@ class AppliedChange(Base):
     )
 
     job: Mapped["Job"] = relationship(back_populates="applied_changes")
+
+
+class ReviewRevision(Base):
+    """Local command/output journal, archived with the runner's SQLite state.
+
+    New tables are additive: runner 7764be7 ignores this journal, and the
+    deployed Worker continues receiving exactly its existing view contract.
+    """
+
+    __tablename__ = "review_revisions"
+    __table_args__ = (UniqueConstraint("job_id", "command_id"),)
+
+    job_id: Mapped[str] = mapped_column(String, ForeignKey("jobs.id"), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True)
+    command_id: Mapped[str] = mapped_column(String, nullable=False)
+    phase: Mapped[str] = mapped_column(String, nullable=False)
+    command_json: Mapped[str] = mapped_column(Text, nullable=False)
+    before_json: Mapped[str] = mapped_column(Text, nullable=False)
+    edits_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    published_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+# ORM boundaries cover every in-process writer without parsing legacy rows on read.
+# Conditional SQL writers (review CAS and snapshot compensation) guard explicitly.
+def _guard_persisted_status(_mapper, _connection, target):
+    from sqlalchemy import inspect
+
+    from app.services.figure_state import FIGURE_TRANSITIONS, figure_status, set_figure_status
+    from app.services.job_transitions import JOB_TRANSITIONS, STEP_TRANSITIONS, guard_transition
+    from app.services.review_revisions import REVISION_TRANSITIONS
+    from app.services.review_state import CHANGE_TRANSITIONS, REVIEW_TRANSITIONS
+
+    contracts = {
+        Job: ("status", JOB_TRANSITIONS),
+        JobStep: ("status", STEP_TRANSITIONS),
+        AltTextEntry: ("status", FIGURE_TRANSITIONS),
+        AppliedChange: ("review_status", CHANGE_TRANSITIONS),
+        ReviewTask: ("status", REVIEW_TRANSITIONS),
+        ReviewRevision: ("phase", REVISION_TRANSITIONS),
+    }
+    field, transitions = contracts[type(target)]
+    history = inspect(target).attrs[field].history
+    if not history.has_changes():
+        return
+    current = history.deleted[0] if history.deleted else getattr(target, field)
+    value = getattr(target, field)
+    if value is None:
+        return
+    if isinstance(target, AltTextEntry):
+        current, value = figure_status(current), figure_status(value)
+        set_figure_status(target, value)
+    guard_transition(current, value, transitions, entity=target.__tablename__)
+
+
+for _model in (Job, JobStep, AltTextEntry, AppliedChange, ReviewTask, ReviewRevision):
+    event.listen(_model, "before_update", _guard_persisted_status)
+    event.listen(_model, "before_insert", _guard_persisted_status)

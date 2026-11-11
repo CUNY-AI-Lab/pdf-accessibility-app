@@ -1,8 +1,5 @@
 import shutil
-import uuid
 from pathlib import Path
-
-from fastapi import HTTPException, UploadFile
 
 from app.config import get_settings
 from app.services.path_safety import safe_filename
@@ -12,51 +9,6 @@ def ensure_dirs():
     settings = get_settings()
     for d in (settings.upload_dir, settings.processing_dir, settings.output_dir):
         d.mkdir(parents=True, exist_ok=True)
-
-
-async def save_upload(file: UploadFile) -> tuple[str, Path, int]:
-    """Save an uploaded file and return (stored_filename, path, size_bytes).
-
-    Validates PDF magic bytes from the first chunk during streaming,
-    avoiding a separate re-read of the file after writing.
-    """
-    settings = get_settings()
-    settings.upload_dir.mkdir(parents=True, exist_ok=True)
-
-    ext = Path(safe_filename(file.filename or "upload.pdf")).suffix
-    stored_name = f"{uuid.uuid4()}{ext}"
-    dest = settings.upload_dir / stored_name
-
-    size = 0
-    max_size = settings.max_upload_size_bytes
-    first_chunk = True
-    with open(dest, "wb") as f:
-        while chunk := await file.read(1024 * 1024):  # 1MB chunks
-            if first_chunk:
-                if not chunk[:5].startswith(b"%PDF-"):
-                    dest.unlink(missing_ok=True)
-                    raise HTTPException(
-                        status_code=400,
-                        detail="File is not a valid PDF",
-                    )
-                first_chunk = False
-            size += len(chunk)
-            if size > max_size:
-                dest.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=413,
-                    detail="File too large",
-                )
-            f.write(chunk)
-
-    if first_chunk:
-        dest.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=400,
-            detail="File is empty",
-        )
-
-    return stored_name, dest, size
 
 
 def create_job_dir(job_id: str) -> Path:

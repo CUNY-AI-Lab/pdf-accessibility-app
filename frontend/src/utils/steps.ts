@@ -10,10 +10,15 @@ const STEP_ORDER: StepName[] = [
   "fidelity",
 ];
 
+export type DisplayPipelineStep = Omit<PipelineStep, "step_name"> & { step_name: StepName };
+
 /** Every pipeline step in order, pending until the job reports it. */
-export function pipelineSteps(steps?: PipelineStep[]): PipelineStep[] {
+export function pipelineSteps(steps?: PipelineStep[]): DisplayPipelineStep[] {
   const reported = new Map((steps ?? []).map((step) => [step.step_name, step]));
   return STEP_ORDER.map(
-    (step_name) => reported.get(step_name) ?? { step_name, status: "pending" },
+    (step_name) => {
+      const step = reported.get(step_name);
+      return step ? { ...step, step_name } : { step_name, status: "pending" };
+    },
   );
 }

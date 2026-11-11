@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.pipeline.document_title import _is_placeholder_document_title, select_document_title
 from app.pipeline.structure import _collapse_spaced_title_caps
 from app.services.bookmark_intelligence import (
     FRONT_MATTER_AUTO_CONFIDENCE,
@@ -72,6 +73,7 @@ Canonical front-matter role labels:
 
 Rules for title:
 - Use only visible evidence from the provided PDF pages and the structural candidates.
+- deterministic_title ranks first-page typography, usable XMP/Info, and the first H1. Keep its title when clear=true; adjudicate only ambiguous candidates.
 - Prefer the document's main title, not author lines, institutional boilerplate, dates, running headers, or filenames.
 - When the visible title is split across adjacent heading fragments, combine them into one natural title.
 - When adjacent title-block fragments together identify the document, include the identity-bearing fragments; do not drop a visible identifier solely because a descriptive phrase is more prominent.
@@ -131,6 +133,10 @@ async def enhance_document_title_and_front_matter_with_intelligence(
     original_filename: str,
     llm_client: LlmClient,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    deterministic = select_document_title(pdf_path, structure_json, original_filename)
+    if deterministic["clear"]:
+        structure_json["title"] = deterministic["title"]
+        structure_json["title_evidence"] = deterministic
     existing_title = _collapse_spaced_title_caps(structure_json.get("title"))
     title_candidates = _title_candidate_elements(structure_json)
     elements = structure_json.get("elements")
@@ -171,6 +177,7 @@ async def enhance_document_title_and_front_matter_with_intelligence(
         "job_filename": original_filename,
         "current_title": existing_title,
         "title_candidates": title_candidates,
+        "deterministic_title": deterministic,
         "front_matter_pages": front_matter_pages,
     }
     parsed = await request_pdf_pages_json(
@@ -189,11 +196,13 @@ async def enhance_document_title_and_front_matter_with_intelligence(
     title_payload = parsed.get("title") if isinstance(parsed.get("title"), dict) else {}
     title_confidence = str(title_payload.get("confidence") or "").strip().lower()
     resolved_title = _collapse_spaced_title_caps(title_payload.get("title"))
-    title_applied = title_confidence in {"high", "medium"} and bool(resolved_title)
+    title_applied = (title_confidence in {"high", "medium"} and bool(resolved_title)
+                     and not deterministic["clear"]
+                     and not _is_placeholder_document_title(resolved_title, original_filename))
     if title_applied:
         structure_json["title"] = resolved_title
-    elif existing_title:
-        structure_json["title"] = existing_title
+    else:
+        structure_json["title"] = deterministic["title"]
 
     front_matter_payload = (
         parsed.get("front_matter") if isinstance(parsed.get("front_matter"), dict) else {}
@@ -220,7 +229,8 @@ async def enhance_document_title_and_front_matter_with_intelligence(
             "applied": title_applied,
             "reason": str(title_payload.get("reason") or "").strip(),
             "confidence": title_confidence,
-            "title": resolved_title or existing_title,
+            "title": structure_json.get("title"),
+            "deterministic_title": deterministic,
             "retained_existing_title": bool(existing_title and not title_applied),
             "candidate_count": len(title_candidates),
             "combined_front_matter": True,

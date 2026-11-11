@@ -12,10 +12,10 @@ import pikepdf
 from app.pipeline.fidelity import (
     _canonical_named_destination,
     _collect_structural_fragments,
-    _extract_pdf_text_sample,
     _is_generated_link_contents,
     _is_implausible_link_text,
     _is_poor_link_text,
+    _pdf_text_sample,
     _reading_order_metrics,
 )
 from app.pipeline.structure import extract_structure
@@ -348,7 +348,7 @@ def _pdf_features(pdf_path: Path) -> dict[str, Any]:
         links = _extract_link_entries(pdf)
 
     fields = extract_widget_fields(pdf_path)
-    raw_text = _extract_pdf_text_sample(pdf_path)
+    raw_text, _text_error = _pdf_text_sample(pdf_path)
     return {
         "title": title,
         "lang": lang,

@@ -7,7 +7,9 @@ strips ``Authorization`` on the way in, so neither travels there.
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,41 @@ RUNNER_TOKEN_HEADER = "x-pdf-runner-token"
 JOB_TOKEN_HEADER = "x-pdf-job-token"
 TASK_KINDS = frozenset({"process", "review", "sync"})
 UPLOAD_ATTEMPTS = 3
+
+
+class UploadPhase(Enum):
+    SENDING = "sending"
+    BACKOFF = "backoff"
+    ACKNOWLEDGED = "acknowledged"
+    FAILED = "failed"
+    LEASE_LOST = "lease_lost"
+
+
+UPLOAD_TRANSITIONS = {
+    UploadPhase.SENDING: {
+        UploadPhase.BACKOFF,
+        UploadPhase.ACKNOWLEDGED,
+        UploadPhase.FAILED,
+        UploadPhase.LEASE_LOST,
+    },
+    UploadPhase.BACKOFF: {UploadPhase.SENDING, UploadPhase.FAILED},
+    UploadPhase.ACKNOWLEDGED: set(),
+    UploadPhase.FAILED: set(),
+    UploadPhase.LEASE_LOST: set(),
+}
+
+
+def upload_transition(current: UploadPhase, target: UploadPhase) -> UploadPhase:
+    if target not in UPLOAD_TRANSITIONS[current]:
+        raise ValueError(f"Illegal upload transition: {current.value} -> {target.value}")
+    return target
+
+
+def retryable_upload(exc: httpx.HTTPError) -> bool:
+    return isinstance(exc, httpx.TransportError) or (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code in {408, 425, 429, 500, 502, 503, 504}
+    )
 
 
 class LeaseLost(Exception):
@@ -43,9 +80,16 @@ class Task:
     action: dict[str, Any] | None = None
     overrides: dict[str, dict[str, str]] = field(default_factory=dict)
     overrides_version: int = 0
+    attempt_id: str | None = None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "Task":
+        for key in ("job_id", "kind", "lease", "original_filename"):
+            if not isinstance(data.get(key), str) or not data[key]:
+                raise ValueError(f"Claim requires a nonempty {key}")
+        for key in ("attempt", "deadline"):
+            if type(data.get(key)) is not int or data[key] <= 0:
+                raise ValueError(f"Claim requires a positive {key}")
         kind = str(data["kind"])
         if kind not in TASK_KINDS:
             raise ValueError(f"unknown task kind {kind!r}")
@@ -53,6 +97,8 @@ class Task:
         if kind == "review" and not isinstance(action, dict):
             raise ValueError("a review task needs an action")
         overrides = data.get("overrides") or {}
+        if not isinstance(overrides, dict):
+            raise ValueError("Claim overrides must be an object")
         return cls(
             job_id=str(data["job_id"]),
             kind=kind,
@@ -67,11 +113,14 @@ class Task:
                 "tasks": dict(overrides.get("tasks") or {}),
             },
             overrides_version=int(data.get("overrides_version") or 0),
+            attempt_id=data.get("attempt_id"),
         )
 
 
 class WorkerClient:
-    def __init__(self, base_url: str, token: str, *, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(
+        self, base_url: str, token: str, *, transport: httpx.AsyncBaseTransport | None = None
+    ):
         self.base_url = base_url.rstrip("/")
         self._token = token
         self._client = httpx.AsyncClient(
@@ -96,7 +145,10 @@ class WorkerClient:
         if response.status_code == 204:
             return None
         response.raise_for_status()
-        return Task.from_json(response.json()["task"])
+        body = response.json()
+        if not isinstance(body, dict) or not isinstance(body.get("task"), dict):
+            raise ValueError("Claim response requires a task object")
+        return Task.from_json(body["task"])
 
     async def download(self, task: Task, what: str, dest: Path) -> None:
         """Stream the task's input PDF or saved state to ``dest``."""
@@ -117,21 +169,43 @@ class WorkerClient:
         _raise_for_task(response)
 
     async def upload(self, task: Task, name: str, body: bytes | Path, content_type: str) -> None:
+        phase = UploadPhase.SENDING
+        # Every retry sends exactly the same bytes, even if a caller's file changes.
+        content = body.read_bytes() if isinstance(body, Path) else body
         for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+            remaining = task.deadline_ms / 1000 - time.time()
+            if remaining <= 0:
+                upload_transition(phase, UploadPhase.FAILED)
+                raise TimeoutError("Upload deadline passed")
             try:
-                content = body.read_bytes() if isinstance(body, Path) else body
-                response = await self._client.put(
-                    f"/tasks/{task.job_id}/files/{name}",
-                    content=content,
-                    headers={**self._task_headers(task), "content-type": content_type},
-                )
+                async with asyncio.timeout(remaining):
+                    response = await self._client.put(
+                        f"/tasks/{task.job_id}/files/{name}",
+                        content=content,
+                        headers={**self._task_headers(task), "content-type": content_type},
+                    )
                 _raise_for_task(response)
+                upload_transition(phase, UploadPhase.ACKNOWLEDGED)
                 return
+            except TimeoutError:
+                upload_transition(phase, UploadPhase.FAILED)
+                raise
+            except LeaseLost:
+                upload_transition(phase, UploadPhase.LEASE_LOST)
+                raise
             except (httpx.TransportError, httpx.HTTPStatusError) as exc:
-                if attempt == UPLOAD_ATTEMPTS:
+                if attempt == UPLOAD_ATTEMPTS or not retryable_upload(exc):
+                    upload_transition(phase, UploadPhase.FAILED)
                     raise
-                logger.warning("Upload of %s failed (%s); retrying", name, exc)
-                await asyncio.sleep(2**attempt)
+                phase = upload_transition(phase, UploadPhase.BACKOFF)
+                delay = 2**attempt
+                remaining = task.deadline_ms / 1000 - time.time()
+                if delay >= remaining:
+                    upload_transition(phase, UploadPhase.FAILED)
+                    raise TimeoutError("Upload retry would exceed deadline") from exc
+                logger.warning("Upload of %s failed; retrying", name)
+                await asyncio.sleep(delay)
+                phase = upload_transition(phase, UploadPhase.SENDING)
 
     async def complete(self, task: Task, payload: dict[str, Any]) -> None:
         response = await self._client.post(

@@ -16,7 +16,7 @@ from typing import Any
 
 from app.config import get_settings
 from app.pipeline.structure import extract_structure
-from app.services.job_manager import JobManager
+from app.services.pipeline_progress import NullProgress, ProgressReporter
 from app.services.roundtrip_compare import (
     compare_roundtrip_pdfs,
     load_roundtrip_manifest,
@@ -394,7 +394,7 @@ async def run_roundtrip_case(
     case_dir: Path,
     settings,
     session_maker,
-    job_manager: JobManager,
+    job_manager: ProgressReporter,
     workflow_runner: Callable[..., Awaitable[Any]] | None = None,
 ) -> RoundtripCorpusRow:
     runner = workflow_runner or resolve_workflow_runner(BENCHMARK_PROFILE_ASSISTIVE_CORE)
@@ -491,7 +491,7 @@ async def run_roundtrip_case_isolated(
     case_dir.mkdir(parents=True, exist_ok=True)
     workflow_db = case_dir / "workflow_benchmark.sqlite3"
     workflow_engine, session_maker = await _init_workflow_db(workflow_db)
-    job_manager = JobManager()
+    job_manager = NullProgress()
     try:
         return await run_roundtrip_case(
             manifest_path=manifest_path,
@@ -569,7 +569,7 @@ async def main() -> None:
     if max_jobs == 1:
         workflow_db = out_dir / "workflow_benchmark.sqlite3"
         workflow_engine, session_maker = await _init_workflow_db(workflow_db)
-        job_manager = JobManager()
+        job_manager = NullProgress()
         try:
             for index, manifest_path in enumerate(manifests, start=1):
                 print(f"[{index}/{len(manifests)}] {manifest_path}")

@@ -1,42 +1,30 @@
-from collections.abc import AsyncGenerator, Callable
+"""Schema preparation for runner task databases and offline scripts.
+
+Migration transitions::
+    pending -> applied (record only after successful migration)
+    applied -> terminal (replay skips; direct duplicate writes are rejected)
+
+Unknown stored migration IDs are retained without enum parsing. The runner
+creates its own per-task engine; callers own engine and session lifetimes.
+"""
+
+from collections.abc import Callable
 from datetime import UTC, datetime
+from enum import Enum
 
 from sqlalchemy import inspect, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-
-from app.config import get_settings
-
-_engine = None
-_async_session = None
 
 SCHEMA_MIGRATIONS_TABLE = "schema_migrations"
 
 
-def get_engine():
-    global _engine
-    if _engine is None:
-        settings = get_settings()
-        _engine = create_async_engine(settings.database_url, echo=settings.debug)
-    return _engine
+class MigrationState(Enum):
+    PENDING = "pending"
+    APPLIED = "applied"
 
 
-def get_session_maker() -> async_sessionmaker[AsyncSession]:
-    global _async_session
-    if _async_session is None:
-        _async_session = async_sessionmaker(
-            get_engine(), class_=AsyncSession, expire_on_commit=False
-        )
-    return _async_session
-
-
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    session_maker = get_session_maker()
-    async with session_maker() as session:
-        yield session
-
-
-async def init_db():
-    await prepare_schema(get_engine())
+def guard_migration_transition(current: MigrationState, target: MigrationState) -> None:
+    if (current, target) != (MigrationState.PENDING, MigrationState.APPLIED):
+        raise ValueError(f"Illegal schema migration transition: {current.value} -> {target.value}")
 
 
 async def prepare_schema(engine) -> None:
@@ -66,6 +54,12 @@ def _applied_migration_ids(sync_conn) -> set[str]:
 
 
 def _record_migration(sync_conn, migration_id: str) -> None:
+    state = (
+        MigrationState.APPLIED
+        if migration_id in _applied_migration_ids(sync_conn)
+        else MigrationState.PENDING
+    )
+    guard_migration_transition(state, MigrationState.APPLIED)
     sync_conn.execute(
         text(
             f"""
@@ -242,9 +236,7 @@ def _ensure_schema(sync_conn, review_tasks_table, applied_changes_table) -> None
             text("CREATE INDEX IF NOT EXISTS idx_alt_texts_job_id ON alt_texts (job_id)")
         )
         sync_conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS idx_review_tasks_job_id ON review_tasks (job_id)"
-            )
+            text("CREATE INDEX IF NOT EXISTS idx_review_tasks_job_id ON review_tasks (job_id)")
         )
         sync_conn.execute(
             text(

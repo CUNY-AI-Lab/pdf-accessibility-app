@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useMachine } from "../hooks/useMachine";
+import { imageTransition, initialImage } from "../state/image";
 
 interface PreviewImageProps {
   src?: string | null;
@@ -24,14 +25,14 @@ function PreviewImageAsset({
   fallbackText,
   imageClassName,
 }: PreviewImageAssetProps) {
-  const [loadState, setLoadState] = useState<"loading" | "loaded" | "error">(
-    src ? "loading" : "error",
-  );
+  const imageState = useMachine(initialImage(src), imageTransition);
+  const { status: loadState, attempt } = imageState.state;
 
-  if (!src || loadState === "error") {
+  if (!src || loadState === "missing" || loadState === "failed") {
     return (
       <div className="rounded-lg border border-ink/8 bg-white/70 p-3">
         <p className="text-xs text-ink-muted">{fallbackText}</p>
+        {loadState === "failed" && <button type="button" onClick={() => imageState.send({ type: "retry" })} className="mr-3 text-xs text-accent">Retry preview</button>}
         {directHref && (
           <a
             href={directHref}
@@ -52,11 +53,12 @@ function PreviewImageAsset({
         <div className="absolute inset-0 animate-pulse rounded-md border border-ink/6 bg-paper-warm/70" />
       )}
       <img
+        key={attempt}
         src={src}
         alt={alt}
         loading="lazy"
-        onLoad={() => setLoadState("loaded")}
-        onError={() => setLoadState("error")}
+        onLoad={() => imageState.send({ type: "loaded", source: src, attempt })}
+        onError={() => imageState.send({ type: "failed", source: src, attempt })}
         className={imageClassName}
       />
     </div>

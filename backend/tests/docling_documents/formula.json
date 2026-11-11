@@ -1,0 +1,213 @@
+{
+ "schema_name": "DoclingDocument",
+ "version": "1.10.0",
+ "name": "f",
+ "origin": {
+  "mimetype": "application/pdf",
+  "binary_hash": 6235861594085186006,
+  "filename": "f.pdf",
+  "uri": null
+ },
+ "furniture": {
+  "self_ref": "#/furniture",
+  "parent": null,
+  "children": [],
+  "content_layer": "furniture",
+  "meta": null,
+  "name": "_root_",
+  "label": "unspecified"
+ },
+ "body": {
+  "self_ref": "#/body",
+  "parent": null,
+  "children": [
+   {
+    "$ref": "#/texts/0"
+   },
+   {
+    "$ref": "#/texts/1"
+   },
+   {
+    "$ref": "#/texts/2"
+   },
+   {
+    "$ref": "#/texts/3"
+   },
+   {
+    "$ref": "#/texts/4"
+   }
+  ],
+  "content_layer": "body",
+  "meta": null,
+  "name": "_root_",
+  "label": "unspecified"
+ },
+ "groups": [],
+ "texts": [
+  {
+   "self_ref": "#/texts/0",
+   "parent": {
+    "$ref": "#/body"
+   },
+   "children": [],
+   "content_layer": "body",
+   "meta": null,
+   "label": "section_header",
+   "prov": [
+    {
+     "page_no": 1,
+     "bbox": {
+      "l": 133.76837,
+      "t": 668.798403976,
+      "r": 206.30273697600003,
+      "b": 654.452207976,
+      "coord_origin": "BOTTOMLEFT"
+     },
+     "charspan": [
+      0,
+      8
+     ]
+    }
+   ],
+   "orig": "1 Energy",
+   "text": "1 Energy",
+   "formatting": null,
+   "hyperlink": null,
+   "level": 1
+  },
+  {
+   "self_ref": "#/texts/1",
+   "parent": {
+    "$ref": "#/body"
+   },
+   "children": [],
+   "content_layer": "body",
+   "meta": null,
+   "label": "text",
+   "prov": [
+    {
+     "page_no": 1,
+     "bbox": {
+      "l": 133.76837,
+      "t": 643.43412784,
+      "r": 477.4794499999999,
+      "b": 621.51631784,
+      "coord_origin": "BOTTOMLEFT"
+     },
+     "charspan": [
+      0,
+      104
+     ]
+    }
+   ],
+   "orig": "The relation between mass and energy is a short sentence of ordinary text that comes before the formula.",
+   "text": "The relation between mass and energy is a short sentence of ordinary text that comes before the formula.",
+   "formatting": null,
+   "hyperlink": null
+  },
+  {
+   "self_ref": "#/texts/2",
+   "parent": {
+    "$ref": "#/body"
+   },
+   "children": [],
+   "content_layer": "body",
+   "meta": null,
+   "label": "formula",
+   "prov": [
+    {
+     "page_no": 1,
+     "bbox": {
+      "l": 276.33705,
+      "t": 625.03818312,
+      "r": 333.70942392,
+      "b": 602.7579122402306,
+      "coord_origin": "BOTTOMLEFT"
+     },
+     "charspan": [
+      0,
+      12
+     ]
+    }
+   ],
+   "orig": "E = mc2 + ab",
+   "text": "",
+   "formatting": null,
+   "hyperlink": null
+  },
+  {
+   "self_ref": "#/texts/3",
+   "parent": {
+    "$ref": "#/body"
+   },
+   "children": [],
+   "content_layer": "body",
+   "meta": null,
+   "label": "text",
+   "prov": [
+    {
+     "page_no": 1,
+     "bbox": {
+      "l": 133.76836999999998,
+      "t": 598.58279784,
+      "r": 477.4794499999999,
+      "b": 576.66498784,
+      "coord_origin": "BOTTOMLEFT"
+     },
+     "charspan": [
+      0,
+      97
+     ]
+    }
+   ],
+   "orig": "After the formula there is another sentence of ordinary text so the page has body text around it.",
+   "text": "After the formula there is another sentence of ordinary text so the page has body text around it.",
+   "formatting": null,
+   "hyperlink": null
+  },
+  {
+   "self_ref": "#/texts/4",
+   "parent": {
+    "$ref": "#/body"
+   },
+   "children": [],
+   "content_layer": "furniture",
+   "meta": null,
+   "label": "page_footer",
+   "prov": [
+    {
+     "page_no": 1,
+     "bbox": {
+      "l": 303.13325,
+      "t": 97.39475784000001,
+      "r": 308.11456999999996,
+      "b": 87.43211784000005,
+      "coord_origin": "BOTTOMLEFT"
+     },
+     "charspan": [
+      0,
+      1
+     ]
+    }
+   ],
+   "orig": "1",
+   "text": "1",
+   "formatting": null,
+   "hyperlink": null
+  }
+ ],
+ "pictures": [],
+ "tables": [],
+ "key_value_items": [],
+ "form_items": [],
+ "pages": {
+  "1": {
+   "size": {
+    "width": 612.0,
+    "height": 792.0
+   },
+   "image": null,
+   "page_no": 1
+  }
+ }
+}

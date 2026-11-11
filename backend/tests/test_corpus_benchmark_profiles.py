@@ -1,5 +1,9 @@
 import asyncio
 
+import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from app.models import AppliedChange, Base, Job
 from scripts import corpus_benchmark
 
 
@@ -48,3 +52,48 @@ def test_benchmark_runner_for_deterministic_profile_dispatches(monkeypatch):
 
     assert result == "deterministic"
     assert captured["args"] == ("a.pdf", "out", "settings")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["complete", "manual_remediation", "processing", "failed"])
+async def test_benchmark_finalization_acknowledges_only_finished_reviewable_changes(status):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with session_maker() as db:
+            job = Job(
+                id="benchmark",
+                filename="sample.pdf",
+                original_filename="sample.pdf",
+                owner_session_hash="benchmark-session",
+                status=status,
+                input_path="sample.pdf",
+            )
+            pending = AppliedChange(
+                job_id=job.id,
+                change_type="figure_semantics",
+                title="Figure",
+                detail="Existing description",
+                reviewable=True,
+            )
+            hidden = AppliedChange(
+                job_id=job.id,
+                change_type="reading_order",
+                title="Order",
+                detail="Applied ordering",
+                reviewable=False,
+            )
+            db.add_all([job, pending, hidden])
+            await db.commit()
+        await corpus_benchmark._finalize_review_if_needed(job.id, session_maker)
+        # A repeat is a no-op, including after the change becomes kept.
+        await corpus_benchmark._finalize_review_if_needed(job.id, session_maker)
+        async with session_maker() as db:
+            expected = "kept" if status in {"complete", "manual_remediation"} else "pending_review"
+            assert (await db.get(AppliedChange, pending.id)).review_status == expected
+            assert (await db.get(AppliedChange, hidden.id)).review_status == "pending_review"
+            assert (await db.get(Job, job.id)).status == status
+    finally:
+        await engine.dispose()

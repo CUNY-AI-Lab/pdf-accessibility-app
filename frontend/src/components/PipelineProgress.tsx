@@ -1,4 +1,5 @@
-import type { PipelineStep, StepName } from "../types";
+import type { StepName } from "../types";
+import type { DisplayPipelineStep } from "../utils/steps";
 import { CheckIcon, XIcon } from "./Icons";
 
 const STEP_META: Record<StepName, { label: string; description: string; icon: string }> = {
@@ -40,7 +41,7 @@ const STEP_META: Record<StepName, { label: string; description: string; icon: st
 };
 
 interface PipelineProgressProps {
-  steps: PipelineStep[];
+  steps: DisplayPipelineStep[];
 }
 
 export default function PipelineProgress({ steps }: PipelineProgressProps) {

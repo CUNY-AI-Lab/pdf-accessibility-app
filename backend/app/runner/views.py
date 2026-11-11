@@ -1,10 +1,9 @@
-"""What the Worker serves for a job, rendered by v1's own response code.
+"""What the Worker serves for a job, rendered by the shared response code.
 
 The Worker applies review statuses changed since the last task (keep and
 resolve) on top of these views; it does not re-implement them.
 """
 
-import asyncio
 import json
 import logging
 import mimetypes
@@ -16,17 +15,20 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.api.documents import visible_review_tasks
-from app.api.jobs import job_to_response
 from app.models import AltTextEntry, AppliedChange, Job, ReviewTask
 from app.schemas import ValidationReportResponse
 from app.services.applied_changes import change_to_response_payload, list_figure_changes
+from app.services.html_export import export_html
 from app.services.html_report import render_batch_parts, render_html_report
+from app.services.job_views import job_to_response, visible_review_tasks
 from app.services.pdf_preview import render_page_png_bytes
+from app.services.thread_work import to_thread
 
 logger = logging.getLogger(__name__)
 
 OUTPUT_READY_STATUSES = frozenset({"complete", "manual_remediation"})
+# Optional revision output; counterpart: worker/src/contract.ts.
+DOCUMENT_HTML_FILE = "document.html"
 PREVIEW_PAGES_PER_TASK = 3
 PREVIEW_TARGET_KEYS = (
     "poor_links",
@@ -152,6 +154,19 @@ async def render_views(db: AsyncSession, job_id: str) -> RenderedViews:
 
     if job.output_path and Path(job.output_path).exists():
         rendered.files.append(RenderedFile("output.pdf", Path(job.output_path), "application/pdf"))
+        try:
+            document = await to_thread(export_html, Path(job.output_path))
+            rendered.files.append(
+                RenderedFile(DOCUMENT_HTML_FILE, document.encode("utf-8"), "text/html; charset=utf-8")
+            )
+        except Exception as exc:
+            # Exception messages and tracebacks may contain document text or
+            # paths. Keep this optional-output diagnostic to identifiers/types.
+            logger.warning(json.dumps({
+                "event": "html_export_failed",
+                "job_id": job_id,
+                "error_type": type(exc).__name__,
+            }))
 
     for entry in alt_texts:
         image = Path(entry.image_path) if entry.image_path else None
@@ -169,7 +184,7 @@ async def render_views(db: AsyncSession, job_id: str) -> RenderedViews:
         if job.page_count and page > job.page_count:
             continue
         try:
-            png = await asyncio.to_thread(render_page_png_bytes, preview_source, page)
+            png = await to_thread(render_page_png_bytes, preview_source, page)
         except Exception:
             logger.exception("Could not render page %s of job %s for review", page, job_id)
             continue
