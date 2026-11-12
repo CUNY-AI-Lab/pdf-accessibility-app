@@ -7,7 +7,8 @@ Transitions::
     JSON: initial -> repair (one malformed answer)
     JSON: initial/repair -> succeeded | failed; terminal states have no successors
 
-Capability keys include endpoint, model and format; access, transport, invalid
+Capability keys include the client's capability scope (one Gateway, across
+jobs), model and format; access, transport, invalid
 schema and unrelated capability failures cannot downgrade or poison the cache.
 A request sent without json_schema states its schema in the prompt instead.
 Every request caps its output; an answer cut off at the cap is a failed call.
@@ -350,7 +351,7 @@ async def request_llm_json_with_response(
         messages.append({"role": "user", "content": request_content})
         request_kwargs: dict[str, Any] = {"temperature": 0, "max_tokens": max_tokens}
         mode = ResponseFormatMode.SCHEMA if response_schema and schema_name else ResponseFormatMode.OBJECT
-        endpoint = str(getattr(llm_client, "base_url", ""))
+        endpoint = str(getattr(llm_client, "capability_scope", "") or getattr(llm_client, "base_url", ""))
         while True:
             key = (endpoint, str(llm_client.model), mode)
             request_kwargs["messages"] = (

@@ -78,6 +78,9 @@ class ModelEndpoint:
 
     base_url: str
     headers: dict[str, str] = field(default_factory=dict)
+    # Calls with the same scope reach the same Gateway, so a model's format
+    # capabilities learned in one job hold for the next. Empty means base_url.
+    capability_scope: str = ""
 
 
 def settings_model_endpoint(settings: Any) -> ModelEndpoint:
@@ -345,6 +348,7 @@ class LlmClient:
         max_concurrency: int = 2,
         headers: dict[str, str] | None = None,
         max_request_bytes: int = DEFAULT_LLM_MAX_REQUEST_BYTES,
+        capability_scope: str = "",
     ):
         if headers is None:
             token = api_key.strip()
@@ -365,6 +369,7 @@ class LlmClient:
             ),
         )
         self.base_url = base_url.rstrip("/")
+        self.capability_scope = capability_scope.rstrip("/") or self.base_url
         self.model = model
         self.max_request_bytes = max_request_bytes
 
@@ -468,6 +473,7 @@ def make_llm_client_with_overrides(
         base_url=endpoint.base_url,
         api_key="",
         headers=endpoint.headers,
+        capability_scope=endpoint.capability_scope,
         model=settings.llm_model,
         max_request_bytes=getattr(settings, "llm_max_request_bytes", DEFAULT_LLM_MAX_REQUEST_BYTES),
         timeout=settings.llm_timeout if timeout is None else timeout,
