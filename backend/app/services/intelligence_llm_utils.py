@@ -1,7 +1,8 @@
 """Structured-response state machines used by runner semantic analysis.
 
 Transitions::
-    format: schema -> object -> text (explicit format-capability rejection only)
+    format: schema -> object -> text (explicit format-capability rejection only);
+        a client configured without json_schema starts at object
     capability: unknown/supported/unsupported -> supported/unsupported (verified response)
     capability: supported/unsupported -> unknown (900s expiry or 256-entry eviction)
     JSON: initial -> repair (one malformed answer)
@@ -350,7 +351,11 @@ async def request_llm_json_with_response(
             messages.extend(copy.deepcopy(conversation_prefix))
         messages.append({"role": "user", "content": request_content})
         request_kwargs: dict[str, Any] = {"temperature": 0, "max_tokens": max_tokens}
-        mode = ResponseFormatMode.SCHEMA if response_schema and schema_name else ResponseFormatMode.OBJECT
+        mode = (
+            ResponseFormatMode.SCHEMA
+            if response_schema and schema_name and getattr(llm_client, "json_schema", True)
+            else ResponseFormatMode.OBJECT
+        )
         endpoint = str(getattr(llm_client, "capability_scope", "") or getattr(llm_client, "base_url", ""))
         while True:
             key = (endpoint, str(llm_client.model), mode)

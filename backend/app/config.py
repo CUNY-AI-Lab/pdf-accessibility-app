@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://tools.ailab.gc.cuny.edu/v1"
     llm_api_key: str = ""
     llm_model: str = "qwen3-vl-235b-a22b-instruct"
+    # Ask for a strict JSON schema only for a model the Gateway lists with
+    # structured output (GET /v1/models). It lists this model with vision and
+    # tools only, so requests ask for json_object and state the schema instead.
+    llm_json_schema: bool = False
     # Requests ask about a page's form fields in batches and show bookmarks a
     # sample of page images.
     llm_page_candidate_batch_size: int = 12

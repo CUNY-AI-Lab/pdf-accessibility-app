@@ -376,7 +376,8 @@ def test_a_format_refusal_learned_in_one_job_holds_for_the_next(tmp_path):
             }})
         return httpx.Response(200, json={"choices": [{"message": {"content": '{"summary":"ok"}'}}]})
 
-    settings = Settings(upload_dir=tmp_path / "u", processing_dir=tmp_path / "p", output_dir=tmp_path / "o")
+    settings = Settings(upload_dir=tmp_path / "u", processing_dir=tmp_path / "p",
+                        output_dir=tmp_path / "o", llm_json_schema=True)
     worker = WorkerClient("https://tools.test/pdf-accessibility/runner", "host-token")
 
     async def run(job_id):
@@ -401,6 +402,31 @@ def test_a_format_refusal_learned_in_one_job_holds_for_the_next(tmp_path):
 
     asyncio.run(both())
     assert asked == [("job-a", "json_schema"), ("job-a", "json_object"), ("job-b", "json_object")]
+
+
+def test_the_configured_model_is_never_asked_for_json_schema(tmp_path):
+    asked = []
+
+    def gateway(request):
+        body = json.loads(request.content)
+        asked.append((body["response_format"]["type"], _stated_schema(body["messages"][-1])))
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"summary":"ok"}'}}]})
+
+    schema = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
+    settings = Settings(upload_dir=tmp_path / "u", processing_dir=tmp_path / "p", output_dir=tmp_path / "o")
+
+    async def run():
+        llm = make_llm_client(settings)
+        await llm.client.aclose()
+        llm.client = httpx.AsyncClient(base_url=llm.base_url, transport=httpx.MockTransport(gateway))
+        try:
+            await request_llm_json(llm_client=llm, content=[{"type": "text", "text": "hello"}],
+                                   schema_name="demo", response_schema=schema)
+        finally:
+            await llm.close()
+
+    asyncio.run(run())
+    assert asked == [("json_object", schema)]
 
 
 class _RecordingSchemaFallbackLlm(_SchemaFallbackLlm):

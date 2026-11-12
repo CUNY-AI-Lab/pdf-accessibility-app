@@ -118,6 +118,7 @@ Configure the app via `.env`. Key variables:
 | `LLM_BASE_URL` | Chat-completions base URL (the CAIL Gateway) | `https://tools.ailab.gc.cuny.edu/v1` |
 | `LLM_API_KEY` | Personal Gateway key for standalone benchmark scripts; the runner uses a task lease instead | — |
 | `LLM_MODEL` | Open-weight vision model on the Gateway | `qwen3-vl-235b-a22b-instruct` |
+| `LLM_JSON_SCHEMA` | Ask for a strict JSON schema (`response_format: json_schema`). Set `true` only for a model the Gateway lists with `json` in `GET /v1/models`; otherwise requests ask for `json_object` and state the schema in the prompt | `false` |
 | `LLM_MAX_REQUEST_BYTES` | Maximum complete encoded vision request body; oversized page/crop images are recompressed or downscaled before transport | `2097152` (2 MiB) |
 | `ALT_TEXT_MAX_CONCURRENCY` | Max concurrent alt-text requests per PDF | `8` |
 | `ALT_TEXT_GLOBAL_MAX_CONCURRENCY` | Process-wide cap for alt-text requests | `12` |

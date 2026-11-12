@@ -349,6 +349,7 @@ class LlmClient:
         headers: dict[str, str] | None = None,
         max_request_bytes: int = DEFAULT_LLM_MAX_REQUEST_BYTES,
         capability_scope: str = "",
+        json_schema: bool = True,
     ):
         if headers is None:
             token = api_key.strip()
@@ -370,6 +371,8 @@ class LlmClient:
         )
         self.base_url = base_url.rstrip("/")
         self.capability_scope = capability_scope.rstrip("/") or self.base_url
+        # Whether structured requests start with response_format json_schema.
+        self.json_schema = json_schema
         self.model = model
         self.max_request_bytes = max_request_bytes
 
@@ -474,6 +477,7 @@ def make_llm_client_with_overrides(
         api_key="",
         headers=endpoint.headers,
         capability_scope=endpoint.capability_scope,
+        json_schema=bool(getattr(settings, "llm_json_schema", False)),
         model=settings.llm_model,
         max_request_bytes=getattr(settings, "llm_max_request_bytes", DEFAULT_LLM_MAX_REQUEST_BYTES),
         timeout=settings.llm_timeout if timeout is None else timeout,
