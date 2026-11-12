@@ -283,6 +283,50 @@ We found three new causes among the five documents the pipeline held:
 - Two are LaTeX lecture notes. Their Computer Modern math fonts have no ToUnicode map, and their glyph names, such as `negationslash` and `summationdisplay`, are not in Adobe's glyph list (7.21.7-1).
 - One is a slide deck with a table the model classified, at low confidence, as a form layout. The pipeline left it as a table without headers, and the `table_headers` check failed.
 
+We then fixed the three causes and the unnamed field. Set 4 informed these fixes, so we no longer count it as held out. The fixes:
+- the pipeline gives a font that shows only invisible text, and draws .notdef, an empty glyph for every code, following Tesseract's glyphless font;
+- the pipeline maps TeX glyph names and Type 1 built-in encodings to Unicode;
+- the pipeline names radio groups and their unnamed options;
+- the tagger joins a table continued on the next page to the table before it, so the first page's headers apply to its rows.
+
+We re-ran every set with these fixes, and sets 1 and 2 also on the released code. Of 7,834 model calls, 606 went to the model and the rest replayed from the cassette; the runs used $1.56 of the Gateway quota.
+
+| Set | Documents | Complete before | Complete after |
+|---|---:|---:|---:|
+| 47 documents above | 47 | 44 | 44 |
+| 1 | 39 | 32 | 35 |
+| 2 | 40 | 37 | 38 |
+| 3 | 33 | 31 | 31 |
+| 4 | 37 | 32 | 37 |
+
+"Before" is the released `c867c05` for sets 1, 2 and 4, and the #64 branch for the 47 documents and set 3. Every document that completed before still completes. Extracted text is unchanged in every document except six LaTeX documents. In those, the pipeline now maps the math symbols (∑, ≠, ⟨⟩, ↦), and in two of them a screen reader no longer hears some formulas twice.
+
+### Second round: the remaining holds (2026-11-02 to 11-04)
+
+After the first round, 11 of the 196 documents were still held. We fixed the causes that recur in other documents:
+- we upgraded pikepdf from 10.5.1 to 10.17.0. Its bundled qpdf 12.3.2 dropped objects created after reading when it linearized a file with object streams and many unused object numbers, so the pipeline returned one re-saved form with four blank pages and an empty structure tree (qpdf PR #1771, fixed in 12.4.2).
+- the pipeline reads a table's order in its text's own direction, and holds a table only when its grid runs across the text. A page whose glyphs run sideways is turned upright for Docling and for OCR, and the boxes are mapped back.
+- a continuation of a table the model laid out follows that layout. A key-value table and a name and code legend get row headers. One failed table call no longer discards the decisions for every other table, and per-table calls get 30 seconds instead of 15.
+- a form's Helvetica is embedded with an encoding PDF/UA allows. Arial Narrow gets URW Nimbus Sans Narrow, which fontconfig lists as metric-compatible. The pipeline no longer maps an unknown glyph name to its base encoding's character, and it sends the model the glyph name and a zoomed crop of the glyph alone when it asks for a font map.
+- a figure image that Docling draws as a flat block is replaced by the page's rendering. Alt text that is a file name, path or URL counts as missing. Control characters are removed from author text.
+- when the Gateway refuses `json_schema`, the schema is stated in the prompt, and every structured call has an output cap. Figure batch calls now return usable decisions, and on three figure-heavy documents the pipeline made about a third as many model calls.
+
+A run after the second round showed two regressions, which we fixed before the final run. The pipeline let a figure review that could not describe a figure override a confident batch decision, and it counted a page answer "confirming" the headers of a table that had none as settling that table. The pipeline also treats a confident "no headers needed" on a headerless table as the layout decision the model used to give.
+
+| Set | Documents | After the first round | Final |
+|---|---:|---:|---:|
+| 47 documents above | 47 | 44 | 46 |
+| 1 | 39 | 35 | 38 |
+| 2 | 40 | 38 | 40 |
+| 3 | 33 | 31 | 33 |
+| 4 | 37 | 37 | 37 |
+
+Two documents are held in the final run. jj_pubs_384 has a sideways scanned chart whose direction only our own OCR suggests. math_04's diagrams use XY-pic glyphs that have no character meaning. Because the prompts changed, the cassette answered few calls; the two full runs cost $7.40, and the pipeline made 710 requests for set 4 (1,233 before). Extracted text changed in only four documents:
+- one form has back the four pages qpdf had dropped;
+- one OCR'd map's labels are read upright;
+- one glyph is ε, not a control character;
+- one deck no longer carries three control characters.
+
 ### Untagged CUNY documents
 
 | Document | Kind | Pages | Classified | Status | Held by | veraPDF | Figures with alt text | Seconds | Cost (USD) |

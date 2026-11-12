@@ -12,6 +12,7 @@ from pathlib import Path
 import pikepdf
 
 from app.config import get_settings
+from app.pipeline.page_orientation import upright_copy
 from app.pipeline.subprocess_utils import (
     SubprocessTimeout,
     communicate_with_timeout,
@@ -24,6 +25,7 @@ from app.services.llm_client import (
 )
 from app.services.ocr_access import OcrJobAccess
 from app.services.runtime_paths import enriched_subprocess_env
+from app.services.thread_work import to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +145,16 @@ async def run_ocr(
     """Run OCRmyPDF as a subprocess to add text layer to scanned PDFs.
 
     OCRmyPDF is not thread-safe, so we run it as a separate process.
+
+    With ``rotate_pages``, OCRmyPDF turns a page whose text Tesseract's
+    orientation detection finds sideways with enough confidence. A page that
+    is mostly picture, such as a map, rarely gives it that confidence, and
+    Tesseract then reads the text it finds running sideways in a direction
+    of its own choosing, sometimes upside down. A page that draws glyphs
+    shows which way its text runs, even when its fonts map them to no
+    Unicode, so a page whose visible glyphs mostly run sideways is turned
+    upright first (see page_orientation), as OCRmyPDF turns a page it is
+    confident about, and stays so.
     """
     if force_pages:
         # Rasterize only outlined pages, retaining native text elsewhere.
@@ -162,27 +174,35 @@ async def run_ocr(
             forced.output_path, output_path, language, mode=mode, pages=remaining, **options,
         )
     logger.info(f"Running OCR on {input_path.name} (language={language}, engine={engine})")
-
-    args = build_ocrmypdf_args(
-        input_path=input_path,
-        output_path=output_path,
-        language=language,
-        mode=mode,
-        rotate_pages=rotate_pages,
-        deskew=deskew,
-        jobs=jobs,
-        max_image_mpixels=max_image_mpixels,
-        engine=engine,
-        pages=pages,
-    )
     if engine == "gateway":
         raise_if_model_access_refused()
     # The directory lasts through both OCRmyPDF attempts, is shared by every
     # page process, and is never reused by a later job.
     with tempfile.TemporaryDirectory(prefix="ocr-access-") as access_dir:
-        return await _run_ocr_process(
+        ocr_input, turned = input_path, {}
+        if rotate_pages:
+            ocr_input, turned = await to_thread(
+                upright_copy, input_path, Path(access_dir) / "upright", pages
+            )
+        args = build_ocrmypdf_args(
+            input_path=ocr_input,
+            output_path=output_path,
+            language=language,
+            mode=mode,
+            rotate_pages=rotate_pages,
+            deskew=deskew,
+            jobs=jobs,
+            max_image_mpixels=max_image_mpixels,
+            engine=engine,
+            pages=pages,
+        )
+        result = await _run_ocr_process(
             args, input_path, output_path, engine, mode, jobs, timeout_seconds, Path(access_dir),
         )
+    if turned and result.success and not result.skipped:
+        note = f"Turned sideways page(s) {sorted(i + 1 for i in turned)} upright to read them"
+        result.message = "; ".join(filter(None, [note, result.message]))
+    return result
 
 
 async def _run_ocr_process(

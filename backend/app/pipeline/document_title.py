@@ -19,6 +19,8 @@ import pikepdf
 import pypdfium2 as pdfium
 import pypdfium2.raw as raw
 
+from app.services.pdf_objects import author_text
+
 OFFICE_TITLE_PREFIX_RE = re.compile(r"^microsoft\s+(?:office\s+)?(?:word|powerpoint|excel)\s*-", re.I)
 FILE_NAME_TITLE_RE = re.compile(r"\.(?:pdf|docx?|pptx?|xlsx?|odt|odp|rtf|txt|indd|pages|key|tex)$", re.I)
 PLACEHOLDER_TITLE_RE = re.compile(
@@ -40,7 +42,8 @@ BOILERPLATE_RE = re.compile(
 
 
 def _clean(value: Any) -> str:
-    return " ".join(str(value or "").replace("\u00ad", "").split())
+    # Author metadata can end in a NUL or other control character.
+    return author_text(str(value or "").replace("\u00ad", ""))
 
 
 def _key(value: Any) -> str:

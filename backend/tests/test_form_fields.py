@@ -165,3 +165,63 @@ def test_apply_field_accessible_names_does_not_write_tu_to_containers(tmp_path):
         assert str(widget["/TU"]) == "Qualified business income checkbox"
         assert str(top["/TU"]) == "Firm's EIN"
         assert "/TU" not in page_container
+
+
+def _widget(pdf: pikepdf.Pdf, x: float, entries: dict[str, pikepdf.Object]) -> pikepdf.Dictionary:
+    return pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Widget"),
+                "/Rect": pikepdf.Array([x, 10, x + 10, 20]),
+                **entries,
+            }
+        )
+    )
+
+
+def test_apply_field_accessible_names_labels_group_options_on_their_widgets(tmp_path):
+    pdf_path = tmp_path / "group.pdf"
+    output_path = tmp_path / "group-labeled.pdf"
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    group = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/T": pikepdf.String("Semester"),
+                "/FT": pikepdf.Name("/Btn"),
+                "/Ff": 49152,
+            }
+        )
+    )
+    fall = _widget(pdf, 10, {"/Parent": group})
+    spring = _widget(pdf, 30, {"/Parent": group})
+    group["/Kids"] = pikepdf.Array([fall, spring])
+    single = pdf.make_indirect(
+        pikepdf.Dictionary({"/T": pikepdf.String("f1_01[0]"), "/FT": pikepdf.Name("/Tx")})
+    )
+    single_widget = _widget(pdf, 50, {"/Parent": single})
+    single["/Kids"] = pikepdf.Array([single_widget])
+    standalone = _widget(pdf, 70, {"/T": pikepdf.String("c1_9[0]"), "/FT": pikepdf.Name("/Btn")})
+    page["/Annots"] = pikepdf.Array([fall, spring, single_widget, standalone])
+    pdf.Root["/AcroForm"] = pikepdf.Dictionary(
+        {"/Fields": pikepdf.Array([group, single, standalone])}
+    )
+    pdf.save(pdf_path)
+    review_ids = [field["field_review_id"] for field in extract_widget_fields(pdf_path)]
+    labels = ["Semester: Fall", "Semester: Spring", "First name", "I agree"]
+
+    applied = apply_field_accessible_names(
+        input_pdf=pdf_path,
+        output_pdf=output_path,
+        labels_by_review_id=dict(zip(review_ids, labels, strict=True)),
+    )
+
+    assert applied == review_ids
+    with pikepdf.Pdf.open(output_path) as pdf:
+        group, single, standalone = pdf.Root["/AcroForm"]["/Fields"]
+        assert "/TU" not in group
+        assert [str(kid["/TU"]) for kid in group["/Kids"]] == labels[:2]
+        assert str(single["/TU"]) == "First name"
+        assert str(single["/Kids"][0]["/TU"]) == "First name"
+        assert str(standalone["/TU"]) == "I agree"

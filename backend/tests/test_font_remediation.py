@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1694,11 +1695,245 @@ async def test_pretag_table_intelligence_times_out_cleanly(monkeypatch, tmp_path
         structure_json=original_structure,
     )
 
+    # The late answer would have set headers; the timed-out table keeps none.
     assert updated == original_structure
     assert audit["applied"] is False
-    assert audit["reason"].startswith(
-        "llm_failed: table_intelligence[review-timeout] timed out after "
+    assert audit["individual_fallback_failed_count"] == 1
+    assert audit["reason"] == "no_safe_resolutions"
+
+
+@pytest.mark.asyncio
+async def test_pretag_table_intelligence_keeps_decisions_when_one_table_call_fails(
+    monkeypatch, tmp_path
+):
+    """A failed call for one table, first or on retry, leaves the decisions
+    for the other tables in the document."""
+
+    def target(review_id, page, reasons, header_rows=()):
+        return {
+            "table_review_id": review_id,
+            "page": page,
+            "bbox": {"l": 10, "t": 20, "r": 100, "b": 60},
+            "num_rows": 2,
+            "num_cols": 2,
+            "risk_score": 1.5,
+            "risk_reasons": reasons,
+            "header_rows": list(header_rows),
+            "row_header_columns": [],
+        }
+
+    def answer(review_id, action, **extra):
+        return {
+            "table_review_id": review_id,
+            "confidence": "medium",
+            "suggested_action": action,
+            **extra,
+        }
+
+    targets = [
+        target("review-a", 1, ["weak header signal"]),
+        target("review-b", 2, ["weak header signal"]),
+        target("review-c", 3, ["merged cells or spans present"]),
+        target("review-d", 4, ["multi-level header pattern"], header_rows=[0]),
+    ]
+
+    async def _fake_generate_page(**kwargs):
+        return [answer(t["table_review_id"], "manual_only") for t in kwargs["targets"]]
+
+    async def _fake_generate(**kwargs):
+        review_id = kwargs["target"]["table_review_id"]
+        if review_id == "review-a" or kwargs.get("aggressive"):
+            raise RuntimeError(f"table_intelligence[{review_id}] timed out after 18.8s")
+        if review_id == "review-b":
+            return answer(review_id, "set_table_headers", header_rows=[0], row_header_columns=[])
+        return answer(review_id, "manual_only")
+
+    structure = {
+        "elements": [
+            {
+                "review_id": t["table_review_id"],
+                "type": "table",
+                "page": t["page"] - 1,
+                "num_rows": 2,
+                "num_cols": 2,
+                "cells": [
+                    {"row": r, "col": c, "text": f"{r}{c}"} for r in range(2) for c in range(2)
+                ],
+            }
+            for t in targets
+        ]
+    }
+    original = copy.deepcopy(structure)
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence_for_page", _fake_generate_page)
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence", _fake_generate)
+    updated, audit = await _apply_pretag_table_intelligence(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_table_intelligence=True),
+        structure_json=structure,
+        targets=targets,
     )
+
+    assert structure == original
+    decisions = {t["review_id"]: t.get("table_llm_decisions") for t in updated["elements"]}
+    assert decisions["review-b"][0]["header_rows"] == [0]
+    assert [decisions[r] for r in ("review-a", "review-c", "review-d")] == [None] * 3
+    assert audit["individual_fallback_failed_count"] == 1
+    # review-c's aggressive retry, and review-d's and its confirming retry.
+    assert audit["retry_failed_count"] == 3
+    assert audit["queued_count"] == 1
+    assert audit["reason"] == "queued_for_tagger"
+
+
+@pytest.mark.asyncio
+async def test_pretag_table_confirmation_of_no_headers_asks_about_the_table_alone(
+    monkeypatch, tmp_path
+):
+    """A page's answer that confirms the current headers settles a table that
+    has headers. For a table with none it confirms nothing, so that table is
+    asked about on its own and gets the decision of that answer."""
+
+    def target(review_id, page, header_rows):
+        return {
+            "table_review_id": review_id,
+            "page": page,
+            "bbox": {"l": 10, "t": 20, "r": 100, "b": 60},
+            "num_rows": 2,
+            "num_cols": 2,
+            "risk_score": 1.0,
+            "risk_reasons": ["missing_docling_simple_headers"],
+            "header_rows": header_rows,
+            "row_header_columns": [],
+        }
+
+    targets = [target("review-plain", 1, []), target("review-headed", 1, [0])]
+    asked = []
+
+    async def _fake_generate_page(**kwargs):
+        return [
+            {
+                "table_review_id": t["table_review_id"],
+                "confidence": "high",
+                "suggested_action": "confirm_current_headers",
+                "resolved_kind": "layout_grid",
+            }
+            for t in kwargs["targets"]
+        ]
+
+    async def _fake_generate(**kwargs):
+        asked.append(kwargs["target"]["table_review_id"])
+        return {
+            "table_review_id": kwargs["target"]["table_review_id"],
+            "confidence": "low",
+            "suggested_action": "reclassify_region",
+            "resolved_kind": "layout_grid",
+        }
+
+    def table(review_id, headed):
+        return {
+            "review_id": review_id,
+            "type": "table",
+            "page": 0,
+            "num_rows": 2,
+            "num_cols": 2,
+            "cells": [
+                {"row": r, "col": c, "text": f"{r}{c}", "column_header": headed and r == 0}
+                for r in range(2)
+                for c in range(2)
+            ],
+        }
+
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence_for_page", _fake_generate_page)
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence", _fake_generate)
+    updated, audit = await _apply_pretag_table_intelligence(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_table_intelligence=True),
+        structure_json={"elements": [table("review-plain", False), table("review-headed", True)]},
+        targets=targets,
+    )
+
+    plain, headed = updated["elements"]
+    assert asked == ["review-plain"]
+    assert audit["page_batch_resolved_count"] == 1
+    assert [d["resolved_kind"] for d in plain["table_llm_decisions"]] == ["layout_grid"]
+    assert headed["table_llm_confirmed"] is True and "table_llm_decisions" not in headed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("confidence", "laid_out"), [("high", True), ("medium", False)])
+async def test_pretag_confident_confirmation_of_no_headers_lays_the_table_out(
+    monkeypatch, tmp_path, confidence, laid_out
+):
+    """A table's own answer confirming headers it lacks, given with high
+    confidence, is the model saying it is not a data table: it becomes a
+    layout grid. A less confident one leaves the table without a decision."""
+
+    target = {
+        "table_review_id": "review-names",
+        "page": 1,
+        "bbox": {"l": 10, "t": 20, "r": 100, "b": 60},
+        "num_rows": 2,
+        "num_cols": 3,
+        "risk_score": 1.0,
+        "risk_reasons": ["missing_docling_simple_headers"],
+        "header_rows": [],
+        "row_header_columns": [],
+    }
+
+    async def _fake_generate_page(**kwargs):
+        return [
+            {"table_review_id": t["table_review_id"], "suggested_action": "manual_only"}
+            for t in kwargs["targets"]
+        ]
+
+    async def _fake_generate(**kwargs):
+        return {
+            "table_review_id": kwargs["target"]["table_review_id"],
+            "confidence": confidence,
+            "suggested_action": "confirm_current_headers",
+            "reason": "A flat list of names; no headers are needed.",
+        }
+
+    element = {
+        "review_id": "review-names",
+        "type": "table",
+        "page": 0,
+        "num_rows": 2,
+        "num_cols": 3,
+        "cells": [{"row": r, "col": c, "text": f"Name {r}{c}"} for r in range(2) for c in range(3)],
+    }
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence_for_page", _fake_generate_page)
+    monkeypatch.setattr(orchestrator, "generate_table_intelligence", _fake_generate)
+    updated, audit = await _apply_pretag_table_intelligence(
+        job=SimpleNamespace(
+            id="job-1",
+            original_filename="sample.pdf",
+            input_path=str(tmp_path / "sample.pdf"),
+            output_path=None,
+        ),
+        settings=_settings(auto_apply_table_intelligence=True),
+        structure_json={"elements": [element]},
+        targets=[target],
+    )
+
+    (table,) = updated["elements"]
+    if laid_out:
+        (decision,) = table["table_llm_decisions"]
+        assert decision["suggested_action"] == "reclassify_region"
+        assert decision["resolved_kind"] == "layout_grid"
+        assert audit["confirmed_no_headers_layout_count"] == 1
+    else:
+        assert "table_llm_decisions" not in table
+        assert not audit.get("confirmed_no_headers_layout_count")
 
 
 @pytest.mark.asyncio
@@ -1768,11 +2003,11 @@ async def test_pretag_table_intelligence_uses_pretag_timeout_override(monkeypatc
         structure_json=original_structure,
     )
 
+    # The late answer would have set headers; the timed-out table keeps none.
     assert updated == original_structure
     assert audit["applied"] is False
-    assert audit["reason"].startswith(
-        "llm_failed: table_intelligence[review-timeout] timed out after "
-    )
+    assert audit["individual_fallback_failed_count"] == 1
+    assert audit["reason"] == "no_safe_resolutions"
 
 
 def test_font_name_normalization_strips_subset_prefix_and_punctuation():

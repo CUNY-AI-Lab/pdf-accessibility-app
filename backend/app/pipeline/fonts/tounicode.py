@@ -347,6 +347,12 @@ def _repair_pdf_tounicode_sync(
         if _symbol_family(font_dict) or font_dict.get("/Subtype") == pikepdf.Name("/Type3"):
             # Preserve valid author semantics, including opaque Type3 glyph names.
             target_map = {**target_map, **existing_map}
+        else:
+            # Generated values win; valid authored values cover used codes they lack.
+            target_map = {
+                **{code: existing_map[code] for code in used_codes if code in existing_map},
+                **target_map,
+            }
         if not target_map and not invalid_entries:
             return False, 0, len(generated), 0, 0, 0
 

@@ -1311,6 +1311,59 @@ def test_fidelity_uses_output_struct_tree_for_table_coverage(monkeypatch, tmp_pa
     assert task["metadata"]["tagged_tables"] == 0
 
 
+@pytest.mark.parametrize("joined", [False, True])
+def test_table_continued_on_the_next_page_counts_as_one_table(monkeypatch, tmp_path, joined):
+    monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
+    monkeypatch.setattr(fidelity, "_output_struct_type_counts", lambda path: {"Table": 1})
+    monkeypatch.setattr(
+        fidelity,
+        "_sample_visual_ink",
+        lambda path: {
+            "sampled_pages": 1,
+            "pages_with_visible_ink": 1,
+            "mean_ink_ratio": 0.01,
+            "max_ink_ratio": 0.01,
+            "visually_blank": False,
+        },
+    )
+    tables = [
+        {
+            "type": "table",
+            "page": page,
+            "bbox": {"l": 72, "t": 700, "r": 520, "b": 200},
+            "num_rows": 2,
+            "num_cols": 2,
+            "cells": [
+                {"row": row, "col": col, "text": f"cell {page}{row}{col}"}
+                for row in range(2)
+                for col in range(2)
+            ],
+        }
+        for page in range(2)
+    ]
+    continuation = {
+        "page": 2,
+        "table_review_id": "review-1",
+        "continues_page": 1,
+        "continues_table_review_id": "review-0",
+    }
+    report, tasks = assess_fidelity(
+        input_pdf=_blank_output_pdf(tmp_path, "in.pdf"),
+        output_pdf=_blank_output_pdf(tmp_path),
+        structure_json={"elements": tables},
+        alt_entries=[],
+        validation_report=_validation_report(compliant=True, violations=[]),
+        tagging_metrics={"tables_tagged": 1, "tables_joined": [continuation] if joined else []},
+        classification="digital",
+    )
+
+    checks = {check["check"]: check for check in report["checks"]}
+    assert checks["table_coverage"]["status"] == ("pass" if joined else "warning")
+    risk = next(task for task in tasks if task["title"] == "Review complex table semantics")
+    reviewed = [target["table_review_id"] for target in risk["metadata"]["table_review_targets"]]
+    assert reviewed == (["review-0"] if joined else ["review-0", "review-1"])
+
+
 def test_fidelity_advises_when_detected_figures_are_not_tagged(monkeypatch, tmp_path):
     monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
     monkeypatch.setattr(fidelity, "_sample_visual_ink", lambda path: {

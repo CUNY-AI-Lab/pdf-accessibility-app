@@ -13,7 +13,7 @@ from app.services.intelligence_normalize import confidence_label, confidence_sco
 from app.services.intelligence_semantics import adjudicate_semantic_unit
 from app.services.llm_client import LlmClient
 from app.services.semantic_units import SemanticUnit
-from app.services.table_decisions import table_action
+from app.services.table_decisions import TABLE_REGION_KINDS, table_action
 
 TABLE_BATCH_PROMPT = """You are a PDF accessibility table-semantics assistant.
 
@@ -52,7 +52,7 @@ TABLE_BATCH_SCHEMA: dict[str, Any] = {
                         "type": "string",
                         "enum": ["confirm_current_headers", "set_table_headers", "reclassify_region", "manual_only"],
                     },
-                    "resolved_kind": {"type": "string", "enum": ["layout_grid", "toc_group", "text_block", "form_region"]},
+                    "resolved_kind": {"type": "string", "enum": list(TABLE_REGION_KINDS)},
                     "reason": {"type": "string"},
                     "header_rows": {
                         "type": "array",

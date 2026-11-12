@@ -5,43 +5,66 @@ from collections import defaultdict
 import pikepdf
 
 from app.pipeline.tagger_table_structure import _associate_columns, _table_has_headers
-from app.services.table_decisions import LAYOUT_KINDS, has_headers, header_selection, table_action
+from app.pipeline.tagger_tables import _key_value_table, _name_code_pairs
+from app.services.table_decisions import (
+    LAYOUT_KINDS,
+    TABLE_REGION_KINDS,
+    has_headers,
+    header_selection,
+    table_action,
+    unsupported_region_kind,
+)
 
 
-def _model_table_layout(table: dict) -> dict | None:
+def _model_table_layout(table: dict, continues: dict | None = None) -> dict | None:
+    """The layout a model reclassification makes of ``table``. The part of
+    a table continued from the page before (_continued_table) takes that
+    table's layout instead of any decision of its own. A key-value table or
+    a name | code directory stays a table (its labels become row headers)
+    against a low-confidence reclassification."""
     if table.get("_table_readability") or has_headers(table):
         return None
-    for item in table.get("table_llm_decisions", []):
-        if (
-            table_action(item) != "reclassify_region"
-            or item.get("resolved_kind") not in LAYOUT_KINDS
-        ):
-            continue
-        rows = defaultdict(list)
-        for c in table.get("cells", []):
-            if isinstance(c, dict):
-                rows[c.get("row", 0)].append(c)
-        groups = [
-            [
-                (c.get("row", 0), c.get("col", 0))
-                for c in sorted(rows[r], key=lambda c: c.get("col", 0))
-            ]
-            for r in sorted(rows)
+    if continues is None:
+        paired = _key_value_table(table) or _name_code_pairs(table) is not None
+        kinds = [
+            item.get("resolved_kind")
+            for item in table.get("table_llm_decisions", [])
+            if table_action(item) == "reclassify_region"
+            and not (item.get("confidence") == "low" and paired)
         ]
-        if groups:
-            kind = item["resolved_kind"]
-            return {
-                "reason": f"model reclassify_region: {kind}",
-                "order": "row",
-                "model_kind": kind,
-                "blocks": [{"role": "L" if kind == "toc_group" else "P", "groups": groups}],
-            }
-    return None
+    else:
+        kinds = [(continues.get("_layout_table") or {}).get("model_kind")]
+    kind = next((k for k in kinds if k in LAYOUT_KINDS), None)
+    rows = defaultdict(list)
+    for c in table.get("cells", []):
+        if isinstance(c, dict):
+            rows[c.get("row", 0)].append(c)
+    groups = [
+        [(c.get("row", 0), c.get("col", 0)) for c in sorted(rows[r], key=lambda c: c.get("col", 0))]
+        for r in sorted(rows)
+    ]
+    if kind is None or not groups:
+        return None
+    layout = {
+        "reason": f"model reclassify_region: {kind}",
+        "order": "row",
+        "model_kind": kind,
+        "blocks": [{"role": "L" if kind == "toc_group" else "P", "groups": groups}],
+    }
+    if continues is not None:
+        layout["continues_page"] = continues.get("page", 0) + 1
+    return layout
 
 
 def _apply_model_table_headers(builder, pages: dict[int, list[dict]]) -> list[dict]:
     audit = []
     applied_layouts = set()
+    # The parts of a table on later pages, joined to it (_finish_table_structure).
+    parts = defaultdict(list)
+    for elems in pages.values():
+        for table in elems:
+            if table.get("_joined_table"):
+                parts[id(table["_continues_table"])].append(table)
     for elems in pages.values():
         for table in elems:
             if table.get("type") != "table":
@@ -51,7 +74,16 @@ def _apply_model_table_headers(builder, pages: dict[int, list[dict]]) -> list[di
             for item in table.get("table_llm_decisions", []):
                 action, kind = table_action(item), item.get("resolved_kind")
                 status = "unsupported_decision"
-                if table.get("_table_readability"):
+                if unsupported_region_kind(item):
+                    # The model named a kind nothing applies; the table stays.
+                    status = "unsupported_kind"
+                elif table.get("_joined_table"):
+                    # Its rows are the table's it continues, whose decision covers them.
+                    status = "joined_previous_table"
+                elif layout.get("continues_page"):
+                    # It continues the layout the model made of the table before.
+                    status = "follows_previous_table"
+                elif table.get("_table_readability"):
                     status = "blocked_unreadable_table"
                 elif layout:
                     status = "superseded_by_layout"
@@ -61,7 +93,7 @@ def _apply_model_table_headers(builder, pages: dict[int, list[dict]]) -> list[di
                         else:
                             status = "applied_layout"
                             applied_layouts.add(id(table))
-                elif action == "reclassify_region" and kind == "form_region":
+                elif action == "reclassify_region" and kind in TABLE_REGION_KINDS:
                     status = "kept_table"
                 elif action == "set_table_headers" and cells:
                     node = next(iter(cells.values())).P.P
@@ -85,6 +117,22 @@ def _apply_model_table_headers(builder, pages: dict[int, list[dict]]) -> list[di
                                 cell.ID = pikepdf.String(
                                     f"t{node.objgen[0]}-model-r{c.get('row', 0)}-c{c.get('col', 0)}"
                                 )
+                            # Its row headers label the rows it continues onto too.
+                            columns = set(item.get("row_header_columns") or [])
+                            for part in parts.get(id(table), []):
+                                offset = part["_joined_row_offset"]
+                                part_cells = builder._fragmented_table_cache.get(id(part), {})
+                                for (row, col), cell in part_cells.items():
+                                    if col in columns and cell.S == "/TD":
+                                        cell.S = pikepdf.Name.TH
+                                        attrs = cell.get("/A") or pikepdf.Dictionary(
+                                            O=pikepdf.Name.Table
+                                        )
+                                        attrs.Scope = pikepdf.Name.Row
+                                        cell.A = attrs
+                                        cell.ID = pikepdf.String(
+                                            f"t{node.objgen[0]}-model-r{offset + row}-c{col}"
+                                        )
                             _associate_columns(node)
                             for row in node.K:
                                 row_ids = [
@@ -95,8 +143,9 @@ def _apply_model_table_headers(builder, pages: dict[int, list[dict]]) -> list[di
                                         attrs = cell.get("/A") or pikepdf.Dictionary(
                                             O=pikepdf.Name.Table
                                         )
+                                        existing = list(attrs.get("/Headers") or [])
                                         attrs.Headers = pikepdf.Array(
-                                            [*(attrs.get("/Headers") or []), *row_ids]
+                                            existing + [i for i in row_ids if i not in existing]
                                         )
                                         cell.A = attrs
                             status = "applied_headers"
