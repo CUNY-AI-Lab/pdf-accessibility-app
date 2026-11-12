@@ -1,10 +1,13 @@
 import asyncio
+import json
 from pathlib import Path
 
 import httpx
 import pikepdf
 import pytest
 
+from app.config import Settings
+from app.runner.client import Task, WorkerClient
 from app.services.intelligence_llm_utils import (
     FORMAT_CAPABILITIES,
     apply_cache_breakpoint,
@@ -14,6 +17,7 @@ from app.services.intelligence_llm_utils import (
     request_llm_json_with_response,
     request_pdf_pages_json,
 )
+from app.services.llm_client import job_model_access, make_llm_client
 
 
 @pytest.fixture(autouse=True)
@@ -356,6 +360,73 @@ def test_a_model_that_refused_json_schema_is_asked_for_json_object_next_time():
         "json_object",
     ]
     assert [call["response_format"]["type"] for call in second.calls] == ["json_object"]
+
+
+def test_a_format_refusal_learned_in_one_job_holds_for_the_next(tmp_path):
+    # Each runner task has its own relay URL; all of them reach one Gateway.
+    asked = []
+
+    def gateway(request):
+        requested = json.loads(request.content)["response_format"]["type"]
+        asked.append((request.url.path.split("/tasks/")[1].split("/")[0], requested))
+        if requested == "json_schema":
+            return httpx.Response(400, json={"error": {
+                "code": "capability_unsupported",
+                "message": 'The model "check-model" does not support response_format json_schema.',
+            }})
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"summary":"ok"}'}}]})
+
+    settings = Settings(upload_dir=tmp_path / "u", processing_dir=tmp_path / "p",
+                        output_dir=tmp_path / "o", llm_json_schema=True)
+    worker = WorkerClient("https://tools.test/pdf-accessibility/runner", "host-token")
+
+    async def run(job_id):
+        task = Task.from_json({"job_id": job_id, "kind": "process", "lease": "lease", "attempt": 1,
+                               "deadline": 4_102_444_800_000, "original_filename": "a.pdf"})
+        with job_model_access(worker.model_endpoint(task)):
+            llm = make_llm_client(settings)
+            await llm.client.aclose()
+            llm.client = httpx.AsyncClient(base_url=llm.base_url, transport=httpx.MockTransport(gateway))
+            try:
+                await request_llm_json(llm_client=llm, content=[{"type": "text", "text": "hello"}],
+                                       schema_name="demo", response_schema={
+                                           "type": "object", "properties": {"summary": {"type": "string"}},
+                                           "required": ["summary"]})
+            finally:
+                await llm.close()
+
+    async def both():
+        await run("job-a")
+        await run("job-b")
+        await worker.close()
+
+    asyncio.run(both())
+    assert asked == [("job-a", "json_schema"), ("job-a", "json_object"), ("job-b", "json_object")]
+
+
+def test_the_configured_model_is_never_asked_for_json_schema(tmp_path):
+    asked = []
+
+    def gateway(request):
+        body = json.loads(request.content)
+        asked.append((body["response_format"]["type"], _stated_schema(body["messages"][-1])))
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"summary":"ok"}'}}]})
+
+    schema = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
+    settings = Settings(upload_dir=tmp_path / "u", processing_dir=tmp_path / "p", output_dir=tmp_path / "o")
+
+    async def run():
+        llm = make_llm_client(settings)
+        await llm.client.aclose()
+        llm.client = httpx.AsyncClient(base_url=llm.base_url, transport=httpx.MockTransport(gateway))
+        try:
+            await request_llm_json(llm_client=llm, content=[{"type": "text", "text": "hello"}],
+                                   schema_name="demo", response_schema=schema)
+        finally:
+            await llm.close()
+
+    asyncio.run(run())
+    assert asked == [("json_object", schema)]
 
 
 class _RecordingSchemaFallbackLlm(_SchemaFallbackLlm):

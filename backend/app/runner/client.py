@@ -138,6 +138,8 @@ class WorkerClient:
         return ModelEndpoint(
             base_url=f"{self.base_url}/tasks/{task.job_id}/v1",
             headers={RUNNER_TOKEN_HEADER: self._token, JOB_TOKEN_HEADER: task.lease},
+            # Every task's relay reaches the same Gateway.
+            capability_scope=f"{self.base_url}/v1",
         )
 
     async def claim(self, runner_id: str) -> Task | None:
