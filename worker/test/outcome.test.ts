@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LIMITS } from "../src/board";
 import type { JsonValue } from "../src/contract";
 import { jobBoard } from "../src/env";
-import { type JobFinished, jobFinishedSchema } from "../src/outcome";
+import { type JobFinished, jobFinishedSchema, storedJobFinishedSchema } from "../src/outcome";
 import { alice, api, claim, createdJobId, finishedJob, finishProcess, ORIGIN, putFile, runner, type TestTask, upload } from "./helpers";
 
 const usage = (requests: number) => ({
@@ -222,5 +222,70 @@ describe("job_finished", () => {
     expect(event?.kind).toBe("review");
     expect(Object.keys(event?.steps ?? {})).toEqual(["tagging", "validation", "fidelity"]);
     expect(event?.model_usage?.requests).toBe(1);
+  });
+});
+
+/** An event as Workers Logs keeps it: without its null fields, empty arrays and empty objects. */
+function asStored(event: JobFinished): string {
+  return JSON.stringify(event, (_key, value: JsonValue) => {
+    const empty = value === null || (Array.isArray(value) ? value.length === 0 : value instanceof Object && Object.keys(value).length === 0);
+    return empty ? undefined : value;
+  });
+}
+
+/** A held upload's event as the telemetry API returned one in production, with the log's own fields. */
+const storedHeldUpload = {
+  event: "job_finished",
+  job: "job-1",
+  kind: "process",
+  attempt: 1,
+  status: "manual_remediation",
+  classification: "ocr_scan",
+  pages: 1,
+  seconds: 184,
+  steps: { classify: { status: "complete", seconds: 0.2 }, ocr: { status: "skipped" } },
+  validation_compliant: false,
+  blocking_tasks: 1,
+  advisory_tasks: 1,
+  review_tasks: { font_text_fidelity: { total: 1, blocking: 1 } },
+  hidden_blocking_tasks: 0,
+  held_by: ["compliance"],
+  model_usage: { requests: 4, prompt_tokens: 13011, completion_tokens: 235, cost_usd: 0 },
+  attempt_id: "attempt-1",
+  result_id: "job-1/attempt-1/result",
+};
+
+describe("job_finished read back from Workers Logs", () => {
+  it("reads back a complete upload's and a failed upload's events without the fields Workers Logs leaves out", async () => {
+    await upload();
+    expect((await finishProcess(await claimed(), "complete")).status).toBe(204);
+    await upload();
+    const failing = await claimed();
+    for (const event of [{ step: "classify", status: "complete", result: { type: "scanned" } }, { step: "ocr", status: "skipped" }]) {
+      await runner(`/tasks/${failing.job_id}/progress`, { method: "POST", lease: failing.lease, body: JSON.stringify(event) });
+    }
+    const failed = await runner(`/tasks/${failing.job_id}/fail`, { method: "POST", lease: failing.lease, body: JSON.stringify({ error: "OCR failed" }) });
+    expect(failed.status).toBe(204);
+    const events = finishedEvents();
+    expect(events.map((event) => [event.status, event.failure])).toEqual([["complete", null], ["failed", "runner"]]);
+    expect(events[1]?.steps["ocr"]?.seconds).toBeNull();
+    for (const event of events) {
+      const stored: unknown = JSON.parse(asStored(event));
+      expect(jobFinishedSchema.safeParse(stored).success).toBe(false);
+      expect(storedJobFinishedSchema.parse(stored)).toEqual(event);
+    }
+  });
+
+  it("restores a stored event's missing nulls, down to a step's seconds", () => {
+    const event = storedJobFinishedSchema.parse(storedHeldUpload);
+    expect(event.failure).toBeNull();
+    expect(event.failed_step).toBeNull();
+    expect(event.steps["ocr"]).toEqual({ status: "skipped", seconds: null });
+    expect(event.held_by).toEqual(["compliance"]);
+  });
+
+  it("still rejects a stored event missing a field that has no empty value", () => {
+    const withoutStatus = Object.fromEntries(Object.entries(storedHeldUpload).filter(([key]) => key !== "status"));
+    expect(storedJobFinishedSchema.safeParse(withoutStatus).success).toBe(false);
   });
 });

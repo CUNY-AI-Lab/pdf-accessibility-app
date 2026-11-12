@@ -56,8 +56,10 @@ const modelUsageSchema = z.object({
 });
 export type ModelUsage = z.infer<typeof modelUsageSchema>;
 const taskCountSchema = z.object({ total: z.number(), blocking: z.number() });
+const failureSchema = z.enum(["pipeline", "runner", "deadline", "interrupted", "sign_in_ending"]).nullable();
+const stepTimingSchema = z.object({ status: z.string(), seconds: z.number().nullable() });
 
-/** The event as logged, and as dev/outcomes.ts reads it back. */
+/** The event as logged; `storedJobFinishedSchema` reads it back. */
 export const jobFinishedSchema = z.object({
   event: z.literal(JOB_FINISHED),
   job: z.string(),
@@ -70,13 +72,13 @@ export const jobFinishedSchema = z.object({
    * error, its own deadline), or the Worker ended it (deadline, runner gone
    * twice, sign-in ending before the work could start).
    */
-  failure: z.enum(["pipeline", "runner", "deadline", "interrupted", "sign_in_ending"]).nullable(),
+  failure: failureSchema,
   failed_step: z.string().nullable(),
   classification: z.string().nullable(),
   pages: z.number().nullable(),
   /** From the upload (process) or the review request (review) to the end. */
   seconds: z.number(),
-  steps: z.record(z.string(), z.object({ status: z.string(), seconds: z.number().nullable() })),
+  steps: z.record(z.string(), stepTimingSchema),
   validation_compliant: z.boolean().nullable(),
   /** The whole backlog's counts, including tasks the review screen does not show. */
   blocking_tasks: z.number().nullable(),
@@ -92,6 +94,28 @@ export const jobFinishedSchema = z.object({
   /** The release gate checks that failed or could not run. */
   held_by: z.array(z.string()),
   model_usage: modelUsageSchema.nullable(),
+});
+
+/**
+ * The event as `dev/outcomes.ts` reads it from Workers Observability.
+ * Workers Logs stores an event without its null fields, empty arrays and
+ * empty objects: a finished upload comes back with no `failure`, and with no
+ * `held_by` when nothing held it. Each such field reads back as that empty
+ * value. A field missing for any other reason still fails.
+ */
+export const storedJobFinishedSchema = jobFinishedSchema.extend({
+  failure: failureSchema.default(null),
+  failed_step: z.string().nullable().default(null),
+  classification: z.string().nullable().default(null),
+  pages: z.number().nullable().default(null),
+  steps: z.record(z.string(), stepTimingSchema.extend({ seconds: z.number().nullable().default(null) })).default({}),
+  validation_compliant: z.boolean().nullable().default(null),
+  blocking_tasks: z.number().nullable().default(null),
+  advisory_tasks: z.number().nullable().default(null),
+  review_tasks: z.record(z.string(), taskCountSchema).default({}),
+  hidden_blocking_tasks: z.number().nullable().default(null),
+  held_by: z.array(z.string()).default([]),
+  model_usage: modelUsageSchema.nullable().default(null),
 });
 export type JobFinished = z.infer<typeof jobFinishedSchema>;
 export type FailureReason = NonNullable<JobFinished["failure"]>;

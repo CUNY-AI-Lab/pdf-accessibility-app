@@ -54,6 +54,12 @@ It needs `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`. The Gateway
 reports no cost per call, so the cost comes from the tokens at the prices
 given (the model's catalog price per million tokens).
 
+Workers Logs stores each event without its null fields and empty arrays and
+objects, and Cloudflare samples the events of a long query window. The script
+restores the missing fields (`storedJobFinishedSchema`) and splits a sampled
+window until each part comes back whole. If an event still cannot be read, or
+a window stays sampled, it says so and exits with status 1.
+
 ## Configuration
 
 - Bindings: `GATEWAY` (service `cail-model-api`), `FILES` (R2
