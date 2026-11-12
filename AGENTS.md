@@ -17,6 +17,13 @@ The fleet rules in the CAIL workspace AGENTS.md apply.
   response mapping in `services/job_views.py`, review operations in
   `services/review_actions.py`, and progress interfaces in
   `services/pipeline_progress.py`.
+- PDFium allows one call at a time per process. `backend/app/pdfium_guard.py`,
+  installed by `app/__init__.py`, serializes `pypdfium2.raw` and pypdfium2's
+  close path. Import the app before opening a PDF, never call `pypdfium2_raw`
+  directly, and hold `PDFIUM_LOCK` across a page in per-character loops.
+  Code a finalizer or `__del__` runs uses `try_acquire` and `defer`, never
+  `acquire`. After a pypdfium2 upgrade, `tests/test_pdfium_guard.py` must
+  still pass.
 - Views the Worker serves are rendered by the runner with the backend's own
   response code. Do not re-implement pipeline or report logic in the Worker.
 - The Worker releases only through `.github/workflows/worker-release.yml`;
