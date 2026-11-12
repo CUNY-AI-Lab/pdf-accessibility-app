@@ -18,6 +18,7 @@ import ctypes
 import io
 import math
 from collections import defaultdict
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,6 +26,7 @@ import pikepdf
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 
+from app.pdfium_guard import PDFIUM_LOCK
 from app.pipeline.page_glyphs import StreamKey
 from app.services.pdf_objects import pdf_named_resource
 
@@ -271,7 +273,13 @@ def _share_inside(word: Box, box: Box) -> float:
 
 
 def _page_words(page: pdfium.PdfPage) -> tuple[PageText, list[Word]]:
-    textpage = page.get_textpage()
+    # One lock hold per page: the guard would otherwise pass the lock
+    # between threads on every character call.
+    with PDFIUM_LOCK, closing(page.get_textpage()) as textpage:
+        return _textpage_words(textpage)
+
+
+def _textpage_words(textpage: pdfium.PdfTextPage) -> tuple[PageText, list[Word]]:
     result = PageText()
     words: list[Word] = []
     for index in range(textpage.count_chars()):
@@ -311,8 +319,15 @@ def read_page_text(pdf_path: Path) -> list[PageText]:
 
 
 def _page_text(page: pdfium.PdfPage, form_paths: list[StreamKey]) -> PageText:
-    streams = _object_marked_refs(page, form_paths)
-    textpage = page.get_textpage()
+    with PDFIUM_LOCK:
+        streams = _object_marked_refs(page, form_paths)
+        with closing(page.get_textpage()) as textpage:
+            return _textpage_text(textpage, streams)
+
+
+def _textpage_text(
+    textpage: pdfium.PdfTextPage, streams: dict[int, set[tuple[StreamKey, int]]]
+) -> PageText:
     result = PageText()
     for index in range(textpage.count_chars()):
         result.chars.append(chr(pdfium_c.FPDFText_GetUnicode(textpage.raw, index)))
