@@ -5,6 +5,16 @@
  * failed; which release gate checks held them; durations, pages and model
  * use. Read-only. Workers Logs keep seven days.
  *
+ * Cloudflare samples the events of a long window (the response's
+ * `statistics.abr_level` is above 1: a seven-day query returns about one
+ * event in ten), so a sampled window is split until each part comes back
+ * whole. Its count of a window (the calculations view) is an estimate and
+ * is not used to check completeness: it put ten events in a 42-second window
+ * where the runner finished two. Events are read with
+ * `storedJobFinishedSchema`, which restores the null fields and empty arrays
+ * and objects Workers Logs leaves out. An event that still does not fit is
+ * reported and sets a failing exit status, never dropped silently.
+ *
  *   bun dev/outcomes.ts [--since 2026-10-28T00:00:00Z | --days 7] [--until ...]
  *     [--price-in 0.53 --price-out 2.66] [--json]
  *
@@ -16,11 +26,13 @@
  */
 import { parseArgs } from "node:util";
 import { z } from "zod";
-import { JOB_FINISHED, type JobFinished, jobFinishedSchema } from "../src/outcome";
+import { JOB_FINISHED, type JobFinished, storedJobFinishedSchema } from "../src/outcome";
 
 const SERVICE = "cail-pdf-accessibility";
 const PAGE = 2000;
 const DAY = 24 * 3600 * 1000;
+/** The shortest window split further when Cloudflare samples it or a page fills. */
+const SHORTEST = 60 * 1000;
 
 const { values: options } = parseArgs({
   options: {
@@ -49,11 +61,37 @@ if (!Number.isFinite(since) || !Number.isFinite(until) || since >= until) {
 const responseSchema = z.object({
   success: z.boolean(),
   errors: z.array(z.object({ message: z.string() })),
-  result: z.object({ events: z.object({ events: z.array(z.object({ source: z.json(), timestamp: z.number() })) }) }).optional(),
+  result: z
+    .object({
+      events: z.object({ events: z.array(z.object({ source: z.json(), timestamp: z.number() })) }),
+      statistics: z.object({ abr_level: z.number().optional() }).optional(),
+    })
+    .optional(),
 });
 
-/** The events between two instants; a window that fills a page is split in two. */
-async function query(from: number, to: number): Promise<JobFinished[]> {
+/** What a set of queries returned: the events read, and what could not be read whole. */
+interface Read {
+  events: JobFinished[];
+  /** Events that did not fit the schema even with dropped fields restored. */
+  unreadable: number;
+  firstProblem: string | null;
+  /** Windows Cloudflare still sampled at the shortest split. */
+  sampled: number;
+}
+
+const NOTHING: Read = { events: [], unreadable: 0, firstProblem: null, sampled: 0 };
+
+function merge(first: Read, second: Read): Read {
+  return {
+    events: [...first.events, ...second.events],
+    unreadable: first.unreadable + second.unreadable,
+    firstProblem: first.firstProblem ?? second.firstProblem,
+    sampled: first.sampled + second.sampled,
+  };
+}
+
+/** The events between two instants. A window that fills a page, or that Cloudflare samples, is split in two. */
+async function query(from: number, to: number): Promise<Read> {
   const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/workers/observability/telemetry/query`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -75,21 +113,29 @@ async function query(from: number, to: number): Promise<JobFinished[]> {
     throw new Error(`Observability query answered ${response.status}: ${body.errors.map((error) => error.message).join("; ")}`);
   }
   const events = body.result.events.events;
-  if (events.length >= PAGE && to - from > 1000) {
+  const sampled = (body.result.statistics?.abr_level ?? 1) > 1;
+  if ((events.length >= PAGE || sampled) && to - from > SHORTEST) {
     const middle = Math.floor((from + to) / 2);
-    return [...(await query(from, middle)), ...(await query(middle, to))];
+    return merge(await query(from, middle), await query(middle, to));
   }
-  return events.flatMap((event) => {
-    const parsed = jobFinishedSchema.safeParse(event.source);
-    return parsed.success ? [parsed.data] : [];
-  });
+  const read: Read = { ...NOTHING, events: [], sampled: sampled ? 1 : 0 };
+  for (const event of events) {
+    const parsed = storedJobFinishedSchema.safeParse(event.source);
+    if (parsed.success) {
+      read.events.push(parsed.data);
+    } else {
+      read.unreadable += 1;
+      read.firstProblem ??= z.prettifyError(parsed.error);
+    }
+  }
+  return read;
 }
 
 /** The API answers at most seven days at a time. */
-async function window(from: number, to: number): Promise<JobFinished[]> {
-  const events: JobFinished[] = [];
-  for (let start = from; start < to; start += 7 * DAY) events.push(...(await query(start, Math.min(start + 7 * DAY, to))));
-  return events;
+async function window(from: number, to: number): Promise<Read> {
+  let read: Read = NOTHING;
+  for (let start = from; start < to; start += 7 * DAY) read = merge(read, await query(start, Math.min(start + 7 * DAY, to)));
+  return read;
 }
 
 function median(values: number[]): number | null {
@@ -107,7 +153,8 @@ function tally(keys: string[]): [string, number][] {
 
 const share = (part: number, whole: number): string => (whole === 0 ? "-" : `${((100 * part) / whole).toFixed(0)}%`);
 
-const events = await window(since, until);
+const read = await window(since, until);
+const events = read.events;
 const uploads = events.filter((event) => event.kind === "process");
 const reviews = events.filter((event) => event.kind === "review");
 const held = uploads.filter((event) => event.status === "manual_remediation");
@@ -141,6 +188,8 @@ const summary = {
   completion_tokens: completionTokens,
   reported_cost_usd: reportedCost,
   estimated_cost_usd: Number.isFinite(estimatedCost) ? estimatedCost : null,
+  unreadable_events: read.unreadable,
+  sampled_windows: read.sampled,
 };
 
 if (options.json) {
@@ -165,5 +214,8 @@ if (options.json) {
       ` cost reported $${reportedCost.toFixed(4)}` +
       (summary.estimated_cost_usd === null ? "" : `, estimated $${summary.estimated_cost_usd.toFixed(4)}`),
   ];
+  if (read.unreadable > 0) lines.push(`unreadable events ${read.unreadable}, not counted above; the first:\n${read.firstProblem ?? ""}`);
+  if (read.sampled > 0) lines.push(`sampled windows ${read.sampled}: Cloudflare returned only part of these one-minute windows`);
   console.log(lines.join("\n"));
 }
+if (read.unreadable > 0 || read.sampled > 0) process.exitCode = 1;
