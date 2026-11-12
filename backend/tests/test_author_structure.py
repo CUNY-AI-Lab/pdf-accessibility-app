@@ -238,6 +238,34 @@ async def test_author_metadata_and_missing_heading_level_reach_output(tmp_path):
     assert enriched['elements'][0]['level'] == 2
 
 
+async def test_cells_outside_a_table_leave_the_rest_of_the_evidence(tmp_path):
+    source, author = tmp_path / 'source.pdf', tmp_path / 'author.pdf'
+    table = _fixture(source, [['Chapter heading']])
+    box = table['elements'][0]['cells'][0]['bbox']
+    await tagger.tag_pdf(source, author, {'elements': [
+        dict(type='paragraph', page=0, text='Chapter heading', bbox=box),
+    ]})
+    with pikepdf.open(author, allow_overwriting_input=True) as pdf:
+        heading = _first_struct_elem(pdf.Root.StructTreeRoot, 'P')
+        heading.S = pikepdf.Name.H3
+        # A row inside a paragraph, as one archive PDF has: its cells have no grid.
+        cells = [pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.StructElem, S=pikepdf.Name(role), K=pikepdf.Array()))
+            for role in ('/TH', '/TD')]
+        row = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.StructElem, S=pikepdf.Name.TR, K=pikepdf.Array(cells)))
+        paragraph = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.StructElem, S=pikepdf.Name.P, K=pikepdf.Array([row]), P=heading.P))
+        for cell in cells:
+            cell.P = row
+        row.P = paragraph
+        parent = heading.P
+        parent.K = pikepdf.Array([*parent.K, paragraph]) if isinstance(parent.K, pikepdf.Array) else pikepdf.Array([parent.K, paragraph])
+        pdf.save(author)
+    evidence = read_author_structure(author)
+    assert [(e['type'], e.get('level'), e['text']) for e in evidence['elements']] == [('heading', 3, 'Chapter heading')]
+
+
 async def test_scope_on_author_td_is_header_evidence(tmp_path):
     source, author, output = [tmp_path / f'{name}.pdf' for name in ('source', 'author', 'output')]
     structure = _fixture(source, [['Code', 'Amount'], ['A17', '42'], ['B92', '67']],

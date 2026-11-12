@@ -103,7 +103,9 @@ def read_author_structure(path: Path) -> dict:
                     elif role == 'TR' and table is not None:
                         row = table['num_rows']
                         table['num_rows'] += 1
-                    if role in {'TH', 'TD', 'Figure', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6'}:
+                    # A cell outside any table has no grid to place it in.
+                    cell = role in {'TH', 'TD'}
+                    if (cell and table is not None) or role in {'Figure', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6'}:
                         reader.last_read = None
                         text, boxes = content(node, page)
                         by_page = defaultdict(list)
@@ -117,7 +119,7 @@ def read_author_structure(path: Path) -> dict:
                                 'bbox': parts[0]['bbox'] if len(parts) == 1 else None,
                                 'page_parts': parts, 'text': text}
                         a = attrs(node)
-                        if role in {'TH', 'TD'} and table is not None:
+                        if cell and table is not None:
                             col = sum(c['col_span'] for c in table['cells'] if c['row'] == row)
                             item.update(row=row, col=col, row_span=int(a.get('/RowSpan') or 1),
                                         col_span=int(a.get('/ColSpan') or 1),
