@@ -222,6 +222,9 @@ class _CachedFigureRequest:
         self.client = client
         self.model = client.model
         self.base_url = getattr(client, "base_url", "")
+        # The JSON transport reads these from whatever client it is given.
+        self.capability_scope = getattr(client, "capability_scope", "")
+        self.json_schema = getattr(client, "json_schema", True)
         self.cache = cache
         self.figure_index = figure.index
         with figure.path.open("rb") as image:
