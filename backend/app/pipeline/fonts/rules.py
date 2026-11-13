@@ -12,6 +12,9 @@ FONT_LANE_REPAIR_TOUNICODE = "repair_tounicode"
 FONT_LANE_EMBED = "embed_fonts"
 
 
+FONT_LANE_OCR_TOUNICODE = "ocr_tounicode"
+
+
 FONT_LANE_OCR_REDO = "ocr_redo"
 
 

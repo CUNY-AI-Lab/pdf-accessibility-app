@@ -92,6 +92,8 @@ class Settings(BaseSettings):
     font_remediation_enable_force_ocr: bool = False
     font_remediation_allow_ocr_on_digital: bool = False
     font_remediation_ocr_max_pages: int = 40
+    # Pages the OCR font mapping reads to recover Unicode no font data gives.
+    font_remediation_ocr_tounicode_max_pages: int = 300
     font_remediation_ocr_suspect_max_pages: int = 200
 
     # Subprocess timeouts (seconds)

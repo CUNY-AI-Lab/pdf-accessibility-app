@@ -201,3 +201,21 @@ within one 256-code block on both sides: only the last source byte may vary
 (Adobe Technical Note #5014), and the last destination byte must not pass 255
 (ISO 32000-1, 9.10.3). `_parse_tounicode_map_details` reads the result back
 exactly.
+
+### OCR font mapping (`ocr_unicode.py`)
+
+The `ocr_tounicode` lane runs after the deterministic ToUnicode lane when
+7.21.7-1 remains, on digital documents too, because it changes no page content.
+It targets used codes of embedded simple and Identity-encoded Type0 fonts that
+have no valid ToUnicode entry and no mapping the font itself gives; symbol
+fonts are never targeted. Each page that draws such a code is rendered and read
+with Tesseract (hOCR words and character boxes). An OCR word with exactly as
+many letters as glyphs under it gives each glyph its letter; otherwise the
+character nearest the glyph's center votes. Occurrences of one outline in
+several subsets of a font vote together. A code maps when at least two readings
+agree, with 60% of them and three times the runner-up; quote styles vote
+together, and a `|` split with `I` or `l` counts for the letter. A glyph with
+no contours, or no ink where OCR read nothing, maps to a space (or U+200B
+without an advance). Two shapes of one font reading as the same character keep
+only the better-supported one. Confident codes are written even when others
+stay unmapped; validation keeps that partial repair, and the document stays held.

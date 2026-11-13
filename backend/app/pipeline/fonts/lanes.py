@@ -6,6 +6,7 @@ from app.config import Settings
 from app.models import Job
 from app.pipeline.fonts.diagnostics import _inspect_font_diagnostics
 from app.pipeline.fonts.embedding import _embed_system_fonts, _rewrite_pdf_with_ghostscript_embed
+from app.pipeline.fonts.ocr_unicode import _recover_tounicode_by_ocr
 from app.pipeline.fonts.repair import _repair_pdf_font_dicts, _sync_pdf_cid_cff_widths
 from app.pipeline.fonts.rules import (
     FONT_DICT_REPAIR_RULE_MARKERS,
@@ -13,6 +14,7 @@ from app.pipeline.fonts.rules import (
     FONT_LANE_EMBED,
     FONT_LANE_OCR_FORCE,
     FONT_LANE_OCR_REDO,
+    FONT_LANE_OCR_TOUNICODE,
     FONT_LANE_REPAIR_DICTS,
     FONT_LANE_REPAIR_TOUNICODE,
     FONT_RULE_FRAGMENT,
@@ -101,6 +103,10 @@ def _font_remediation_lanes(
     lanes.append(FONT_LANE_EMBED)
     if allow_unicode_lane and has_unembedded_fonts:
         lanes.append(FONT_LANE_REPAIR_TOUNICODE)
+    # Glyphs no font data explains get Unicode from OCR of their pages. The
+    # page is unchanged, so digital documents qualify, unlike the re-OCR lanes.
+    if any("-7.21.7-" in rule_id for rule_id in error_rule_ids):
+        lanes.append(FONT_LANE_OCR_TOUNICODE)
 
     # OCR-based lanes are only used for Unicode/.notdef families and only when low-risk.
     if has_unicode_rules:
@@ -178,6 +184,28 @@ async def _attempt_font_lane(
     elif lane == FONT_LANE_REPAIR_TOUNICODE:
         repaired = job_dir / "fontfix_repair_tounicode.pdf"
         ok, message, stats = await _repair_pdf_tounicode(tagged_pdf, repaired)
+        preprocess_message = message
+        preprocess_details = stats
+        if not ok:
+            return {
+                "lane": lane,
+                "attempted": True,
+                "success": False,
+                "error": message,
+                "ocr_skipped": False,
+                "ocr_message": "",
+                "details": preprocess_details,
+            }
+        remediation_input = repaired
+        requires_retag = False
+    elif lane == FONT_LANE_OCR_TOUNICODE:
+        repaired = job_dir / "fontfix_ocr_tounicode.pdf"
+        ok, message, stats = await _recover_tounicode_by_ocr(
+            tagged_pdf,
+            repaired,
+            languages=job.ocr_language or settings.ocr_language,
+            max_pages=settings.font_remediation_ocr_tounicode_max_pages,
+        )
         preprocess_message = message
         preprocess_details = stats
         if not ok:
