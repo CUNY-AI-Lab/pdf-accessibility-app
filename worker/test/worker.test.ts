@@ -15,6 +15,7 @@ import {
   finishedJob,
   finishProcess,
   job,
+  jobSchema,
   ORIGIN,
   PDF,
   putFile,
@@ -110,6 +111,35 @@ describe("uploads", () => {
     expect((await api(`/jobs/${id}`, { method: "DELETE", as: asBob, headers: { origin: ORIGIN } })).status).toBe(404);
     const listed = await (await api("/jobs", { as: asBob })).json();
     expect(listed).toEqual({ jobs: [], total: 0 });
+  });
+});
+
+describe("the job list", () => {
+  it("lists a day of jobs whose step results together pass the RPC limit", async () => {
+    const id = await createdJobId(await upload());
+    // About 1 MB of results per job: audits grow with the document.
+    const steps = ["classify", "structure", "tagging"].map((step_name) => ({
+      step_name, status: "complete", started_at: null, completed_at: null, error: null,
+      result: { audit: "x".repeat(350_000) },
+    }));
+    await runInDurableObject(jobBoard(env), (_board, state) => {
+      state.storage.sql.exec("UPDATE jobs SET status = 'complete', steps_json = ?, task_kind = NULL, task_state = NULL WHERE id = ?",
+        JSON.stringify(steps), id);
+      for (let copy = 1; copy < 40; copy++) {
+        state.storage.sql.exec(
+          `INSERT INTO jobs (id, owner, original_filename, file_size_bytes, status, created_at, updated_at, steps_json)
+           SELECT ?, owner, original_filename, file_size_bytes, status, created_at - ?, updated_at, steps_json FROM jobs WHERE id = ?`,
+          crypto.randomUUID(), copy, id);
+      }
+    });
+    const listed = z.object({ jobs: z.array(jobSchema), total: z.number() }).parse(await (await api("/jobs")).json());
+    expect(listed.total).toBe(40);
+    for (const listedJob of listed.jobs) {
+      expect(listedJob.steps.map((step) => [step.step_name, step.result])).toEqual(
+        [["classify", null], ["structure", null], ["tagging", null]]);
+    }
+    // One job's detail still carries its results.
+    expect((await job(id)).steps[1]?.result).toEqual(steps[1]?.result);
   });
 });
 

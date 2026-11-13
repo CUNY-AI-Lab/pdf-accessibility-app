@@ -96,6 +96,26 @@ const jobRowSchema = z.object({
   gateway_exp: z.number().nullable(),
 });
 type JobRow = z.infer<typeof jobRowSchema>;
+/** The columns a job record is made from. */
+const recordRowSchema = jobRowSchema.pick({
+  id: true,
+  owner: true,
+  original_filename: true,
+  file_size_bytes: true,
+  status: true,
+  error: true,
+  notice: true,
+  created_at: true,
+  updated_at: true,
+  job_json: true,
+  steps_json: true,
+  rev: true,
+  files_json: true,
+  overrides_json: true,
+  task_kind: true,
+  pending_review_json: true,
+});
+type RecordRow = z.infer<typeof recordRowSchema>;
 
 const priorSchema = z.object({ status: z.string(), steps: stepsSchema });
 /**
@@ -267,7 +287,7 @@ function iso(ms: number): string {
   return new Date(ms).toISOString();
 }
 
-function toRecord(row: JobRow): JobRecord {
+function toRecord(row: RecordRow): JobRecord {
   const view = row.job_json === null ? null : jobViewJsonSchema.parse(row.job_json);
   const text = (key: string): string | null => {
     const value = view?.[key];
@@ -446,8 +466,23 @@ export class JobBoard extends DurableObject<Env> {
     return { admission, record: row === null ? null : toRecord(row) };
   }
 
+  /**
+   * A person's jobs, for the job list and the batch report. Neither shows step
+   * results, which grow with the document, so SQLite leaves them out: a day of
+   * uploads with whole results would not fit in one RPC reply (32 MiB).
+   */
   listJobs(owner: string): JobRecord[] {
-    return this.rows("SELECT * FROM jobs WHERE owner = ? ORDER BY created_at DESC", owner).map(toRecord);
+    return this.sql
+      .exec(
+        `SELECT id, owner, original_filename, file_size_bytes, status, error, notice, created_at, updated_at,
+                job_json, rev, files_json, overrides_json, task_kind, pending_review_json,
+                (SELECT json_group_array(json_set(value, '$.result', NULL) ORDER BY key)
+                   FROM json_each(jobs.steps_json)) AS steps_json
+           FROM jobs WHERE owner = ? ORDER BY created_at DESC`,
+        owner,
+      )
+      .toArray()
+      .map((row) => toRecord(recordRowSchema.parse(row)));
   }
 
   getJob(owner: string, id: string): JobRecord | null {
