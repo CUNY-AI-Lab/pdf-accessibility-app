@@ -4,6 +4,11 @@ from io import BytesIO
 
 import pikepdf
 import pytest
+from fontTools.cffLib import CFFFontSet, FDArrayIndex, FDSelect, FontDict
+from fontTools.fontBuilder import FontBuilder
+from fontTools.misc.psCharStrings import T2CharString
+from fontTools.pens.recordingPen import RecordingPen
+from fontTools.pens.t2CharStringPen import T2CharStringPen
 from fontTools.ttLib import TTFont
 from fontTools.ttLib.scaleUpem import scale_upem
 
@@ -24,6 +29,7 @@ from app.pipeline.validator import ValidationResult, Violation
 from app.services.structure_text import screen_reader_text
 from app.services.validation_compare import is_better_validation
 from tests.pdf_fixtures import helvetica, rendered
+from tests.test_font_invisible import _text
 from tests.test_font_substitution import _install_test_font, _text_contract, _unembedded_pdf
 
 
@@ -88,6 +94,152 @@ def test_width_repair_does_not_choose_between_conflicting_glyph_aliases(tmp_path
             BytesIO(pdf.pages[0].Resources.Font.F1.FontDescriptor.FontFile2.read_bytes())
         ) as font:
             assert font["hmtx"].metrics["A"] == (562, 17)
+
+
+def _box(width, left, right, top) -> T2CharString:
+    pen = T2CharStringPen(width, None)
+    pen.moveTo((left, 0))
+    pen.lineTo((right, 0))
+    pen.lineTo((right, top))
+    pen.lineTo((left, top))
+    pen.closePath()
+    return pen.getCharString()
+
+
+def _acrobat_ocr_cid_cff() -> bytes:
+    """A CID-keyed CFF like Acrobat's OCR fonts (*Times New Roman-18786).
+
+    The program gives a hyphen an advance of -1, which veraPDF reads as a
+    missing glyph, and lets a subroutine supply the first operand, the
+    advance, of another glyph.
+    """
+    builder = FontBuilder(1000, isTTF=False)
+    builder.setupGlyphOrder([".notdef", "cid00001", "cid00002", "cid00003"])
+    builder.setupCFF(
+        "OCRFixture",
+        {},
+        {
+            ".notdef": _box(1000, 50, 950, 700),
+            "cid00001": _box(500, 50, 450, 700),
+            "cid00002": _box(-1, 20, 260, 300),
+            "cid00003": T2CharString(program=[-107, "callgsubr", "endchar"]),
+        },
+        {},
+    )
+    cff = builder.font["CFF "].cff
+    cff.GlobalSubrs.append(
+        T2CharString(
+            program=[240, 30, 0, "rmoveto", 180, 0, "rlineto", 0, 650, "rlineto", "return"]
+        )
+    )
+    top = cff.topDictIndex[0]
+    top.ROS = ("Adobe", "Identity", 0)
+    top.CIDCount = 4
+    fd = FontDict()
+    setattr(fd, "Private", top.Private)  # FontDict declares its keys at runtime.
+    top.FDArray = FDArrayIndex()
+    top.FDArray.append(fd)
+    top.FDSelect = FDSelect()
+    top.FDSelect.format = 3
+    top.FDSelect.gidArray = [0, 0, 0, 0]
+    del top.Private
+    buffer = BytesIO()
+    cff.compile(buffer, builder.font)
+    return buffer.getvalue()
+
+
+def _cid_cff_width_mismatch(path):
+    with pikepdf.new() as pdf:
+        page = pdf.add_blank_page(page_size=(300, 200))
+        descriptor = pikepdf.Dictionary(
+            Type=pikepdf.Name.FontDescriptor,
+            FontName=pikepdf.Name("/*Times New Roman-18786"),
+            Flags=6,
+            FontBBox=[0, 0, 1000, 700],
+            ItalicAngle=0,
+            Ascent=700,
+            Descent=0,
+            CapHeight=700,
+            StemV=80,
+            FontFile3=pdf.make_stream(
+                _acrobat_ocr_cid_cff(), Subtype=pikepdf.Name("/CIDFontType0C")
+            ),
+        )
+        cid_font = pikepdf.Dictionary(
+            Type=pikepdf.Name.Font,
+            Subtype=pikepdf.Name.CIDFontType0,
+            BaseFont=pikepdf.Name("/*Times New Roman-18786"),
+            CIDSystemInfo=pikepdf.Dictionary(
+                Registry=pikepdf.String("Adobe"), Ordering=pikepdf.String("Identity"), Supplement=0
+            ),
+            FontDescriptor=pdf.make_indirect(descriptor),
+            # Acrobat records the hyphen's negative advance as 0.
+            W=[1, [500, 0, 250]],
+        )
+        page.Resources = pikepdf.Dictionary(
+            Font=pikepdf.Dictionary(
+                F1=pdf.make_indirect(
+                    pikepdf.Dictionary(
+                        Type=pikepdf.Name.Font,
+                        Subtype=pikepdf.Name.Type0,
+                        BaseFont=pikepdf.Name("/*Times New Roman-18786-Identity-H"),
+                        Encoding=pikepdf.Name("/Identity-H"),
+                        DescendantFonts=[pdf.make_indirect(cid_font)],
+                        ToUnicode=pdf.make_stream(
+                            _render_tounicode_cmap({1: "A", 2: "-", 3: "I"}, 2)
+                        ),
+                    )
+                )
+            )
+        )
+        page.Contents = pdf.make_stream(b"BT /F1 60 Tf 20 80 Td <0001000200030001> Tj ET")
+        pdf.save(path)
+    return path
+
+
+def _cid_cff_glyphs(path):
+    """Each glyph's advance and drawing, and the PDF's own text contract."""
+    with pikepdf.open(path) as pdf:
+        font = pdf.pages[0].Resources.Font.F1
+        cid_font = font.DescendantFonts[0]
+        fonts = CFFFontSet()
+        fonts.decompile(BytesIO(cid_font.FontDescriptor.FontFile3.read_bytes()), None)
+        cff = fonts[fonts.fontNames[0]]
+        glyphs = {}
+        for name in cff.charset:
+            pen = RecordingPen()
+            cff.CharStrings[name].draw(pen)
+            glyphs[name] = (cff.CharStrings[name].width, pen.value)
+        contract = (
+            repr(cid_font.W),
+            font.ToUnicode.read_bytes(),
+            pdf.pages[0].Contents.read_bytes(),
+        )
+        return glyphs, contract
+
+
+def test_cid_cff_width_repair_changes_program_not_pdf_positioning(tmp_path):
+    before = _cid_cff_width_mismatch(tmp_path / "before.pdf")
+    after = tmp_path / "after.pdf"
+    ok, message, stats = _repair_pdf_font_dicts_sync(before, after)
+    assert ok, message
+    assert stats["cid_cff_widths_aligned"] == 2
+    old, old_contract = _cid_cff_glyphs(before)
+    new, new_contract = _cid_cff_glyphs(after)
+    assert {name: width for name, (width, _) in old.items()} == {
+        ".notdef": 1000, "cid00001": 500, "cid00002": -1, "cid00003": 240,
+    }
+    # Every program advance is now the /W advance viewers already used.
+    assert {name: width for name, (width, _) in new.items()} == {
+        ".notdef": 1000, "cid00001": 500, "cid00002": 0, "cid00003": 250,
+    }
+    assert {name: path for name, (_, path) in old.items()} == {
+        name: path for name, (_, path) in new.items()
+    }
+    assert old_contract == new_contract
+    assert rendered(before) == rendered(after)
+    assert _text(before) == _text(after) == "A-IA"
+    assert not _repair_pdf_font_dicts_sync(after, tmp_path / "again.pdf")[0]
 
 
 @pytest.mark.parametrize(

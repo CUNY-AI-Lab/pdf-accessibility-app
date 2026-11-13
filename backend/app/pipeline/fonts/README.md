@@ -163,6 +163,18 @@ two PDF widths) are counted and left unresolved. A shared descriptor/program
 is copied for the font use being repaired. Local TrueType embedding performs
 the same alignment before installing the program.
 
+CIDFontType0 fonts with a CID-keyed CFF program (`/CIDFontType0C`) get the
+same treatment in that lane: each charstring's advance is restated as the
+CIDFont's `/W` width (or `/DW`), scaled by the program's FontMatrix, and `/W`
+is not changed. A glyph whose advance comes from a subroutine is
+desubroutinized first, as fontTools' `CFFToCFF2` does to drop widths;
+outlines and hints are kept. The fonts Acrobat's OCR generates for
+recognized text on scanned pages (`*Times New Roman-18786` and the like) give
+some glyphs a negative program advance and record 0 in `/W`. veraPDF reads a
+program advance of exactly -1 as a missing glyph and compares `/DW` instead,
+so copying program advances into `/W` (what the OCR lanes'
+`_sync_pdf_cid_cff_widths` does) cannot clear those glyphs.
+
 ### Invisible OCR fonts
 
 `invisible.repair_invisible_fonts()` runs in the dictionary-repair lane before
