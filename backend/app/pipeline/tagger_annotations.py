@@ -5,6 +5,7 @@ from typing import Any
 
 import pikepdf
 from docling_core.types.doc.page import TextCellUnit
+from docling_parse.pdf_parsers import DecodePageConfig
 
 from app.pipeline.tagger_geometry import (
     LINK_TEXT_ELEMENT_TYPES,
@@ -29,6 +30,21 @@ from app.services.form_fields import button_option_name, name_widget_field
 from app.services.pdf_objects import pdf_text
 
 
+def _tagging_page_config() -> DecodePageConfig:
+    """Decode a page's text, links and widgets as docling-parse's default does.
+
+    The default also decodes every image on the page, re-encodes it as PNG and
+    keeps it in the page cache for the life of the document, so tagging a scan
+    held all of its image data at once. Tagging reads no images or shapes.
+    """
+    config = DecodePageConfig()
+    config.page_boundary = "crop_box"
+    config.do_sanitization = False
+    config.keep_bitmaps = False
+    config.keep_shapes = False
+    return config
+
+
 def _get_docling_parse_page(parser_doc: Any | None, page_index: int) -> Any | None:
     """Return a docling-parse page object for a 0-indexed page, if available."""
     if parser_doc is None:
@@ -38,7 +54,7 @@ def _get_docling_parse_page(parser_doc: Any | None, page_index: int) -> Any | No
     try:
         if page_no > parser_doc.number_of_pages():
             return None
-        return parser_doc.get_page(page_no)
+        return parser_doc.get_page(page_no, config=_tagging_page_config())
     except Exception:
         return None
 

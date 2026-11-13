@@ -1,8 +1,11 @@
 import subprocess
 import sys
 import textwrap
+import zlib
 
 import pikepdf
+from docling_core.types.doc.page import TextCellUnit
+from docling_parse.pdf_parser import DoclingPdfParser
 
 from app.pipeline.tagger import (
     StructTreeBuilder,
@@ -17,6 +20,10 @@ from app.pipeline.tagger import (
     _tag_generic_annotations,
     _tag_link_annotations,
     _tag_widget_annotations,
+)
+from app.pipeline.tagger_annotations import (
+    _extract_docling_parse_text_cells,
+    _get_docling_parse_page,
 )
 
 
@@ -949,3 +956,35 @@ def test_normalize_media_clip_data_dicts_handles_direct_self_referential_array()
 
     assert result.returncode == 0, result.stderr
     assert "changes 0" in result.stdout
+
+
+def test_tagging_reads_page_text_and_links_without_decoding_its_images(tmp_path):
+    path = tmp_path / "scan-with-link.pdf"
+    with pikepdf.new() as pdf:
+        page = pdf.add_blank_page(page_size=(612, 792))
+        scan = pdf.make_stream(
+            zlib.compress(bytes(i % 256 for i in range(400 * 300 * 3))),
+            Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Image, Width=400, Height=300,
+            ColorSpace=pikepdf.Name.DeviceRGB, BitsPerComponent=8, Filter=pikepdf.Name.FlateDecode,
+        )
+        font = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1, BaseFont=pikepdf.Name.Helvetica))
+        page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font), XObject=pikepdf.Dictionary(Im1=scan))
+        page.Contents = pdf.make_stream(
+            b"q 400 0 0 300 100 350 cm /Im1 Do Q BT /F1 12 Tf 72 300 Td (Minutes of the 1968 meeting) Tj ET")
+        page.Annots = pdf.make_indirect(pikepdf.Array([pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Link, Rect=[72, 295, 250, 315],
+            A=pikepdf.Dictionary(S=pikepdf.Name.URI, URI=pikepdf.String("https://cdha.cuny.edu/")),
+        ))]))
+        pdf.save(path)
+
+    full = DoclingPdfParser(loglevel="fatal").load(str(path)).get_page(1)
+    tagging = _get_docling_parse_page(DoclingPdfParser(loglevel="fatal").load(str(path)), 0)
+    # docling-parse's default decodes the scan; tagging needs only text and links.
+    assert len(full.bitmap_resources) == 1
+    assert tagging.bitmap_resources == []
+    words = _extract_docling_parse_text_cells(tagging, TextCellUnit.WORD)
+    assert words == _extract_docling_parse_text_cells(full, TextCellUnit.WORD)
+    assert [w["text"] for w in words][:2] == ["minutes", "of"]
+    assert [(link.uri, link.rect) for link in tagging.hyperlinks] == [(link.uri, link.rect) for link in full.hyperlinks]
+    assert [str(link.uri) for link in tagging.hyperlinks] == ["https://cdha.cuny.edu/"]
