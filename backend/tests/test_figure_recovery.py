@@ -469,6 +469,62 @@ def test_docling_image_showing_less_than_the_page_is_replaced(tmp_path, rotate):
     assert all(dark[y][x] != dark[y + 1][x] for y in range(7) for x in range(8))
 
 
+def _layered_scan_page(path):
+    """A page drawn as a layered scan, at user box (40, 100)-(120, 180).
+
+    The background image has each text line smudged into a grey block; a
+    stencil mask over it paints the letter strokes black. Returns the page
+    and the background alone, as Docling's image of the region shows it.
+    """
+    import pikepdf
+
+    side = 160
+    in_line = [10 <= y % 20 < 20 and 10 <= y < 150 for y in range(side)]
+    background = bytes(
+        128 if in_line[y] and 10 <= x < 150 else 255 for y in range(side) for x in range(side)
+    )
+    strokes = bytearray()  # 1 bit per pixel; 0 paints with the fill colour
+    for y in range(side):
+        bits = [0 if in_line[y] and 10 <= x < 150 and x % 4 < 2 else 1 for x in range(side)]
+        for start in range(0, side, 8):
+            strokes.append(int("".join(map(str, bits[start:start + 8])), 2))
+
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 300))
+    common = {"/Type": pikepdf.Name("/XObject"), "/Subtype": pikepdf.Name("/Image"),
+              "/Width": side, "/Height": side}
+    background_image = pdf.make_stream(background)
+    background_image.update({**common, "/ColorSpace": pikepdf.Name("/DeviceGray"),
+                             "/BitsPerComponent": 8})
+    mask = pdf.make_stream(bytes(strokes))
+    mask.update({**common, "/ImageMask": True, "/BitsPerComponent": 1})
+    page["/Resources"] = pikepdf.Dictionary(
+        {"/XObject": pikepdf.Dictionary({"/Bg": background_image, "/Fg": mask})}
+    )
+    page["/Contents"] = pdf.make_stream(
+        b"q 80 0 0 80 40 100 cm /Bg Do Q q 0 g 80 0 0 80 40 100 cm /Fg Do Q\n"
+    )
+    pdf.save(path)
+    return path, Image.frombytes("L", (side, side), background)
+
+
+def test_docling_image_of_a_layered_scans_background_is_replaced(tmp_path):
+    from app.pipeline.structure import ensure_figure_images
+
+    source, background = _layered_scan_page(tmp_path / "source.pdf")
+    path = tmp_path / "figure_0.png"
+    background.save(path)
+    bbox = _docling_box(source, {"l": 40, "b": 100, "r": 120, "t": 180})
+    figure = FigureInfo(index=0, path=path, page=0, bbox=bbox)
+    structure = {"elements": [{"type": "figure", "figure_index": 0, "page": 0, "bbox": bbox}]}
+    [result] = ensure_figure_images(source, structure, [figure], tmp_path / "figures")
+    assert result.path == path
+    # The figure now shows the strokes the page draws over the smudges.
+    with Image.open(path) as image:
+        ink = [image.convert("L").getpixel((x, 15)) < 64 for x in range(20, 140)]
+    assert sum(a != b for a, b in zip(ink, ink[1:])) >= 40
+
+
 def test_docling_image_matching_the_page_is_kept(tmp_path):
     from app.pipeline.structure import ensure_figure_images
 
