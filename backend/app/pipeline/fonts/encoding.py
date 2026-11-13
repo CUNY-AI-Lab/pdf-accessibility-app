@@ -206,7 +206,9 @@ def _encoding_differences_map(differences) -> dict[int, str]:
     return mapping
 
 
-def _standard_encoding_over_winansi(encoding, *, implicit_standard: bool):
+def _standard_encoding_over_winansi(
+    encoding, *, implicit_standard: bool, shown_codes: set[int] | None = None
+):
     """Restate a StandardEncoding-based simple encoding over WinAnsiEncoding.
 
     PDF/UA-1 (ISO 14289-1, 7.21.6) allows a non-symbolic TrueType font only
@@ -216,6 +218,11 @@ def _standard_encoding_over_winansi(encoding, *, implicit_standard: bool):
     StandardEncoding leaves undefined keep WinAnsiEncoding's character. Returns
     None when the encoding is not StandardEncoding-based, or a name is not in
     the AGL.
+
+    With `shown_codes`, every code the font shows in the document, a name
+    outside the AGL at a code never shown is dropped: no glyph is ever drawn
+    or read for it. Some PostScript drivers name the control codes 0-31 that
+    way (`NUL` ... `US`).
     """
     from fontTools.agl import LEGACY_AGL2UV
     from fontTools.encodings.StandardEncoding import StandardEncoding
@@ -240,6 +247,8 @@ def _standard_encoding_over_winansi(encoding, *, implicit_standard: bool):
             continue
         unicode = LEGACY_AGL2UV.get(name)
         if unicode is None:
+            if shown_codes is not None and code not in shown_codes:
+                continue
             return None
         if "".join(map(chr, unicode)) != winansi.get(code):
             entries.append((code, name))

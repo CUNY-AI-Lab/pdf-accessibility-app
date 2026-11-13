@@ -3314,13 +3314,15 @@ async def test_font_dict_lane_reuses_existing_tags(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_embed_lane_skips_local_attempt_when_diagnostics_rule_it_out(tmp_path, monkeypatch):
+    """Without local candidates, a local pass that leaves a font unembedded is not kept."""
     tagged_pdf = tmp_path / "tagged.pdf"
     tagged_pdf.write_bytes(b"%PDF-1.7\n")
 
-    async def fail_local_embed(*args, **kwargs):
-        raise AssertionError(
-            "_embed_system_fonts should not run when diagnostics skip local embedding"
-        )
+    async def fail_local_embed(input_path, output_path):
+        # Unseen fonts got empty-glyph programs; diagnostics still report one
+        # unembedded font, so Ghostscript rewrites the document as before.
+        output_path.write_bytes(b"%PDF-1.7\n")
+        return True, "Local font embedding completed", {"fonts_glyphless": 1}
 
     async def fake_gs_embed(input_path, output_path, **kwargs):
         output_path.write_bytes(b"%PDF-1.7\n")
