@@ -31,6 +31,27 @@ def pdftoppm_path() -> str:
     return binary
 
 
+def _preview_dpi(pdf_path: Path, page_number: int, dpi: float, max_width: int) -> float:
+    """The resolution at which the page is at most max_width pixels wide.
+
+    pdftoppm renders the crop box after /Rotate and /UserUnit. A poster at the
+    preview dpi would be tens of megapixels only to be shrunk to max_width.
+    """
+    try:
+        with pikepdf.open(pdf_path) as pdf:
+            page = pdf.pages[page_number - 1]
+            box = [float(v) for v in page.cropbox]
+            rotate = int(page.obj.get("/Rotate", 0)) % 180
+            unit = float(page.obj.get("/UserUnit", 1))
+    except Exception:
+        return dpi
+    width = abs(box[3] - box[1]) if rotate else abs(box[2] - box[0])
+    width_inches = width * unit / 72
+    if width_inches <= 0:
+        return dpi
+    return min(dpi, max_width / width_inches)
+
+
 def render_page_png_bytes(
     pdf_path: Path,
     page_number: int,
@@ -53,7 +74,7 @@ def render_page_png_bytes(
             "-l",
             str(page_number),
             "-r",
-            str(dpi),
+            f"{_preview_dpi(pdf_path, page_number, dpi, max_width):g}",
             "-png",
             "-singlefile",
             str(pdf_path),
