@@ -617,13 +617,21 @@ export class JobBoard extends DurableObject<Env> {
     }
   }
 
-  /** Give the oldest queued task to a runner. */
+  /**
+   * Give a queued task to a runner: reviews first, then the person with the
+   * fewest tasks running, oldest first. One person's batch cannot hold every
+   * slot while someone else's upload waits behind it.
+   */
   async claim(now: number): Promise<ClaimedTask | null> {
     const lease = randomToken();
     const leaseHash = await sha256Hex(lease);
     for (;;) {
       const row = this.rows(
-        "SELECT * FROM jobs WHERE task_state = 'queued' ORDER BY task_kind = 'process', task_queued_at LIMIT 1",
+        `SELECT * FROM jobs AS queued WHERE queued.task_state = 'queued'
+           ORDER BY queued.task_kind = 'process',
+             (SELECT COUNT(*) FROM jobs AS running WHERE running.owner = queued.owner AND running.task_state = 'claimed'),
+             queued.task_queued_at
+           LIMIT 1`,
       )[0];
       if (row === undefined) return null;
       const kind = row.task_kind ?? "process";
