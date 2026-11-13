@@ -11,7 +11,11 @@ from app.pipeline.fonts.resources import (
     _obj_key,
     _resolve_dictionary,
 )
-from app.pipeline.fonts.widths import _align_truetype_advances
+from app.pipeline.fonts.widths import (
+    _align_cid_cff_advances,
+    _align_truetype_advances,
+    _cid_cff_width_key,
+)
 from app.services.pdf_objects import pdf_text
 from app.services.thread_work import to_thread
 
@@ -88,18 +92,6 @@ def _render_cid_widths_array(widths: dict[int, int]):
     return array
 
 
-def _cid_cff_width_key(glyph_name: str | None, fallback_index: int) -> int:
-    raw = str(glyph_name or "").strip()
-    if raw == ".notdef":
-        return 0
-    if raw.startswith("cid") and raw[3:].isdigit():
-        try:
-            return int(raw[3:])
-        except ValueError:
-            pass
-    return fallback_index
-
-
 def _collect_cid_cff_widths(font_bytes: bytes) -> dict[int, int]:
     from fontTools.cffLib import CFFFontSet
     from fontTools.pens.basePen import NullPen
@@ -144,10 +136,48 @@ def _repair_pdf_font_dicts_sync(
         "cidset_removed": 0,
         "truetype_widths_aligned": 0,
         "truetype_width_conflicts": 0,
+        "cid_cff_widths_aligned": 0,
         "notdef_mappings_repaired": 0,
         "invisible_fonts_replaced": 0,
     }
     seen_fonts: set[tuple[int, int]] = set()
+    aligned_cid_fonts: set[tuple[int, int]] = set()
+
+    def _align_cid_cff_program(cid_font) -> None:
+        """Restate CIDFontType0C advances from /W; the PDF's widths stay."""
+        if cid_font.get("/Subtype") != pikepdf.Name("/CIDFontType0"):
+            return
+        obj_key = _obj_key(cid_font)
+        if obj_key:
+            if obj_key in aligned_cid_fonts:
+                return
+            aligned_cid_fonts.add(obj_key)
+        descriptor = _resolve_dictionary(cid_font.get("/FontDescriptor"))
+        if not isinstance(descriptor, pikepdf.Dictionary):
+            return
+        program = descriptor.get("/FontFile3")
+        if not isinstance(program, pikepdf.Stream) or program.get("/Subtype") != pikepdf.Name(
+            "/CIDFontType0C"
+        ):
+            return
+        try:
+            widths = _parse_cid_widths_array(cid_font.get("/W"))
+            default_width = float(cid_font.get("/DW", 1000))
+            aligned, count = _align_cid_cff_advances(widths, default_width, program.read_bytes())
+        except Exception:
+            # One malformed/unsupported font must not prevent repairs of
+            # other fonts. Validation retains its unresolved failure.
+            return
+        if not count:
+            return
+        replacement = pdf.make_stream(aligned)
+        replacement["/Subtype"] = pikepdf.Name("/CIDFontType0C")
+        # Another CIDFont may share this descriptor/program with other /W.
+        descriptor = pikepdf.Dictionary(descriptor)
+        descriptor["/FontFile3"] = replacement
+        cid_font["/FontDescriptor"] = pdf.make_indirect(descriptor)
+        stats["cid_cff_widths_aligned"] += count
+        stats["fonts_touched"] += 1
 
     def _repair_cid_font_dict(cid_font) -> None:
         if not isinstance(cid_font, pikepdf.Dictionary):
@@ -232,6 +262,7 @@ def _repair_pdf_font_dicts_sync(
                     stats["notdef_mappings_repaired"] += count
                     if count:
                         stats["fonts_touched"] += 1
+                    _align_cid_cff_program(cid_font)
         elif subtype == pikepdf.Name("/CIDFontType2"):
             _repair_cid_font_dict(font_dict)
 
@@ -260,6 +291,7 @@ def _repair_pdf_font_dicts_sync(
                 f"CIDToGIDMap added={stats['cidtogid_added']}, "
                 f"CIDSet removed={stats['cidset_removed']}, "
                 f"TrueType advances aligned={stats['truetype_widths_aligned']}, "
+                f"CID CFF advances aligned={stats['cid_cff_widths_aligned']}, "
                 f"invisible fonts replaced={stats['invisible_fonts_replaced']})"
             ),
             stats,

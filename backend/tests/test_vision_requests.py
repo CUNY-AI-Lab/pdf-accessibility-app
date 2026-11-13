@@ -227,6 +227,50 @@ async def test_description_cache_matches_the_resized_wire_input(
     )
 
 
+@pytest.mark.asyncio
+async def test_a_cached_figure_request_keeps_the_clients_format_settings(
+    tmp_path, monkeypatch, oversized_crop
+):
+    from app.pipeline.structure import FigureInfo
+    from app.runner.client import Task, WorkerClient
+    from app.services.intelligence_llm_utils import request_llm_json
+    from app.services.llm_client import job_model_access, make_llm_client
+
+    path = tmp_path / "figure.png"
+    path.write_bytes(oversized_crop)
+    worker = WorkerClient("https://tools.test/pdf-accessibility/runner", "host-token")
+    task = Task.from_json({"job_id": "job-a", "kind": "process", "lease": "lease", "attempt": 1,
+                           "deadline": 4_102_444_800_000, "original_filename": "a.pdf"})
+    with job_model_access(worker.model_endpoint(task)):
+        client = make_llm_client(Settings(_env_file=None, llm_api_key="check-only"))
+    adapter = _CachedFigureRequest(
+        client, AltTextCache(tmp_path / "cache.sqlite3"), FigureInfo(index=0, path=path), "test"
+    )
+    formats = []
+
+    async def post(url, *, json):
+        formats.append(json["response_format"]["type"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"decisions": []}'}}]},
+            request=httpx.Request("POST", url, json=json),
+        )
+
+    monkeypatch.setattr(client.client, "post", post)
+    try:
+        await request_llm_json(
+            llm_client=adapter, content=[{"type": "text", "text": "describe"}],
+            schema_name="decisions",
+            response_schema={"type": "object", "properties": {"decisions": {"type": "array"}},
+                             "required": ["decisions"]},
+        )
+    finally:
+        await client.close()
+        await worker.close()
+    assert formats == ["json_object"]
+    assert adapter.capability_scope == "https://tools.test/pdf-accessibility/runner/v1"
+
+
 def test_request_limit_setting_defaults_and_validation():
     settings = Settings(_env_file=None, llm_api_key="check-only")
     assert settings.llm_max_request_bytes == DEFAULT_LLM_MAX_REQUEST_BYTES == 2 * 1024 * 1024
