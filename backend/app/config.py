@@ -103,13 +103,18 @@ class Settings(BaseSettings):
     # Upload limits
     max_upload_size_bytes: int = 100 * 1024 * 1024  # 100 MB
     max_upload_pages: int = 300
-    max_upload_page_render_pixels: int = 75_000_000
+    # Previews render at their display width, so a poster-size page needs no
+    # more memory than a letter page there.
+    max_upload_page_render_pixels: int = 300_000_000
     upload_preflight_render_dpi: int = 300
     max_upload_image_pixels: int = 75_000_000
     max_upload_total_image_pixels: int = 1_000_000_000
     max_upload_image_heavy_pages: int = 75
-    max_upload_ocr_scan_total_image_pixels: int = 150_000_000
-    max_upload_ocr_scan_image_heavy_pages: int = 25
+    # Tagging no longer holds a scan's decoded images (#77): the largest CDHA
+    # scan, 2,377 MP over 154 pages, peaked at 2.5 GB. OCR/Paper Capture
+    # scans now share the image limits of other PDFs.
+    max_upload_ocr_scan_total_image_pixels: int = 1_000_000_000
+    max_upload_ocr_scan_image_heavy_pages: int = 75
     upload_image_heavy_page_min_pixels: int = 4_000_000
     ocrmypdf_jobs: int = 1
     ocrmypdf_max_image_mpixels: int = 75
