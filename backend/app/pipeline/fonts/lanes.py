@@ -138,6 +138,24 @@ def _embed_lane_should_skip_local(font_diagnostics: dict[str, object] | None) ->
     )
 
 
+async def _embed_unseen_only(tagged_pdf: Path, output: Path):
+    """Local embedding, kept only when it leaves no font unembedded.
+
+    With no local program for any unembedded font, the pass can still give
+    fonts whose text no reader can see an empty-glyph program. When those
+    were all of them, the result needs no retagging, and no Ghostscript
+    substitute (whose re-encoded fonts lose their ToUnicode).
+    """
+    ok, message, stats = await _embed_system_fonts(tagged_pdf, output)
+    if not ok:
+        return None
+    diagnostics = _inspect_font_diagnostics(output, include_used_code_analysis=False)
+    summary = diagnostics.get("summary") if isinstance(diagnostics, dict) else None
+    if not isinstance(summary, dict) or int(summary.get("unembedded_fonts", 1) or 0) != 0:
+        return None
+    return output, message, stats
+
+
 async def _attempt_font_lane(
     job_id: str,
     job: Job,
@@ -197,7 +215,16 @@ async def _attempt_font_lane(
             tagged_pdf,
             include_used_code_analysis=False,
         )
-        if _embed_lane_should_skip_local(embed_diagnostics):
+        skip_local = _embed_lane_should_skip_local(embed_diagnostics)
+        unseen_only = (
+            await _embed_unseen_only(tagged_pdf, job_dir / "fontfix_embedded_unseen.pdf")
+            if skip_local
+            else None
+        )
+        if unseen_only is not None:
+            remediation_input, preprocess_message, preprocess_details = unseen_only
+            requires_retag = False
+        elif skip_local:
             preprocess_message = "Local font embedding skipped: no supported local candidates for unresolved unembedded fonts"
             preprocess_details = {
                 "local_embed_skipped": True,
