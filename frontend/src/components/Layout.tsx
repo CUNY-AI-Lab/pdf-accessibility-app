@@ -54,7 +54,17 @@ export default function Layout() {
       {/* Footer */}
       <footer className="border-t border-ink/5 py-6">
         <div className="max-w-6xl mx-auto px-6 flex items-center justify-between text-xs text-ink-muted">
-          <span>PDF Accessibility Tool</span>
+          <span>
+            PDF Accessibility Tool ·{" "}
+            <a
+              href="https://tools.ailab.gc.cuny.edu/help/projects/support/issues/new?topic=pdf"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline hover:text-ink"
+            >
+              Report a problem
+            </a>
+          </span>
           <span className="font-mono">v0.1.0</span>
         </div>
       </footer>
