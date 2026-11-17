@@ -124,12 +124,12 @@ Configure the app via `.env`. Key variables:
 | `ALT_TEXT_GLOBAL_MAX_CONCURRENCY` | Process-wide cap for alt-text requests | `12` |
 | `MAX_UPLOAD_SIZE_BYTES` | Maximum raw upload size accepted by the app | `104857600` |
 | `MAX_UPLOAD_PAGES` | Maximum pages accepted for self-service processing | `300` |
-| `MAX_UPLOAD_PAGE_RENDER_PIXELS` | Maximum estimated pixels for one page rendered at `UPLOAD_PREFLIGHT_RENDER_DPI` | `75000000` |
+| `MAX_UPLOAD_PAGE_RENDER_PIXELS` | Maximum estimated pixels for one page rendered at `UPLOAD_PREFLIGHT_RENDER_DPI` | `300000000` |
 | `MAX_UPLOAD_IMAGE_PIXELS` | Maximum embedded image pixels on one page | `75000000` |
 | `MAX_UPLOAD_TOTAL_IMAGE_PIXELS` | Maximum embedded image pixels across the PDF | `1000000000` |
 | `MAX_UPLOAD_IMAGE_HEAVY_PAGES` | Maximum pages with at least `UPLOAD_IMAGE_HEAVY_PAGE_MIN_PIXELS` image pixels | `75` |
-| `MAX_UPLOAD_OCR_SCAN_TOTAL_IMAGE_PIXELS` | Stricter embedded scan-image pixel cap for OCR/Paper Capture PDFs | `150000000` |
-| `MAX_UPLOAD_OCR_SCAN_IMAGE_HEAVY_PAGES` | Stricter image-heavy page cap for OCR/Paper Capture PDFs | `25` |
+| `MAX_UPLOAD_OCR_SCAN_TOTAL_IMAGE_PIXELS` | Embedded scan-image pixel cap for OCR/Paper Capture PDFs | `1000000000` |
+| `MAX_UPLOAD_OCR_SCAN_IMAGE_HEAVY_PAGES` | Image-heavy page cap for OCR/Paper Capture PDFs | `75` |
 | `OCRMYPDF_JOBS` | OCRmyPDF worker count per PDF; keep low on shared hosts | `1` |
 | `OCRMYPDF_MAX_IMAGE_MPIXELS` | OCRmyPDF image decompression ceiling per image | `75` |
 | `WITH_LOCAL_DOCLING` | Include local Docling in Docker builds | `false` |
