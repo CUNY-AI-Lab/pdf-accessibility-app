@@ -144,6 +144,23 @@ describe("the job list", () => {
 });
 
 describe("the runner", () => {
+  it("gives the next free slot to the person with fewer tasks running", async () => {
+    const alice1 = await createdJobId(await upload());
+    const alice2 = await createdJobId(await upload());
+    const alice3 = await createdJobId(await upload());
+    const bob1 = await createdJobId(await upload(await signedIn(bob)));
+    await runInDurableObject(jobBoard(env), (_board, state) => {
+      for (const [order, id] of [alice1, alice2, alice3, bob1].entries()) {
+        state.storage.sql.exec("UPDATE jobs SET task_queued_at = ? WHERE id = ?", 1_000 + order, id);
+      }
+    });
+    expect((await claim())?.job_id).toBe(alice1);
+    // Alice has one running, Bob none: Bob's later upload goes before Alice's queue.
+    expect((await claim())?.job_id).toBe(bob1);
+    expect((await claim())?.job_id).toBe(alice2);
+    expect((await claim())?.job_id).toBe(alice3);
+  });
+
   it("takes a job, relays its model calls as the person, and returns the result", async () => {
     const person = await signedIn();
     const id = await createdJobId(await upload(person));
