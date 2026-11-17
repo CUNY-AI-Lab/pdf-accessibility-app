@@ -141,7 +141,10 @@ StandardEncoding, gets its glyph names restated over WinAnsiEncoding: PDF/UA-1
 WinAnsiEncoding as its base, and only AGL names in Differences. Each code keeps
 its glyph; codes StandardEncoding leaves undefined take WinAnsiEncoding's
 character. Acrobat's form font (`/Helv`, Differences with no base) is the
-common case.
+common case. A Differences name outside the AGL at a code no content shows is
+left out of the restatement; QuarkXPress output printed through LaserWriter 8
+names the control codes 0-31 `NUL` ... `US`. Codes of a font in the AcroForm
+default resources all count as shown, since a field can show any code.
 
 Families Liberation lacks are converted from the URW base-35 Type 1 programs
 (`fonts-urw-base35`, installed in the image, not in the repository) to
@@ -191,6 +194,38 @@ Forms, appearances, tiling patterns, Type 3 glyphs and soft masks are walked
 with `Tr` tracked through q/Q; a font painted in any of them, or listed in the
 AcroForm `/DR`, is left alone. `repair_notdef_content` never removes codes
 shown in rendering mode 3: they are the document's recognized text.
+
+### Fonts no reader can see
+
+ABBYY FineReader's "text under the page image" PDFs and Acrobat Paper
+Capture's paint the recognized text first and the page scan over the whole
+page after it, often in fonts that are not embedded (Times New Roman,
+AppleMyungjo). veraPDF still requires a program for them (7.21.4.1 exempts
+only rendering mode 3, and 7.21.6-2 needs the program's (3,1) cmap for a
+Differences array). `hidden.simple_font_uses()` walks every page, Form,
+appearance, tiling pattern, Type 3 glyph and soft mask in paint order. A
+simple font's text is unseen when each show is in mode 3, is followed in the
+page's own content stream by an image that covers the page (fills a rectangle
+containing the MediaBox/CropBox intersection within 1 pt, no mask, soft mask
+or JPEG 2000 opacity, no clip, opaque Normal-blend graphics state without
+overprint, not optional content), or shows only `space`/`nbspace`. Images
+inside Forms never count as covers; text in appearances, patterns, Type 3
+glyphs and soft masks is seen unless it is in mode 3; fonts in the AcroForm
+default resources are seen.
+
+A nonsymbolic TrueType font whose text is unseen, whose encoding is
+WinAnsiEncoding or MacRomanEncoding with AGL-only Differences, and that no
+local program fully draws (none installed, or the substitute lacks a shown
+glyph such as FineReader's `checkmark` in Times New Roman), gets an
+empty-glyph program from `hidden.glyphless_program()`: one empty glyph per
+shown character in a (3,1) cmap, advance equal to the PDF width. The page
+looks the same, and the encoding, ToUnicode, widths and content are
+unchanged; this is what Tesseract's GlyphLessFont is to OCRmyPDF's text
+layer. A font with an installed or metric-compatible program that draws every
+shown code keeps that program. When diagnostics find no local candidate, the
+embed lane still runs the local pass and keeps it, without retagging, if it
+leaves no font unembedded; otherwise Ghostscript rewrites the document as
+before (its substitutes for such fonts were written without ToUnicode).
 
 ### Writing ToUnicode CMaps
 
