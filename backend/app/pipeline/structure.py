@@ -122,21 +122,28 @@ def ensure_figure_images(
 # Docling's renderer draws some images without their soft masks or
 # transparency groups, so a photo can come back as a flat or graded block of
 # colour, and the model then calls it blank or decorative. A figure image
-# with less than this share of the detail the page shows in the same box is
-# replaced by the page's own rendering.
+# with less than this share of the detail the page shows in the same box, at
+# any of the FIGURE_DETAIL_SIDES, is replaced by the page's own rendering.
 FIGURE_IMAGE_DETAIL_SHARE = 0.5
+# A flat block shows none of the page's edges at 64 px. A layered scan (mixed
+# raster content) draws its text as a masked foreground image over a
+# background in which the text is smudged out; Docling's image can show only
+# that background. Its smudges keep the layout's edges at 64 px, but not the
+# letter strokes, which show at 256 px.
+FIGURE_DETAIL_SIDES = (64, 256)
 # Docling renders figure images at images_scale 2.0.
 FIGURE_RENDER_SCALE = 2.0
 FIGURE_RENDER_MAX_SIDE = 4000
 
 
-def _image_detail(image: Image.Image) -> float:
-    """Mean edge strength of an image seen at a fixed small size; 0 for one colour."""
+def _image_detail(image: Image.Image, side: int = 64) -> float:
+    """Mean edge strength of an image seen at side x side pixels; 0 for one colour."""
     from PIL import Image as PILImage
     from PIL import ImageFilter, ImageStat
 
-    small = image.convert("L").resize((64, 64), PILImage.Resampling.BOX)
-    return ImageStat.Stat(small.filter(ImageFilter.FIND_EDGES).crop((1, 1, 63, 63))).mean[0]
+    small = image.convert("L").resize((side, side), PILImage.Resampling.BOX)
+    edges = small.filter(ImageFilter.FIND_EDGES).crop((1, 1, side - 1, side - 1))
+    return ImageStat.Stat(edges).mean[0]
 
 
 def _show_figures_as_the_page_does(pdf_path: Path, figures: list[FigureInfo]) -> None:
@@ -196,17 +203,21 @@ def _show_figures_as_the_page_does(pdf_path: Path, figures: list[FigureInfo]) ->
                         continue
                     region = rendered.crop(box)
                     with PILImage.open(figure.path) as image:
-                        shown = _image_detail(image)
-                    page_detail = _image_detail(region)
-                    if shown < FIGURE_IMAGE_DETAIL_SHARE * page_detail:
-                        region.save(figure.path, format="PNG")
-                        logger.info(
-                            "Figure %s: Docling's image shows less than the page (detail %.1f of %.1f); "
-                            "using the page's rendering",
-                            figure.index,
-                            shown,
-                            page_detail,
-                        )
+                        shown = image.convert("L")
+                    for side in FIGURE_DETAIL_SIDES:
+                        shown_detail = _image_detail(shown, side)
+                        page_detail = _image_detail(region, side)
+                        if shown_detail < FIGURE_IMAGE_DETAIL_SHARE * page_detail:
+                            region.save(figure.path, format="PNG")
+                            logger.info(
+                                "Figure %s: Docling's image shows less than the page "
+                                "(detail %.1f of %.1f at %s px); using the page's rendering",
+                                figure.index,
+                                shown_detail,
+                                page_detail,
+                                side,
+                            )
+                            break
                 except Exception:
                     logger.warning("Could not check figure %s image", figure.index, exc_info=True)
     finally:
