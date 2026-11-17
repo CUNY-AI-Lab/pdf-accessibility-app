@@ -5,7 +5,11 @@ import logging
 from pathlib import Path
 
 from app.config import get_settings
-from app.pipeline.fonts.encoding import _standard_encoding_over_winansi
+from app.pipeline.fonts.encoding import (
+    _encoding_differences_names,
+    _standard_encoding_over_winansi,
+)
+from app.pipeline.fonts.hidden import SimpleFontUses, glyphless_program, simple_font_uses
 from app.pipeline.fonts.names import _strip_subset_prefix
 from app.pipeline.fonts.programs import (
     _ghostscript_type1_descriptor,
@@ -19,7 +23,11 @@ from app.pipeline.fonts.resources import (
     _obj_key,
     _resolve_dictionary,
 )
-from app.pipeline.fonts.widths import _align_truetype_advances, _derive_truetype_widths
+from app.pipeline.fonts.widths import (
+    _align_truetype_advances,
+    _derive_truetype_widths,
+    _truetype_code_glyphs,
+)
 from app.pipeline.subprocess_utils import (
     SubprocessTimeout,
     communicate_with_timeout,
@@ -62,8 +70,89 @@ def _embed_system_fonts_sync(
         "fonts_already_embedded": 0,
         "fonts_unsupported": 0,
         "cidtogid_added": 0,
+        "fonts_glyphless": 0,
     }
     seen_fonts: set[tuple[int, int]] = set()
+    font_uses: list[SimpleFontUses | None] = []
+
+    def _uses() -> SimpleFontUses | None:
+        """Where each simple font is shown, read once and only when needed."""
+        if not font_uses:
+            try:
+                font_uses.append(simple_font_uses(pdf))
+            except Exception:
+                # Reading only; an unreadable document keeps every code shown.
+                logger.warning("Could not read simple-font uses", exc_info=True)
+                font_uses.append(None)
+        return font_uses[0]
+
+    def _shown_codes(font_dict) -> set[int] | None:
+        uses = _uses()
+        return uses.shown_codes(font_dict) if uses is not None else None
+
+    def _restate(encoding, *, implicit_standard: bool, font_dict):
+        restated = _standard_encoding_over_winansi(encoding, implicit_standard=implicit_standard)
+        if restated is None:
+            shown = _shown_codes(font_dict)
+            if shown is not None:
+                restated = _standard_encoding_over_winansi(
+                    encoding, implicit_standard=implicit_standard, shown_codes=shown
+                )
+        return restated
+
+    def _program_draws(font_dict, font_name: str, codes: set[int]) -> bool:
+        """A local program exists and has a glyph for each code (Type 1: assumed)."""
+        from io import BytesIO
+
+        from fontTools.ttLib import TTFont
+
+        font_bytes, _, fontfile_key, _ = _local_font_program(font_dict, font_name)
+        if not font_bytes:
+            return False
+        if fontfile_key != "/FontFile2":
+            return True
+        with TTFont(BytesIO(font_bytes), lazy=True) as program:
+            glyphs = _truetype_code_glyphs(font_dict, program)
+        return all(glyphs.get(code, ".notdef") != ".notdef" for code in codes)
+
+    def _embed_glyphless(font_dict, descriptor, font_name: str) -> bool:
+        """Give a TrueType font whose text shows nothing an empty-glyph program.
+
+        Its text is covered by the page scan, in rendering mode 3, or spaces
+        (``hidden.py``), and no local program draws every code it shows. Its
+        encoding must already be what PDF/UA requires of TrueType:
+        WinAnsiEncoding or MacRomanEncoding, with AGL names in Differences.
+        """
+        from fontTools.agl import LEGACY_AGL2UV
+
+        if not isinstance(descriptor, pikepdf.Dictionary) or _obj_key(font_dict) is None:
+            return False
+        uses = _uses()
+        codes = uses.unseen_codes(font_dict) if uses is not None else None
+        if not codes:
+            return False
+        encoding = font_dict.get("/Encoding")
+        base = encoding.get("/BaseEncoding") if isinstance(encoding, pikepdf.Dictionary) else encoding
+        if str(base) not in ("/WinAnsiEncoding", "/MacRomanEncoding"):
+            return False
+        if isinstance(encoding, pikepdf.Dictionary) and any(
+            name not in LEGACY_AGL2UV
+            for name in _encoding_differences_names(encoding.get("/Differences")).values()
+        ):
+            return False
+        if _program_draws(font_dict, font_name, codes):
+            return False
+        program = glyphless_program(font_dict, codes)
+        if program is None:
+            return False
+        descriptor = pikepdf.Dictionary(descriptor)
+        descriptor[pikepdf.Name("/FontFile2")] = pdf.make_stream(program, Length1=len(program))
+        font_dict[pikepdf.Name("/FontDescriptor")] = pdf.make_indirect(descriptor)
+        stats["fonts_embedded"] += 1
+        stats["fonts_glyphless"] += 1
+        stats["fonts_touched"] += 1
+        logger.info(f"Embedded an empty-glyph program for {font_name}: its text shows nothing")
+        return True
 
     def _ensure_type1_descriptor(font_dict, descriptor, font_name: str, font_bytes, fontfile_key):
         if isinstance(descriptor, pikepdf.Dictionary):
@@ -164,7 +253,7 @@ def _embed_system_fonts_sync(
             restated = (
                 None
                 if symbolic
-                else _standard_encoding_over_winansi(encoding, implicit_standard=True)
+                else _restate(encoding, implicit_standard=True, font_dict=font_dict)
             )
             if restated is not None:
                 font_dict["/Encoding"] = restated
@@ -180,8 +269,8 @@ def _embed_system_fonts_sync(
             and font_dict.get("/Subtype") == pikepdf.Name("/TrueType")
             and not symbolic
         ):
-            restated = _standard_encoding_over_winansi(
-                font_dict.get("/Encoding"), implicit_standard=False
+            restated = _restate(
+                font_dict.get("/Encoding"), implicit_standard=False, font_dict=font_dict
             )
             if restated is not None:
                 font_dict["/Encoding"] = restated
@@ -231,6 +320,10 @@ def _embed_system_fonts_sync(
                     else ""
                 )
             )
+            if not _has_embedded_font(descriptor) and _embed_glyphless(
+                font_dict, descriptor, font_name
+            ):
+                return
             _embed_descriptor_font(font_dict, descriptor, font_name)
             return
 
@@ -294,7 +387,8 @@ def _embed_system_fonts_sync(
                 f"(embedded={stats['fonts_embedded']}, "
                 f"missing={stats['fonts_missing']}, "
                 f"unsupported={stats['fonts_unsupported']}, "
-                f"CIDToGIDMap added={stats['cidtogid_added']})"
+                f"CIDToGIDMap added={stats['cidtogid_added']}, "
+                f"empty-glyph programs for unseen text={stats['fonts_glyphless']})"
             ),
             stats,
         )
