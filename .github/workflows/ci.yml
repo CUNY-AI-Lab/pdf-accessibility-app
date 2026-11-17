@@ -67,7 +67,7 @@ jobs:
       - name: Install Worker dependencies
         working-directory: worker
         run: bun install --frozen-lockfile
-      - name: Install PDF rendering tools
+      - name: Install PDF rendering and OCR tools
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -76,7 +76,8 @@ jobs:
             -e 's#^URIs: http://security.ubuntu.com/ubuntu/$#URIs: https://mirrors.edge.kernel.org/ubuntu/#' \
             /etc/apt/sources.list.d/ubuntu.sources
           apt-get update
-          apt-get install --no-install-recommends -y poppler-utils
+          # Tesseract (with English) runs the OCR font-mapping test.
+          apt-get install --no-install-recommends -y poppler-utils tesseract-ocr tesseract-ocr-eng
       - name: Run canonical source gate
         run: ./scripts/check.sh
 
