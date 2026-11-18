@@ -71,13 +71,17 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
+          # kernel.org first, with Ubuntu's own mirrors as alternatives: one
+          # unreachable mirror must not fail the gate. apt checks signatures
+          # whichever mirror answers.
           sed -i \
-            -e 's#^URIs: http://azure.archive.ubuntu.com/ubuntu/$#URIs: https://mirrors.edge.kernel.org/ubuntu/#' \
-            -e 's#^URIs: http://security.ubuntu.com/ubuntu/$#URIs: https://mirrors.edge.kernel.org/ubuntu/#' \
+            -e 's#^URIs: http://azure.archive.ubuntu.com/ubuntu/$#URIs: https://mirrors.edge.kernel.org/ubuntu/ http://archive.ubuntu.com/ubuntu/#' \
+            -e 's#^URIs: http://security.ubuntu.com/ubuntu/$#URIs: https://mirrors.edge.kernel.org/ubuntu/ http://security.ubuntu.com/ubuntu/#' \
             /etc/apt/sources.list.d/ubuntu.sources
-          apt-get update
+          apt_options=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          apt-get "${apt_options[@]}" update
           # Tesseract (with English) runs the OCR font-mapping test.
-          apt-get install --no-install-recommends -y poppler-utils tesseract-ocr tesseract-ocr-eng
+          apt-get "${apt_options[@]}" install --no-install-recommends -y poppler-utils tesseract-ocr tesseract-ocr-eng
       - name: Run canonical source gate
         run: ./scripts/check.sh
 
