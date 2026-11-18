@@ -158,8 +158,14 @@ class Settings(BaseSettings):
     runner_slots: int = 2
     runner_poll_seconds: float = 2.0
     runner_heartbeat_seconds: float = 30.0
-    # Touched every 30 seconds while the runner is running, for its health check.
+    # Touched every 30 seconds while the Worker answers the runner, for its
+    # health check. The Dockerfile's check fails after 3 minutes untouched.
     runner_alive_file: str = ""
+    # No answer from the Worker for this long: stop touching the file.
+    runner_health_stale_seconds: float = 150.0
+    # No answer for this long: exit with an error so Docker restarts the runner.
+    # Any task's lease (3 minutes) has lapsed by then, so nothing is lost.
+    runner_contact_timeout_seconds: float = 600.0
 
     @model_validator(mode="after")
     def validate_llm_settings(self):

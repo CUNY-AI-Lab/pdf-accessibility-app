@@ -9,6 +9,8 @@ import asyncio
 import logging
 import signal
 import socket
+import time
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 
@@ -22,6 +24,10 @@ from app.services.file_storage import ensure_dirs
 
 logger = logging.getLogger("app.runner")
 IDLE_BACKOFF_SECONDS = 30.0
+HEALTH_BEAT_SECONDS = 30.0
+# Consecutive 401/403 answers to a claim before the runner exits. A revoked or
+# wrong RUNNER_TOKEN never heals by retrying, so it should restart loudly.
+AUTH_REFUSAL_LIMIT = 3
 
 
 class RunnerMode(Enum):
@@ -50,6 +56,42 @@ class RunnerControl:
     def stop(self) -> None:
         if self.mode is RunnerMode.ACCEPTING:
             self.transition(RunnerMode.STOPPING)
+
+
+class RunnerHealth:
+    """Whether the runner can take work, judged by the Worker's answers.
+
+    Healthy means the Worker answered recently, through a claim or a task's
+    lease renewal, so a runner whose slots are all busy still reads as alive.
+    After ``give_up_after`` seconds without an answer the runner stops with an
+    error, so Docker restarts it and the failure shows.
+    """
+
+    def __init__(
+        self,
+        client,
+        *,
+        started: float,
+        stale_after: float,
+        give_up_after: float,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.client = client
+        self.started = started
+        self.stale_after = stale_after
+        self.give_up_after = give_up_after
+        self.clock = clock
+        self.failure: str | None = None
+
+    def _silence(self) -> float:
+        last = self.client.last_contact
+        return self.clock() - (self.started if last is None else last)
+
+    def fresh(self) -> bool:
+        return self.client.last_contact is not None and self._silence() < self.stale_after
+
+    def gave_up(self) -> bool:
+        return self._silence() >= self.give_up_after
 
 
 async def acquire_slot(slots: asyncio.Semaphore, stopping: asyncio.Event) -> bool:
@@ -84,8 +126,17 @@ async def main() -> None:
         loop.add_signal_handler(signum, control.stop)
 
     logger.info("Runner %s taking work from %s", runner_id, client.base_url)
+    health = RunnerHealth(
+        client,
+        started=time.monotonic(),
+        stale_after=settings.runner_health_stale_seconds,
+        give_up_after=settings.runner_contact_timeout_seconds,
+    )
     alive = Path(settings.runner_alive_file) if settings.runner_alive_file.strip() else None
-    heartbeat = asyncio.create_task(_stay_alive(alive, stopping)) if alive is not None else None
+    heartbeat = (
+        asyncio.create_task(_stay_alive(alive, control, health)) if alive is not None else None
+    )
+    refusals = 0
     try:
         while not stopping.is_set():
             if not await acquire_slot(slots, stopping):
@@ -94,9 +145,19 @@ async def main() -> None:
                 task = await client.claim(runner_id)
             except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
                 slots.release()
+                status = (
+                    exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                )
+                refusals = refusals + 1 if status in {401, 403} else 0
+                if refusals >= AUTH_REFUSAL_LIMIT:
+                    health.failure = (
+                        f"the Worker refused RUNNER_TOKEN {refusals} times in a row (HTTP {status})"
+                    )
+                    break
                 logger.warning("Claim failed (%s); waiting", exc)
                 await _sleep_unless(stopping, IDLE_BACKOFF_SECONDS)
                 continue
+            refusals = 0
             if stopping.is_set():
                 slots.release()
                 break
@@ -122,13 +183,23 @@ async def main() -> None:
         await asyncio.gather(*running, return_exceptions=True)
         await client.close()
         control.transition(RunnerMode.STOPPED)
+    if health.failure is not None:
+        logger.error("Runner stopping: %s", health.failure)
+        raise SystemExit(f"Runner stopped: {health.failure}")
 
 
-async def _stay_alive(path: Path, stopping: asyncio.Event) -> None:
-    """Touch the health check's file while the runner is running."""
-    while not stopping.is_set():
-        path.touch()
-        await _sleep_unless(stopping, 30.0)
+async def _stay_alive(path: Path, control: RunnerControl, health: RunnerHealth) -> None:
+    """Touch the health check's file while the Worker answers; give up when it won't."""
+    while not control.stopping.is_set():
+        if health.gave_up():
+            health.failure = (
+                f"no answer from the Worker for {health.give_up_after:.0f} seconds"
+            )
+            control.stop()
+            return
+        if health.fresh():
+            path.touch()
+        await _sleep_unless(control.stopping, HEALTH_BEAT_SECONDS)
 
 
 async def _sleep_unless(stopping: asyncio.Event, seconds: float) -> None:

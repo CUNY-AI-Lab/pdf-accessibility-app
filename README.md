@@ -82,7 +82,10 @@ docker compose up -d --build
 
 The default command is `python -m app.runner`. It makes outbound requests and
 opens no HTTP port. Docker checks the file named by `RUNNER_ALIVE_FILE`
-(default `/tmp/runner-alive`), which the runner touches every 30 seconds.
+(default `/tmp/runner-alive`), which the runner touches every 30 seconds
+while the Worker answers it. A runner the Worker refuses (a wrong
+`RUNNER_TOKEN`) or hasn't answered for `RUNNER_CONTACT_TIMEOUT_SECONDS`
+(default 600) exits with an error, so its restart policy restarts it.
 
 The image expects `DOCLING_SERVE_URL` to point to a remote `docling-serve`.
 Set `WITH_LOCAL_DOCLING=true` before building to include local Docling and

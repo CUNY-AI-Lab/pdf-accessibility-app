@@ -123,12 +123,21 @@ class WorkerClient:
     ):
         self.base_url = base_url.rstrip("/")
         self._token = token
+        # Monotonic time of the Worker's last real answer, for the health check.
+        self.last_contact: float | None = None
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             headers={RUNNER_TOKEN_HEADER: token},
             timeout=httpx.Timeout(120.0, connect=15.0),
             transport=transport,
+            event_hooks={"response": [self._note_contact]},
         )
+
+    async def _note_contact(self, response: httpx.Response) -> None:
+        # A refused credential or a failing Worker is not contact: the runner
+        # can't take work through either. A 404/409/410 about one lease is.
+        if response.status_code < 500 and response.status_code not in {401, 403}:
+            self.last_contact = time.monotonic()
 
     async def close(self) -> None:
         await self._client.aclose()

@@ -98,39 +98,77 @@ jobs:
         run: docker build --tag pdf-accessibility-app:ci .
       - name: Verify container CA trust
         run: docker run --rm pdf-accessibility-app:ci python /usr/local/libexec/check_ca_trust.py
-      # The local dummy endpoint refuses claims; this checks runner liveness only.
+      # A stub Worker that answers every claim with "no work": the runner must
+      # turn healthy. A dead endpoint: the runner must never report healthy,
+      # and must exit with an error once it gives up on the Worker.
       - name: Smoke-test runner container health
         run: |
           set -euo pipefail
-          container_name=pdf-accessibility-ci-smoke
+          network=pdf-accessibility-ci
+          stub=pdf-accessibility-ci-worker
+          healthy=pdf-accessibility-ci-smoke
+          dead=pdf-accessibility-ci-dead
           cleanup() {
-            docker rm -f "$container_name" >/dev/null 2>&1 || true
+            docker rm -f "$healthy" "$dead" "$stub" >/dev/null 2>&1 || true
+            docker network rm "$network" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
+          runner_env=(
+            --env RUNNER_TOKEN=check-only
+            --env LLM_API_KEY=check-only
+            --env LLM_BASE_URL=http://127.0.0.1:8000/v1
+            --env LLM_MODEL=check-model
+            --env DOCLING_SERVE_URL=
+            --env DOCLING_SERVE_TOKEN=
+          )
 
-          docker run --detach --name "$container_name" \
+          docker network create "$network" >/dev/null
+          docker run --detach --name "$stub" --network "$network" --no-healthcheck \
+            pdf-accessibility-app:ci python -c '
+          import http.server
+
+          class NoWork(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  self.send_response(204)
+                  self.end_headers()
+
+          http.server.ThreadingHTTPServer(("0.0.0.0", 8080), NoWork).serve_forever()
+          '
+          docker run --detach --name "$healthy" --network "$network" "${runner_env[@]}" \
+            --env RUNNER_WORKER_URL="http://$stub:8080" \
+            pdf-accessibility-app:ci
+          docker run --detach --name "$dead" "${runner_env[@]}" \
             --env RUNNER_WORKER_URL=http://127.0.0.1:9 \
-            --env RUNNER_TOKEN=check-only \
-            --env LLM_API_KEY=check-only \
-            --env LLM_BASE_URL=http://127.0.0.1:8000/v1 \
-            --env LLM_MODEL=check-model \
-            --env DOCLING_SERVE_URL= \
-            --env DOCLING_SERVE_TOKEN= \
+            --env RUNNER_CONTACT_TIMEOUT_SECONDS=20 \
             pdf-accessibility-app:ci
 
           health_ok=false
           for ((attempt = 1; attempt <= 150; attempt++)); do
-            if [[ "$(docker inspect --format '{{.State.Health.Status}}' "$container_name")" == healthy ]]; then
+            if [[ "$(docker inspect --format '{{.State.Health.Status}}' "$healthy")" == healthy ]]; then
               health_ok=true
               break
             fi
             sleep 1
           done
-
           if [[ "$health_ok" != true ]]; then
-            docker logs "$container_name"
+            docker logs "$healthy"
             exit 1
           fi
+
+          exit_code="$(timeout 120 docker wait "$dead")" || {
+            echo "The runner kept running against a dead Worker" >&2
+            docker logs "$dead"
+            exit 1
+          }
+          if [[ "$exit_code" == 0 ]]; then
+            echo "The runner exited 0 after giving up on the Worker" >&2
+            docker logs "$dead"
+            exit 1
+          fi
+          docker logs "$dead" 2>&1 | grep -q "no answer from the Worker" || {
+            docker logs "$dead"
+            exit 1
+          }
 
   source-gate-result:
     name: Source gate

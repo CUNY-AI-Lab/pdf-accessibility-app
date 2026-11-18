@@ -16,3 +16,13 @@ progress; it can still be split into PRs per item when it is merged.
 `CUNY-AI-Lab/pdf-accessibility` (ASUCICREPO's AWS solution) does not serve the
 live tool. Its review findings are kept in the appendix of IMPROVEMENT_PLAN.md
 and no work is planned there.
+
+## 2026-11-18 — The runner restarts itself instead of relying on an autoheal sidecar
+
+Docker's `restart: unless-stopped` ignores health status, so an unhealthy
+runner was never restarted. Rather than add an autoheal container (another
+image with access to the Docker socket), the runner exits with an error when
+the Worker refuses its token three times in a row or hasn't answered for
+`RUNNER_CONTACT_TIMEOUT_SECONDS` (600 s, longer than a 3-minute lease, so no
+held task is cut short). The existing restart policy then restarts it, and
+the restarts are visible in `docker compose ps`.

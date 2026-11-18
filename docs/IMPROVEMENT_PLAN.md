@@ -46,7 +46,7 @@ Priority: P0 = fix first (a live failure mode), P1 = next, P2 = as time allows.
 
 ### P0 — resilience
 
-- [ ] **1. A health check that tells the truth.**
+- [x] **1. A health check that tells the truth.**
   `_stay_alive` (`backend/app/runner/__main__.py`) touches the health file on
   a timer, whatever the claim loop is doing. A revoked token or an unreachable
   Worker loops on "Claim failed" every 30 s and the container stays healthy;
@@ -55,6 +55,13 @@ Priority: P0 = fix first (a live failure mode), P1 = next, P2 = as time allows.
   repeated authentication refusals so Docker restarts the runner and the
   failure is visible. The CI smoke test should expect "unhealthy" against its
   dead endpoint.
+  *Done:* the health file is touched only while the Worker answers (claims or
+  lease renewals); three refused claims in a row, or 10 minutes without an
+  answer, exit with an error. CI now runs the image against a stub Worker
+  (must turn healthy) and a dead one (must exit non-zero). Verified locally
+  by unit tests and by running the runner against both; the image itself
+  could not be built in the sandbox (Debian mirrors blocked), so the CI job
+  is its first run.
 - [ ] **2. Graceful drain on SIGTERM.** Shutdown cancels in-flight jobs at
   once. Each then waits out its 3-minute lease and spends one of its two
   attempts (`worker/src/board.ts` `LIMITS.attempts`), so two restarts during a

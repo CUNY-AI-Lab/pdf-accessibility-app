@@ -1401,3 +1401,105 @@ async def test_revision_relocation_handles_old_snapshot_roots_without_rewriting_
     with sqlite3.connect(database_path(second, JOB_ID)) as db:
         db.execute("DROP TABLE review_revisions")
     relocate_database(database_path(second, JOB_ID), JOB_ID, data_root(base))
+
+
+@pytest.mark.parametrize(
+    "status,counts",
+    [(200, True), (204, True), (409, True), (401, False), (403, False), (502, False)],
+)
+async def test_worker_client_records_contact_only_for_real_answers(status, counts):
+    def handler(_request):
+        return httpx.Response(status, json={"task": None} if status == 200 else None)
+
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    assert client.last_contact is None
+    try:
+        await client.claim("runner")
+    except (httpx.HTTPError, ValueError):
+        pass
+    assert (client.last_contact is not None) is counts
+    await client.close()
+
+
+async def test_worker_client_records_no_contact_when_unreachable():
+    def handler(request):
+        raise httpx.ConnectError("refused", request=request)
+
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    with pytest.raises(httpx.ConnectError):
+        await client.claim("runner")
+    assert client.last_contact is None
+    await client.close()
+
+
+async def test_health_file_is_touched_only_while_the_worker_answers(tmp_path, monkeypatch):
+    from app.runner import __main__ as runner_main
+
+    alive = tmp_path / "alive"
+    clock = [100.0]
+    control = runner_main.RunnerControl()
+
+    class Client:
+        last_contact: float | None = None
+
+    client = Client()
+    health = runner_main.RunnerHealth(
+        client, started=clock[0], stale_after=150.0, give_up_after=600.0, clock=lambda: clock[0]
+    )
+    beats = []
+
+    async def sleep(_stopping, _seconds):
+        beats.append(alive.exists())
+        alive.unlink(missing_ok=True)
+        step = len(beats)
+        if step == 1:
+            client.last_contact = clock[0]  # the Worker answers
+        elif step == 2:
+            clock[0] += 200.0  # no answer since: stale
+        elif step == 3:
+            clock[0] += 400.0  # past the give-up limit
+
+    monkeypatch.setattr(runner_main, "_sleep_unless", sleep)
+    await asyncio.wait_for(runner_main._stay_alive(alive, control, health), 1)
+    # Never contacted, then contacted, then stale, then the runner gives up.
+    assert beats == [False, True, False]
+    assert control.stopping.is_set()
+    assert health.failure is not None and "no answer from the Worker" in health.failure
+
+
+async def test_runner_exits_nonzero_after_repeated_auth_refusals(tmp_path, monkeypatch):
+    from app.runner import __main__ as runner_main
+
+    settings = _settings(tmp_path)
+
+    class Client:
+        base_url = WORKER
+        last_contact: float | None = None
+        calls = 0
+        closed = False
+
+        async def claim(self, _runner):
+            self.calls += 1
+            request = httpx.Request("POST", f"{WORKER}/claim")
+            status = 503 if self.calls == 2 else 401
+            response = httpx.Response(status, request=request)
+            raise httpx.HTTPStatusError("refused", request=request, response=response)
+
+        async def close(self):
+            self.closed = True
+
+    async def sleep(*_args):
+        pass
+
+    client = Client()
+    monkeypatch.setattr(runner_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(runner_main, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(runner_main, "WorkerClient", lambda *_args: client)
+    monkeypatch.setattr(runner_main, "_sleep_unless", sleep)
+    monkeypatch.setattr(asyncio.get_running_loop(), "add_signal_handler", lambda *_args: None)
+    with pytest.raises(SystemExit) as exited:
+        await asyncio.wait_for(runner_main.main(), 1)
+    assert exited.value.code != 0
+    # A 503 between refusals is not a refusal; three in a row are needed.
+    assert client.calls == 1 + 1 + runner_main.AUTH_REFUSAL_LIMIT
+    assert client.closed

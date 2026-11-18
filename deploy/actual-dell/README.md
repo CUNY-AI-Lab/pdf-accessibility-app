@@ -84,8 +84,9 @@ runner; tasks claimed under the old token fail their next call and retry.
 
 ## Checks
 
-- `docker compose ps` shows the runner healthy (it touches a file every 30
-  seconds).
+- `docker compose ps` shows the runner healthy: it touches a file every 30
+  seconds while the Worker answers it. If it is unhealthy or restarting, its
+  log says why (a refused `RUNNER_TOKEN`, or no answer from the Worker).
 - A job uploaded at `/pdf-accessibility/` moves from queued to processing
   within a few seconds while the runner is up.
 - The runner's log names each task it takes; model calls appear as
