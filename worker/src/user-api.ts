@@ -140,16 +140,34 @@ export async function handleApi(request: Request, env: Env, path: string, person
   return detail(405, "Method Not Allowed");
 }
 
+// HTML the runner renders is a document, never an app: no scripts, no requests.
+const HTML_POLICY = "default-src 'none'; img-src data:; style-src 'unsafe-inline'";
+const HTML_TYPE = "text/html; charset=utf-8";
+const IMAGE_TYPES = ["image/png", "image/jpeg"];
+
+/**
+ * The type each runner file is served as. The route decides, not the stored
+ * metadata: a runner (or a compromised one) cannot make a figure into HTML
+ * served from this origin.
+ */
+function servedType(name: string, stored: string | undefined): string {
+  if (name === DOCUMENT_HTML_FILE || name === "report.html") return HTML_TYPE;
+  if (name === "output.pdf") return "application/pdf";
+  if (name.startsWith("views/")) return "application/json";
+  if (name.startsWith("figures/") || name.startsWith("previews/")) {
+    const type = (stored ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+    if (IMAGE_TYPES.includes(type)) return type;
+  }
+  return "application/octet-stream";
+}
+
 async function file(env: Env, job: JobRecord, name: string, disposition: string | null): Promise<Response> {
   const object = await env.FILES.get(fileKey(job, name));
   if (object === null) return detail(404, "File not found");
-  const headers = new Headers({ "cache-control": "private, no-store" });
-  object.writeHttpMetadata(headers);
-  if (name === DOCUMENT_HTML_FILE) {
-    headers.set("content-type", "text/html; charset=utf-8");
-    headers.set("content-security-policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'");
-    headers.set("x-content-type-options", "nosniff");
-  }
+  const headers = new Headers({ "cache-control": "private, no-store", "x-content-type-options": "nosniff" });
+  const type = servedType(name, object.httpMetadata?.contentType);
+  headers.set("content-type", type);
+  if (type === HTML_TYPE) headers.set("content-security-policy", HTML_POLICY);
   if (disposition !== null) headers.set("content-disposition", disposition);
   return new Response(object.body, { headers });
 }
@@ -171,9 +189,11 @@ async function downloadBatchReport(env: Env, person: Person, now: number): Promi
   if (html === null) return detail(404, "No completed jobs to report on");
   return new Response(html, {
     headers: {
-      "content-type": "text/html; charset=utf-8",
+      "content-type": HTML_TYPE,
       "cache-control": "private, no-store",
       "content-disposition": 'attachment; filename="batch_accessibility_report.html"',
+      "content-security-policy": HTML_POLICY,
+      "x-content-type-options": "nosniff",
     },
   });
 }

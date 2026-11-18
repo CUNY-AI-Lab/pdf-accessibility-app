@@ -18,6 +18,9 @@ import { detail, json, noContent, sameSecret } from "./http";
 export const RUNNER_TOKEN_HEADER = "x-pdf-runner-token";
 export const JOB_TOKEN_HEADER = "x-pdf-job-token";
 const MAX_RUNNER_FILE_BYTES = 500 * 1024 * 1024;
+// The runner caps its own requests at LLM_MAX_REQUEST_BYTES (2 MiB by
+// default); this bounds what one lease can push through to the Gateway.
+const MAX_RELAY_BODY_BYTES = 16 * 1024 * 1024;
 const RELAYED_HEADERS = ["content-type", "retry-after", "x-should-retry"];
 
 const leaseLost = (): Response => detail(409, "This task is no longer held by the runner");
@@ -48,13 +51,24 @@ export async function handleRunner(request: Request, env: Env, path: string): Pr
   const action = parts.slice(2).join("/");
 
   if (action === "v1/chat/completions" && request.method === "POST") {
+    const declared = request.headers.get("content-length");
+    if (declared !== null) {
+      const length = Number(declared);
+      if (!Number.isInteger(length) || length < 0 || length > MAX_RELAY_BODY_BYTES) {
+        return detail(413, "Model request too large");
+      }
+    }
     const credential = await board.relayCredential(jobId, lease, now);
     if (credential === null) return leaseLost();
+    // Without a declared length, read the body under the same limit rather
+    // than refuse it: a proxy that drops the header must not stop processing.
+    const body = declared !== null ? request.body : await boundedBody(request, MAX_RELAY_BODY_BYTES);
+    if (body === "too large") return detail(413, "Model request too large");
     const upstream = await env.GATEWAY.fetch(
       new Request(`${env.CAIL_API_BASE}/v1/chat/completions`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-cail-identity-jwt": credential },
-        body: request.body,
+        body,
       }),
     );
     const headers = new Headers({ "cache-control": "no-store" });
@@ -126,4 +140,29 @@ export async function handleRunner(request: Request, env: Env, path: string): Pr
     return noContent();
   }
   return detail(404, "Not Found");
+}
+
+/** A request body read into memory, refusing it past ``limit`` bytes. */
+export async function boundedBody(request: Request, limit: number): Promise<Uint8Array | "too large"> {
+  if (request.body === null) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    length += value.length;
+    if (length > limit) {
+      await reader.cancel();
+      return "too large";
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return body;
 }

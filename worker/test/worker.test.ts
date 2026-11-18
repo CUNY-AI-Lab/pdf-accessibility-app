@@ -4,6 +4,7 @@ import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { JobBoard, LIMITS, MESSAGES } from "../src/board";
+import { boundedBody } from "../src/runner-api";
 import { jobBoard } from "../src/env";
 import {
   alice,
@@ -281,6 +282,66 @@ describe("the runner", () => {
     const failed = await job(id);
     expect(failed.status).toBe("failed");
     expect(failed.error).toBe(MESSAGES.signInEnding);
+  });
+});
+
+describe("serving runner files", () => {
+  const LOCKED_DOWN = "default-src 'none'; img-src data:; style-src 'unsafe-inline'";
+
+  it("serves every file with nosniff, and HTML reports with a content security policy", async () => {
+    const id = await createdJobId(await upload());
+    const task = await claim();
+    if (task === null) throw new Error("no task");
+    expect((await finishProcess(task)).status).toBe(204);
+    const report = await api(`/jobs/${id}/download/report.html`);
+    expect(report.status).toBe(200);
+    expect(report.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(report.headers.get("content-security-policy")).toBe(LOCKED_DOWN);
+    expect(report.headers.get("x-content-type-options")).toBe("nosniff");
+    const batch = await api("/jobs/download/batch-report.html");
+    expect(batch.headers.get("content-security-policy")).toBe(LOCKED_DOWN);
+    expect(batch.headers.get("x-content-type-options")).toBe("nosniff");
+    for (const path of [`/jobs/${id}/download`, `/jobs/${id}/pages/2/preview`, `/jobs/${id}/figures/0/image`]) {
+      expect((await api(path)).headers.get("x-content-type-options")).toBe("nosniff");
+    }
+  });
+
+  it("never serves a runner's figure or preview as anything but an image", async () => {
+    const id = await createdJobId(await upload());
+    const task = await claim();
+    if (task === null) throw new Error("no task");
+    expect((await finishProcess(task)).status).toBe(204);
+    // As if a compromised runner had stored HTML under an image's name.
+    await env.FILES.put(`jobs/${id}/r1/figures/0`, "<script>alert(1)</script>", { httpMetadata: { contentType: "text/html" } });
+    await env.FILES.put(`jobs/${id}/r1/previews/2`, "jpeg-bytes", { httpMetadata: { contentType: "image/jpeg" } });
+    expect((await api(`/jobs/${id}/figures/0/image`)).headers.get("content-type")).toBe("application/octet-stream");
+    expect((await api(`/jobs/${id}/pages/2/preview`)).headers.get("content-type")).toBe("image/jpeg");
+    expect((await api(`/jobs/${id}/download`)).headers.get("content-type")).toBe("application/pdf");
+  });
+});
+
+describe("model relay limits", () => {
+  it("refuses a model request larger than the relay accepts", async () => {
+    await upload();
+    const task = await claim();
+    if (task === null) throw new Error("no task");
+    const huge = "x".repeat(17 * 1024 * 1024);
+    const refused = await runner(`/tasks/${task.job_id}/v1/chat/completions`, {
+      method: "POST",
+      lease: task.lease,
+      body: JSON.stringify({ model: "qwen3-vl", messages: [{ role: "user", content: huge }] }),
+    });
+    expect(refused.status).toBe(413);
+  });
+
+  it("reads a body without a declared length only up to the limit", async () => {
+    const streamed = (text: string): Request =>
+      new Request(`${ORIGIN}/relay`, { method: "POST", body: new Blob([text]).stream() });
+    expect(streamed("{}").headers.get("content-length")).toBeNull();
+    const small = await boundedBody(streamed('{"model":"m"}'), 1024);
+    expect(small).not.toBe("too large");
+    expect(new TextDecoder().decode(small === "too large" ? undefined : small)).toBe('{"model":"m"}');
+    expect(await boundedBody(streamed("x".repeat(2048)), 1024)).toBe("too large");
   });
 });
 

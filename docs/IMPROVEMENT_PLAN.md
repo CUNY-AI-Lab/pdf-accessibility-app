@@ -148,6 +148,18 @@ Priority: P0 = fix first (a live failure mode), P1 = next, P2 = as time allows.
   call limits on the model relay; `nosniff`, a content-type allowlist and a
   CSP on HTML reports; a per-person cap on uploads in flight; accept the
   `%PDF-` header anywhere in the first 1024 bytes, as the PDF spec allows.
+  *Part done:* every runner file is served with `nosniff`; the route, not the
+  stored metadata, decides its type (HTML only for `report.html` and
+  `document.html`, images only as PNG/JPEG, otherwise octet-stream); HTML
+  reports and the batch report get the locked-down CSP `document.html` had;
+  relayed model requests over 16 MiB are refused (bodies without a declared
+  length are read under the same limit, so a proxy that drops the header
+  can't stop processing).
+  *Open:* a per-person cap on uploads in flight (the `uploads` table has no
+  owner, so it needs a Durable Object migration); `max_tokens`, call-count
+  and model limits on the relay (need the runner's real request profile
+  first); a `%PDF-` header after byte 0 (needs checking that every pipeline
+  tool accepts leading bytes).
 
 ### P1 — tests and gates
 
