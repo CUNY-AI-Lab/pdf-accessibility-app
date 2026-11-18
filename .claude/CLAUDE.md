@@ -1,37 +1,39 @@
 # PDF Accessibility App
 
+Read `AGENTS.md` first: it has the working rules (the source gate, the runner
+contract, the Gateway relay, the PDFium lock). `docs/cail-integration-plan.md`
+is the product plan of record; `docs/IMPROVEMENT_PLAN.md` tracks engineering
+work and `docs/DECISIONS.md` records decisions.
+
 ## Project Structure
-- `backend/` — FastAPI (Python 3.12, managed with `uv`)
-- `frontend/` — React + Vite + TypeScript (managed with `bun`)
-- `data/` — Runtime storage (git-ignored): uploads, processing, output, SQLite DB
+- `worker/` — Cloudflare Worker (v2): serves the app at `/pdf-accessibility`,
+  the API, sign-in through Doorway, jobs in the `JobBoard` Durable Object,
+  files in R2, and the Gateway relay. Managed with `bun`; tests run in workerd.
+- `backend/` — the Python 3.12 pipeline, run as `python -m app.runner`. It
+  claims work from the Worker and has no HTTP server. Managed with `uv`.
+- `frontend/` — React + Vite + TypeScript, served by the Worker. Managed with `bun`.
+- `deploy/actual-dell/` — how the runner and docling-serve run in production.
 
 ## Development
-
-### Backend
-```bash
-cd backend
-uv run uvicorn app.main:app --reload --port 8001
-```
-
-### Frontend
-```bash
-cd frontend
-bun dev
-```
-
-Frontend proxies `/api` and `/health` to `http://localhost:8001` via Vite config.
+- Source gate (run before pushing): `scripts/check.sh`.
+- Backend tests: `cd backend && PYTHONPATH=. uv run pytest tests -q`.
+- Worker and frontend: `bun run check` in `worker/` and `frontend/`.
+- The Worker and runner together on one PDF: `worker/dev/e2e.mjs`
+  (see `worker/README.md`).
 
 ## Conventions
-- Python: ruff for linting/formatting, async everywhere, type hints required
-- TypeScript: strict mode, TanStack Query for server state, Tailwind CSS 4
-- Database: SQLite via SQLAlchemy async + aiosqlite
-- API: RESTful, all under `/api/` prefix, Pydantic schemas for validation
+- Python: ruff for linting, pyright for types, async where the code is async.
+- TypeScript: strict mode, TanStack Query for server state, Tailwind CSS 4.
+- Runner state: per-task SQLite via SQLAlchemy async + aiosqlite.
+- The runner contract lives in both `worker/src/contract.ts` and
+  `backend/app/runner/`; change both in one change.
 
 ## Key Files
-- `backend/app/main.py` — FastAPI app entry point
+- `backend/app/runner/` — task claims, leases, pipeline execution, view publication
 - `backend/app/pipeline/` — 7-step PDF accessibility pipeline
-- `backend/app/api/` — API route handlers
-- `backend/app/models.py` — SQLAlchemy ORM models (Job, JobStep, AltTextEntry)
+- `backend/app/models.py` — SQLAlchemy ORM models
+- `worker/src/board.ts` — the JobBoard Durable Object (jobs, leases, retention)
+- `worker/src/user-api.ts`, `worker/src/runner-api.ts` — the person's API and the runner's API
 - `frontend/src/pages/` — React pages (Upload, Dashboard, JobDetail, Review)
 - `frontend/src/api/jobs.ts` — TanStack Query hooks for API calls
 
