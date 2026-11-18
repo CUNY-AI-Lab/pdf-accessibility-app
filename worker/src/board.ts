@@ -49,6 +49,9 @@ export const LIMITS = {
   ...CREDENTIAL_LIMITS,
   retentionMs: 12 * HOUR,
   sweepMs: MINUTE,
+  // Queued work fails once no runner has asked for work this long: the
+  // runner is down, not busy (a busy runner still polls).
+  runnerAbsentMs: 30 * MINUTE,
 };
 
 export const MESSAGES = {
@@ -58,6 +61,8 @@ export const MESSAGES = {
   deadline: "Processing took longer than the time limit, so it was stopped.",
   inconsistent: "This PDF's processing record was inconsistent, so it was stopped. Upload the PDF again.",
   reviewNotApplied: "This change could not be applied, so the earlier result was kept. Try the change again.",
+  runnerUnavailable:
+    "PDF processing was unavailable for too long, so this PDF was not processed. Upload it again later.",
   reviewSignInEnding:
     "Your sign-in ended before this change could be applied, so the earlier result was kept. Sign in again and make the change again.",
 };
@@ -330,6 +335,10 @@ function failSteps(steps: Step[], error: string, now: number): Step[] {
 
 export class JobBoard extends DurableObject<Env> {
   private readonly sql: SqlStorage;
+  // When a runner last asked for work. Kept in memory, not storage, since
+  // runners poll every few seconds; after an eviction it starts at "now",
+  // which can only delay failing queued work, never fail it early.
+  private lastRunnerPoll = Date.now();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -623,6 +632,7 @@ export class JobBoard extends DurableObject<Env> {
    * slot while someone else's upload waits behind it.
    */
   async claim(now: number): Promise<ClaimedTask | null> {
+    this.lastRunnerPoll = now;
     const lease = randomToken();
     const leaseHash = await sha256Hex(lease);
     for (;;) {
@@ -1048,41 +1058,87 @@ export class JobBoard extends DurableObject<Env> {
   /** Requeue or fail tasks whose runner went quiet, end overdue ones, and delete old jobs. */
   override async alarm(): Promise<void> {
     const now = Date.now();
-    await this.sweep(now);
-    const remaining = z.object({ n: z.number() }).parse(this.sql.exec("SELECT (SELECT COUNT(*) FROM jobs) + (SELECT COUNT(*) FROM cleanup) + (SELECT COUNT(*) FROM uploads) AS n").one()).n;
-    if (remaining > 0) await this.ctx.storage.setAlarm(now + LIMITS.sweepMs);
+    try {
+      await this.sweep(now);
+    } finally {
+      // Re-arm even when the sweep throws: lease recovery and retention
+      // deletion must not stop because the platform gave up retrying.
+      const remaining = z.object({ n: z.number() }).parse(this.sql.exec("SELECT (SELECT COUNT(*) FROM jobs) + (SELECT COUNT(*) FROM cleanup) + (SELECT COUNT(*) FROM uploads) AS n").one()).n;
+      if (remaining > 0) await this.ctx.storage.setAlarm(now + LIMITS.sweepMs);
+    }
   }
 
   async sweep(now: number): Promise<void> {
     for (const row of this.rows("SELECT * FROM jobs WHERE task_state = 'claimed'")) {
-      if ((row.deadline ?? 0) <= now) {
-        if (row.task_kind === "sync") this.stopSync(row, now);
-        else this.failRow(row, MESSAGES.deadline, "deadline", now);
-      } else if ((row.lease_expires ?? 0) <= now) {
-        if (row.task_kind === "sync") this.retrySync(row, now);
-        else if (row.attempt < LIMITS.attempts) {
-          this.requeue(row, now);
-        } else this.failRow(row, MESSAGES.interrupted, "interrupted", now);
-      }
+      this.sweepJob(row, now, () => {
+        if ((row.deadline ?? 0) <= now) {
+          if (row.task_kind === "sync") this.stopSync(row, now);
+          else this.failRow(row, MESSAGES.deadline, "deadline", now);
+        } else if ((row.lease_expires ?? 0) <= now) {
+          if (row.task_kind === "sync") this.retrySync(row, now);
+          else if (row.attempt < LIMITS.attempts) {
+            this.requeue(row, now);
+          } else this.failRow(row, MESSAGES.interrupted, "interrupted", now);
+        }
+      });
     }
     for (const upload of this.sql.exec("SELECT id FROM uploads WHERE expires <= ?", now).toArray()) {
       const id = z.object({ id: z.string() }).parse(upload).id;
-      const state = this.sql.exec("SELECT state FROM uploads WHERE id = ?", id).toArray()[0];
-      guardUploadTransition(z.object({ state: z.string() }).parse(state).state, "abandoned");
-      this.requestCleanup(`jobs/${id}/`, now);
-      this.sql.exec("DELETE FROM uploads WHERE id = ?", id);
-      // An upload renews its reservation while bytes arrive, so an expired
-      // one has no live writer. Its write marker would otherwise hold this
-      // cleanup, and the alarm that retries it, open for good.
-      this.sql.exec("DELETE FROM upload_writes WHERE id = ?", id);
+      try {
+        this.ctx.storage.transactionSync(() => {
+          const state = this.sql.exec("SELECT state FROM uploads WHERE id = ?", id).toArray()[0];
+          guardUploadTransition(z.object({ state: z.string() }).parse(state).state, "abandoned");
+          this.requestCleanup(`jobs/${id}/`, now);
+          this.sql.exec("DELETE FROM uploads WHERE id = ?", id);
+          // An upload renews its reservation while bytes arrive, so an expired
+          // one has no live writer. Its write marker would otherwise hold this
+          // cleanup, and the alarm that retries it, open for good.
+          this.sql.exec("DELETE FROM upload_writes WHERE id = ?", id);
+        });
+      } catch (error) {
+        console.error(`Sweep could not abandon upload ${id}: ${String(error)}`);
+      }
     }
     for (const row of this.rows("SELECT * FROM jobs WHERE updated_at <= ?", now - LIMITS.retentionMs)) {
-      this.requestCleanup(`jobs/${row.id}/`, now);
-      this.sql.exec("DELETE FROM completions WHERE job_id = ?", row.id);
-      this.sql.exec("DELETE FROM jobs WHERE id = ?", row.id);
-      this.sql.exec("DELETE FROM artifact_attempts WHERE job_id = ?", row.id);
+      try {
+        this.ctx.storage.transactionSync(() => {
+          this.requestCleanup(`jobs/${row.id}/`, now);
+          this.sql.exec("DELETE FROM completions WHERE job_id = ?", row.id);
+          this.sql.exec("DELETE FROM jobs WHERE id = ?", row.id);
+          this.sql.exec("DELETE FROM artifact_attempts WHERE job_id = ?", row.id);
+        });
+      } catch (error) {
+        console.error(`Sweep could not delete expired job ${row.id}: ${String(error)}`);
+      }
+    }
+    // After retention, so work that is due for deletion is not failed first.
+    if (now - this.lastRunnerPoll >= LIMITS.runnerAbsentMs) {
+      const waitedSince = now - LIMITS.runnerAbsentMs;
+      for (const row of this.rows("SELECT * FROM jobs WHERE task_state = 'queued' AND task_queued_at <= ?", waitedSince)) {
+        this.sweepJob(row, now, () => {
+          if (row.task_kind === "sync") this.stopSync(row, now);
+          else this.failRow(row, MESSAGES.runnerUnavailable, "runner_unavailable", now);
+        });
+      }
     }
     await this.cleanFiles(now);
+  }
+
+  /**
+   * One job's sweep work, atomically. A row that can't be handled is retired
+   * as inconsistent, as at claim, so it can't stop the sweep for everyone.
+   */
+  private sweepJob(row: JobRow, now: number, work: () => void): void {
+    try {
+      this.ctx.storage.transactionSync(work);
+    } catch (error) {
+      console.error(`Sweep retired job ${row.id}: ${String(error)}`);
+      try {
+        this.ctx.storage.transactionSync(() => this.failRow(row, MESSAGES.inconsistent, "runner", now));
+      } catch (retireError) {
+        console.error(`Sweep could not retire job ${row.id}: ${String(retireError)}`);
+      }
+    }
   }
 
   private requeue(row: JobRow, now: number): void {

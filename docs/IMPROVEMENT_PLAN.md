@@ -78,13 +78,18 @@ Priority: P0 = fix first (a live failure mode), P1 = next, P2 = as time allows.
   deadline (the failure report ignores the deadline, since it may be what
   reports it). Safe to replay: completion has a per-lease receipt; a replayed
   failure report after a lost answer gets 409 and ends the task as lease lost.
-- [ ] **4. A sweep that can't be stopped by one bad row, and a queue that
+- [x] **4. A sweep that can't be stopped by one bad row, and a queue that
   can't fill with dead jobs.** `sweep` (`worker/src/board.ts`) has no per-row
   isolation, unlike `claim`, so one throwing row stops lease recovery and
   retention deletion for everyone. It only looks at claimed rows: when the
   runner is down, queued jobs wait silently until retention deletes them, and
   twelve of them make every new upload fail with 503. Fix: isolate each row,
   and fail queued jobs that wait longer than a set limit with a clear message.
+  *Done:* each job's sweep work runs in its own transaction, and a row that
+  throws is retired as inconsistent (as at claim); upload and retention
+  deletions are isolated per row too; the alarm re-arms in a `finally`.
+  Queued work fails only when no runner has polled for 30 minutes, since a
+  busy runner still polls and a long queue behind it is legitimate.
 - [ ] **5. Work that can be stopped.** `owned_thread_work`
   (`backend/app/services/thread_work.py`) waits for threads with no limit, and
   several synchronous `subprocess.run` calls bypass the process-group helper in

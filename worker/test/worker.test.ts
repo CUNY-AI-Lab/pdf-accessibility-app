@@ -1,7 +1,7 @@
 import { canonicalTestSubject } from "@cuny-ai-lab/cail-identity/testing";
 import { runInDurableObject, SELF } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { JobBoard, LIMITS, MESSAGES } from "../src/board";
 import { jobBoard } from "../src/env";
@@ -34,6 +34,8 @@ beforeEach(async () => {
       state.storage.sql.exec(`DELETE FROM ${table}`);
     }
   });
+  // The last runner poll lives in memory; start every test from "a runner just polled".
+  await jobBoard(env).claim(Date.now());
   const stored = await env.FILES.list({ prefix: "jobs/" });
   if (stored.objects.length > 0) await env.FILES.delete(stored.objects.map((object) => object.key));
 });
@@ -376,6 +378,55 @@ describe("leases and retention", () => {
     const failed = await job(id);
     expect(failed.status).toBe("failed");
     expect(failed.error).toBe(MESSAGES.interrupted);
+  });
+
+  it("fails queued jobs once no runner has polled for a while, freeing their slots", async () => {
+    const id = await createdJobId(await upload());
+    const later = Date.now() + LIMITS.runnerAbsentMs + 1000;
+    await jobBoard(env).sweep(later);
+    const failed = await job(id);
+    expect(failed.status).toBe("failed");
+    expect(failed.error).toBe(MESSAGES.runnerUnavailable);
+  });
+
+  it("keeps queued jobs waiting while a runner is polling, however long the queue", async () => {
+    const first = await createdJobId(await upload());
+    const waiting = await createdJobId(await upload());
+    const later = Date.now() + LIMITS.runnerAbsentMs + 60_000;
+    const board = jobBoard(env);
+    // A busy runner still polls; here it takes the first job.
+    expect((await board.claim(later))?.job_id).toBe(first);
+    await board.sweep(later + 1000);
+    expect((await job(waiting)).status).toBe("queued");
+  });
+
+  it("does not let one inconsistent row stop lease recovery for the others", async () => {
+    const broken = await createdJobId(await upload());
+    const healthy = await createdJobId(await upload());
+    expect(await claim()).not.toBeNull();
+    expect(await claim()).not.toBeNull();
+    await runInDurableObject(jobBoard(env), (_board, state) => {
+      state.storage.sql.exec("UPDATE jobs SET task_kind = 'unknown' WHERE id = ?", broken);
+    });
+    await jobBoard(env).sweep(Date.now() + LIMITS.leaseMs + 1000);
+    expect((await job(healthy)).status).toBe("queued");
+    const retired = await job(broken);
+    expect(retired.status).toBe("failed");
+    expect(retired.error).toBe(MESSAGES.inconsistent);
+  });
+
+  it("schedules the next sweep even when a sweep fails", async () => {
+    await createdJobId(await upload());
+    await runInDurableObject(jobBoard(env), async (board, state) => {
+      await state.storage.deleteAlarm();
+      const failing = vi.spyOn(board, "sweep").mockRejectedValue(new Error("sweep failed"));
+      try {
+        await expect(board.alarm()).rejects.toThrow("sweep failed");
+      } finally {
+        failing.mockRestore();
+      }
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
   });
 
   it("deletes a job and its files after the retention period", async () => {

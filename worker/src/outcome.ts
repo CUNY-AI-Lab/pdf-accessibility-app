@@ -56,7 +56,7 @@ const modelUsageSchema = z.object({
 });
 export type ModelUsage = z.infer<typeof modelUsageSchema>;
 const taskCountSchema = z.object({ total: z.number(), blocking: z.number() });
-const failureSchema = z.enum(["pipeline", "runner", "deadline", "interrupted", "sign_in_ending"]).nullable();
+const failureSchema = z.enum(["pipeline", "runner", "deadline", "interrupted", "sign_in_ending", "runner_unavailable"]).nullable();
 const stepTimingSchema = z.object({ status: z.string(), seconds: z.number().nullable() });
 
 /** The event as logged; `storedJobFinishedSchema` reads it back. */
