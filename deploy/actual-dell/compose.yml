@@ -30,6 +30,19 @@ services:
       start_period: 60s
       retries: 3
     mem_limit: 8g
+    # The runner parses untrusted PDFs with Ghostscript, qpdf, Tesseract and
+    # veraPDF. It runs as a non-root user and needs no capabilities; a parser
+    # exploit should not gain privileges or fork without limit. (A read-only
+    # root and a bridge network need testing on this host first; see
+    # docs/IMPROVEMENT_PLAN.md item 6.)
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 1024
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
     # The runner gives running tasks RUNNER_DRAIN_SECONDS (40) to finish, then
     # hands the rest back to the queue; this must leave room for that.
     stop_grace_period: 60s

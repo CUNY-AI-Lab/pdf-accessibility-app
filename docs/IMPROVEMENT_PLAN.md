@@ -119,6 +119,17 @@ Priority: P0 = fix first (a live failure mode), P1 = next, P2 = as time allows.
   drop all capabilities, `no-new-privileges`, read-only root with tmpfs,
   `pids_limit`, a JVM heap cap for veraPDF, log rotation, and a minimum length
   for `RUNNER_TOKEN` in the Worker.
+  *Part done:* compose drops all capabilities, sets `no-new-privileges`,
+  `pids_limit: 1024` and log rotation; CI runs the smoke test and the PDF
+  tools (Ghostscript, qpdf, OCRmyPDF, and veraPDF through the app's
+  validator) under the same flags. The JVM already caps its default heap at
+  25% of the container limit, so no flag was added.
+  *Open:* a read-only root (OCRmyPDF's temp space, and tmpfs counting
+  against `mem_limit`), a bridge network instead of `network_mode: host`
+  (docling-serve's binding on the host), both to test on actual-dell; and a
+  minimum `RUNNER_TOKEN` length in the Worker, which needs the production
+  token's length confirmed first or the next release could lock the runner
+  out.
 - [ ] **7. Close preflight gaps** (`backend/app/services/pdf_preflight.py`):
   bound decompressed stream size, count inline images, annotation appearances,
   soft masks and inherited resources, honour `/UserUnit`, and cap object count.

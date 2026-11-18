@@ -102,6 +102,30 @@ jobs:
         run: docker build --tag pdf-accessibility-app:ci .
       - name: Verify container CA trust
         run: docker run --rm pdf-accessibility-app:ci python /usr/local/libexec/check_ca_trust.py
+      # The PDF tools must work under the production hardening, not only start.
+      - name: Run the PDF tools in the hardened container
+        run: |
+          set -euo pipefail
+          docker run --rm --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 1024 \
+            --env LLM_API_KEY=check-only --env LLM_BASE_URL=http://127.0.0.1:8000/v1 \
+            --env LLM_MODEL=check-model --env DOCLING_SERVE_URL= \
+            pdf-accessibility-app:ci bash -euo pipefail -c '
+              python -c "import pikepdf; pdf = pikepdf.new(); pdf.add_blank_page(); pdf.save(\"/tmp/blank.pdf\")"
+              gs -q -dSAFER -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -o /tmp/gs.pdf /tmp/blank.pdf
+              qpdf --check /tmp/gs.pdf
+              ocrmypdf --force-ocr --output-type pdf /tmp/blank.pdf /tmp/ocr.pdf
+              test -s /tmp/ocr.pdf
+              # veraPDF through the app'"'"'s own validator: a report, not an error.
+              python -c "
+          import asyncio
+          from pathlib import Path
+          from app.pipeline.validator import validate_pdf
+          result = asyncio.run(validate_pdf(Path(\"/tmp/gs.pdf\"), timeout_seconds=120))
+          assert result.error is None, result.error
+          print(\"veraPDF ran; compliant:\", result.compliant)
+          "
+            '
+
       # A stub Worker that answers every claim with "no work": the runner must
       # turn healthy. A dead endpoint: the runner must never report healthy,
       # and must exit with an error once it gives up on the Worker.
@@ -117,7 +141,10 @@ jobs:
             docker network rm "$network" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
+          # The production hardening from deploy/actual-dell/compose.yml.
+          hardening=(--cap-drop ALL --security-opt no-new-privileges:true --pids-limit 1024)
           runner_env=(
+            "${hardening[@]}"
             --env RUNNER_TOKEN=check-only
             --env LLM_API_KEY=check-only
             --env LLM_BASE_URL=http://127.0.0.1:8000/v1

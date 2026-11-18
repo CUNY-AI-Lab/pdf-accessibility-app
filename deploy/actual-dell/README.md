@@ -81,7 +81,9 @@ file is capped at 16 MiB and uses full auto-vacuum.
 turn it off. With it off, the runner creates no cache file and performs no
 cache reads or writes. Any existing cache file is left untouched.
 
-`RUNNER_TOKEN` must equal the Worker's `RUNNER_TOKEN` secret. To rotate it,
+`RUNNER_TOKEN` must equal the Worker's `RUNNER_TOKEN` secret. It grants
+access to every queued job, so make it long and random
+(`openssl rand -base64 32`) and keep `runner.env` mode 600. To rotate it,
 set the new value on the Worker, then in `runner.env`, then restart the
 runner; tasks claimed under the old token fail their next call and retry.
 
