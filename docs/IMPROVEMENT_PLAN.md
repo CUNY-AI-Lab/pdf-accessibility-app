@@ -96,7 +96,7 @@ Priority: P0 = fix first (a live failure mode), P1 = next, P2 = as time allows.
   deletions are isolated per row too; the alarm re-arms in a `finally`.
   Queued work fails only when no runner has polled for 30 minutes, since a
   busy runner still polls and a long queue behind it is legitimate.
-- [ ] **5. Work that can be stopped.** `owned_thread_work`
+- [x] **5. Work that can be stopped.** `owned_thread_work`
   (`backend/app/services/thread_work.py`) waits for threads with no limit, and
   several synchronous `subprocess.run` calls bypass the process-group helper in
   `pipeline/subprocess_utils.py`; two have no timeout at all
@@ -104,6 +104,14 @@ Priority: P0 = fix first (a live failure mode), P1 = next, P2 = as time allows.
   a parser holds a runner slot forever. Fix: timeouts and process-group kills
   everywhere; a thread that outlives its deadline fails the task and restarts
   the runner.
+  *Done:* `run_bounded` (in `pipeline/subprocess_utils.py`) is the only way
+  synchronous code starts a child process: a required timeout, its own
+  process group, and the whole group killed on timeout or interruption. A
+  test fails if `subprocess.run`/`Popen` appears anywhere else in `app/`.
+  A task's threads get `RUNNER_THREAD_JOIN_SECONDS` (120) after it ends;
+  past that the runner drains, releases the other slot's task and exits
+  non-zero (via `os._exit`, since a stuck thread would otherwise hold the
+  interpreter's shutdown).
 
 ### P0/P1 — security
 

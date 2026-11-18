@@ -6,7 +6,9 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app.config import get_settings
+from app.pipeline.subprocess_utils import run_bounded
 
+COMMAND_TIMEOUT_SECONDS = 10
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 GPU_LIBRARY_MARKERS = (
     "agxmetal",
@@ -50,13 +52,8 @@ def _parse_listener_pid(lsof_output: str) -> int | None:
 
 def _command_output(args: list[str]) -> str:
     try:
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            check=False,
-            text=True,
-        )
-    except FileNotFoundError:
+        result = run_bounded(args, timeout=COMMAND_TIMEOUT_SECONDS, capture_output=True, text=True)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return ""
     if result.returncode != 0:
         return ""

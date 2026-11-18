@@ -24,7 +24,7 @@ def test_extract_ocr_text_from_bbox_returns_normalized_tesseract_output(monkeypa
         assert "/opt/homebrew/bin" in env["PATH"]
         return CompletedProcess(cmd, 0, stdout="Data   Book\n", stderr="")
 
-    monkeypatch.setattr(text_grounding.subprocess, "run", _fake_run)
+    monkeypatch.setattr(text_grounding, "run_bounded", _fake_run)
 
     result = text_grounding.extract_ocr_text_from_bbox(
         pdf_path,

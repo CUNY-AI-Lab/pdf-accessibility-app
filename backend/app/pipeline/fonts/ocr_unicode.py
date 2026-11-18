@@ -21,7 +21,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-import subprocess
 import tempfile
 import unicodedata
 from collections import Counter, defaultdict
@@ -53,6 +52,7 @@ from app.pipeline.fonts.resources import _font_stream_bytes, _resolve_dictionary
 from app.pipeline.fonts.symbols import _symbol_family
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.pdf_repair import pdfminer_readable
+from app.pipeline.subprocess_utils import run_bounded
 from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
 from app.services.thread_work import to_thread
 
@@ -282,7 +282,7 @@ def _ocr_page(page: pdfium.PdfPage, languages: str, tesseract: str) -> tuple[lis
         png = Path(tmp) / "page.png"
         image.save(png)
         base = Path(tmp) / "page"
-        subprocess.run(
+        run_bounded(
             [tesseract, str(png), str(base), "-l", languages, "--psm", "3", "-c", "hocr_char_boxes=1", "hocr"],
             check=True,
             capture_output=True,

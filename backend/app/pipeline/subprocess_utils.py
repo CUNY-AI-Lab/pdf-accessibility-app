@@ -5,6 +5,7 @@ import contextlib
 import os
 import signal
 import subprocess
+from collections.abc import Mapping, Sequence
 
 
 class SubprocessTimeout(Exception):
@@ -68,3 +69,58 @@ async def communicate_with_timeout(
     except TimeoutError:
         await _terminate_process_tree(proc)
         raise SubprocessTimeout(timeout if timeout is not None else 0)
+
+
+def _terminate_sync(proc: subprocess.Popen, grace_seconds: float) -> None:
+    if os.name == "nt":
+        proc.kill()
+        proc.wait()
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=grace_seconds)
+    # Kill what is left of the group even if the child itself exited: its
+    # own children may have ignored SIGTERM.
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait()
+
+
+def run_bounded(
+    args: Sequence[str],
+    *,
+    timeout: float,
+    check: bool = False,
+    capture_output: bool = False,
+    text: bool = False,
+    env: Mapping[str, str] | None = None,
+    grace_seconds: float = 5.0,
+) -> subprocess.CompletedProcess:
+    """``subprocess.run`` for synchronous code, with a required timeout.
+
+    The child runs in its own process group, and a timeout or interruption
+    kills the whole group, so tools that start helpers (Ghostscript,
+    OCRmyPDF, Tesseract) cannot leave them running. Raises the same
+    ``TimeoutExpired`` and ``CalledProcessError`` as ``subprocess.run``.
+    """
+    pipe = subprocess.PIPE if capture_output else None
+    with subprocess.Popen(
+        list(args),
+        stdout=pipe,
+        stderr=pipe,
+        text=text,
+        env=env,
+        **subprocess_process_group_kwargs(),  # type: ignore[arg-type]
+    ) as proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_sync(proc, grace_seconds)
+            raise subprocess.TimeoutExpired(list(args), timeout) from None
+        except BaseException:
+            _terminate_sync(proc, grace_seconds)
+            raise
+    if check and proc.returncode:
+        raise subprocess.CalledProcessError(proc.returncode, list(args), stdout, stderr)
+    return subprocess.CompletedProcess(list(args), proc.returncode, stdout, stderr)

@@ -8,6 +8,7 @@ import pikepdf
 from PIL import Image, ImageDraw
 
 from app.config import get_settings
+from app.pipeline.subprocess_utils import run_bounded
 from app.services.pdf_operator_context import extract_operator_visual_context
 from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
 
@@ -81,7 +82,7 @@ def render_page_png_bytes(
             str(output_prefix),
         ]
         try:
-            subprocess.run(
+            run_bounded(
                 cmd,
                 check=True,
                 capture_output=True,
@@ -467,7 +468,7 @@ def _render_png_image(
         if region is not None:
             x, y, width, height = region
             crop = ["-x", str(x), "-y", str(y), "-W", str(width), "-H", str(height)]
-        subprocess.run(
+        run_bounded(
             [
                 pdftoppm_path(),
                 "-f",

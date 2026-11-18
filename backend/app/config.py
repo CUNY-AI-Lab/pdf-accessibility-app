@@ -169,6 +169,9 @@ class Settings(BaseSettings):
     # On SIGTERM, how long running tasks get to finish before they are handed
     # back to the queue. Keep it under the container's stop grace period.
     runner_drain_seconds: float = 40.0
+    # How long a finished task waits for its threads (pikepdf, pdfium, tool
+    # calls) before the runner gives up on them and restarts.
+    runner_thread_join_seconds: float = 120.0
 
     @model_validator(mode="after")
     def validate_llm_settings(self):

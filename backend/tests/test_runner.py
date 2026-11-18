@@ -1736,3 +1736,43 @@ async def test_shutdown_lets_a_finishing_task_publish_instead_of_releasing(
     await asyncio.wait_for(runner_main.main(), 3)
     assert finished.is_set()
     assert client.released == []
+
+
+async def test_runner_stops_with_an_error_when_a_task_leaves_a_thread_running(
+    tmp_path, monkeypatch
+):
+    # Python can't stop a thread, so a slot whose thread won't finish is only
+    # recovered by restarting the process.
+    from app.services.thread_work import ThreadsOverran
+
+    settings = _settings(tmp_path)
+    settings.runner_drain_seconds = 0.05
+
+    async def work():
+        raise ThreadsOverran("1 thread(s) still running")
+
+    runner_main, client = _shutdown_runner(monkeypatch, settings, work)
+    with pytest.raises(SystemExit) as exited:
+        await asyncio.wait_for(runner_main.main(), 2)
+    assert exited.value.code != 0
+    assert "thread" in str(exited.value.code)
+    assert client.closed
+
+
+async def test_run_task_bounds_the_thread_join(tmp_path, monkeypatch):
+    seen = {}
+    real = runner_tasks.owned_thread_work
+
+    def owned(**kwargs):
+        seen.update(kwargs)
+        return real(**kwargs)
+
+    async def run(self):
+        return None
+
+    settings = _settings(tmp_path)
+    settings.runner_thread_join_seconds = 7.0
+    monkeypatch.setattr(runner_tasks, "owned_thread_work", owned)
+    monkeypatch.setattr(runner_tasks.ClaimedTaskExecution, "run", run)
+    await runner_tasks.run_task(FakeWorker().client(), _task(), settings)
+    assert seen == {"join_timeout": 7.0}

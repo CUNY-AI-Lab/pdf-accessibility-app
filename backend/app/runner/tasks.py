@@ -192,7 +192,7 @@ async def run_task(client: WorkerClient, task: Task, settings: Settings) -> None
     with attempt_workspace(settings, task.lease) as isolated, task_settings(isolated):
         execution = ClaimedTaskExecution(client, task, isolated)
         execution.archive_root = data_root(settings)
-        async with owned_thread_work():
+        async with owned_thread_work(join_timeout=settings.runner_thread_join_seconds):
             await execution.run()
 
 

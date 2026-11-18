@@ -31,6 +31,7 @@ from app.pipeline.language import (
     normalize_lang_tag as _normalize_lang_tag,
 )
 from app.pipeline.page_orientation import SidewaysPage, elements_to_shown, upright_copy
+from app.pipeline.subprocess_utils import run_bounded
 from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
 from app.services.thread_work import to_thread
 
@@ -1329,7 +1330,7 @@ def _repair_pdf_with_ghostscript(
         str(input_path),
     ]
     try:
-        proc = subprocess.run(
+        proc = run_bounded(
             cmd,
             check=False,
             capture_output=True,

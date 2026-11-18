@@ -7,12 +7,18 @@ step (per-element language tagging).
 from __future__ import annotations
 
 import functools
+import logging
 import re
 import subprocess
 
 from lingua import Language, LanguageDetectorBuilder
 
+from app.pipeline.subprocess_utils import run_bounded
 from app.services.runtime_paths import resolve_binary
+
+logger = logging.getLogger(__name__)
+# Listing packs is instant; a hung tesseract must not hold up classification.
+LIST_LANGUAGES_TIMEOUT_SECONDS = 30
 
 # ── Mapping tables ──
 
@@ -132,10 +138,16 @@ def installed_tesseract_languages() -> frozenset[str]:
     """The language packs the installed Tesseract can use."""
     binary = resolve_binary("tesseract") or "tesseract"
     try:
-        listing = subprocess.run(
-            [binary, "--list-langs"], capture_output=True, text=True, check=False
+        listing = run_bounded(
+            [binary, "--list-langs"],
+            timeout=LIST_LANGUAGES_TIMEOUT_SECONDS,
+            capture_output=True,
+            text=True,
         ).stdout
     except OSError:
+        return frozenset()
+    except subprocess.TimeoutExpired:
+        logger.warning("tesseract --list-langs timed out; treating no packs as installed")
         return frozenset()
     # The first line is a header naming the tessdata directory.
     return frozenset(line.strip() for line in listing.splitlines()[1:] if line.strip())

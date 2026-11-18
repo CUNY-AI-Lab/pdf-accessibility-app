@@ -1,4 +1,3 @@
-import subprocess
 from io import BytesIO
 
 import pikepdf
@@ -19,13 +18,13 @@ def _page(path, width_points, height_points, rotate=0):
 
 def _render(path, monkeypatch):
     requested = []
-    real_run = subprocess.run
+    real_run = pdf_preview.run_bounded
 
     def run(cmd, **kwargs):
         requested.append(float(cmd[cmd.index("-r") + 1]))
         return real_run(cmd, **kwargs)
 
-    monkeypatch.setattr(pdf_preview.subprocess, "run", run)
+    monkeypatch.setattr(pdf_preview, "run_bounded", run)
     png = pdf_preview.render_page_png_bytes(path, 1)
     with Image.open(BytesIO(png)) as image:
         return requested[0], image.size

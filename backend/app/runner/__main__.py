@@ -7,8 +7,10 @@ OCR, and validation use the shared pipeline settings.
 
 import asyncio
 import logging
+import os
 import signal
 import socket
+import sys
 import time
 from collections.abc import Callable
 from enum import Enum
@@ -21,6 +23,7 @@ from app.runner.client import LeaseLost, Task, WorkerClient
 from app.runner.state import cleanup_abandoned_attempts
 from app.runner.tasks import run_task
 from app.services.file_storage import ensure_dirs
+from app.services.thread_work import ThreadsOverran
 
 logger = logging.getLogger("app.runner")
 IDLE_BACKOFF_SECONDS = 30.0
@@ -172,6 +175,9 @@ async def main() -> None:
             running[job] = task
             job.add_done_callback(lambda done: running.pop(done, None))
             job.add_done_callback(lambda _done: slots.release())
+            job.add_done_callback(
+                lambda done, job_id=task.job_id: _task_ended(done, job_id, control, health)
+            )
     finally:
         control.stop()
         if heartbeat is not None:
@@ -183,6 +189,20 @@ async def main() -> None:
     if health.failure is not None:
         logger.error("Runner stopping: %s", health.failure)
         raise SystemExit(f"Runner stopped: {health.failure}")
+
+
+def _task_ended(
+    done: asyncio.Task, job_id: str, control: RunnerControl, health: RunnerHealth
+) -> None:
+    if done.cancelled():
+        return
+    error = done.exception()
+    if isinstance(error, ThreadsOverran):
+        # Python can't stop a thread: only a new process frees its slot.
+        health.failure = f"job {job_id} left work running that can't be stopped ({error})"
+        control.stop()
+    elif error is not None:
+        logger.error("Task for job %s ended with an error", job_id, exc_info=error)
 
 
 async def _drain(
@@ -239,4 +259,15 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    asyncio.run(main())
+    code = 0
+    try:
+        asyncio.run(main())
+    except SystemExit as exit_:
+        if isinstance(exit_.code, str):
+            print(exit_.code, file=sys.stderr)
+        code = exit_.code if isinstance(exit_.code, int) else 1
+    # Exit without waiting for worker threads: a thread that won't stop would
+    # otherwise hold the interpreter's shutdown, and the restart, forever.
+    logging.shutdown()
+    sys.stderr.flush()
+    os._exit(code)

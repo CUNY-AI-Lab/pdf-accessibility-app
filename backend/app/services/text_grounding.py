@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import subprocess
 import tempfile
 from pathlib import Path
 
 from app.config import get_settings
+from app.pipeline.subprocess_utils import run_bounded
 from app.services.page_intelligence import normalize_visible_text
 from app.services.pdf_preview import render_bbox_preview_png_bytes
 from app.services.runtime_paths import enriched_subprocess_env, resolve_binary
@@ -54,7 +54,7 @@ def extract_ocr_text_from_bbox(
             ocr_language,
         ]
         try:
-            proc = subprocess.run(
+            proc = run_bounded(
                 cmd,
                 capture_output=True,
                 check=False,
