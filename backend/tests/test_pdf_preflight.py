@@ -142,3 +142,119 @@ def test_preflight_rejects_oversized_page_render_area(tmp_path):
         preflight_pdf_upload(path, settings=_settings(max_upload_page_render_pixels=50_000_000))
 
     assert "largest page would render" in exc_info.value.detail
+
+
+def _image(pdf, width, height):
+    image = pdf.make_stream(b"\x00")
+    image["/Type"] = pikepdf.Name("/XObject")
+    image["/Subtype"] = pikepdf.Name("/Image")
+    image["/Width"] = width
+    image["/Height"] = height
+    image["/ColorSpace"] = pikepdf.Name("/DeviceGray")
+    image["/BitsPerComponent"] = 8
+    return image
+
+
+def test_preflight_counts_soft_mask_pixels(tmp_path):
+    path = tmp_path / "masked.pdf"
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    shown = _image(pdf, 100, 100)
+    shown["/SMask"] = _image(pdf, 5000, 5000)
+    page.obj["/Resources"] = pikepdf.Dictionary({"/XObject": pikepdf.Dictionary({"/Im0": shown})})
+    pdf.save(path)
+    report = inspect_pdf_upload(path, settings=_settings())
+    assert report.max_workload_image_pixels == 25_010_000
+    # What classification reads stays what the page draws directly.
+    assert report.max_image_pixels == 10_000
+    with pytest.raises(PdfUploadPreflightError, match="largest page embeds"):
+        preflight_pdf_upload(path, settings=_settings(max_upload_image_pixels=20_000_000))
+
+
+def test_preflight_counts_images_in_annotation_appearances(tmp_path):
+    path = tmp_path / "stamped.pdf"
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    form = pdf.make_stream(b"/Im0 Do")
+    form["/Type"] = pikepdf.Name("/XObject")
+    form["/Subtype"] = pikepdf.Name("/Form")
+    form["/BBox"] = [0, 0, 10, 10]
+    form["/Resources"] = pikepdf.Dictionary(
+        {"/XObject": pikepdf.Dictionary({"/Im0": _image(pdf, 4000, 4000)})}
+    )
+    stamp = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Stamp"),
+                "/Rect": [0, 0, 10, 10],
+                "/AP": pikepdf.Dictionary({"/N": form}),
+            }
+        )
+    )
+    page.obj["/Annots"] = pdf.make_indirect(pikepdf.Array([stamp]))
+    pdf.save(path)
+    report = inspect_pdf_upload(path, settings=_settings())
+    assert report.max_workload_image_pixels == 16_000_000
+    assert report.total_workload_image_pixels == 16_000_000
+    with pytest.raises(PdfUploadPreflightError, match="totals"):
+        preflight_pdf_upload(path, settings=_settings(max_upload_total_image_pixels=10_000_000))
+
+
+def test_preflight_scales_page_area_by_user_unit(tmp_path):
+    path = tmp_path / "user-unit.pdf"
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    # Letter-sized in units, but each unit is 10 points: a 85 x 110 inch page.
+    page.obj["/UserUnit"] = 10
+    pdf.save(path)
+    report = inspect_pdf_upload(path, settings=_settings())
+    assert report.max_page_render_pixels == int((612 * 10 / 72 * 300) * (792 * 10 / 72 * 300))
+    with pytest.raises(PdfUploadPreflightError, match="largest page would render"):
+        preflight_pdf_upload(path, settings=_settings())
+
+
+def test_preflight_rejects_a_compressed_stream_that_expands_past_the_limit(tmp_path):
+    import zlib
+
+    path = tmp_path / "bomb.pdf"
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    # 8 MB of spaces is a few KB compressed.
+    page.obj["/Contents"] = pdf.make_stream(
+        zlib.compress(b" " * 8_000_000), Filter=pikepdf.Name("/FlateDecode")
+    )
+    pdf.save(path, compress_streams=False)
+    with pytest.raises(PdfUploadPreflightError, match="expands"):
+        preflight_pdf_upload(path, settings=_settings(max_upload_decoded_stream_bytes=1_000_000))
+    # Under the limit, the same file is fine.
+    preflight_pdf_upload(path, settings=_settings(max_upload_decoded_stream_bytes=10_000_000))
+
+
+def test_preflight_bounds_total_decompressed_stream_data(tmp_path):
+    import zlib
+
+    path = tmp_path / "many.pdf"
+    pdf = pikepdf.Pdf.new()
+    for _ in range(4):
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.obj["/Contents"] = pdf.make_stream(
+            zlib.compress(b" " * 600_000), Filter=pikepdf.Name("/FlateDecode")
+        )
+    pdf.save(path, compress_streams=False)
+    with pytest.raises(PdfUploadPreflightError, match="streams expand past"):
+        preflight_pdf_upload(
+            path,
+            settings=_settings(
+                max_upload_decoded_stream_bytes=1_000_000,
+                max_upload_decoded_total_bytes=2_000_000,
+            ),
+        )
+
+
+def test_preflight_rejects_too_many_objects(tmp_path):
+    path = tmp_path / "objects.pdf"
+    _write_image_pdf(path, pages=30)
+    with pytest.raises(PdfUploadPreflightError, match="objects"):
+        preflight_pdf_upload(path, settings=_settings(max_upload_objects=50))
+    preflight_pdf_upload(path, settings=_settings(max_upload_objects=10_000))

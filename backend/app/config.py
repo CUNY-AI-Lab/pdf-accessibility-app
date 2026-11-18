@@ -118,6 +118,11 @@ class Settings(BaseSettings):
     max_upload_ocr_scan_total_image_pixels: int = 1_000_000_000
     max_upload_ocr_scan_image_heavy_pages: int = 75
     upload_image_heavy_page_min_pixels: int = 4_000_000
+    # Decompression bombs: non-image Flate streams (content, fonts, forms)
+    # may not decode past these, and a PDF may not hold more objects.
+    max_upload_decoded_stream_bytes: int = 256 * 1024 * 1024
+    max_upload_decoded_total_bytes: int = 2 * 1024 * 1024 * 1024
+    max_upload_objects: int = 1_000_000
     ocrmypdf_jobs: int = 1
     ocrmypdf_max_image_mpixels: int = 75
 

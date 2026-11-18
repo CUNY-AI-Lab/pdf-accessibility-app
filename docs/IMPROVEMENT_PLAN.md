@@ -130,9 +130,19 @@ Priority: P0 = fix first (a live failure mode), P1 = next, P2 = as time allows.
   minimum `RUNNER_TOKEN` length in the Worker, which needs the production
   token's length confirmed first or the next release could lock the runner
   out.
-- [ ] **7. Close preflight gaps** (`backend/app/services/pdf_preflight.py`):
+- [x] **7. Close preflight gaps** (`backend/app/services/pdf_preflight.py`):
   bound decompressed stream size, count inline images, annotation appearances,
   soft masks and inherited resources, honour `/UserUnit`, and cap object count.
+  *Done:* non-image Flate streams are decoded incrementally and refused past
+  256 MB each or 2 GB together; more than 1,000,000 objects is refused; soft
+  masks and images in annotation appearances count toward the image limits
+  (as new report fields, so classification is unchanged); `/UserUnit` scales
+  the page area. Inherited resources were already counted (pikepdf resolves
+  them), so nothing changed there. Same verdicts as before on all 79
+  evaluation-corpus PDFs; slowest preflight 1.2 s.
+  *Open:* inline images (needs a content-stream parse), Flate bombs inside
+  image streams or object streams, and running preflight in a
+  memory-limited subprocess.
 - [ ] **8. Limit the relay and what the Worker serves**
   (`worker/src/runner-api.ts`, `worker/src/user-api.ts`): body size, token and
   call limits on the model relay; `nosniff`, a content-type allowlist and a

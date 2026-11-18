@@ -1,3 +1,4 @@
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,10 @@ class PdfUploadPreflightReport:
     producer: str = ""
     has_structure_tree: bool = False
     has_acroform: bool = False
+    # Image pixels a renderer must also decode: soft masks and images inside
+    # annotation appearances. Limits use these; classification does not.
+    max_workload_image_pixels: int = 0
+    total_workload_image_pixels: int = 0
 
     @property
     def is_ocr_scan_like(self) -> bool:
@@ -106,8 +111,10 @@ def _iter_resource_image_pixels(resources: Any, *, visited: set[tuple[int, int] 
 def _page_render_pixels(page: pikepdf.Page, *, dpi: int) -> int:
     try:
         mediabox = page.mediabox
-        width_points = max(0.0, float(mediabox[2]) - float(mediabox[0]))
-        height_points = max(0.0, float(mediabox[3]) - float(mediabox[1]))
+        # /UserUnit makes each unit that many points (PDF 1.6), as previews render it.
+        unit = max(1.0, float(page.obj.get("/UserUnit", 1)))
+        width_points = max(0.0, float(mediabox[2]) - float(mediabox[0])) * unit
+        height_points = max(0.0, float(mediabox[3]) - float(mediabox[1])) * unit
     except Exception:
         return 0
 
@@ -120,6 +127,116 @@ def page_image_pixels_of(page: Any) -> int:
     """The pixels of every image a page draws, forms included."""
     resources = page.get("/Resources", {}) if hasattr(page, "get") else page.obj.get("/Resources")
     return sum(_iter_resource_image_pixels(resources, visited=set()))
+
+
+def _iter_workload_image_pixels(resources: Any, *, visited: set[tuple[int, int] | int]):
+    """Like the drawn images, plus each image's soft mask, which is decoded too."""
+    if not hasattr(resources, "get"):
+        return
+    xobjects = resources.get("/XObject")
+    if not hasattr(xobjects, "values"):
+        return
+    for xobject in xobjects.values():
+        if not hasattr(xobject, "get"):
+            continue
+        key = _object_key(xobject)
+        if key in visited:
+            continue
+        visited.add(key)
+        subtype = xobject.get("/Subtype")
+        if subtype == pikepdf.Name("/Image"):
+            yield _image_pixels(xobject)
+            mask = xobject.get("/SMask")
+            if hasattr(mask, "get") and _object_key(mask) not in visited:
+                visited.add(_object_key(mask))
+                yield _image_pixels(mask)
+        elif subtype == pikepdf.Name("/Form"):
+            yield from _iter_workload_image_pixels(xobject.get("/Resources"), visited=visited)
+
+
+def _annotation_appearances(page: Any):
+    annotations = page.get("/Annots") if hasattr(page, "get") else None
+    if not isinstance(annotations, pikepdf.Array):
+        return
+    for annotation in annotations:
+        appearance = annotation.get("/AP") if hasattr(annotation, "get") else None
+        if not hasattr(appearance, "get"):
+            continue
+        for kind in ("/N", "/R", "/D"):
+            entry = appearance.get(kind)
+            if isinstance(entry, pikepdf.Stream):
+                yield entry
+            elif isinstance(entry, pikepdf.Dictionary):
+                # Appearance states (checkbox on/off): each is a form.
+                yield from (state for state in entry.values() if isinstance(state, pikepdf.Stream))
+
+
+def page_workload_image_pixels_of(page: Any) -> int:
+    """Every image pixel rendering the page decodes: drawn, masked, and annotated."""
+    visited: set[tuple[int, int] | int] = set()
+    resources = page.get("/Resources", {}) if hasattr(page, "get") else page.obj.get("/Resources")
+    total = sum(_iter_workload_image_pixels(resources, visited=visited))
+    for form in _annotation_appearances(page):
+        total += sum(_iter_workload_image_pixels(form.get("/Resources"), visited=visited))
+    return total
+
+
+def _flate_only(stream: pikepdf.Stream) -> bool:
+    filters = stream.get("/Filter")
+    if isinstance(filters, pikepdf.Array):
+        return len(filters) == 1 and filters[0] == pikepdf.Name("/FlateDecode")
+    return filters == pikepdf.Name("/FlateDecode")
+
+
+def _decoded_size(stream: pikepdf.Stream, cap: int) -> int:
+    """How many bytes a Flate stream decodes to, counting no further than cap + 1."""
+    decoder = zlib.decompressobj()
+    pending = stream.read_raw_bytes()
+    size = 0
+    try:
+        while pending and size <= cap:
+            size += len(decoder.decompress(pending, cap + 1 - size))
+            pending = decoder.unconsumed_tail
+    except zlib.error:
+        # A damaged stream is not a bomb; the tools that read it repair or skip it.
+        pass
+    return size
+
+
+@dataclass(frozen=True)
+class StreamWorkload:
+    objects: int
+    largest_decoded_bytes: int
+    total_decoded_bytes: int
+
+
+def inspect_stream_workload(
+    path: Path, *, stream_cap: int, total_cap: int
+) -> StreamWorkload:
+    """Object count and decoded size of the non-image Flate streams.
+
+    Images are bounded by their pixel limits. Content streams, fonts and
+    forms are not, and a few kilobytes of Flate can expand to gigabytes, so
+    each is decoded incrementally and counting stops at the caps.
+    """
+    try:
+        with pikepdf.open(str(path)) as pdf:
+            objects = len(pdf.objects)
+            largest = 0
+            total = 0
+            for obj in pdf.objects:
+                if total > total_cap:
+                    break
+                if not isinstance(obj, pikepdf.Stream) or not _flate_only(obj):
+                    continue
+                if obj.get("/Subtype") == pikepdf.Name("/Image"):
+                    continue
+                size = _decoded_size(obj, stream_cap)
+                largest = max(largest, size)
+                total += size
+    except pikepdf.PdfError as exc:
+        raise PdfUploadPreflightError("File is not a readable PDF", status_code=400) from exc
+    return StreamWorkload(objects, largest, total)
 
 
 def inspect_pdf_upload(path: Path, *, settings: Any) -> PdfUploadPreflightReport:
@@ -135,6 +252,8 @@ def inspect_pdf_upload(path: Path, *, settings: Any) -> PdfUploadPreflightReport
             max_page_render_pixels = 0
             max_image_pixels = 0
             total_image_pixels = 0
+            max_workload_image_pixels = 0
+            total_workload_image_pixels = 0
             image_heavy_pages = 0
             image_heavy_page_min_pixels = _setting_int(
                 settings,
@@ -152,6 +271,9 @@ def inspect_pdf_upload(path: Path, *, settings: Any) -> PdfUploadPreflightReport
                 max_image_pixels = max(max_image_pixels, page_image_pixels)
                 if page_image_pixels >= image_heavy_page_min_pixels:
                     image_heavy_pages += 1
+                workload_pixels = page_workload_image_pixels_of(page)
+                total_workload_image_pixels += workload_pixels
+                max_workload_image_pixels = max(max_workload_image_pixels, workload_pixels)
     except pikepdf.PdfError as exc:
         raise PdfUploadPreflightError(
             "File is not a readable PDF",
@@ -168,6 +290,8 @@ def inspect_pdf_upload(path: Path, *, settings: Any) -> PdfUploadPreflightReport
         producer=producer,
         has_structure_tree=has_structure_tree,
         has_acroform=has_acroform,
+        max_workload_image_pixels=max_workload_image_pixels,
+        total_workload_image_pixels=total_workload_image_pixels,
     )
 
 
@@ -194,7 +318,24 @@ def preflight_pdf_upload(path: Path, *, settings: Any) -> PdfUploadPreflightRepo
         25,
     )
 
+    max_objects = _setting_int(settings, "max_upload_objects", 1_000_000)
+    stream_cap = _setting_int(settings, "max_upload_decoded_stream_bytes", 256 * 1024 * 1024)
+    total_cap = _setting_int(settings, "max_upload_decoded_total_bytes", 2 * 1024 * 1024 * 1024)
+    streams = inspect_stream_workload(path, stream_cap=stream_cap, total_cap=total_cap)
+    max_workload = max(report.max_image_pixels, report.max_workload_image_pixels)
+    total_workload = max(report.total_image_pixels, report.total_workload_image_pixels)
+
     reasons: list[str] = []
+    if streams.objects > max_objects:
+        reasons.append(f"{streams.objects:,} objects exceeds the {max_objects:,}-object limit")
+    if streams.largest_decoded_bytes > stream_cap:
+        reasons.append(
+            f"a compressed stream expands past the {stream_cap // (1024 * 1024)} MB limit"
+        )
+    elif streams.total_decoded_bytes > total_cap:
+        reasons.append(
+            f"its compressed streams expand past the {total_cap // (1024 * 1024)} MB limit"
+        )
     if report.page_count > max_pages:
         reasons.append(f"{report.page_count} pages exceeds the {max_pages}-page limit")
     if report.max_page_render_pixels > max_page_render_pixels:
@@ -202,14 +343,14 @@ def preflight_pdf_upload(path: Path, *, settings: Any) -> PdfUploadPreflightRepo
             f"the largest page would render at {_megapixels(report.max_page_render_pixels)}, "
             f"above the {_megapixels(max_page_render_pixels)} limit"
         )
-    if report.max_image_pixels > max_image_pixels:
+    if max_workload > max_image_pixels:
         reasons.append(
-            f"the largest page embeds {_megapixels(report.max_image_pixels)} of image data, "
+            f"the largest page embeds {_megapixels(max_workload)} of image data, "
             f"above the {_megapixels(max_image_pixels)} limit"
         )
-    if report.total_image_pixels > max_total_image_pixels:
+    if total_workload > max_total_image_pixels:
         reasons.append(
-            f"embedded image data totals {_megapixels(report.total_image_pixels)}, "
+            f"embedded image data totals {_megapixels(total_workload)}, "
             f"above the {_megapixels(max_total_image_pixels)} limit"
         )
     if report.image_heavy_pages > max_image_heavy_pages:
