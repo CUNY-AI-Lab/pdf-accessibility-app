@@ -8,6 +8,7 @@ strips ``Authorization`` on the way in, so neither travels there.
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -164,20 +165,28 @@ class WorkerClient:
     async def download(self, task: Task, what: str, dest: Path) -> None:
         """Stream the task's input PDF or saved state to ``dest``."""
         dest.parent.mkdir(parents=True, exist_ok=True)
-        async with self._client.stream(
-            "GET", f"/tasks/{task.job_id}/{what}", headers=self._task_headers(task)
-        ) as response:
-            _raise_for_task(response)
-            with open(dest, "wb") as out:
-                async for chunk in response.aiter_bytes(1024 * 1024):
-                    out.write(chunk)
+
+        async def fetch() -> None:
+            async with self._client.stream(
+                "GET", f"/tasks/{task.job_id}/{what}", headers=self._task_headers(task)
+            ) as response:
+                _raise_for_task(response)
+                # "wb" so a retry starts the file over.
+                with open(dest, "wb") as out:
+                    async for chunk in response.aiter_bytes(1024 * 1024):
+                        out.write(chunk)
+
+        await self._with_retries(task, f"Download of {what}", fetch)
 
     async def progress(self, task: Task, event: dict[str, Any]) -> None:
         """Report a step event; an empty event only renews the lease."""
-        response = await self._client.post(
-            f"/tasks/{task.job_id}/progress", json=event, headers=self._task_headers(task)
-        )
-        _raise_for_task(response)
+        async def send() -> None:
+            response = await self._client.post(
+                f"/tasks/{task.job_id}/progress", json=event, headers=self._task_headers(task)
+            )
+            _raise_for_task(response)
+
+        await self._with_retries(task, "Progress", send)
 
     async def upload(self, task: Task, name: str, body: bytes | Path, content_type: str) -> None:
         phase = UploadPhase.SENDING
@@ -219,16 +228,51 @@ class WorkerClient:
                 phase = upload_transition(phase, UploadPhase.SENDING)
 
     async def complete(self, task: Task, payload: dict[str, Any]) -> None:
-        response = await self._client.post(
-            f"/tasks/{task.job_id}/complete", json=payload, headers=self._task_headers(task)
-        )
-        _raise_for_task(response)
+        # The Worker keeps a receipt per lease, so a replayed completion whose
+        # first answer was lost is acknowledged rather than refused.
+        async def send() -> None:
+            response = await self._client.post(
+                f"/tasks/{task.job_id}/complete", json=payload, headers=self._task_headers(task)
+            )
+            _raise_for_task(response)
+
+        await self._with_retries(task, "Completion", send)
 
     async def fail(self, task: Task, error: str) -> None:
-        response = await self._client.post(
-            f"/tasks/{task.job_id}/fail", json={"error": error}, headers=self._task_headers(task)
-        )
-        _raise_for_task(response)
+        async def send() -> None:
+            response = await self._client.post(
+                f"/tasks/{task.job_id}/fail",
+                json={"error": error},
+                headers=self._task_headers(task),
+            )
+            _raise_for_task(response)
+
+        # A task that ran out of time still reports it, so no deadline here.
+        await self._with_retries(task, "Failure report", send, deadline=False)
+
+    async def _with_retries(
+        self,
+        task: Task,
+        label: str,
+        send: Callable[[], Awaitable[None]],
+        *,
+        deadline: bool = True,
+    ) -> None:
+        """Send a call to the Worker, retrying transient failures like ``upload`` does."""
+        for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+            try:
+                await send()
+                return
+            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+                if attempt == UPLOAD_ATTEMPTS or not retryable_upload(exc):
+                    raise
+                delay = 2**attempt
+                if deadline and delay >= task.deadline_ms / 1000 - time.time():
+                    raise TimeoutError(f"{label} retry would exceed deadline") from exc
+                logger.warning(
+                    "%s for job %s failed (%s); retrying", label, task.job_id, exc
+                )
+                await asyncio.sleep(delay)
 
     def _task_headers(self, task: Task) -> dict[str, str]:
         return {JOB_TOKEN_HEADER: task.lease}

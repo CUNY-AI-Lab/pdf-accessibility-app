@@ -68,11 +68,16 @@ Priority: P0 = fix first (a live failure mode), P1 = next, P2 = as time allows.
   job fail it. Fix: stop claiming, let the runner hand unfinished tasks back
   through a new release call that requeues without spending an attempt, and
   lengthen `stop_grace_period`. Contract change on both sides.
-- [ ] **3. Retry the Worker calls that don't.** Only `upload` retries.
+- [x] **3. Retry the Worker calls that don't.** Only `upload` retries.
   `download`, `progress`, `complete` and `fail` (`backend/app/runner/client.py`)
   are single attempts, so a transient 502 on `complete` after every file is
   uploaded turns a finished job into `INTERNAL_ERROR`. Fix: the same bounded
   retry as upload, within the lease.
+  *Done:* download, progress, complete and fail retry 408/425/429/5xx and
+  transport errors three times with 2 s and 4 s backoff, within the task's
+  deadline (the failure report ignores the deadline, since it may be what
+  reports it). Safe to replay: completion has a per-lease receipt; a replayed
+  failure report after a lost answer gets 409 and ends the task as lease lost.
 - [ ] **4. A sweep that can't be stopped by one bad row, and a queue that
   can't fill with dead jobs.** `sweep` (`worker/src/board.ts`) has no per-row
   isolation, unlike `claim`, so one throwing row stops lease recovery and

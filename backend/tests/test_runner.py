@@ -67,8 +67,11 @@ class FakeWorker:
         progress_status: int = 200,
         refuse_once: asyncio.Event | None = None,
         lease: str = "lease-token",
+        complete_failures: int = 0,
     ):
         self.state = state
+        # Answer this many completions with a 502 before accepting one.
+        self.complete_failures = complete_failures
         self.lease = lease
         self.progress_status = progress_status
         # When given, progress answers 200 until the event is set.
@@ -101,6 +104,9 @@ class FakeWorker:
             )
             return httpx.Response(204)
         if action == "/complete":
+            if self.complete_failures > 0:
+                self.complete_failures -= 1
+                return httpx.Response(502)
             self.completed = json.loads(request.content)
             return httpx.Response(204)
         if action == "/fail":
@@ -1503,3 +1509,128 @@ async def test_runner_exits_nonzero_after_repeated_auth_refusals(tmp_path, monke
     # A 503 between refusals is not a refusal; three in a row are needed.
     assert client.calls == 1 + 1 + runner_main.AUTH_REFUSAL_LIMIT
     assert client.closed
+
+
+async def _no_sleep(_seconds):
+    pass
+
+
+async def _call(client: WorkerClient, call: str, task: Task, tmp_path: Path) -> None:
+    if call == "download":
+        await client.download(task, "input", tmp_path / "input.pdf")
+    elif call == "progress":
+        await client.progress(task, {"step": "classify", "status": "running"})
+    elif call == "complete":
+        await client.complete(task, {"review_refused": "no", "overrides_version": 0})
+    else:
+        await client.fail(task, "broken")
+
+
+@pytest.mark.parametrize("call", ["download", "progress", "complete", "fail"])
+@pytest.mark.parametrize("failure", [502, 503, "transport"])
+async def test_worker_calls_retry_transient_errors(tmp_path, monkeypatch, call, failure):
+    from app.runner import client as runner_client
+
+    requests = []
+    sleeps = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    def handler(request):
+        requests.append(request)
+        if len(requests) == 3:
+            return httpx.Response(200, content=PDF) if call == "download" else httpx.Response(204)
+        if failure == "transport":
+            raise httpx.ReadError("connection reset")
+        return httpx.Response(failure)
+
+    monkeypatch.setattr(runner_client.asyncio, "sleep", sleep)
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    await _call(client, call, _task(), tmp_path)
+    await client.close()
+    assert len(requests) == 3
+    assert sleeps == [2, 4]
+    if call == "download":
+        # A retried download starts over rather than appending to a partial file.
+        assert (tmp_path / "input.pdf").read_bytes() == PDF
+
+
+@pytest.mark.parametrize("call", ["download", "progress", "complete", "fail"])
+@pytest.mark.parametrize("status", [400, 404, 409, 422])
+async def test_worker_calls_do_not_retry_permanent_errors(tmp_path, monkeypatch, call, status):
+    from app.runner import client as runner_client
+    from app.runner.client import LeaseLost
+
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(status)
+
+    monkeypatch.setattr(runner_client.asyncio, "sleep", _no_sleep)
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    with pytest.raises(LeaseLost if status in {404, 409} else httpx.HTTPStatusError):
+        await _call(client, call, _task(), tmp_path)
+    await client.close()
+    assert len(requests) == 1
+
+
+async def test_failure_report_retries_after_the_deadline(tmp_path, monkeypatch):
+    # A task that ran out of time still has to say so; its report is not bound
+    # by the deadline that ended it.
+    from app.runner import client as runner_client
+
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(204) if len(requests) == 2 else httpx.Response(503)
+
+    monkeypatch.setattr(runner_client.asyncio, "sleep", _no_sleep)
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    await client.fail(_task(deadline=int((time.time() - 5) * 1000)), "too slow")
+    await client.close()
+    assert len(requests) == 2
+
+
+async def test_completion_retry_stops_at_the_deadline(tmp_path, monkeypatch):
+    from app.runner import client as runner_client
+
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503)
+
+    monkeypatch.setattr(runner_client.asyncio, "sleep", _no_sleep)
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    with pytest.raises(TimeoutError):
+        await client.complete(
+            _task(deadline=int((time.time() + 1) * 1000)), {"review_refused": "no"}
+        )
+    await client.close()
+    assert len(requests) == 1
+
+
+async def test_transient_completion_error_does_not_fail_a_finished_job(
+    tmp_path, monkeypatch, quiet_previews
+):
+    # Every file was uploaded; a 502 on the completion call used to turn the
+    # finished job into "internal error".
+    from app.runner import client as runner_client
+
+    settings = _settings(tmp_path)
+    worker = FakeWorker(complete_failures=1)
+    client = worker.client()
+
+    async def fake_pipeline(job_id, session_maker, settings_arg, sink):
+        await _finish_as_reviewed(session_maker, settings_arg, job_id)
+
+    monkeypatch.setattr(runner_tasks, "run_pipeline", fake_pipeline)
+    monkeypatch.setattr(runner_client.asyncio, "sleep", _no_sleep)
+    await runner_tasks.run_task(client, _task(), settings)
+    await client.close()
+    assert worker.failed is None
+    assert worker.completed is not None
+    assert worker.completed["job"]["status"] == "manual_remediation"
