@@ -92,7 +92,9 @@ flowchart LR
 - **Time.** Work is not queued when the person's Gateway leg has under an
   hour left. A task's deadline is the earlier of three hours and the leg's
   expiry; a lease lasts three minutes and is renewed by progress. A job
-  whose runner goes quiet is retried once. When no runner has asked for
+  whose runner goes quiet is retried once; a runner that is shutting down
+  releases its tasks instead, which requeues them without using up that
+  retry. When no runner has asked for
   work for 30 minutes, queued work fails with a message to try again later,
   so it stops holding the global limit. Jobs and files are deleted 12 hours
   after their last change. A row the sweep can't handle is retired as

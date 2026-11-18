@@ -1634,3 +1634,105 @@ async def test_transient_completion_error_does_not_fail_a_finished_job(
     assert worker.failed is None
     assert worker.completed is not None
     assert worker.completed["job"]["status"] == "manual_remediation"
+
+
+async def test_release_hands_the_task_back(tmp_path):
+    from app.runner.client import LeaseLost
+
+    requests = []
+
+    def handler(request):
+        requests.append((request.method, request.url.path, request.headers[JOB_TOKEN_HEADER]))
+        return httpx.Response(204 if len(requests) == 1 else 409)
+
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    await client.release(_task())
+    with pytest.raises(LeaseLost):
+        await client.release(_task())
+    await client.close()
+    assert requests[0] == (
+        "POST",
+        f"/pdf-accessibility/runner/tasks/{JOB_ID}/release",
+        "lease-token",
+    )
+
+
+def _shutdown_runner(monkeypatch, settings, work):
+    """main() with one claimed task, stopped by SIGTERM once the task is running."""
+    from app.runner import __main__ as runner_main
+
+    signals = []
+    started = asyncio.Event()
+
+    class Client:
+        base_url = WORKER
+        last_contact: float | None = None
+        calls = 0
+        closed = False
+        released: list[str] = []
+
+        async def claim(self, _runner):
+            self.calls += 1
+            if self.calls == 1:
+                return _task()
+            await started.wait()
+            signals[0]()
+            return None
+
+        async def release(self, task):
+            self.released.append(task.job_id)
+
+        async def close(self):
+            self.closed = True
+
+    async def run(_client, _task, _settings):
+        started.set()
+        await work()
+
+    client = Client()
+    monkeypatch.setattr(runner_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(runner_main, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(runner_main, "WorkerClient", lambda *_args: client)
+    monkeypatch.setattr(runner_main, "run_task", run)
+    monkeypatch.setattr(
+        asyncio.get_running_loop(),
+        "add_signal_handler",
+        lambda _signal, callback: signals.append(callback),
+    )
+    return runner_main, client
+
+
+async def test_shutdown_releases_tasks_that_do_not_finish_in_time(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    settings.runner_drain_seconds = 0.05
+    cancelled = asyncio.Event()
+
+    async def work():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    runner_main, client = _shutdown_runner(monkeypatch, settings, work)
+    await asyncio.wait_for(runner_main.main(), 2)
+    assert cancelled.is_set()
+    assert client.released == [JOB_ID]
+    assert client.closed
+
+
+async def test_shutdown_lets_a_finishing_task_publish_instead_of_releasing(
+    tmp_path, monkeypatch
+):
+    settings = _settings(tmp_path)
+    settings.runner_drain_seconds = 2.0
+    finished = asyncio.Event()
+
+    async def work():
+        await asyncio.sleep(0.05)
+        finished.set()
+
+    runner_main, client = _shutdown_runner(monkeypatch, settings, work)
+    await asyncio.wait_for(runner_main.main(), 3)
+    assert finished.is_set()
+    assert client.released == []

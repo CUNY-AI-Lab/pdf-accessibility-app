@@ -55,9 +55,12 @@ docker compose logs -f runner      # "Runner actual-dell taking work from ..."
 ```
 
 The image is the app's GHCR image (`Publish container` workflow), published
-for a commit on main. To update, run the same `up -d` with the new tag; a
-task in progress is lost and retried once by the Worker when its lease
-lapses (three minutes).
+for a commit on main. To update, run the same `up -d` with the new tag.
+On stop, the runner gives running tasks 40 seconds to finish, then hands
+the rest back to the Worker's queue without using up a retry; they start
+over when the new runner claims them. Deploy a Worker that has the
+`release` route before a runner that calls it (an older Worker answers
+404, and the task waits out its three-minute lease instead).
 
 The runner removes each job's working files after its task. A shared cache
 keeps generated figure descriptions keyed by hashes of the image and exact

@@ -79,6 +79,10 @@ export async function handleRunner(request: Request, env: Env, path: string): Pr
     return completed.ok ? noContent() : detail(completed.status, completed.detail);
   }
 
+  if (action === "release" && request.method === "POST") {
+    return (await board.release(jobId, lease, now)) ? noContent() : leaseLost();
+  }
+
   if (action === "fail" && request.method === "POST") {
     const failure = failRequestSchema.safeParse(await request.json().catch(() => null));
     if (!failure.success) return detail(422, "Invalid failure");

@@ -380,6 +380,33 @@ describe("leases and retention", () => {
     expect(failed.error).toBe(MESSAGES.interrupted);
   });
 
+  it("requeues a released task without spending one of its attempts", async () => {
+    const id = await createdJobId(await upload());
+    const first = await claim();
+    if (first === null) throw new Error("no task");
+    expect((await runner(`/tasks/${id}/release`, { method: "POST", lease: first.lease })).status).toBe(204);
+    expect((await job(id)).status).toBe("queued");
+    // The released lease is spent.
+    expect((await runner(`/tasks/${id}/release`, { method: "POST", lease: first.lease })).status).toBe(409);
+    const again = await claim();
+    expect(again?.attempt).toBe(1);
+    // A quiet runner still gets its one retry after a release.
+    await jobBoard(env).sweep(Date.now() + LIMITS.leaseMs + 1000);
+    expect((await job(id)).status).toBe("queued");
+  });
+
+  it("releases a task on its last attempt instead of failing it", async () => {
+    const id = await createdJobId(await upload());
+    await claim();
+    await jobBoard(env).sweep(Date.now() + LIMITS.leaseMs + 1000);
+    const second = await claim();
+    if (second === null) throw new Error("no retry");
+    expect(second.attempt).toBe(2);
+    expect((await runner(`/tasks/${id}/release`, { method: "POST", lease: second.lease })).status).toBe(204);
+    expect((await job(id)).status).toBe("queued");
+    expect((await claim())?.attempt).toBe(2);
+  });
+
   it("fails queued jobs once no runner has polled for a while, freeing their slots", async () => {
     const id = await createdJobId(await upload());
     const later = Date.now() + LIMITS.runnerAbsentMs + 1000;

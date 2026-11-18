@@ -166,6 +166,9 @@ class Settings(BaseSettings):
     # No answer for this long: exit with an error so Docker restarts the runner.
     # Any task's lease (3 minutes) has lapsed by then, so nothing is lost.
     runner_contact_timeout_seconds: float = 600.0
+    # On SIGTERM, how long running tasks get to finish before they are handed
+    # back to the queue. Keep it under the container's stop grace period.
+    runner_drain_seconds: float = 40.0
 
     @model_validator(mode="after")
     def validate_llm_settings(self):

@@ -24,6 +24,7 @@ RUNNER_TOKEN_HEADER = "x-pdf-runner-token"
 JOB_TOKEN_HEADER = "x-pdf-job-token"
 TASK_KINDS = frozenset({"process", "review", "sync"})
 UPLOAD_ATTEMPTS = 3
+RELEASE_TIMEOUT_SECONDS = 5.0
 
 
 class UploadPhase(Enum):
@@ -249,6 +250,18 @@ class WorkerClient:
 
         # A task that ran out of time still reports it, so no deadline here.
         await self._with_retries(task, "Failure report", send, deadline=False)
+
+    async def release(self, task: Task) -> None:
+        """Hand a task back to the Worker's queue when the runner shuts down.
+
+        One quick attempt: the process is about to be killed, and an
+        unreleased task is still recovered when its lease lapses.
+        """
+        async with asyncio.timeout(RELEASE_TIMEOUT_SECONDS):
+            response = await self._client.post(
+                f"/tasks/{task.job_id}/release", headers=self._task_headers(task)
+            )
+        _raise_for_task(response)
 
     async def _with_retries(
         self,

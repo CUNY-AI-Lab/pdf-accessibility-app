@@ -981,6 +981,24 @@ export class JobBoard extends DurableObject<Env> {
     logOutcome(row, event);
   }
 
+  /**
+   * A runner that is shutting down hands its task back. The task is queued
+   * again, and the attempt its claim counted is returned: a restart is not
+   * the job's fault, so it must not use up the job's retries.
+   */
+  async release(id: string, lease: string, now: number): Promise<boolean> {
+    const leaseHash = await sha256Hex(lease);
+    const row = this.heldRow(id, leaseHash, now);
+    if (row === null) return false;
+    const released = { ...row, attempt: Math.max(0, row.attempt - 1) };
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("UPDATE jobs SET attempt = ? WHERE id = ?", released.attempt, id);
+      if (row.task_kind === "sync") this.retrySync(released, now);
+      else this.requeue(released, now);
+    });
+    return true;
+  }
+
   async fail(id: string, lease: string, error: string, now: number): Promise<boolean> {
     const leaseHash = await sha256Hex(lease);
     const row = this.heldRow(id, leaseHash, now);

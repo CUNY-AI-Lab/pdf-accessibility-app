@@ -17,7 +17,7 @@ from pathlib import Path
 import httpx
 
 from app.config import get_settings
-from app.runner.client import WorkerClient
+from app.runner.client import LeaseLost, Task, WorkerClient
 from app.runner.state import cleanup_abandoned_attempts
 from app.runner.tasks import run_task
 from app.services.file_storage import ensure_dirs
@@ -118,7 +118,7 @@ async def main() -> None:
     runner_id = settings.runner_id.strip() or socket.gethostname()
     client = WorkerClient(settings.runner_worker_url, settings.runner_token)
     slots = asyncio.Semaphore(max(1, settings.runner_slots))
-    running: set[asyncio.Task] = set()
+    running: dict[asyncio.Task, Task] = {}
     control = RunnerControl()
     stopping = control.stopping
     loop = asyncio.get_running_loop()
@@ -169,23 +169,49 @@ async def main() -> None:
                 "Took %s task for job %s (attempt %s)", task.kind, task.job_id, task.attempt
             )
             job = asyncio.create_task(run_task(client, task, settings))
-            running.add(job)
-            job.add_done_callback(running.discard)
+            running[job] = task
+            job.add_done_callback(lambda done: running.pop(done, None))
             job.add_done_callback(lambda _done: slots.release())
     finally:
         control.stop()
         if heartbeat is not None:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
-        # Unfinished tasks go back to the queue when their leases lapse.
-        for job in running:
-            job.cancel()
-        await asyncio.gather(*running, return_exceptions=True)
+        await _drain(client, running, settings.runner_drain_seconds)
         await client.close()
         control.transition(RunnerMode.STOPPED)
     if health.failure is not None:
         logger.error("Runner stopping: %s", health.failure)
         raise SystemExit(f"Runner stopped: {health.failure}")
+
+
+async def _drain(
+    client: WorkerClient, running: dict[asyncio.Task, Task], grace_seconds: float
+) -> None:
+    """Let running tasks finish for a while, then hand the rest back to the Worker.
+
+    A released task is queued again without spending one of its attempts;
+    one that can't be released comes back when its lease lapses.
+    """
+    if running:
+        logger.info("Waiting up to %.0f s for %d task(s) to finish", grace_seconds, len(running))
+        await asyncio.wait(set(running), timeout=grace_seconds)
+    unfinished = {job: task for job, task in running.items() if not job.done()}
+    for job in unfinished:
+        job.cancel()
+    # Release before joining: a cancelled task may wait on a thread that
+    # won't stop, and the process may be killed before it does.
+    results = await asyncio.gather(
+        *(client.release(task) for task in unfinished.values()), return_exceptions=True
+    )
+    for task, result in zip(unfinished.values(), results, strict=True):
+        if isinstance(result, LeaseLost):
+            logger.info("Job %s was no longer held, so not released", task.job_id)
+        elif isinstance(result, BaseException):
+            logger.warning("Could not release job %s: %r", task.job_id, result)
+        else:
+            logger.info("Released job %s back to the queue", task.job_id)
+    await asyncio.gather(*unfinished, return_exceptions=True)
 
 
 async def _stay_alive(path: Path, control: RunnerControl, health: RunnerHealth) -> None:

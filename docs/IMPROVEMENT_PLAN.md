@@ -60,14 +60,20 @@ Priority: P0 = fix first (a live failure mode), P1 = next, P2 = as time allows.
   answer, exit with an error. CI now runs the image against a stub Worker
   (must turn healthy) and a dead one (must exit non-zero). Verified locally
   by unit tests and by running the runner against both; the image itself
-  could not be built in the sandbox (Debian mirrors blocked), so the CI job
-  is its first run.
-- [ ] **2. Graceful drain on SIGTERM.** Shutdown cancels in-flight jobs at
+  could not be built in the sandbox (Debian mirrors blocked); the CI
+  container job passed on this branch (run 44400133030).
+- [x] **2. Graceful drain on SIGTERM.** Shutdown cancels in-flight jobs at
   once. Each then waits out its 3-minute lease and spends one of its two
   attempts (`worker/src/board.ts` `LIMITS.attempts`), so two restarts during a
   job fail it. Fix: stop claiming, let the runner hand unfinished tasks back
   through a new release call that requeues without spending an attempt, and
   lengthen `stop_grace_period`. Contract change on both sides.
+  *Done:* the Worker has `POST /tasks/{id}/release` (lease-authorized);
+  it requeues the task and returns the attempt its claim counted. On SIGTERM
+  the runner waits up to `RUNNER_DRAIN_SECONDS` (40) for tasks to finish,
+  then cancels and releases the rest before joining them; compose's
+  `stop_grace_period` is 60 s. Release order: Worker first (an older Worker
+  answers 404, which the runner treats as an already-lost lease).
 - [x] **3. Retry the Worker calls that don't.** Only `upload` retries.
   `download`, `progress`, `complete` and `fail` (`backend/app/runner/client.py`)
   are single attempts, so a transient 502 on `complete` after every file is
