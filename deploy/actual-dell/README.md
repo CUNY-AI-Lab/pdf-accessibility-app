@@ -87,6 +87,15 @@ access to every queued job, so make it long and random
 set the new value on the Worker, then in `runner.env`, then restart the
 runner; tasks claimed under the old token fail their next call and retry.
 
+The token should be at least 32 characters. The runner logs a warning at
+start-up, and the Worker a `runner_token_weak` event, when it is shorter;
+both give the length, never the token. To check the length here without
+printing the token:
+
+```bash
+awk -F= '/^RUNNER_TOKEN=/{print length($2)}' runner.env
+```
+
 ## Checks
 
 - `docker compose ps` shows the runner healthy: it touches a file every 30

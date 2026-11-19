@@ -31,6 +31,8 @@ HEALTH_BEAT_SECONDS = 30.0
 # Consecutive 401/403 answers to a claim before the runner exits. A revoked or
 # wrong RUNNER_TOKEN never heals by retrying, so it should restart loudly.
 AUTH_REFUSAL_LIMIT = 3
+# Matches the Worker's MIN_RUNNER_TOKEN_LENGTH (worker/src/http.ts).
+MIN_RUNNER_TOKEN_LENGTH = 32
 
 
 class RunnerMode(Enum):
@@ -116,6 +118,14 @@ async def main() -> None:
     settings = get_settings()
     if not settings.runner_worker_url.strip() or not settings.runner_token.strip():
         raise SystemExit("RUNNER_WORKER_URL and RUNNER_TOKEN are required")
+    token_length = len(settings.runner_token.strip())
+    if token_length < MIN_RUNNER_TOKEN_LENGTH:
+        # The length only: the token itself grants access to every queued job.
+        logger.warning(
+            "RUNNER_TOKEN is %d characters; use at least %d (openssl rand -base64 32)",
+            token_length,
+            MIN_RUNNER_TOKEN_LENGTH,
+        )
     ensure_dirs()
     cleanup_abandoned_attempts(settings)
     runner_id = settings.runner_id.strip() or socket.gethostname()

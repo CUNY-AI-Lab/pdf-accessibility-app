@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { guardArtifactTransition, guardRetentionTransition, guardUploadTransition } from "../src/artifacts";
 import { credentialEligibility } from "../src/credential";
+import { MIN_RUNNER_TOKEN_LENGTH, weakRunnerTokenEvent } from "../src/http";
 import { applyStepProgress, guardStepTransition, resetSteps, validateSteps } from "../src/steps";
 import { finishedJob } from "./helpers";
 
@@ -78,5 +79,19 @@ describe("credential eligibility", () => {
     expect(credentialEligibility("process", null, 999999, 0)).toBe("missing");
     expect(credentialEligibility("review", "token", null, 0)).toBe("missing");
     expect(credentialEligibility("sync", null, null, 0)).toBe("not_required");
+  });
+});
+
+describe("runner token strength", () => {
+  it("reports a short token by its length only", () => {
+    const token = "short-runner-token";
+    const event = weakRunnerTokenEvent(token);
+    expect(event).not.toBeNull();
+    expect(JSON.parse(event ?? "{}")).toEqual({ event: "runner_token_weak", length: token.length, minimum: MIN_RUNNER_TOKEN_LENGTH });
+    expect(event).not.toContain(token);
+  });
+
+  it("says nothing about a token of at least the minimum length", () => {
+    expect(weakRunnerTokenEvent("x".repeat(MIN_RUNNER_TOKEN_LENGTH))).toBeNull();
   });
 });

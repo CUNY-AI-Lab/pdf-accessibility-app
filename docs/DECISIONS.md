@@ -36,3 +36,12 @@ busy or not, so the JobBoard remembers the last poll and fails queued work
 once there has been none for 30 minutes. The time is kept in memory rather
 than written on every poll; after an eviction it restarts at "now", which
 can delay this failure but never cause a wrong one.
+
+## 2026-11-19 — Report a short RUNNER_TOKEN before refusing one
+
+A minimum token length protects every queued job, but the production token
+can't be read from outside: Cloudflare secrets are write-only and
+`runner.env` lives on actual-dell. Enforcing blind could lock the runner out
+on the next release. So the Worker and the runner first log a short token's
+length (never its value); enforcement follows once a release shows the
+production token passes, or after rotating it if it doesn't.

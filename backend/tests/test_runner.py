@@ -1776,3 +1776,72 @@ async def test_run_task_bounds_the_thread_join(tmp_path, monkeypatch):
     monkeypatch.setattr(runner_tasks.ClaimedTaskExecution, "run", run)
     await runner_tasks.run_task(FakeWorker().client(), _task(), settings)
     assert seen == {"join_timeout": 7.0}
+
+
+async def test_runner_warns_about_a_short_token_without_logging_it(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from app.runner import __main__ as runner_main
+
+    settings = _settings(tmp_path)  # runner_token="host-token": 10 characters
+    signals = []
+
+    class Client:
+        base_url = WORKER
+        last_contact: float | None = None
+        closed = False
+
+        async def claim(self, _runner):
+            signals[0]()
+            return None
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(runner_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(runner_main, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(runner_main, "WorkerClient", lambda *_args: Client())
+    monkeypatch.setattr(
+        asyncio.get_running_loop(),
+        "add_signal_handler",
+        lambda _signal, callback: signals.append(callback),
+    )
+    with caplog.at_level(logging.WARNING, logger="app.runner"):
+        await asyncio.wait_for(runner_main.main(), 1)
+    warnings = [record.getMessage() for record in caplog.records if "RUNNER_TOKEN" in record.getMessage()]
+    assert len(warnings) == 1
+    assert "10 characters" in warnings[0]
+    assert "host-token" not in caplog.text
+
+
+async def test_runner_says_nothing_about_a_long_token(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from app.runner import __main__ as runner_main
+
+    settings = _settings(tmp_path)
+    settings.runner_token = "x" * 44
+    signals = []
+
+    class Client:
+        base_url = WORKER
+        last_contact: float | None = None
+
+        async def claim(self, _runner):
+            signals[0]()
+            return None
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(runner_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(runner_main, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(runner_main, "WorkerClient", lambda *_args: Client())
+    monkeypatch.setattr(
+        asyncio.get_running_loop(),
+        "add_signal_handler",
+        lambda _signal, callback: signals.append(callback),
+    )
+    with caplog.at_level(logging.WARNING, logger="app.runner"):
+        await asyncio.wait_for(runner_main.main(), 1)
+    assert "RUNNER_TOKEN" not in caplog.text

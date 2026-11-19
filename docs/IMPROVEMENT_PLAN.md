@@ -130,6 +130,17 @@ Priority: P0 = fix first (a live failure mode), P1 = next, P2 = as time allows.
   minimum `RUNNER_TOKEN` length in the Worker, which needs the production
   token's length confirmed first or the next release could lock the runner
   out.
+  *Token length, step 1 done:* the token can't be read from outside (Cloudflare
+  secrets are write-only; `runner.env` is on actual-dell), so the deployed
+  code reports it: the Worker logs `runner_token_weak` (length only) once
+  per isolate and the runner logs a start-up warning when it is under 32
+  characters. Nothing is refused yet.
+  *Step 2, after the next release of both:* if neither reports a weak
+  token, make `sameSecret` refuse an expected token under
+  `MIN_RUNNER_TOKEN_LENGTH` and make the runner exit at start-up on one,
+  each with a test. If either reports one, rotate first
+  (`openssl rand -base64 32`, Worker secret, then `runner.env`, then restart
+  the runner), then enforce.
 - [x] **7. Close preflight gaps** (`backend/app/services/pdf_preflight.py`):
   bound decompressed stream size, count inline images, annotation appearances,
   soft masks and inherited resources, honour `/UserUnit`, and cap object count.

@@ -13,7 +13,7 @@ import {
   progressEventSchema,
 } from "./contract";
 import { type Env, jobBoard } from "./env";
-import { detail, json, noContent, sameSecret } from "./http";
+import { detail, json, noContent, sameSecret, weakRunnerTokenEvent } from "./http";
 
 export const RUNNER_TOKEN_HEADER = "x-pdf-runner-token";
 export const JOB_TOKEN_HEADER = "x-pdf-job-token";
@@ -24,8 +24,15 @@ const MAX_RELAY_BODY_BYTES = 16 * 1024 * 1024;
 const RELAYED_HEADERS = ["content-type", "retry-after", "x-should-retry"];
 
 const leaseLost = (): Response => detail(409, "This task is no longer held by the runner");
+// Each isolate reports a short RUNNER_TOKEN once, not on every poll.
+let tokenStrengthReported = false;
 
 export async function handleRunner(request: Request, env: Env, path: string): Promise<Response> {
+  if (!tokenStrengthReported) {
+    tokenStrengthReported = true;
+    const weak = weakRunnerTokenEvent(env.RUNNER_TOKEN);
+    if (weak !== null) console.warn(weak);
+  }
   if (!(await sameSecret(request.headers.get(RUNNER_TOKEN_HEADER) ?? "", env.RUNNER_TOKEN))) {
     return detail(401, "Runner credential required");
   }

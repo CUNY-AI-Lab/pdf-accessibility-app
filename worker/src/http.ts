@@ -45,6 +45,19 @@ export function randomToken(): string {
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+// RUNNER_TOKEN reaches every queued job. `openssl rand -base64 32` gives 44.
+export const MIN_RUNNER_TOKEN_LENGTH = 32;
+
+/**
+ * A log line when the configured runner token is short, naming its length
+ * only. Reported, not enforced, until production confirms its token passes
+ * (docs/IMPROVEMENT_PLAN.md item 6): refusing it would stop processing.
+ */
+export function weakRunnerTokenEvent(token: string): string | null {
+  if (token.length >= MIN_RUNNER_TOKEN_LENGTH) return null;
+  return JSON.stringify({ event: "runner_token_weak", length: token.length, minimum: MIN_RUNNER_TOKEN_LENGTH });
+}
+
 export async function sameSecret(given: string, expected: string): Promise<boolean> {
   if (expected === "") return false;
   const [a, b] = await Promise.all([sha256Hex(given), sha256Hex(expected)]);
