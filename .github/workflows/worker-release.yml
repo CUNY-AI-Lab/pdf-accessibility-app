@@ -127,10 +127,15 @@ jobs:
         if: env.first_release != 'true'
         run: |
           set -euo pipefail
-          bunx wrangler versions upload --config wrangler.jsonc --strict --tag "$GITHUB_SHA" --message "commit $GITHUB_SHA"
-          version_id="$(bunx wrangler versions list --config wrangler.jsonc --json | jq -er --arg sha "$GITHUB_SHA" '
-            [.[] | select(.annotations["workers/tag"] == $sha and .annotations["workers/triggered_by"] == "version_upload")]
-            | if length == 0 then error("no uploaded version is tagged \($sha)") else max_by(.number).id end')"
+          # `versions list` can miss a version uploaded seconds earlier, so the
+          # ID comes from wrangler's own upload record. The next step reads the
+          # version back and checks that its tag is this commit.
+          output="$RUNNER_TEMP/versions-upload.ndjson"
+          rm -f "$output"
+          WRANGLER_OUTPUT_FILE_PATH="$output" bunx wrangler versions upload --config wrangler.jsonc --strict --tag "$GITHUB_SHA" --message "commit $GITHUB_SHA"
+          version_id="$(jq -ser '
+            [.[] | select(.type == "version-upload") | .version_id | strings]
+            | if length == 1 then .[0] else error("expected one uploaded version, found \(length)") end' "$output")"
           printf 'version_id=%s\n' "$version_id" >> "$GITHUB_ENV"
 
       - name: Read back the version's config and bindings
