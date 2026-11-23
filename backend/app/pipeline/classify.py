@@ -82,8 +82,6 @@ class ClassificationResult:
     ocr_pages: list[int] = field(default_factory=list)
     # Vector-only pages need rasterization; skip/redo OCR ignores their ink.
     force_ocr_pages: list[int] = field(default_factory=list)
-    # The 0-based pages among them that draw their letters as outlines.
-    outline_pages: list[int] = field(default_factory=list)
 
 
 def _vector_outline_pages(pdf_path: Path) -> list[int]:
@@ -313,8 +311,7 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
             ratio = pages_with_text / total
             workload = _inspect_workload(pdf_path)
             no_text_pages = sorted(set(range(total)) - set(text_pages))
-            outline_pages = _vector_outline_pages(pdf_path)
-            force_pages = sorted(set(outline_pages) | set(unmapped_type3_pages(pdf_path)))
+            force_pages = sorted(set(_vector_outline_pages(pdf_path)) | set(unmapped_type3_pages(pdf_path)))
             # Pages that are pictures with no text at all (a scanned insert in
             # a born-digital document); the OCR step is the only one that
             # recognizes text, so the document is OCR'd there.
@@ -366,7 +363,6 @@ async def classify_pdf(pdf_path: Path) -> ClassificationResult:
                     else []
                 ),
                 force_ocr_pages=force_pages,
-                outline_pages=outline_pages,
             )
 
     result = await to_thread(_classify_structure)

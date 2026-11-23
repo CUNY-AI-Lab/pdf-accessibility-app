@@ -1,16 +1,19 @@
 """OCR text gets checked: crops are read in the job's language, text in any
-script is compared, and pages OCR'd from letter outlines get a spot-check."""
+script is compared, and pages force-OCR'd from drawn letters get a spot-check."""
 
 import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
 
+import pikepdf
 import pytest
 
 from app.config import Settings
 from app.pipeline import classify, fidelity, orchestrator
-from app.pipeline.fidelity import assess_fidelity
+from app.pipeline.fidelity import FORCED_OCR_PAGES_KEY, assess_fidelity
+from app.pipeline.fonts import lanes
+from app.pipeline.fonts.rules import FONT_LANE_OCR_REDO
 from app.services import remediation_intelligence
 from app.services.candidate_state import CandidatePhase
 from app.services.page_intelligence import (
@@ -19,6 +22,7 @@ from app.services.page_intelligence import (
     collect_grounded_text_candidates,
 )
 from app.services.release_policy import release_decision
+from tests.pdf_fixtures import helvetica
 from tests.test_quality_ocr import outline_document, type3_document
 from tests.test_remediation_intelligence import (
     _document_model,
@@ -202,58 +206,39 @@ def test_a_kanji_swap_in_a_mixed_script_block_becomes_a_review_target(monkeypatc
     assert result["targets"][0]["issue_type"] == "encoding_problem"
 
 
-# ── Pages OCR'd from letter outlines get an advisory spot-check ──
+# ── Pages force-OCR'd from drawn letters get an advisory spot-check ──
 
 
-async def test_classification_names_outline_pages_but_not_type3_pages(tmp_path, monkeypatch):
-    monkeypatch.setattr(classify, "_detect_language_from_text", lambda _: "en")
-    outlined = tmp_path / "outlined.pdf"
-    outline_document(outlined)
-    type3 = tmp_path / "type3.pdf"
-    type3_document(type3)
-
-    outlined_result = await classify.classify_pdf(outlined)
-    type3_result = await classify.classify_pdf(type3)
-
-    assert outlined_result.outline_pages == [1]
-    assert type3_result.force_ocr_pages == [0]
-    assert type3_result.outline_pages == []
-
-
-def _outline_task(tasks):
+def _forced_ocr_task(tasks):
     return [
         task for task in tasks
         if isinstance(task.get("metadata"), dict)
-        and task["metadata"].get("check") == "ocr_outline_text"
+        and task["metadata"].get("check") == "forced_ocr_text"
     ]
 
 
 @pytest.mark.parametrize("compliant", [True, False])
-def test_outline_pages_get_an_advisory_task_that_never_holds_release(monkeypatch, compliant):
+def test_forced_ocr_pages_get_an_advisory_task_that_never_holds_release(monkeypatch, compliant):
     monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
-    without_report, without_tasks = assess_fidelity(
-        input_pdf=Path("in.pdf"),
-        output_pdf=Path("out.pdf"),
-        structure_json={"elements": []},
-        alt_entries=[],
-        validation_report=_validation_report(compliant=compliant),
-        tagging_metrics={"tables_tagged": 0},
-        classification="mixed",
-    )
-    report, tasks = assess_fidelity(
-        input_pdf=Path("in.pdf"),
-        output_pdf=Path("out.pdf"),
-        structure_json={"elements": [], "ocr_outline_pages": [3, 2, 0, "x"]},
-        alt_entries=[],
-        validation_report=_validation_report(compliant=compliant),
-        tagging_metrics={"tables_tagged": 0},
-        classification="mixed",
-    )
 
-    (task,) = _outline_task(tasks)
+    def assess(structure_json):
+        return assess_fidelity(
+            input_pdf=Path("in.pdf"),
+            output_pdf=Path("out.pdf"),
+            structure_json=structure_json,
+            alt_entries=[],
+            validation_report=_validation_report(compliant=compliant),
+            tagging_metrics={"tables_tagged": 0},
+            classification="mixed",
+        )
+
+    without_report, without_tasks = assess({"elements": []})
+    report, tasks = assess({"elements": [], FORCED_OCR_PAGES_KEY: [3, 2, 0, "x"]})
+
+    (task,) = _forced_ocr_task(tasks)
     assert task["blocking"] is False
     assert task["metadata"]["pages_to_check"] == [2, 3]
-    assert not _outline_task(without_tasks)
+    assert not _forced_ocr_task(without_tasks)
     # Release, pass/fail and the blocking count are what they were without it.
     assert report["passed"] == without_report["passed"]
     assert report["summary"]["blocking_tasks"] == without_report["summary"]["blocking_tasks"]
@@ -266,8 +251,23 @@ class _StopAfterStructure(Exception):
     pass
 
 
-@pytest.mark.parametrize(("outline_pages", "recorded"), [([1], [2]), ([], None)])
-async def test_pipeline_records_outline_pages_after_ocr(tmp_path, monkeypatch, outline_pages, recorded):
+def _plain_text_document(path):
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
+    page.Contents = pdf.make_stream(b"BT /F1 12 Tf 72 720 Td (Native text stays native) Tj ET")
+    pdf.save(path)
+
+
+@pytest.mark.parametrize(
+    ("build", "recorded"),
+    [
+        (outline_document, [2]),  # page 2 draws its letters as outlines
+        (type3_document, [1]),  # page 1 shows undecodable Type3 codes
+        (_plain_text_document, None),
+    ],
+)
+async def test_pipeline_records_force_ocrd_pages(tmp_path, monkeypatch, build, recorded):
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     from app.models import Base, Job, JobStep
@@ -275,15 +275,9 @@ async def test_pipeline_records_outline_pages_after_ocr(tmp_path, monkeypatch, o
     from tests.test_orchestrator_release_decision import _RecordingJobManager
 
     source = tmp_path / "source.pdf"
-    outline_document(source)
+    build(source)
     stored = {}
-
-    async def classify_source(path):
-        return classify.ClassificationResult(
-            type="mixed", confidence=0.5, pages_with_text=2, total_pages=4,
-            detected_language="en", ocr_pages=[1, 3], force_ocr_pages=[1],
-            outline_pages=outline_pages,
-        )
+    monkeypatch.setattr(classify, "_detect_language_from_text", lambda _: "en")
 
     async def recognize(input_path, output_path, language, **kwargs):
         output_path.write_bytes(input_path.read_bytes())
@@ -301,7 +295,6 @@ async def test_pipeline_records_outline_pages_after_ocr(tmp_path, monkeypatch, o
             raise _StopAfterStructure()
         await real_update_step(db, job_id, step, status, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "classify_pdf", classify_source)
     monkeypatch.setattr(orchestrator, "run_ocr", recognize)
     monkeypatch.setattr(orchestrator, "extract_structure", extract)
     monkeypatch.setattr(orchestrator, "ensure_figure_images", lambda _pdf, _structure, figures, _dir: figures)
@@ -345,4 +338,63 @@ async def test_pipeline_records_outline_pages_after_ocr(tmp_path, monkeypatch, o
     await engine.dispose()
 
     assert stored, "the pipeline did not reach the end of the structure step"
-    assert stored.get("ocr_outline_pages") == recorded
+    assert stored.get(FORCED_OCR_PAGES_KEY) == recorded
+
+
+async def test_font_ocr_lane_candidate_keeps_the_forced_ocr_advisory(tmp_path, monkeypatch):
+    working_pdf = tmp_path / "working.pdf"
+    working_pdf.write_bytes(b"%PDF-1.7\n")
+    tagged_pdf = tmp_path / "tagged.pdf"
+    tagged_pdf.write_bytes(b"%PDF-1.7\n")
+
+    async def fake_run_ocr(*args, **kwargs):
+        return SimpleNamespace(success=True, output_path=working_pdf, skipped=False, message="")
+
+    async def rebuilt_structure(input_path, job_dir, **_kwargs):
+        return SimpleNamespace(
+            document_json={"elements": [{"type": "paragraph", "text": "fresh", "page": 0}]}
+        )
+
+    async def fake_tag_pdf(*args, **kwargs):
+        output = kwargs["output_path"]
+        output.write_bytes(b"%PDF-1.7\n")
+        return SimpleNamespace(output_path=output, struct_elems_created=1)
+
+    async def fake_validate(pdf_path, verapdf_path, flavour, **kwargs):
+        return SimpleNamespace(compliant=True, violations=[], raw_report={}, validated_path=Path(pdf_path))
+
+    monkeypatch.setattr(lanes, "create_job_dir", lambda job_id: tmp_path)
+    monkeypatch.setattr(lanes, "run_ocr", fake_run_ocr)
+    monkeypatch.setattr(lanes, "extract_structure", rebuilt_structure)
+    monkeypatch.setattr(lanes, "tag_pdf", fake_tag_pdf)
+    monkeypatch.setattr(lanes, "validate_pdf", fake_validate)
+
+    result = await lanes._attempt_font_lane(
+        job_id="job-ocr",
+        job=SimpleNamespace(original_filename="sample.pdf", ocr_language=None),
+        settings=Settings(llm_api_key="check-only"),
+        working_pdf=working_pdf,
+        tagged_pdf=tagged_pdf,
+        structure_json={
+            "elements": [{"type": "paragraph", "text": "stale", "page": 0}],
+            FORCED_OCR_PAGES_KEY: [2],
+        },
+        reviewed_alts=[],
+        lane=FONT_LANE_OCR_REDO,
+        current_tagging_result=SimpleNamespace(),
+    )
+    assert result["details"]["structure_refreshed"] is True
+
+    # Fidelity on the lane's candidate still asks for the spot-check.
+    monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
+    _, tasks = assess_fidelity(
+        input_pdf=Path("in.pdf"),
+        output_pdf=Path("out.pdf"),
+        structure_json=result["structure_json"],
+        alt_entries=[],
+        validation_report=_validation_report(),
+        tagging_metrics={"tables_tagged": 0},
+        classification="mixed",
+    )
+    (task,) = _forced_ocr_task(tasks)
+    assert task["metadata"]["pages_to_check"] == [2]

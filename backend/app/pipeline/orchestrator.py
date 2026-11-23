@@ -28,7 +28,7 @@ from app.pipeline.alt_text import (
 from app.pipeline.author_repairs import author_table_readability, repair_author_pdf
 from app.pipeline.author_structure import apply_author_structure, read_author_structure
 from app.pipeline.classify import classify_pdf
-from app.pipeline.fidelity import _table_semantics_risk, assess_fidelity
+from app.pipeline.fidelity import FORCED_OCR_PAGES_KEY, _table_semantics_risk, assess_fidelity
 
 # Keep the former font entry points importable; dependency patches belong in fonts.*.
 from app.pipeline.fonts.diagnostics import _inspect_font_diagnostics as _inspect_font_diagnostics
@@ -2039,8 +2039,8 @@ async def _run_pipeline(
             # ── Step 2: OCR (conditional) ──
             current_step = "ocr"
             working_pdf = input_path
-            # 1-based pages whose text OCR recovered from drawn letter outlines.
-            ocr_outline_pages: list[int] = []
+            # 1-based pages whose text forced OCR recovered from drawn letters.
+            forced_ocr_pages: list[int] = []
 
             if classification.type in ("scanned", "mixed"):
                 await _update_step(db, job_id, "ocr", "running")
@@ -2064,7 +2064,7 @@ async def _run_pipeline(
 
                 if ocr_result.success:
                     working_pdf = ocr_result.output_path
-                    ocr_outline_pages = [page + 1 for page in classification.outline_pages]
+                    forced_ocr_pages = [page + 1 for page in classification.force_ocr_pages]
                     await _update_step(
                         db,
                         job_id,
@@ -2336,9 +2336,9 @@ async def _run_pipeline(
             structure.document_json = apply_author_structure(structure.document_json, author_evidence)
             if author_evidence.get("author_candidate_audit"):
                 structure.document_json["author_candidate_audit"] = author_evidence["author_candidate_audit"]
-            if ocr_outline_pages:
+            if forced_ocr_pages:
                 # Fidelity asks for a spot-check of these pages' OCR text.
-                structure.document_json["ocr_outline_pages"] = ocr_outline_pages
+                structure.document_json[FORCED_OCR_PAGES_KEY] = forced_ocr_pages
             elements = structure.document_json.get("elements", [])
             headings_count = sum(1 for el in elements if el.get("type") == "heading")
             tables_count = sum(1 for el in elements if el.get("type") == "table")

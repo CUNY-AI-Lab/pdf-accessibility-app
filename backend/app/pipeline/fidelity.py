@@ -217,6 +217,9 @@ OCR_VISUAL_MIN_INK_RATIO = FIDELITY_THRESHOLDS.ocr_visual_min_ink_ratio
 STRUCTURE_FRAGMENT_LIMIT = FIDELITY_THRESHOLDS.structure_fragment_limit
 STRUCTURE_FRAGMENT_MIN_LEN = FIDELITY_THRESHOLDS.structure_fragment_min_len
 GROUNDED_TEXT_TARGET_LIMIT = FIDELITY_THRESHOLDS.grounded_text_target_limit
+# The structure key holding the 1-based pages whose text forced OCR recovered
+# from drawn letters (see _check_forced_ocr_text).
+FORCED_OCR_PAGES_KEY = "forced_ocr_pages"
 
 NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 TABLE_KEYWORDS = ("table", "thead", "tbody", "tfoot", "tr", "th", "td")
@@ -2124,14 +2127,16 @@ def _check_grounded_text_fidelity(inputs: _FidelityInputs, out: _FidelityCollect
         )
 
 
-def _check_ocr_outline_text(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
-    """Pages that drew their letters as outlines got all their text from OCR.
+def _check_forced_ocr_text(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
+    """Pages force-OCR'd because they draw their letters as outlines, or in
+    Type3 fonts that do not say which letters they are, got all their text
+    from OCR.
 
     OCR there swaps look-alike characters (O and 0, l and 1, I and 1) and
     raises none of the suspicious-text signals, so the pages get an advisory
     spot-check. It never holds a release.
     """
-    recorded = inputs.structure_json.get("ocr_outline_pages")
+    recorded = inputs.structure_json.get(FORCED_OCR_PAGES_KEY)
     pages = sorted(
         {page for page in recorded if isinstance(page, int) and page > 0}
         if isinstance(recorded, list)
@@ -2140,24 +2145,25 @@ def _check_ocr_outline_text(inputs: _FidelityInputs, out: _FidelityCollector) ->
     if not pages:
         return
     out.add_task(
-        "review:content_fidelity:ocr_outline_text",
+        "review:content_fidelity:forced_ocr_text",
         task_type="content_fidelity",
-        title="Check text read by OCR from letter outlines",
+        title="Check text read by OCR from drawn letters",
         detail=(
-            "These pages draw their letters as shapes rather than font text, so their text "
-            "was recovered by OCR. OCR can confuse look-alike characters, such as O and 0 "
-            "or l and 1. Check codes, numbers and names against the page."
+            "These pages draw their letters as shapes, or in fonts that do not say which "
+            "letters they are, so their text was recovered by OCR. OCR can confuse "
+            "look-alike characters, such as O and 0 or l and 1. Check codes, numbers and "
+            "names against the page."
         ),
         severity="medium",
         blocking=False,
-        metadata={"check": "ocr_outline_text", "pages_to_check": pages},
+        metadata={"check": "forced_ocr_text", "pages_to_check": pages},
     )
     out.checks.append(
         {
-            "check": "ocr_outline_text",
+            "check": "forced_ocr_text",
             "status": "warning",
-            "message": "Pages drawn as letter outlines have text recovered by OCR only.",
-            "metrics": {"outline_pages": len(pages)},
+            "message": "Pages drawn as shapes or in undecodable fonts have text recovered by OCR only.",
+            "metrics": {"forced_ocr_pages": len(pages)},
         }
     )
 
@@ -3033,7 +3039,7 @@ def assess_fidelity(
     _check_text_drift(inputs, out)
     _check_tagged_text_coverage(inputs, out)
     _check_grounded_text_fidelity(inputs, out)
-    _check_ocr_outline_text(inputs, out)
+    _check_forced_ocr_text(inputs, out)
     _check_reading_order(inputs, out)
     _check_figure_coverage(inputs, out)
     _check_table_coverage(inputs, out)
