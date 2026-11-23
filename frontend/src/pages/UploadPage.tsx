@@ -1,9 +1,11 @@
+import { useRef } from "react";
+import { flushSync } from "react-dom";
 import { useMachine } from "../hooks/useMachine";
 import { emptyUpload, retryableUploads, runUploadBatch, uploadTransition } from "../state/upload";
 import { useNavigate } from "react-router-dom";
 import { useCreateJobs } from "../api/jobs";
 import { formatBytes } from "../utils/format";
-import FileDropzone from "../components/FileDropzone";
+import FileDropzone, { type FileDropzoneHandle } from "../components/FileDropzone";
 import { ArrowRightIcon, XIcon } from "../components/Icons";
 
 const PIPELINE_STEPS = [
@@ -21,19 +23,28 @@ export default function UploadPage() {
   const createJobs = useCreateJobs();
   const { state, send, read } = useMachine(emptyUpload, uploadTransition);
   const busy = state.requestId !== null;
+  const dropzone = useRef<FileDropzoneHandle>(null);
+  const removeButtons = useRef(new Map<string, HTMLButtonElement>());
   const handleFiles = (files: File[]) => {
     if (read().requestId === null) send({ type: "add", files });
   };
   const handleUpload = async () => {
     if (read().requestId !== null || retryableUploads(read()).length === 0) return;
     const result = await runUploadBatch(read, send, (file) => createJobs.mutateAsync(file), crypto.randomUUID());
-    if (result.items.every((item) => item.outcome.status === "accepted")) {
+    // A refused file was never sent; it does not hold the user on this page.
+    if (result.items.every((item) => item.outcome.status === "accepted" || item.outcome.status === "refused")) {
       const jobs = result.items.flatMap((item) => item.outcome.status === "accepted" ? item.outcome.jobs : []);
       navigate(jobs.length === 1 ? `/jobs/${jobs[0].id}` : "/dashboard");
     }
   };
   const removeFile = (id: string) => {
-    if (read().requestId === null) send({ type: "remove", id });
+    const { items, requestId } = read();
+    if (requestId !== null) return;
+    const index = items.findIndex((item) => item.id === id);
+    const next = items[index + 1] ?? items[index - 1];
+    // Render the removal now so focus can move off the removed button.
+    flushSync(() => send({ type: "remove", id }));
+    (next ? removeButtons.current.get(next.id) : dropzone.current)?.focus();
   };
 
   return (
@@ -52,6 +63,7 @@ export default function UploadPage() {
       {/* Dropzone */}
       <div className="max-w-2xl mx-auto">
         <FileDropzone
+          ref={dropzone}
           onFiles={handleFiles}
           disabled={busy}
         />
@@ -83,11 +95,15 @@ export default function UploadPage() {
                     </p>
                     <p className="text-xs text-ink-muted">
                       {formatBytes(file.size)} · {outcome.status}
-                      {outcome.status === "failed" && <span role="alert">: {outcome.error}</span>}
+                      {(outcome.status === "failed" || outcome.status === "refused") && <span role="alert">: {outcome.error}</span>}
                     </p>
                   </div>
                 </div>
                 <button
+                  ref={(node) => {
+                    if (node) removeButtons.current.set(id, node);
+                    return () => { removeButtons.current.delete(id); };
+                  }}
                   type="button"
                   onClick={() => removeFile(id)}
                   disabled={busy}
@@ -104,7 +120,7 @@ export default function UploadPage() {
               <button
                 type="button"
                 onClick={handleUpload}
-                disabled={busy}
+                disabled={busy || retryableUploads(state).length === 0}
                 className="
                   w-full py-3.5 rounded-xl
                   bg-accent text-white font-semibold text-sm

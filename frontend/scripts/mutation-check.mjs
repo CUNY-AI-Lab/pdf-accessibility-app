@@ -24,6 +24,16 @@ const mutations = [
   ["filter write guard", "src/state/modes.ts", 'if (next !== undefined && !JOB_STATUSES.includes(next))', 'if (false)', "permits all known filters"],
   ["late picker guard", "src/state/dropzone.ts", 'if (disabled) return;', 'if (false) return;', "projects disabled state over dragging"],
   ["toast registration identity", "src/state/toast.ts", 'if (callback === next) callback = null;', 'callback = null;', "unregisters only its own callback"],
+  ["upload size refusal", "src/state/upload.ts", 'file.size > MAX_UPLOAD_BYTES', 'false', "refuses a file over the Worker limit"],
+  ["upload size boundary", "src/state/upload.ts", 'file.size > MAX_UPLOAD_BYTES', 'file.size >= MAX_UPLOAD_BYTES', "refuses a file over the Worker limit"],
+  ["refused not retried", "src/state/upload.ts", 'outcome.status === "selected" || outcome.status === "failed"', 'outcome.status !== "uploading" && outcome.status !== "accepted"', "refuses a file over the Worker limit"],
+  ["Worker upload limit", "../worker/src/user-api.ts", 'MAX_UPLOAD_BYTES = 100 * 1024 * 1024', 'MAX_UPLOAD_BYTES = 200 * 1024 * 1024', "uses the Worker's upload limit"],
+  ["upload limit shown", "src/components/FileDropzone.tsx", 'Up to {MAX_UPLOAD_LABEL} per PDF.', '', "shows the upload limit"],
+  ["refusal message", "src/pages/UploadPage.tsx", '(outcome.status === "failed" || outcome.status === "refused")', 'outcome.status === "failed"', "refuses an oversized file before any upload request"],
+  ["nothing to send", "src/pages/UploadPage.tsx", 'disabled={busy || retryableUploads(state).length === 0}', 'disabled={busy}', "refuses an oversized file before any upload request"],
+  ["refused file after batch", "src/pages/UploadPage.tsx", ' || item.outcome.status === "refused"', '', "refuses an oversized file before any upload request"],
+  ["removal focus", "src/pages/UploadPage.tsx", '(next ? removeButtons.current.get(next.id) : dropzone.current)?.focus();', '', "moves focus to the next control"],
+  ["removal focus fallback", "src/pages/UploadPage.tsx", 'items[index + 1] ?? items[index - 1]', 'items[index + 1]', "moves focus to the next control"],
 ];
 let failures = 0;
 let restore = null;

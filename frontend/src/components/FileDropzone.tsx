@@ -1,18 +1,25 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useImperativeHandle, useRef, type Ref } from "react";
 
 import { useMachine } from "../hooks/useMachine";
 import { acceptPickedFiles, dropzoneMode, dropzoneTransition, type DropzoneState } from "../state/dropzone";
+import { MAX_UPLOAD_LABEL } from "../state/upload";
+
+export interface FileDropzoneHandle {
+  focus: () => void;
+}
 
 interface FileDropzoneProps {
   onFiles: (files: File[]) => void;
   disabled?: boolean;
+  ref?: Ref<FileDropzoneHandle>;
 }
 
-export default function FileDropzone({ onFiles, disabled }: FileDropzoneProps) {
+export default function FileDropzone({ onFiles, disabled, ref }: FileDropzoneProps) {
   const { state: dragState, send: dragSend } = useMachine<DropzoneState, Parameters<typeof dropzoneTransition>[1]>("idle", dropzoneTransition);
   const mode = dropzoneMode(dragState, disabled === true);
   const isDragging = mode === "dragging";
   const zone = useRef<HTMLButtonElement>(null);
+  useImperativeHandle(ref, () => ({ focus: () => zone.current?.focus() }), []);
 
   const handleDragOver = useCallback((e: React.DragEvent<HTMLButtonElement>) => {
     e.preventDefault();
@@ -109,6 +116,8 @@ export default function FileDropzone({ onFiles, disabled }: FileDropzoneProps) {
       </h3>
       <p className="text-sm text-ink-muted max-w-sm mx-auto leading-relaxed">
         Drag and drop PDF files, or click to browse.
+        <br />
+        Up to {MAX_UPLOAD_LABEL} per PDF.
         <br />
         <span className="text-xs opacity-70">
           Multiple files supported for batch processing.
