@@ -28,7 +28,7 @@ from app.pipeline.alt_text import (
 from app.pipeline.author_repairs import author_table_readability, repair_author_pdf
 from app.pipeline.author_structure import apply_author_structure, read_author_structure
 from app.pipeline.classify import classify_pdf
-from app.pipeline.fidelity import FORCED_OCR_PAGES_KEY, _table_semantics_risk, assess_fidelity
+from app.pipeline.fidelity import _table_semantics_risk, assess_fidelity
 
 # Keep the former font entry points importable; dependency patches belong in fonts.*.
 from app.pipeline.fonts.diagnostics import _inspect_font_diagnostics as _inspect_font_diagnostics
@@ -155,7 +155,7 @@ from app.pipeline.llm_operations import (
 from app.pipeline.llm_operations import (
     pretag_llm_operation_timeout_seconds as _pretag_llm_operation_timeout_seconds,
 )
-from app.pipeline.ocr import run_ocr
+from app.pipeline.ocr import FORCED_OCR_PAGES_KEY, run_ocr
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.pdfium_text import PdfiumText
 from app.pipeline.structure import (

@@ -21,6 +21,7 @@ from PIL import Image
 from rapidfuzz.distance import Levenshtein
 from rapidfuzz.fuzz import partial_ratio
 
+from app.pipeline.ocr import FORCED_OCR_PAGES_KEY
 from app.pipeline.pdfium_text import PdfiumText, pagination_artifact_indices
 from app.pipeline.tagger import is_placeholder_alt_text
 from app.services.candidate_state import CheckVerdict
@@ -217,9 +218,6 @@ OCR_VISUAL_MIN_INK_RATIO = FIDELITY_THRESHOLDS.ocr_visual_min_ink_ratio
 STRUCTURE_FRAGMENT_LIMIT = FIDELITY_THRESHOLDS.structure_fragment_limit
 STRUCTURE_FRAGMENT_MIN_LEN = FIDELITY_THRESHOLDS.structure_fragment_min_len
 GROUNDED_TEXT_TARGET_LIMIT = FIDELITY_THRESHOLDS.grounded_text_target_limit
-# The structure key holding the 1-based pages whose text forced OCR recovered
-# from drawn letters (see _check_forced_ocr_text).
-FORCED_OCR_PAGES_KEY = "forced_ocr_pages"
 
 NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 TABLE_KEYWORDS = ("table", "thead", "tbody", "tfoot", "tr", "th", "td")

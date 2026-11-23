@@ -11,9 +11,10 @@ import pytest
 
 from app.config import Settings
 from app.pipeline import classify, fidelity, orchestrator
-from app.pipeline.fidelity import FORCED_OCR_PAGES_KEY, assess_fidelity
+from app.pipeline.fidelity import assess_fidelity
 from app.pipeline.fonts import lanes
 from app.pipeline.fonts.rules import FONT_LANE_OCR_REDO
+from app.pipeline.ocr import FORCED_OCR_PAGES_KEY
 from app.services import remediation_intelligence
 from app.services.candidate_state import CandidatePhase
 from app.services.page_intelligence import (

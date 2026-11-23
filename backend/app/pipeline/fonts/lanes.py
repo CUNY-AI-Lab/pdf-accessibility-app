@@ -4,7 +4,7 @@ from pathlib import Path
 
 from app.config import Settings
 from app.models import Job
-from app.pipeline.fidelity import FORCED_OCR_PAGES_KEY
+from app.pipeline import ocr
 from app.pipeline.fonts.diagnostics import _inspect_font_diagnostics
 from app.pipeline.fonts.embedding import _embed_system_fonts, _rewrite_pdf_with_ghostscript_embed
 from app.pipeline.fonts.ocr_unicode import _recover_tounicode_by_ocr
@@ -360,10 +360,9 @@ async def _attempt_font_lane(
                     else:
                         # A rebuilt structure does not know which pages the
                         # OCR step forced; keep their review advisory.
-                        if isinstance(structure_json, dict) and FORCED_OCR_PAGES_KEY in structure_json:
-                            candidate_structure_json[FORCED_OCR_PAGES_KEY] = structure_json[
-                                FORCED_OCR_PAGES_KEY
-                            ]
+                        forced_key = ocr.FORCED_OCR_PAGES_KEY
+                        if isinstance(structure_json, dict) and forced_key in structure_json:
+                            candidate_structure_json[forced_key] = structure_json[forced_key]
                         effective_structure_json = candidate_structure_json
                         preprocess_details["structure_refreshed"] = True
                         preprocess_details["structure_elements"] = len(
