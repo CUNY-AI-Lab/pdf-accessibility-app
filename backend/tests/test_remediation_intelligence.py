@@ -22,7 +22,7 @@ from app.services.remediation_intelligence import (
 )
 
 
-def _job(tmp_path, *, structure: dict | None = None):
+def _job(tmp_path, *, structure: dict | None = None, ocr_language: str | None = None):
     pdf_path = tmp_path / "sample.pdf"
     pdf_path.write_bytes(b"%PDF-1.4\n% test\n")
     return SimpleNamespace(
@@ -30,6 +30,7 @@ def _job(tmp_path, *, structure: dict | None = None):
         input_path=str(pdf_path),
         output_path=str(pdf_path),
         structure_json=json.dumps(structure or {}),
+        ocr_language=ocr_language,
     )
 
 
@@ -217,7 +218,7 @@ def test_suspicious_reading_blocks_collects_grounding(monkeypatch, tmp_path):
     monkeypatch.setattr(
         remediation_intelligence,
         "extract_ocr_text_from_bbox",
-        lambda pdf_path, page_number, bbox: "Data Book",
+        lambda pdf_path, page_number, bbox, **_kwargs: "Data Book",
     )
 
     job = _job(
@@ -255,7 +256,7 @@ def test_generate_remediation_intelligence_supports_reading_order(monkeypatch, t
     monkeypatch.setattr(
         remediation_intelligence,
         "extract_ocr_text_from_bbox",
-        lambda pdf_path, page_number, bbox: "Data Book",
+        lambda pdf_path, page_number, bbox, **_kwargs: "Data Book",
     )
 
     async def _fake_page_intelligence(**kwargs):

@@ -54,6 +54,7 @@ async def test_outline_selection_excludes_native_text_images_and_sparse_paths(
     monkeypatch.setattr(classify, "_detect_language_from_text", lambda _: "en")
     result = await classify.classify_pdf(source)
     assert result.force_ocr_pages == ([] if raster else [1])
+    assert result.outline_pages == ([] if raster else [1])
     if not raster:
         assert result.type == "mixed"
         assert set(result.ocr_pages) == {1, 3}

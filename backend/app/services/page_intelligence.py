@@ -56,8 +56,10 @@ def text_similarity_score(left: Any, right: Any) -> float:
 
 
 def _normalize_text(value: str | None) -> str:
-    raw = str(value or "").lower()
-    return " ".join(regex.sub(r"[^a-z0-9]+", " ", raw).split())
+    """Letters and digits of any script, NFKC-folded and casefolded. Marks
+    stay: Devanagari, Bengali and Thai write vowels as combining marks."""
+    raw = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return " ".join(regex.sub(r"[^\p{L}\p{M}\p{N}]+", " ", raw).split())
 
 
 def _normalize_dense_text(value: str | None) -> str:
@@ -106,7 +108,9 @@ def collect_grounded_text_candidates(
     structure_json: dict[str, Any],
     *,
     target_limit: int | None = None,
+    ocr_language: str | None = None,
 ) -> dict[str, Any]:
+    """``ocr_language`` is the job's Tesseract language spec for the crop OCR."""
     from app.services.document_intelligence import build_document_model
     from app.services.text_grounding import extract_ocr_text_from_bbox
 
@@ -137,6 +141,7 @@ def collect_grounded_text_candidates(
                     pdf_path,
                     page_number=page.page_number,
                     bbox=bbox,
+                    language=ocr_language,
                 )
             )
             if sum(char.isalnum() for char in ocr_text) < GROUNDED_TEXT_OCR_MIN_ALNUM:
