@@ -27,7 +27,7 @@ from app.services.intelligence_llm_utils import (
 )
 from app.services.intelligence_normalize import confidence_label, confidence_score
 from app.services.intelligence_semantics import adjudicate_semantic_unit
-from app.services.llm_client import LlmClient
+from app.services.llm_client import LlmClient, model_service_failure
 from app.services.semantic_units import SemanticUnit
 
 logger = logging.getLogger(__name__)
@@ -193,8 +193,10 @@ def _normalize_figure_result(*, figure_index: int, raw: dict[str, Any]) -> dict[
     }
 
 
-def _manual_only_figure_result(*, figure_index: int, reason: str) -> dict[str, object]:
-    return {
+def _manual_only_figure_result(
+    *, figure_index: int, reason: str, service_failure: dict[str, object] | None = None,
+) -> dict[str, object]:
+    result: dict[str, object] = {
         "task_type": "figure_intelligence",
         "summary": "Figure review required.",
         "confidence": "low",
@@ -206,6 +208,10 @@ def _manual_only_figure_result(*, figure_index: int, reason: str) -> dict[str, o
         "resolved_kind": None,
         "is_decorative": False,
     }
+    if service_failure is not None:
+        # No model saw the figure; this is not a judgment about it.
+        result["service_failure"] = service_failure
+    return result
 
 
 class _CachedFigureRequest:
@@ -505,6 +511,14 @@ async def generate_figure_intelligence(
             decision = await adjudicate_semantic_unit(job=job, unit=unit, llm_client=llm_client)
     except Exception as exc:
         logger.warning("Figure %s semantics failed: %s", figure.index, exc)
+        failure = model_service_failure(exc)
+        if failure is not None:
+            status = f" {failure['status']}" if failure["status"] is not None else ""
+            return _manual_only_figure_result(
+                figure_index=figure.index,
+                reason=f"The model service did not answer ({failure['error']}{status}).",
+                service_failure=failure,
+            )
         return _manual_only_figure_result(
             figure_index=figure.index,
             reason=f"Figure semantics fallback: {exc}",

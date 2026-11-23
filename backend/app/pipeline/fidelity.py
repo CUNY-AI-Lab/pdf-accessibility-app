@@ -2695,6 +2695,11 @@ def _check_figure_descriptions(inputs: _FidelityInputs, out: _FidelityCollector)
             {
                 "figure_index": entry["figure_index"],
                 "page": inputs.figure_pages.get(entry["figure_index"]),
+                **(
+                    {"model_service_failure": entry["service_failure"]}
+                    if isinstance(entry.get("service_failure"), dict)
+                    else {}
+                ),
             }
             for entry in inputs.alt_entries
             if isinstance(entry, dict)
@@ -2705,20 +2710,32 @@ def _check_figure_descriptions(inputs: _FidelityInputs, out: _FidelityCollector)
                 or is_placeholder_alt_text(entry.get("edited_text") or entry.get("generated_text"))
             )
         ]
+        # Figures left undescribed because the model service did not answer;
+        # a later run can describe them, so the person is told to upload again.
+        model_unavailable = sum("model_service_failure" in item for item in waiting_figures)
         if undescribed_figures:
+            detail = (
+                f"{len(undescribed_figures)} figure(s) have no description a screen reader "
+                "can announce. Add a description for each before distribution."
+            )
+            if model_unavailable:
+                detail = (
+                    f"{len(undescribed_figures)} figure(s) have no description a screen reader "
+                    f"can announce. The model service was unavailable for {model_unavailable} "
+                    "of them, so uploading the PDF again should describe those. Add a "
+                    "description for any figure still without one before distribution."
+                )
             out.add_task(
                 "review:alt_text:undescribed",
                 task_type="alt_text",
                 title="Describe figures that have no description",
-                detail=(
-                    f"{len(undescribed_figures)} figure(s) have no description a screen reader "
-                    "can announce. Add a description for each before distribution."
-                ),
+                detail=detail,
                 severity="high",
                 blocking=True,
                 metadata={
                     "check": "figure_descriptions",
                     "undescribed_figures": len(undescribed_figures),
+                    "figures_model_unavailable": model_unavailable,
                     "pages_to_check": sorted(
                         {
                             int(item["page"])
@@ -2737,6 +2754,7 @@ def _check_figure_descriptions(inputs: _FidelityInputs, out: _FidelityCollector)
                 "metrics": {
                     "undescribed_figures": len(undescribed_figures),
                     "figures_awaiting_description": len(waiting_figures),
+                    "figures_model_unavailable": model_unavailable,
                 },
             }
         )

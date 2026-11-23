@@ -11,7 +11,7 @@ from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pikepdf
 from sqlalchemy import select
@@ -364,11 +364,22 @@ def _alt_text_step_result(
     reason: str | None = None,
     skipped_figure_count: int | None = None,
     figure_reclassification: dict[str, object] | None = None,
+    needs_description: int = 0,
+    service_failures: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
+    """approved + rejected + reclassified + needs_description + service_failed == count.
+
+    needs_description counts figures a model answered for but did not describe;
+    service_failures lists those left undescribed because no model answered.
+    """
+    service_failures = list(service_failures or [])
     result: dict[str, object] = {
         "count": count,
         "approved": approved,
         "rejected": rejected,
+        "needs_description": needs_description,
+        "service_failed": len(service_failures),
+        "service_failures": service_failures,
         "reviewable_changes": reviewable_changes,
         "reclassified": reclassified,
         "auto_approve_enabled": auto_approve_enabled,
@@ -786,6 +797,60 @@ def _alt_text_entry_state(
     if auto_approve:
         return "approved", generated_text
     return status, generated_text
+
+
+class _FigureOutcomes(TypedDict):
+    approved: int
+    rejected: int
+    reclassified: int
+    needs_description: int
+    service_failures: list[dict[str, object]]
+
+
+def _record_figure_decisions(
+    db: AsyncSession,
+    job_id: str,
+    alt_texts: list,
+    figures: list,
+    *,
+    removed_indexes: list[int],
+    auto_approve: bool,
+) -> _FigureOutcomes:
+    """Add one AltTextEntry per kept figure and count where each figure ended."""
+    outcomes = _FigureOutcomes(
+        approved=0, rejected=0, reclassified=0, needs_description=0, service_failures=[],
+    )
+    figures_by_index = {figure.index: figure for figure in figures}
+    for alt in alt_texts:
+        fig = figures_by_index.get(alt.figure_index)
+        if fig is None:
+            continue
+        if not resolve_figure_for_storage(alt, removed_indexes):
+            outcomes["reclassified"] += 1
+            continue
+        status, generated_text = _alt_text_entry_state(
+            alt, caption=fig.caption, auto_approve=auto_approve,
+        )
+        if status == "approved":
+            outcomes["approved"] += 1
+        elif status == "rejected":
+            outcomes["rejected"] += 1
+        elif alt.service_failure:
+            outcomes["service_failures"].append(
+                {"figure_index": alt.figure_index, **alt.service_failure}
+            )
+        else:
+            outcomes["needs_description"] += 1
+        db.add(
+            AltTextEntry(
+                job_id=job_id,
+                figure_index=alt.figure_index,
+                image_path=str(fig.path),
+                generated_text=generated_text or None,
+                status=status,
+            )
+        )
+    return outcomes
 
 
 # A reclassified figure's region is covered by a Docling table only when the
@@ -2457,38 +2522,14 @@ async def _run_pipeline(
                     await db.commit()
 
                 # Save figure semantics to database and continue directly into tagging.
-                approved_count = 0
-                rejected_count = 0
-                reclassified_count = 0
-                figures_by_index = {figure.index: figure for figure in structure.figures}
-                for alt in alt_texts:
-                    fig = figures_by_index.get(alt.figure_index)
-                    if fig is None:
-                        continue
-                    if not resolve_figure_for_storage(
-                        alt, figure_reclassification.get("removed_indexes", []),
-                    ):
-                        reclassified_count += 1
-                        continue
-                    status, generated_text = _alt_text_entry_state(
-                        alt,
-                        caption=fig.caption,
-                        auto_approve=settings.auto_approve_generated_alt_text,
-                    )
-
-                    if status == "approved":
-                        approved_count += 1
-                    elif status == "rejected":
-                        rejected_count += 1
-                    db.add(
-                        AltTextEntry(
-                            job_id=job_id,
-                            figure_index=alt.figure_index,
-                            image_path=str(fig.path),
-                            generated_text=generated_text or None,
-                            status=status,
-                        )
-                    )
+                figure_outcomes = _record_figure_decisions(
+                    db,
+                    job_id,
+                    alt_texts,
+                    structure.figures,
+                    removed_indexes=figure_reclassification.get("removed_indexes", []),
+                    auto_approve=settings.auto_approve_generated_alt_text,
+                )
                 await db.commit()
                 figure_change_specs = figure_applied_change_specs(
                     figures=structure.figures,
@@ -2502,10 +2543,8 @@ async def _run_pipeline(
                     "complete",
                     result=_alt_text_step_result(
                         count=len(alt_texts),
-                        approved=approved_count,
-                        rejected=rejected_count,
+                        **figure_outcomes,
                         reviewable_changes=len(figure_change_specs),
-                        reclassified=reclassified_count,
                         auto_approve_enabled=settings.auto_approve_generated_alt_text,
                         llm_usage=alt_text_llm_usage,
                         figure_reclassification=figure_reclassification,
@@ -2517,10 +2556,8 @@ async def _run_pipeline(
                     status="complete",
                     result=_alt_text_step_result(
                         count=len(alt_texts),
-                        approved=approved_count,
-                        rejected=rejected_count,
+                        **figure_outcomes,
                         reviewable_changes=len(figure_change_specs),
-                        reclassified=reclassified_count,
                         auto_approve_enabled=settings.auto_approve_generated_alt_text,
                         llm_usage=alt_text_llm_usage,
                     ),
@@ -2697,6 +2734,7 @@ async def evaluate_candidate(
     on_tagged=None,
     on_validated=None,
     adjudicate: bool = True,
+    figure_service_failures: dict[int, dict[str, object]] | None = None,
 ) -> Candidate:
     """Tag, validate, build the report, assess fidelity, then adjudicate if needed.
 
@@ -2769,6 +2807,11 @@ async def evaluate_candidate(
                 "generated_text": entry.generated_text,
                 "edited_text": entry.edited_text,
                 "status": entry.status,
+                **(
+                    {"service_failure": figure_service_failures[entry.figure_index]}
+                    if figure_service_failures and entry.figure_index in figure_service_failures
+                    else {}
+                ),
             }
             for entry in alt_entries
         ],
@@ -3529,6 +3572,23 @@ async def _store_candidate_result(
     logger.info(f"Pipeline complete for job {job_id} with status={final_status}")
 
 
+async def _figure_service_failures(db: AsyncSession, job_id: str) -> dict[int, dict[str, object]]:
+    """Figures the alt-text step left undescribed because no model answered."""
+    step = await db.scalar(
+        select(JobStep).where(JobStep.job_id == job_id, JobStep.step_name == "alt_text")
+    )
+    try:
+        result = json.loads(step.result_json) if step is not None and step.result_json else None
+    except json.JSONDecodeError:
+        result = None
+    failures = result.get("service_failures") if isinstance(result, dict) else None
+    return {
+        failure["figure_index"]: {key: value for key, value in failure.items() if key != "figure_index"}
+        for failure in failures or []
+        if isinstance(failure, dict) and isinstance(failure.get("figure_index"), int)
+    }
+
+
 async def _run_tagging_and_validation(
     job_id: str,
     db: AsyncSession,
@@ -3631,6 +3691,7 @@ async def _run_tagging_and_validation(
             baseline_validation=baseline_validation,
             font_remediation=font_remediation,
             llm_font_map_auto=llm_font_map_auto,
+            figure_service_failures=await _figure_service_failures(db, job_id),
         )
         candidate = await evaluate(
             input_path=working_pdf,
