@@ -3400,8 +3400,11 @@ async def test_ocr_lane_refreshes_structure_before_retag(tmp_path, monkeypatch):
     async def fake_run_ocr(*args, **kwargs):
         return SimpleNamespace(success=True, output_path=ocr_pdf, skipped=False, message="")
 
-    async def fake_extract_structure(input_path, job_dir, *, ocr_languages=()):
+    async def fake_extract_structure(
+        input_path, job_dir, *, ocr_languages=(), classified_language=None
+    ):
         captured["ocr_languages"] = list(ocr_languages)
+        captured["classified_language"] = classified_language
         return SimpleNamespace(
             document_json={"elements": [{"type": "paragraph", "text": "fresh", "page": 0}]}
         )
@@ -3445,7 +3448,10 @@ async def test_ocr_lane_refreshes_structure_before_retag(tmp_path, monkeypatch):
         settings=_settings(),
         working_pdf=working_pdf,
         tagged_pdf=tagged_pdf,
-        structure_json={"elements": [{"type": "paragraph", "text": "stale", "page": 0}]},
+        structure_json={
+            "elements": [{"type": "paragraph", "text": "stale", "page": 0}],
+            "language_evidence": {"language": "nl", "classify_language": "nl"},
+        },
         reviewed_alts=[],
         lane=FONT_LANE_OCR_REDO,
         current_tagging_result=SimpleNamespace(),
@@ -3456,5 +3462,7 @@ async def test_ocr_lane_refreshes_structure_before_retag(tmp_path, monkeypatch):
     assert result["details"]["structure_refreshed"] is True
     assert captured["structure_json"]["elements"][0]["text"] == "fresh"
     assert result["structure_json"]["elements"][0]["text"] == "fresh"
-    # The refreshed text came from OCR in the job's language (settings default eng).
+    # The refreshed text came from OCR in the job's language (settings default
+    # eng); the classify step's language is the one the structure step recorded.
     assert captured["ocr_languages"] == ["en"]
+    assert captured["classified_language"] == "nl"

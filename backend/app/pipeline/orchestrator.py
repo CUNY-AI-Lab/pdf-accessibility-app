@@ -2111,15 +2111,17 @@ async def _run_pipeline(
             await _update_step(db, job_id, "structure", "running")
             job_manager.emit_progress(job_id, step="structure", status="running")
 
+            ocr_text = classification.type in OCR_TEXT_CLASSIFICATIONS
             structure = await extract_structure(
                 working_pdf,
                 job_dir,
                 table_cell_matching=docling_table_cell_matching(classification.type),
                 ocr_languages=(
                     tesseract_languages_to_bcp47(job.ocr_language or settings.ocr_language)
-                    if classification.type in OCR_TEXT_CLASSIFICATIONS
+                    if ocr_text
                     else ()
                 ),
+                classified_language=classification.detected_language if ocr_text else None,
             )
             structure.document_json = apply_author_structure(structure.document_json, author_evidence)
             if structure.processed_pdf_path:

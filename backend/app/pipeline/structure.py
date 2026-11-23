@@ -1282,15 +1282,19 @@ def _infer_document_language(
     title: str | None = None,
     *,
     ocr_languages: Sequence[str] = (),
+    classified_language: str | None = None,
 ) -> dict[str, Any]:
-    """Choose the document language and record the reason.
+    """Choose the document language and record which path chose it.
 
     Docling element metadata wins; otherwise lingua reads the visible text.
     When that text came from OCR, ``ocr_languages`` (BCP-47, primary first)
-    names the languages it was recognized in. Lingua reads noisy OCR output
-    as unrelated languages (English zines came out Yoruba), so a detection is
-    kept only if it is one of those languages; otherwise the primary OCR
-    language is the document language.
+    names the languages it was recognized in and ``classified_language`` is
+    the classify step's detection. Lingua reads noisy OCR output as unrelated
+    languages (English zines came out Yoruba), so a detection is kept only
+    when one of those signals agrees with it. Otherwise the classify step's
+    language is used, then the primary OCR language: a language without an
+    installed Tesseract pack is OCR'd with the default pack, and the classify
+    step's detection still names it.
     """
     language_weights: dict[str, int] = {}
 
@@ -1326,19 +1330,24 @@ def _infer_document_language(
         if text
     )
     detected = _normalize_lang_tag(_detect_language(visible_text))
-    if not ocr_languages:
+    classified = _normalize_lang_tag(classified_language)
+    if not ocr_languages and not classified:
         return {
             "language": detected,
             "reason": "text_detection" if detected else "no_language_signal",
         }
-    evidence = {"detected": detected, "ocr_languages": list(ocr_languages)}
-    if detected and _primary_subtag(detected) in {_primary_subtag(tag) for tag in ocr_languages}:
-        return {"language": detected, "reason": "detection_is_an_ocr_language", **evidence}
-    return {
-        "language": ocr_languages[0],
-        "reason": "detection_not_an_ocr_language" if detected else "no_detection_on_ocr_text",
-        **evidence,
+    evidence = {
+        "detected": detected,
+        "ocr_languages": list(ocr_languages),
+        "classify_language": classified,
     }
+    if detected and _primary_subtag(detected) in {_primary_subtag(tag) for tag in ocr_languages}:
+        return {"language": detected, "reason": "detection_matches_ocr_language", **evidence}
+    if detected and classified and _primary_subtag(detected) == _primary_subtag(classified):
+        return {"language": detected, "reason": "detection_matches_classify_language", **evidence}
+    if classified:
+        return {"language": classified, "reason": "classify_language", **evidence}
+    return {"language": ocr_languages[0], "reason": "primary_ocr_language", **evidence}
 
 
 def _repair_pdf_with_ghostscript(
@@ -1586,14 +1595,15 @@ async def extract_structure(
     include_figure_images: bool = True,
     table_cell_matching: bool = True,
     ocr_languages: Sequence[str] = (),
+    classified_language: str | None = None,
 ) -> StructureResult:
     """Extract document structure using Docling.
 
     Use docling-serve when configured, otherwise local Docling. Docling reads
     sideways pages turned upright, and its boxes are moved back into the
     frame of the page as shown (see page_orientation). ``ocr_languages``
-    (BCP-47, primary first) is given when the text came from OCR; see
-    _infer_document_language.
+    (BCP-47, primary first) and the classify step's ``classified_language``
+    are given when the text came from OCR; see _infer_document_language.
     """
     settings = get_settings()
     use_docling_serve = bool(settings.docling_serve_url)
@@ -1706,7 +1716,9 @@ async def extract_structure(
         select_document_title, toc_source_pdf, {"title": title, "elements": elements}, pdf_path.name,
     )
     title = title_evidence["title"]
-    language_evidence = _infer_document_language(elements, title, ocr_languages=ocr_languages)
+    language_evidence = _infer_document_language(
+        elements, title, ocr_languages=ocr_languages, classified_language=classified_language
+    )
     native_toc = await to_thread(_extract_native_toc_from_pdf, toc_source_pdf)
 
     page_count = len(doc_dict.get("pages", {}))

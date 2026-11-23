@@ -328,11 +328,22 @@ async def _attempt_font_lane(
             try:
                 refresh_dir = job_dir / f"{lane}_structure"
                 refresh_dir.mkdir(parents=True, exist_ok=True)
+                # The classify step's language, as the structure step recorded it.
+                language_evidence = (
+                    structure_json.get("language_evidence")
+                    if isinstance(structure_json, dict)
+                    else None
+                )
                 refreshed_structure = await extract_structure(
                     remediation_input,
                     refresh_dir,
                     ocr_languages=tesseract_languages_to_bcp47(
                         job.ocr_language or settings.ocr_language
+                    ),
+                    classified_language=(
+                        language_evidence.get("classify_language")
+                        if isinstance(language_evidence, dict)
+                        else None
                     ),
                 )
                 candidate_structure_json = refreshed_structure.document_json

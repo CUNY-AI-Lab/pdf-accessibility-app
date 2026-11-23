@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pikepdf
 import pytest
 
-from app.pipeline import orchestrator, structure
+from app.pipeline import classify, language, orchestrator, structure
 from app.pipeline.classify import ClassificationResult
 from app.pipeline.language import tesseract_languages_to_bcp47
 from app.pipeline.tagger import tag_pdf
@@ -31,38 +31,36 @@ def test_tesseract_language_specs_become_tags_primary_first(spec, tags):
     assert tesseract_languages_to_bcp47(spec) == tags
 
 
-def test_ocr_text_rejects_a_detection_outside_its_ocr_languages(monkeypatch):
-    monkeypatch.setattr(structure, "_detect_language", lambda _text: "yo")
+@pytest.mark.parametrize(
+    ("detected", "ocr_languages", "classified", "language", "reason"),
+    [
+        # Lingua agrees with an OCR language.
+        ("en", ["ja", "en"], None, "en", "detection_matches_ocr_language"),
+        ("zh", ["zh-Hans"], None, "zh", "detection_matches_ocr_language"),
+        # A Dutch scan OCR'd with the eng pack: classify said nl.
+        ("nl", ["en"], "nl", "nl", "detection_matches_classify_language"),
+        # Yoruba on English OCR text, with and without a classify detection.
+        ("yo", ["en"], "en", "en", "classify_language"),
+        ("yo", ["en"], "nl", "nl", "classify_language"),
+        ("yo", ["en"], None, "en", "primary_ocr_language"),
+        (None, ["ja", "en"], None, "ja", "primary_ocr_language"),
+        (None, ["en"], "nl", "nl", "classify_language"),
+        # OCR text whose Tesseract spec names no language (osd only).
+        ("yo", [], "en", "en", "classify_language"),
+    ],
+)
+def test_ocr_text_language_needs_a_second_signal(
+    monkeypatch, detected, ocr_languages, classified, language, reason
+):
+    monkeypatch.setattr(structure, "_detect_language", lambda _text: detected)
 
-    decision = structure._infer_document_language(_elements(), ocr_languages=["en"])
+    decision = structure._infer_document_language(
+        _elements(), ocr_languages=ocr_languages, classified_language=classified
+    )
 
-    assert decision["language"] == "en"
-    assert decision["detected"] == "yo"
-    assert decision["reason"] != "detection_is_an_ocr_language"
-
-
-def test_ocr_text_keeps_a_detection_among_its_ocr_languages(monkeypatch):
-    monkeypatch.setattr(structure, "_detect_language", lambda _text: "en")
-
-    decision = structure._infer_document_language(_elements(), ocr_languages=["ja", "en"])
-
-    assert decision["language"] == "en"
-
-
-def test_ocr_text_matches_a_detection_by_primary_subtag(monkeypatch):
-    monkeypatch.setattr(structure, "_detect_language", lambda _text: "zh")
-
-    decision = structure._infer_document_language(_elements(), ocr_languages=["zh-Hans"])
-
-    assert decision["language"] == "zh"
-
-
-def test_ocr_text_without_a_detection_uses_the_primary_ocr_language(monkeypatch):
-    monkeypatch.setattr(structure, "_detect_language", lambda _text: None)
-
-    decision = structure._infer_document_language(_elements(), ocr_languages=["ja", "en"])
-
-    assert decision["language"] == "ja"
+    assert decision["language"] == language
+    assert decision["reason"] == reason
+    assert decision["detected"] == detected
 
 
 def test_digital_text_keeps_whatever_lingua_detects(monkeypatch):
@@ -77,17 +75,19 @@ def test_escalation_plan_records_the_rejected_detection():
             "language": "en",
             "language_evidence": {
                 "language": "en",
-                "reason": "detection_not_an_ocr_language",
+                "reason": "classify_language",
                 "detected": "yo",
                 "ocr_languages": ["en"],
+                "classify_language": "en",
             },
         }
     )
 
     assert plan["language"]["signal"] == "en"
-    assert plan["language"]["reason"] == "detection_not_an_ocr_language"
+    assert plan["language"]["reason"] == "classify_language"
     assert plan["language"]["detected"] == "yo"
     assert plan["language"]["ocr_languages"] == ["en"]
+    assert plan["language"]["classify_language"] == "en"
 
 
 def test_escalation_plan_does_not_claim_a_reason_for_a_language_set_later():
@@ -102,33 +102,62 @@ def test_escalation_plan_does_not_claim_a_reason_for_a_language_set_later():
     assert plan["language"]["reason"] != "no_language_signal"
 
 
-def _one_line_pdf(path):
+DUTCH = [
+    "De gemeente publiceert elk jaar een verslag over de woningmarkt in de stad.",
+    "Dit rapport beschrijft hoe het aantal nieuwe woningen zich heeft ontwikkeld.",
+    "Ook laten we zien welke wijken het snelst groeien en waar nog ruimte is.",
+]
+
+
+def _text_pdf(path, pages, *, pictured_page=False):
+    """One page per list of lines; with ``pictured_page``, a last page that is
+    a picture of a table with a one-line caption."""
     pdf = pikepdf.new()
-    page = pdf.add_blank_page(page_size=(612, 792))
-    page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica(pdf)))
-    page.Contents = pdf.make_stream(f"BT /F1 10 Tf 72 700 Td ({TEXT}) Tj ET".encode())
+    font = helvetica(pdf)
+    for lines in pages:
+        page = pdf.add_blank_page(page_size=(612, 792))
+        page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+        shown = " ".join(f"({line}) Tj 0 -14 Td" for line in lines)
+        page.Contents = pdf.make_stream(f"BT /F1 10 Tf 72 700 Td {shown} ET".encode())
+    if pictured_page:
+        page = pdf.add_blank_page(page_size=(612, 792))
+        image = pdf.make_stream(b"\x00")
+        image.Type, image.Subtype = pikepdf.Name.XObject, pikepdf.Name.Image
+        image.Width, image.Height = 2000, 3000
+        image.ColorSpace, image.BitsPerComponent = pikepdf.Name.DeviceGray, 8
+        page.Resources = pikepdf.Dictionary(
+            Font=pikepdf.Dictionary(F1=font), XObject=pikepdf.Dictionary(Im0=image)
+        )
+        page.Contents = pdf.make_stream(
+            b"q 612 0 0 792 0 0 cm /Im0 Do Q BT /F1 10 Tf 72 40 Td (Tabel 1) Tj ET"
+        )
     pdf.save(path)
 
 
-@pytest.mark.parametrize(("ocr_languages", "lang"), [(["en"], "en"), ((), "yo")])
-async def test_document_lang_follows_the_ocr_language_on_ocr_text(
-    tmp_path, monkeypatch, ocr_languages, lang
-):
-    source = tmp_path / "zine.pdf"
-    _one_line_pdf(source)
+def _one_line_pdf(path):
+    _text_pdf(path, [[TEXT]])
+
+
+def _fake_docling(monkeypatch, pages):
+    """Docling returns each page's lines as one paragraph."""
 
     async def convert(pdf_path, job_dir, *args, **kwargs):
+        texts = [
+            {
+                "label": "text",
+                "text": " ".join(lines),
+                "prov": [{"page_no": index + 1, "bbox": {"l": 72, "t": 712, "r": 540, "b": 660,
+                                                         "coord_origin": "BOTTOMLEFT"}}],
+            }
+            for index, lines in enumerate(pages)
+        ]
         doc = {
-            "body": {"children": [{"$ref": "#/texts/0"}]},
-            "texts": [
-                {
-                    "label": "text",
-                    "text": TEXT,
-                    "prov": [{"page_no": 1, "bbox": {"l": 72, "t": 712, "r": 540, "b": 698,
-                                                     "coord_origin": "BOTTOMLEFT"}}],
-                }
-            ],
-            "pages": {"1": {"size": {"width": 612, "height": 792}}},
+            "body": {"children": [{"$ref": f"#/texts/{index}"} for index in range(len(texts))]},
+            "texts": texts,
+            "pages": {
+                str(index + 1): {"size": {"width": 612, "height": 792}}
+                for index in range(len(pages))
+            },
         }
         return doc, []
 
@@ -143,53 +172,54 @@ async def test_document_lang_follows_the_ocr_language_on_ocr_text(
             docling_serve_token="",
         ),
     )
+
+
+async def _tagged_lang(source, job_dir, **structure_kwargs):
+    """The tagged PDF's /Lang and the structure step's recorded reason."""
+    result = await structure.extract_structure(source, job_dir, **structure_kwargs)
+    output = job_dir.parent / "tagged.pdf"
+    await tag_pdf(source, output, result.document_json, [])
+    with pikepdf.open(output) as pdf:
+        return str(pdf.Root.Lang), result.document_json["language_evidence"]["reason"]
+
+
+@pytest.mark.parametrize(("ocr_languages", "lang"), [(["en"], "en"), ((), "yo")])
+async def test_document_lang_follows_the_ocr_language_on_ocr_text(
+    tmp_path, monkeypatch, ocr_languages, lang
+):
+    source = tmp_path / "zine.pdf"
+    _one_line_pdf(source)
+    _fake_docling(monkeypatch, [[TEXT]])
     monkeypatch.setattr(structure, "_detect_language", lambda _text: "yo")
 
-    result = await structure.extract_structure(
-        source, tmp_path / "job", ocr_languages=ocr_languages
-    )
-    output = tmp_path / "tagged.pdf"
-    await tag_pdf(source, output, result.document_json, [])
-
-    with pikepdf.open(output) as pdf:
-        assert str(pdf.Root.Lang) == lang
+    assert (await _tagged_lang(source, tmp_path / "job", ocr_languages=ocr_languages))[0] == lang
 
 
 class _StopAfterExtraction(Exception):
     pass
 
 
-@pytest.mark.parametrize(
-    ("classification", "ocr_languages"),
-    [("ocr_scan", ["ja", "en"]), ("mixed", ["ja", "en"]), ("digital", [])],
-)
-async def test_pipeline_passes_the_jobs_ocr_languages_for_ocr_text(
-    tmp_path, monkeypatch, classification, ocr_languages
-):
+async def _structure_kwargs_from_pipeline(tmp_path, monkeypatch, source, classify_source, ocr_language):
+    """Run the pipeline to the structure step; return what it passes to
+    extract_structure and the job's OCR language by then."""
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     from app.config import Settings
     from app.models import Base, Job, JobStep
     from tests.test_orchestrator_release_decision import _RecordingJobManager
 
-    source = tmp_path / "source.pdf"
-    _one_line_pdf(source)
     seen = {}
-
-    async def classify_source(path):
-        return ClassificationResult(
-            type=classification, confidence=1.0, pages_with_text=1, total_pages=1,
-        )
 
     async def recognize(input_path, output_path, language, **kwargs):
         output_path.write_bytes(input_path.read_bytes())
         return SimpleNamespace(success=True, output_path=output_path, skipped=False, message="")
 
-    async def extract(path, *args, ocr_languages=(), **kwargs):
-        seen["ocr_languages"] = list(ocr_languages)
+    async def extract(path, *args, **kwargs):
+        seen.update(kwargs)
         raise _StopAfterExtraction()
 
-    monkeypatch.setattr(orchestrator, "classify_pdf", classify_source)
+    if classify_source is not None:
+        monkeypatch.setattr(orchestrator, "classify_pdf", classify_source)
     monkeypatch.setattr(orchestrator, "run_ocr", recognize)
     monkeypatch.setattr(orchestrator, "extract_structure", extract)
     monkeypatch.setattr(orchestrator, "create_job_dir", lambda _: tmp_path)
@@ -206,7 +236,7 @@ async def test_pipeline_passes_the_jobs_ocr_languages_for_ocr_text(
                 original_filename="source.pdf",
                 owner_session_hash="owner",
                 status="queued",
-                ocr_language="jpn+eng",
+                ocr_language=ocr_language,
             )
         )
         for step in ("classify", "ocr", "structure", "alt_text", "tagging", "validation", "fidelity"):
@@ -215,6 +245,76 @@ async def test_pipeline_passes_the_jobs_ocr_languages_for_ocr_text(
     await orchestrator._run_pipeline(
         "job", maker, Settings(llm_api_key="check-only"), _RecordingJobManager()
     )
+    async with maker() as db:
+        job_ocr_language = (await db.get(Job, "job")).ocr_language
     await engine.dispose()
+    return {key: seen[key] for key in ("ocr_languages", "classified_language")}, job_ocr_language
 
-    assert seen["ocr_languages"] == ocr_languages
+
+@pytest.mark.parametrize(
+    ("classification", "ocr_languages", "classified"),
+    [("ocr_scan", ["ja", "en"], "ja"), ("mixed", ["ja", "en"], "ja"), ("digital", [], None)],
+)
+async def test_pipeline_passes_language_signals_only_for_ocr_text(
+    tmp_path, monkeypatch, classification, ocr_languages, classified
+):
+    source = tmp_path / "source.pdf"
+    _one_line_pdf(source)
+
+    async def classify_source(path):
+        return ClassificationResult(
+            type=classification, confidence=1.0, pages_with_text=1, total_pages=1,
+            detected_language="ja",
+        )
+
+    kwargs, _ = await _structure_kwargs_from_pipeline(
+        tmp_path, monkeypatch, source, classify_source, "jpn+eng"
+    )
+
+    assert list(kwargs["ocr_languages"]) == ocr_languages
+    assert kwargs["classified_language"] == classified
+
+
+async def test_dutch_scan_ocrd_with_the_eng_pack_keeps_dutch_lang(tmp_path, monkeypatch):
+    monkeypatch.setattr(language, "installed_tesseract_languages", lambda: frozenset({"eng"}))
+    source = tmp_path / "scan.pdf"
+    _text_pdf(source, [DUTCH])
+
+    async def classify_source(path):
+        return ClassificationResult(
+            type="scanned", confidence=1.0, pages_with_text=0, total_pages=1,
+            detected_language="nl",
+        )
+
+    kwargs, job_ocr_language = await _structure_kwargs_from_pipeline(
+        tmp_path, monkeypatch, source, classify_source, None
+    )
+    _fake_docling(monkeypatch, [DUTCH])
+
+    assert job_ocr_language == "eng"
+    assert await _tagged_lang(source, tmp_path / "job", **kwargs) == (
+        "nl",
+        "detection_matches_classify_language",
+    )
+
+
+async def test_mixed_dutch_report_with_a_pictured_table_keeps_dutch_lang(tmp_path, monkeypatch):
+    monkeypatch.setattr(language, "installed_tesseract_languages", lambda: frozenset({"eng"}))
+    source = tmp_path / "report.pdf"
+    _text_pdf(source, [DUTCH, DUTCH], pictured_page=True)
+
+    classified = await classify.classify_pdf(source)
+    assert classified.type == "mixed"
+    assert classified.detected_language == "nl"
+
+    # The real classify step, as the pipeline runs it.
+    kwargs, job_ocr_language = await _structure_kwargs_from_pipeline(
+        tmp_path, monkeypatch, source, None, None
+    )
+    _fake_docling(monkeypatch, [DUTCH, DUTCH, ["Tabel 1"]])
+
+    assert job_ocr_language == "eng"
+    assert await _tagged_lang(source, tmp_path / "job", **kwargs) == (
+        "nl",
+        "detection_matches_classify_language",
+    )

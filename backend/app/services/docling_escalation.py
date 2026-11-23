@@ -131,7 +131,7 @@ def _language_decision(structure: dict[str, Any]) -> dict[str, Any]:
     evidence = structure.get("language_evidence")
     if isinstance(evidence, dict) and _normalize_text(evidence.get("language")) == language:
         decision["reason"] = str(evidence.get("reason") or decision["reason"])
-        for key in ("detected", "ocr_languages"):
+        for key in ("detected", "ocr_languages", "classify_language"):
             if key in evidence:
                 decision[key] = evidence[key]
     return decision
