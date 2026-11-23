@@ -1,7 +1,12 @@
 import type { Job } from "../types";
 
+/** The Worker refuses larger uploads: MAX_UPLOAD_BYTES in worker/src/user-api.ts. */
+export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+export const MAX_UPLOAD_LABEL = `${MAX_UPLOAD_BYTES / (1024 * 1024)} MB`;
+
 export type UploadOutcome =
   | { status: "selected" }
+  | { status: "refused"; error: string }
   | { status: "uploading"; requestId: string }
   | { status: "accepted"; jobs: Job[] }
   | { status: "failed"; error: string };
@@ -30,7 +35,12 @@ export function uploadTransition(state: UploadState, event: UploadEvent): Upload
     const items = [...state.items];
     for (const file of event.files) {
       const id = uploadKey(file);
-      if (!items.some((item) => item.id === id)) items.push({ id, file, outcome: { status: "selected" } });
+      if (items.some((item) => item.id === id)) continue;
+      // Refused here so an oversized file is never sent or retried.
+      const outcome: UploadOutcome = file.size > MAX_UPLOAD_BYTES
+        ? { status: "refused", error: `Over the ${MAX_UPLOAD_LABEL} limit` }
+        : { status: "selected" };
+      items.push({ id, file, outcome });
     }
     return { ...state, items };
   }

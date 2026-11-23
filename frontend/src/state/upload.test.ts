@@ -1,8 +1,14 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import { emptyUpload, retryableUploads, runUploadBatch, uploadKey, uploadTransition, type UploadEvent, type UploadState } from "./upload";
+import { emptyUpload, MAX_UPLOAD_BYTES, retryableUploads, runUploadBatch, uploadKey, uploadTransition, type UploadEvent, type UploadState } from "./upload";
 import type { Job } from "../types";
 
 const file = (name: string) => new File([name], name, { lastModified: 1 });
+function sized(name: string, size: number) {
+  const input = file(name);
+  Object.defineProperty(input, "size", { value: size });
+  return input;
+}
 const accepted = { id: "accepted" } as Job;
 function machine(files = [file("one.pdf"), file("two.pdf")]) {
   let state = uploadTransition(emptyUpload, { type: "add", files });
@@ -60,5 +66,22 @@ describe("per-file uploads", () => {
     expect(m.read()).toEqual(emptyUpload);
     expect(() => m.send({ type: "remove", id: "missing" })).toThrow();
     expect(() => uploadTransition({ items: [], requestId: null } satisfies UploadState, { type: "start", requestId: "a" })).toThrow();
+  });
+  it("refuses a file over the Worker limit and never sends or retries it", async () => {
+    const m = machine([sized("big.pdf", MAX_UPLOAD_BYTES + 1), sized("edge.pdf", MAX_UPLOAD_BYTES)]);
+    expect(m.read().items.map((item) => item.outcome.status)).toEqual(["refused", "selected"]);
+    const create = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue({ jobs: [accepted] });
+    await runUploadBatch(m.read, m.send, create, "first");
+    await runUploadBatch(m.read, m.send, create, "second");
+    expect(create.mock.calls.map(([input]) => input.name)).toEqual(["edge.pdf", "edge.pdf"]);
+    expect(retryableUploads(m.read())).toEqual([]);
+    m.send({ type: "remove", id: m.read().items[0].id });
+    expect(m.read().items.map((item) => item.file.name)).toEqual(["edge.pdf"]);
+  });
+  it("uses the Worker's upload limit", () => {
+    const source = readFileSync(new URL("../../../worker/src/user-api.ts", import.meta.url), "utf8");
+    const expression = source.match(/export const MAX_UPLOAD_BYTES = ([^;]+);/)![1];
+    const workerLimit = expression.split("*").map((term) => Number(term.trim().replaceAll("_", ""))).reduce((product, term) => product * term, 1);
+    expect(MAX_UPLOAD_BYTES).toBe(workerLimit);
   });
 });
