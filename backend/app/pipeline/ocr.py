@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 GATEWAY_OCR_PLUGIN = "app.pipeline.ocr_vlm_plugin"
 # Time for Tesseract to read a page after the Gateway gave up on it.
 GATEWAY_PAGE_FALLBACK_SECONDS = 60
+# The structure key holding the 1-based pages this step force-OCR'd: their
+# text was drawn as shapes, so all of it comes from OCR (see fidelity's
+# _check_forced_ocr_text).
+FORCED_OCR_PAGES_KEY = "forced_ocr_pages"
 
 
 @dataclass

@@ -22,6 +22,7 @@ from rapidfuzz.distance import Levenshtein
 from rapidfuzz.fuzz import partial_ratio
 
 from app.pipeline.fonts.unembedded import describe_unembedded_font
+from app.pipeline.ocr import FORCED_OCR_PAGES_KEY
 from app.pipeline.pdfium_text import PdfiumText, pagination_artifact_indices
 from app.pipeline.tagger import is_placeholder_alt_text
 from app.services.candidate_state import CheckVerdict
@@ -845,11 +846,14 @@ def _reading_order_metrics(fragments: list[str], output_text: str) -> dict[str, 
     }
 
 
-def _grounded_text_risk(output_pdf: Path, structure_json: dict[str, Any]) -> dict[str, Any]:
+def _grounded_text_risk(
+    output_pdf: Path, structure_json: dict[str, Any], ocr_language: str | None = None
+) -> dict[str, Any]:
     return collect_grounded_text_candidates(
         output_pdf,
         structure_json,
         target_limit=GROUNDED_TEXT_TARGET_LIMIT,
+        ocr_language=ocr_language,
     )
 
 
@@ -1283,6 +1287,8 @@ class _FidelityInputs:
     tagged_table_count: int
     # Review ids of tables tagged as rows of the table before (see tagger_table_structure).
     continued_tables: frozenset[str]
+    # The job's Tesseract language spec, for OCR of block crops.
+    ocr_language: str | None = None
 
 
 @dataclass
@@ -1386,6 +1392,7 @@ def _build_fidelity_inputs(
     raw_validation_report: dict[str, Any] | None = None,
     tagging_metrics: dict[str, Any],
     classification: str | None,
+    ocr_language: str | None = None,
 ) -> _FidelityInputs:
     output_struct_counts = _output_struct_type_counts(output_pdf)
 
@@ -1499,6 +1506,7 @@ def _build_fidelity_inputs(
         table_count=table_count,
         tagged_table_count=tagged_table_count,
         continued_tables=continued_tables,
+        ocr_language=ocr_language,
     )
 
 
@@ -2096,7 +2104,7 @@ def _check_tagged_text_coverage(inputs: _FidelityInputs, out: _FidelityCollector
 
 
 def _check_grounded_text_fidelity(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
-    grounded_text = _grounded_text_risk(inputs.output_pdf, inputs.structure_json)
+    grounded_text = _grounded_text_risk(inputs.output_pdf, inputs.structure_json, inputs.ocr_language)
     if grounded_text["target_count"] > 0:
         out.add_task(
             "review:content_fidelity:grounded_text",
@@ -2146,6 +2154,47 @@ def _check_grounded_text_fidelity(inputs: _FidelityInputs, out: _FidelityCollect
                 },
             }
         )
+
+
+def _check_forced_ocr_text(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
+    """Pages force-OCR'd because they draw their letters as outlines, or in
+    Type3 fonts that do not say which letters they are, got all their text
+    from OCR.
+
+    OCR there swaps look-alike characters (O and 0, l and 1, I and 1) and
+    raises none of the suspicious-text signals, so the pages get an advisory
+    spot-check. It never holds a release.
+    """
+    recorded = inputs.structure_json.get(FORCED_OCR_PAGES_KEY)
+    pages = sorted(
+        {page for page in recorded if isinstance(page, int) and page > 0}
+        if isinstance(recorded, list)
+        else set()
+    )
+    if not pages:
+        return
+    out.add_task(
+        "review:content_fidelity:forced_ocr_text",
+        task_type="content_fidelity",
+        title="Check text read by OCR from drawn letters",
+        detail=(
+            "These pages draw their letters as shapes, or in fonts that do not say which "
+            "letters they are, so their text was recovered by OCR. OCR can confuse "
+            "look-alike characters, such as O and 0 or l and 1. Check codes, numbers and "
+            "names against the page."
+        ),
+        severity="medium",
+        blocking=False,
+        metadata={"check": "forced_ocr_text", "pages_to_check": pages},
+    )
+    out.checks.append(
+        {
+            "check": "forced_ocr_text",
+            "status": "warning",
+            "message": "Pages drawn as shapes or in undecodable fonts have text recovered by OCR only.",
+            "metrics": {"forced_ocr_pages": len(pages)},
+        }
+    )
 
 
 def _check_reading_order(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
@@ -3019,6 +3068,7 @@ def assess_fidelity(
     raw_validation_report: dict[str, Any] | None = None,
     tagging_metrics: dict[str, Any],
     classification: str | None,
+    ocr_language: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     inputs = _build_fidelity_inputs(
         input_pdf=input_pdf,
@@ -3030,6 +3080,7 @@ def assess_fidelity(
         raw_validation_report=raw_validation_report,
         tagging_metrics=tagging_metrics,
         classification=classification,
+        ocr_language=ocr_language,
     )
     out = _FidelityCollector()
     _check_compliance(inputs, out)
@@ -3037,6 +3088,7 @@ def assess_fidelity(
     _check_text_drift(inputs, out)
     _check_tagged_text_coverage(inputs, out)
     _check_grounded_text_fidelity(inputs, out)
+    _check_forced_ocr_text(inputs, out)
     _check_reading_order(inputs, out)
     _check_figure_coverage(inputs, out)
     _check_table_coverage(inputs, out)

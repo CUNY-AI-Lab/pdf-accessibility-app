@@ -157,7 +157,7 @@ from app.pipeline.llm_operations import (
 from app.pipeline.llm_operations import (
     pretag_llm_operation_timeout_seconds as _pretag_llm_operation_timeout_seconds,
 )
-from app.pipeline.ocr import run_ocr
+from app.pipeline.ocr import FORCED_OCR_PAGES_KEY, run_ocr
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.pdfium_text import PdfiumText
 from app.pipeline.structure import (
@@ -1131,6 +1131,7 @@ async def _apply_pretag_grounded_text_resolutions(
         working_pdf,
         structure_json,
         target_limit=PRETAG_GROUNDED_TEXT_TARGET_LIMIT,
+        ocr_language=job.ocr_language,
     )
     suspicious_blocks = grounded.get("targets")
     if not isinstance(suspicious_blocks, list) or not suspicious_blocks:
@@ -2122,6 +2123,8 @@ async def _run_pipeline(
             # ── Step 2: OCR (conditional) ──
             current_step = "ocr"
             working_pdf = input_path
+            # 1-based pages whose text forced OCR recovered from drawn letters.
+            forced_ocr_pages: list[int] = []
 
             if classification.type in ("scanned", "mixed"):
                 await _update_step(db, job_id, "ocr", "running")
@@ -2145,6 +2148,7 @@ async def _run_pipeline(
 
                 if ocr_result.success:
                     working_pdf = ocr_result.output_path
+                    forced_ocr_pages = [page + 1 for page in classification.force_ocr_pages]
                     await _update_step(
                         db,
                         job_id,
@@ -2423,6 +2427,9 @@ async def _run_pipeline(
             structure.document_json = apply_author_structure(structure.document_json, author_evidence)
             if author_evidence.get("author_candidate_audit"):
                 structure.document_json["author_candidate_audit"] = author_evidence["author_candidate_audit"]
+            if forced_ocr_pages:
+                # Fidelity asks for a spot-check of these pages' OCR text.
+                structure.document_json[FORCED_OCR_PAGES_KEY] = forced_ocr_pages
             elements = structure.document_json.get("elements", [])
             headings_count = sum(1 for el in elements if el.get("type") == "heading")
             tables_count = sum(1 for el in elements if el.get("type") == "table")
@@ -2719,6 +2726,7 @@ async def _assess_candidate_fidelity(
         raw_validation_report=candidate.validation.raw_report,
         tagging_metrics=candidate.validation_report["tagging"],
         classification=job.classification,
+        ocr_language=job.ocr_language,
     )
     candidate.fidelity_report["adjudication_state"] = AdjudicationState.NOT_REQUESTED
     if adjudicate:
