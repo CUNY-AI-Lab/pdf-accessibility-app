@@ -14,7 +14,7 @@ def test_infer_document_language_prefers_weighted_element_language():
         {"type": "paragraph", "text": "Hello world", "lang": "en"},
     ]
 
-    assert structure._infer_document_language(elements, "Titre") == "fr-CA"
+    assert structure._infer_document_language(elements, "Titre")["language"] == "fr-CA"
 
 
 def test_infer_document_language_falls_back_to_visible_text_detection(monkeypatch):
@@ -31,7 +31,7 @@ def test_infer_document_language_falls_back_to_visible_text_detection(monkeypatc
 
     monkeypatch.setattr(structure, "_detect_language", lambda _text: "en")
 
-    assert structure._infer_document_language(elements, "Form instructions") == "en"
+    assert structure._infer_document_language(elements, "Form instructions")["language"] == "en"
 
 
 def test_extract_title_from_docling_ignores_late_table_caption_titles():

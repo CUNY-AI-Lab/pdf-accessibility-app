@@ -115,12 +115,26 @@ def docling_structure_escalation_plan(structure_json: dict[str, Any] | None) -> 
             ),
             "signal": "native_toc" if has_native_toc else "",
         },
-        "language": {
-            "decision": "docling",
-            "reason": "docling_element_language_metadata",
-            "signal": _normalize_text(structure.get("language")),
-        },
+        "language": _language_decision(structure),
     }
+
+
+def _language_decision(structure: dict[str, Any]) -> dict[str, Any]:
+    language = _normalize_text(structure.get("language"))
+    decision: dict[str, Any] = {
+        "decision": "docling",
+        "reason": "docling_element_language_metadata",
+        "signal": language,
+    }
+    # The structure step's reason holds while the language is still its choice
+    # (author /Lang fills the language only when that choice was empty).
+    evidence = structure.get("language_evidence")
+    if isinstance(evidence, dict) and _normalize_text(evidence.get("language")) == language:
+        decision["reason"] = str(evidence.get("reason") or decision["reason"])
+        for key in ("detected", "ocr_languages"):
+            if key in evidence:
+                decision[key] = evidence[key]
+    return decision
 
 
 def docling_table_targets_for_intelligence(

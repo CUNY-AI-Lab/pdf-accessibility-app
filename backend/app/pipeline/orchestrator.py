@@ -27,7 +27,7 @@ from app.pipeline.alt_text import (
 )
 from app.pipeline.author_repairs import author_table_readability, repair_author_pdf
 from app.pipeline.author_structure import apply_author_structure, read_author_structure
-from app.pipeline.classify import classify_pdf
+from app.pipeline.classify import OCR_TEXT_CLASSIFICATIONS, classify_pdf
 from app.pipeline.fidelity import _table_semantics_risk, assess_fidelity
 
 # Keep the former font entry points importable; dependency patches belong in fonts.*.
@@ -136,7 +136,7 @@ from app.pipeline.fonts.rules import FONT_RULE_FRAGMENT as FONT_RULE_FRAGMENT
 from app.pipeline.fonts.rules import FONT_UNICODE_RULE_MARKERS as FONT_UNICODE_RULE_MARKERS
 from app.pipeline.fonts.tounicode import _repair_pdf_tounicode as _repair_pdf_tounicode
 from app.pipeline.fonts.tounicode import _repair_pdf_tounicode_sync as _repair_pdf_tounicode_sync
-from app.pipeline.language import bcp47_to_tesseract
+from app.pipeline.language import bcp47_to_tesseract, tesseract_languages_to_bcp47
 from app.pipeline.llm_operations import (
     await_llm_operation as _await_llm_operation,
 )
@@ -2115,6 +2115,11 @@ async def _run_pipeline(
                 working_pdf,
                 job_dir,
                 table_cell_matching=docling_table_cell_matching(classification.type),
+                ocr_languages=(
+                    tesseract_languages_to_bcp47(job.ocr_language or settings.ocr_language)
+                    if classification.type in OCR_TEXT_CLASSIFICATIONS
+                    else ()
+                ),
             )
             structure.document_json = apply_author_structure(structure.document_json, author_evidence)
             if structure.processed_pdf_path:

@@ -3400,7 +3400,8 @@ async def test_ocr_lane_refreshes_structure_before_retag(tmp_path, monkeypatch):
     async def fake_run_ocr(*args, **kwargs):
         return SimpleNamespace(success=True, output_path=ocr_pdf, skipped=False, message="")
 
-    async def fake_extract_structure(input_path, job_dir):
+    async def fake_extract_structure(input_path, job_dir, *, ocr_languages=()):
+        captured["ocr_languages"] = list(ocr_languages)
         return SimpleNamespace(
             document_json={"elements": [{"type": "paragraph", "text": "fresh", "page": 0}]}
         )
@@ -3455,3 +3456,5 @@ async def test_ocr_lane_refreshes_structure_before_retag(tmp_path, monkeypatch):
     assert result["details"]["structure_refreshed"] is True
     assert captured["structure_json"]["elements"][0]["text"] == "fresh"
     assert result["structure_json"]["elements"][0]["text"] == "fresh"
+    # The refreshed text came from OCR in the job's language (settings default eng).
+    assert captured["ocr_languages"] == ["en"]
