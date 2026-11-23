@@ -28,3 +28,7 @@ FONT_UNICODE_RULE_MARKERS = ("-7.21.7-", "-7.21.8-")
 
 
 FONT_DICT_REPAIR_RULE_MARKERS = ("-7.21.3.2-", "-7.21.4.2-", "-7.21.5-", "-7.21.8-")
+
+
+# "The font programs for all fonts used for rendering ... shall be embedded."
+FONT_NOT_EMBEDDED_RULE_MARKER = "-7.21.4.1-1"
