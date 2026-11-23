@@ -894,11 +894,16 @@ def _transient(failure, request: httpx.Request) -> httpx.Response:
     return httpx.Response(failure)
 
 
+COMPLETION = {"job": {"status": "complete"}, "files": ["report.html"], "has_state": False}
+
+
 async def _transfer(client: WorkerClient, direction: str, task: Task, tmp_path: Path) -> None:
     if direction == "download":
         await client.download(task, "input", tmp_path / "input.pdf")
-    else:
+    elif direction == "upload":
         await client.upload(task, "state.tar.gz", b"state", "application/gzip")
+    else:
+        await client.complete(task, COMPLETION)
 
 
 @pytest.mark.parametrize("failure", [408, 425, 429, 500, 502, 503, 504, "transport", "midstream"])
@@ -971,6 +976,8 @@ async def test_upload_survives_a_half_minute_storage_outage(clock):
         ("download", "midstream"),
         ("upload", 503),
         ("upload", "transport"),
+        ("complete", 503),
+        ("complete", "transport"),
     ],
 )
 async def test_transfer_gives_up_after_five_tries(tmp_path, clock, direction, failure):
@@ -988,7 +995,7 @@ async def test_transfer_gives_up_after_five_tries(tmp_path, clock, direction, fa
     assert clock.sleeps == [2, 4, 8, 16]
 
 
-@pytest.mark.parametrize("direction", ["download", "upload"])
+@pytest.mark.parametrize("direction", ["download", "upload", "complete"])
 async def test_transfer_retries_never_sleep_past_the_deadline(tmp_path, clock, direction):
     requests = []
 
@@ -1008,7 +1015,7 @@ async def test_transfer_retries_never_sleep_past_the_deadline(tmp_path, clock, d
     assert clock.now <= task.deadline_ms / 1000
 
 
-@pytest.mark.parametrize("direction", ["download", "upload"])
+@pytest.mark.parametrize("direction", ["download", "upload", "complete"])
 async def test_transfer_past_its_deadline_sends_nothing(tmp_path, clock, direction):
     requests = []
 
@@ -1024,7 +1031,7 @@ async def test_transfer_past_its_deadline_sends_nothing(tmp_path, clock, directi
     assert clock.sleeps == []
 
 
-@pytest.mark.parametrize("stall", ["upload", "download-response", "download-body"])
+@pytest.mark.parametrize("stall", ["upload", "download-response", "download-body", "complete"])
 async def test_transfer_deadline_cancels_a_stalled_try(tmp_path, clock, stall):
     cancelled = asyncio.Event()
 
@@ -1038,7 +1045,7 @@ async def test_transfer_deadline_cancels_a_stalled_try(tmp_path, clock, stall):
 
     client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
     task = _task(deadline=int((clock.now + 0.05) * 1000))
-    direction = "upload" if stall == "upload" else "download"
+    direction = stall.removesuffix("-response").removesuffix("-body")
     transfer = asyncio.create_task(_transfer(client, direction, task, tmp_path))
     try:
         # Hang guard only: the deadline, 50 ms away, must end the try by itself.
@@ -1051,6 +1058,41 @@ async def test_transfer_deadline_cancels_a_stalled_try(tmp_path, clock, stall):
         await asyncio.gather(transfer, return_exceptions=True)
         await client.close()
     assert cancelled.is_set()
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize("first", ["bad_gateway", "response_lost"])
+async def test_complete_retries_the_same_completion_until_acknowledged(clock, first):
+    received = []
+
+    def handler(request):
+        received.append(json.loads(request.content))
+        if len(received) > 1:
+            return httpx.Response(204)
+        if first == "bad_gateway":
+            return httpx.Response(502)
+        raise httpx.ReadError("Network connection lost", request=request)
+
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    await client.complete(_task(), COMPLETION)
+    await client.close()
+    assert received == [COMPLETION, COMPLETION]
+    assert clock.sleeps == [2]
+
+
+@pytest.mark.parametrize("status", [404, 409, 410, 422])
+async def test_complete_stops_at_once_on_a_lost_lease_or_refusal(clock, status):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(status, json={"detail": "refused"})
+
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    with pytest.raises(LeaseLost if status in {404, 409, 410} else httpx.HTTPStatusError):
+        await client.complete(_task(), COMPLETION)
+    await client.close()
+    assert len(requests) == 1
     assert clock.sleeps == []
 
 
@@ -1112,6 +1154,30 @@ async def test_storage_blip_on_saved_state_still_completes_the_job(tmp_path, mon
     assert worker.failed is None
     assert worker.uploads["state.tar.gz"] == ("application/gzip", b"saved-state")
     assert worker.completed["has_state"] is True
+
+
+async def test_storage_blip_on_completion_still_completes_the_job(tmp_path, monkeypatch, clock):
+    worker = FakeWorker()
+    completions = 0
+
+    def handler(request):
+        nonlocal completions
+        if request.url.path.endswith("/complete"):
+            completions += 1
+            if completions == 1:
+                return httpx.Response(502)
+        return worker.handler(request)
+
+    async def perform(*_args):
+        return _publication_outcome()
+
+    monkeypatch.setattr(runner_tasks, "_perform", perform)
+    client = WorkerClient(WORKER, "host-token", transport=httpx.MockTransport(handler))
+    await runner_tasks.run_task(client, _task(), _settings(tmp_path))
+    await client.close()
+    assert completions == 2
+    assert worker.failed is None
+    assert worker.completed["files"] == ["report.html"]
 
 
 def test_outcome_rejects_empty_or_contradictory_results():

@@ -233,10 +233,15 @@ class WorkerClient:
                 phase = transfer_transition(phase, TransferPhase.SENDING)
 
     async def complete(self, task: Task, payload: dict[str, Any]) -> None:
-        response = await self._client.post(
-            f"/tasks/{task.job_id}/complete", json=payload, headers=self._task_headers(task)
-        )
-        _raise_for_task(response)
+        # The Worker keeps one receipt per lease: repeating a completion that
+        # already landed is acknowledged again, not applied twice.
+        async def send() -> None:
+            response = await self._client.post(
+                f"/tasks/{task.job_id}/complete", json=payload, headers=self._task_headers(task)
+            )
+            _raise_for_task(response)
+
+        await self._transfer(task, "Completion", send)
 
     async def fail(self, task: Task, error: str) -> None:
         response = await self._client.post(
