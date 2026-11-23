@@ -66,6 +66,11 @@ _OCR_SCAN_PREFLIGHT_SETTINGS = SimpleNamespace(
 )
 
 
+# Classifications whose text came, in whole or in part, from OCR: this app's
+# OCR step for scanned and mixed documents, an earlier OCR for an ocr_scan.
+OCR_TEXT_CLASSIFICATIONS = frozenset({"scanned", "mixed", "ocr_scan"})
+
+
 @dataclass
 class ClassificationResult:
     type: str  # "scanned", "digital", "mixed", "ocr_scan"
