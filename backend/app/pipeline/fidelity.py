@@ -21,6 +21,7 @@ from PIL import Image
 from rapidfuzz.distance import Levenshtein
 from rapidfuzz.fuzz import partial_ratio
 
+from app.pipeline.fonts.unembedded import describe_unembedded_font
 from app.pipeline.pdfium_text import PdfiumText, pagination_artifact_indices
 from app.pipeline.tagger import is_placeholder_alt_text
 from app.services.candidate_state import CheckVerdict
@@ -1501,6 +1502,18 @@ def _build_fidelity_inputs(
     )
 
 
+def _unembedded_fonts(inputs: _FidelityInputs) -> list[dict[str, Any]]:
+    """Fonts the output shows text in without a program (see fonts.unembedded)."""
+    fonts = inputs.validation_report.get("unembedded_fonts")
+    return [font for font in fonts if isinstance(font, dict)] if isinstance(fonts, list) else []
+
+
+def _font_pages(fonts: list[dict[str, Any]]) -> list[int]:
+    return sorted({
+        page for font in fonts for page in font.get("pages") or [] if isinstance(page, int)
+    })
+
+
 def _check_compliance(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
     if inputs.unresolved_errors:
         out.checks.append(
@@ -1536,16 +1549,34 @@ def _check_compliance(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
             if rule_id and rule_id not in entry["rules"]:
                 entry["rules"].append(rule_id)
 
+        unembedded = _unembedded_fonts(inputs)
         for key, entry in grouped.items():
+            title = entry["title"]
+            detail = f"{entry['detail']} Remaining occurrences: {entry['count']}."
+            metadata: dict[str, Any] = {"rules": entry["rules"], "count": entry["count"]}
+            if entry["task_type"] == "font_text_fidelity" and unembedded:
+                # No font lane embedded a program for these fonts, so the
+                # source document has to supply one.
+                title = "Embed fonts in the source PDF"
+                fonts = "; ".join(describe_unembedded_font(font) for font in unembedded)
+                detail = (
+                    f"This font is not embedded in the PDF: {fonts}. Embed it in the source "
+                    "PDF, then upload the PDF again. "
+                    if len(unembedded) == 1
+                    else f"These fonts are not embedded in the PDF: {fonts}. Embed them in the "
+                    "source PDF, then upload the PDF again. "
+                ) + f"Remaining font errors: {entry['count']}."
+                metadata["unembedded_fonts"] = unembedded
+                metadata["pages_to_check"] = _font_pages(unembedded)
             out.add_task(
                 key,
                 task_type=entry["task_type"],
-                title=entry["title"],
-                detail=f"{entry['detail']} Remaining occurrences: {entry['count']}.",
+                title=title,
+                detail=detail,
                 severity="high",
                 blocking=True,
                 source="validation",
-                metadata={"rules": entry["rules"], "count": entry["count"]},
+                metadata=metadata,
             )
     else:
         out.checks.append(
@@ -2695,6 +2726,11 @@ def _check_figure_descriptions(inputs: _FidelityInputs, out: _FidelityCollector)
             {
                 "figure_index": entry["figure_index"],
                 "page": inputs.figure_pages.get(entry["figure_index"]),
+                **(
+                    {"model_service_failure": entry["service_failure"]}
+                    if isinstance(entry.get("service_failure"), dict)
+                    else {}
+                ),
             }
             for entry in inputs.alt_entries
             if isinstance(entry, dict)
@@ -2705,20 +2741,32 @@ def _check_figure_descriptions(inputs: _FidelityInputs, out: _FidelityCollector)
                 or is_placeholder_alt_text(entry.get("edited_text") or entry.get("generated_text"))
             )
         ]
+        # Figures left undescribed because the model service did not answer;
+        # a later run can describe them, so the person is told to upload again.
+        model_unavailable = sum("model_service_failure" in item for item in waiting_figures)
         if undescribed_figures:
+            detail = (
+                f"{len(undescribed_figures)} figure(s) have no description a screen reader "
+                "can announce. Add a description for each before distribution."
+            )
+            if model_unavailable:
+                detail = (
+                    f"{len(undescribed_figures)} figure(s) have no description a screen reader "
+                    f"can announce. The model service was unavailable for {model_unavailable} "
+                    "of them, so uploading the PDF again should describe those. Add a "
+                    "description for any figure still without one before distribution."
+                )
             out.add_task(
                 "review:alt_text:undescribed",
                 task_type="alt_text",
                 title="Describe figures that have no description",
-                detail=(
-                    f"{len(undescribed_figures)} figure(s) have no description a screen reader "
-                    "can announce. Add a description for each before distribution."
-                ),
+                detail=detail,
                 severity="high",
                 blocking=True,
                 metadata={
                     "check": "figure_descriptions",
                     "undescribed_figures": len(undescribed_figures),
+                    "figures_model_unavailable": model_unavailable,
                     "pages_to_check": sorted(
                         {
                             int(item["page"])
@@ -2737,6 +2785,7 @@ def _check_figure_descriptions(inputs: _FidelityInputs, out: _FidelityCollector)
                 "metrics": {
                     "undescribed_figures": len(undescribed_figures),
                     "figures_awaiting_description": len(waiting_figures),
+                    "figures_model_unavailable": model_unavailable,
                 },
             }
         )
@@ -2903,6 +2952,8 @@ def _check_font_text_fidelity(inputs: _FidelityInputs, out: _FidelityCollector) 
         set(font_rule_ids),
         output_pdf=inputs.output_pdf,
     )
+    # This task shares the compliance task's key; its pages replace those.
+    pages_to_check = sorted({*pages_to_check, *_font_pages(_unembedded_fonts(inputs))})
     has_concrete_font_review = bool(font_review_targets or pages_to_check or fonts_to_check)
     if remaining_font_errors > 0 or has_concrete_font_review:
         out.add_task(

@@ -37,6 +37,11 @@ def _caption_fallback(caption: str | None) -> str:
     return caption if usable_description(caption) else ""
 
 
+def _service_failure(decision: dict[str, Any]) -> dict[str, Any] | None:
+    failure = decision.get("service_failure")
+    return dict(failure) if isinstance(failure, dict) else None
+
+
 @dataclass
 class AltTextResult:
     figure_index: int
@@ -52,7 +57,9 @@ class AltTextResult:
     reviewable: bool = False
     importance: str = "medium"
     remediation_intelligence: dict[str, Any] | None = None
-
+    # Set when the latest model request for this figure got no answer from the
+    # model service: {"error": class name, "status": HTTP status or None}.
+    service_failure: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.status = FigureStatus(self.status)
@@ -103,7 +110,13 @@ def figure_applied_change_specs(
             detail = result.summary or "The model hid this figure from assistive technology."
         elif result.status == NEEDS_DESCRIPTION:
             title = f"Figure {result.figure_index + 1} needs a description"
-            if result.resolved_kind in ("table", "form_region"):
+            if result.service_failure:
+                detail = (
+                    "The model service was unavailable when the app tried to describe this "
+                    "figure, so it has no alt text. Upload the PDF again to retry. If the "
+                    "figure still has no description, add one before distribution."
+                )
+            elif result.resolved_kind in ("table", "form_region"):
                 kind = "a table" if result.resolved_kind == "table" else "part of a form"
                 detail = (
                     f"The model judged this figure to be {kind}, but nothing tagged in the "
@@ -127,6 +140,8 @@ def figure_applied_change_specs(
             "suggested_action": result.suggested_action,
             "remediation_intelligence": result.remediation_intelligence or {},
         }
+        if result.service_failure:
+            metadata["model_service_failure"] = dict(result.service_failure)
         if figure.page is not None:
             metadata["page"] = int(figure.page) + 1
         if isinstance(figure.caption, str) and figure.caption.strip():
@@ -344,6 +359,7 @@ async def generate_alt_text(
                 reviewable=reviewable,
                 importance=importance,
                 remediation_intelligence=dict(adjudication),
+                service_failure=_service_failure(adjudication),
             )
         except Exception as e:
             logger.error(f"Alt text generation failed for figure {fig.index}: {e}")
@@ -424,7 +440,8 @@ async def describe_unresolved_figures(
     """One targeted recovery for each unresolved figure after coverage checks.
 
     This prompt differs from the initial semantic decision, so it deliberately
-    bypasses the persistent description cache. Failure leaves the release hold.
+    bypasses the persistent description cache. Failure leaves the release hold;
+    the figure's service_failure then says whether the model service answered.
     """
     by_index = {figure.index: figure for figure in figures}
     live_indexes = (
@@ -450,6 +467,9 @@ async def describe_unresolved_figures(
             previous_intelligence=result.remediation_intelligence,
             description_only=True,
         )
+        # This is the figure's latest model request: an answer, even "cannot
+        # describe", clears an earlier service failure.
+        result.service_failure = _service_failure(decision)
         action = decision.get("suggested_action")
         text = str(decision.get("alt_text") or "").strip()
         if action == "set_alt_text" and usable_description(text):

@@ -26,6 +26,10 @@ _REVIEW_SURFACE_UNAVAILABLE_DETAIL = (
     "In-app review is only available after the app reaches a complete or manual-remediation output."
 )
 _REVIEWABLE_JOB_STATUSES = frozenset({"complete", "manual_remediation"})
+_MODEL_SERVICE_UNAVAILABLE_DETAIL = (
+    "The model service was unavailable, so the app could not ask about this figure "
+    "again. Try again in a few minutes."
+)
 
 
 def _parse_json(raw: str | None) -> dict:
@@ -163,6 +167,12 @@ async def apply_revised_figure_change(
     finally:
         await llm_client.close()
 
+    failure = decision.get("service_failure")
+    if isinstance(failure, dict):
+        # No model saw the figure, so this is no verdict on it.
+        raise ReviewRefusal(
+            code=503, detail=_MODEL_SERVICE_UNAVAILABLE_DETAIL, service_failure=dict(failure),
+        )
     suggested_action = str(decision.get("suggested_action") or "").strip()
     if suggested_action not in {"set_alt_text", "mark_decorative"}:
         raise ReviewRefusal(

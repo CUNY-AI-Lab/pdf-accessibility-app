@@ -311,7 +311,9 @@ def test_fidelity_passes_a_described_figure(tmp_path):
 # ── The release decision ─────────────────────────────────────────────────
 
 
-async def _tag_and_release(tmp_path: Path, monkeypatch, entry: dict) -> tuple[Job, list, Path]:
+async def _tag_and_release(
+    tmp_path: Path, monkeypatch, entry: dict, alt_text_result: dict | None = None,
+) -> tuple[Job, list, Path]:
     """Run tagging, fidelity and the release decision with the real tagger and
     fidelity; veraPDF and the model-backed pretag steps are stand-ins."""
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -371,6 +373,11 @@ async def _tag_and_release(tmp_path: Path, monkeypatch, entry: dict) -> tuple[Jo
         db.add(AltTextEntry(job_id="job-1", figure_index=0, image_path="figure.png", **entry))
         for step_name in ("tagging", "validation", "fidelity"):
             db.add(JobStep(job_id="job-1", step_name=step_name))
+        if alt_text_result is not None:
+            db.add(JobStep(
+                job_id="job-1", step_name="alt_text", status="complete",
+                result_json=json.dumps(alt_text_result),
+            ))
         await db.commit()
 
         await orchestrator.run_tagging_and_validation(
@@ -409,3 +416,34 @@ async def test_undescribed_figure_holds_the_document_until_a_person_describes_it
     assert job.status == "complete"
     assert _figure_alts(output) == ["A gray square"]
     assert not [row for row in rows if row.blocking]
+
+
+@pytest.mark.asyncio
+async def test_hold_names_figures_the_model_service_could_not_describe(tmp_path, monkeypatch):
+    failure = {"error": "HTTPStatusError", "status": 500}
+    job, rows, output = await _tag_and_release(
+        tmp_path / "outage",
+        monkeypatch,
+        {"generated_text": None, "status": "pending_review"},
+        alt_text_result={"count": 1, "service_failures": [{"figure_index": 0, **failure}]},
+    )
+
+    assert job.status == "manual_remediation"
+    assert _figure_alts(output) == [None]
+    [task] = [row for row in rows if row.task_type == "alt_text" and row.blocking]
+    metadata = json.loads(task.metadata_json)
+    assert metadata["figures_model_unavailable"] == 1
+    assert metadata["figures_awaiting_description"] == [
+        {"figure_index": 0, "page": 1, "model_service_failure": failure}
+    ]
+
+    _, rows, _ = await _tag_and_release(
+        tmp_path / "judged",
+        monkeypatch,
+        {"generated_text": None, "status": "pending_review"},
+        alt_text_result={"count": 1, "service_failures": []},
+    )
+    [judged] = [row for row in rows if row.task_type == "alt_text" and row.blocking]
+    assert json.loads(judged.metadata_json)["figures_model_unavailable"] == 0
+    # The person reads a different instruction for each cause.
+    assert judged.detail != task.detail
