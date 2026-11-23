@@ -155,6 +155,19 @@ fontconfig's `conf.d/30-metric-aliases.conf` lists as metric-compatible with
 both; Liberation Sans Narrow is not in Liberation 2. An installed original
 program is used before any substitute.
 
+### Fonts nothing embeds
+
+A font with no installed program and no approved substitute, such as Avenir
+on the runner, goes from the local pass to the Ghostscript rewrite, which
+draws it with Ghostscript's own substitute (NimbusSans-Regular for Avenir).
+That candidate is kept only if validation improves without a tag-count
+regression. When veraPDF still reports 7.21.4.1-1 on the chosen output,
+`unembedded.unembedded_fonts()` names each font shown in a painted rendering
+mode without a program: BaseFont, subtype, (base) encoding, whether a
+Differences array changes it, and the pages it appears on. The list is in
+the validation report and the validation step result, and the blocking font
+task names the fonts and asks for them to be embedded in the source PDF.
+
 ### Program width repair
 
 For simple TrueType fonts, rule 7.21.5 is handled in the dictionary-repair

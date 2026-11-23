@@ -132,10 +132,12 @@ from app.pipeline.fonts.rules import FONT_LANE_OCR_FORCE as FONT_LANE_OCR_FORCE
 from app.pipeline.fonts.rules import FONT_LANE_OCR_REDO as FONT_LANE_OCR_REDO
 from app.pipeline.fonts.rules import FONT_LANE_REPAIR_DICTS as FONT_LANE_REPAIR_DICTS
 from app.pipeline.fonts.rules import FONT_LANE_REPAIR_TOUNICODE as FONT_LANE_REPAIR_TOUNICODE
+from app.pipeline.fonts.rules import FONT_NOT_EMBEDDED_RULE_MARKER
 from app.pipeline.fonts.rules import FONT_RULE_FRAGMENT as FONT_RULE_FRAGMENT
 from app.pipeline.fonts.rules import FONT_UNICODE_RULE_MARKERS as FONT_UNICODE_RULE_MARKERS
 from app.pipeline.fonts.tounicode import _repair_pdf_tounicode as _repair_pdf_tounicode
 from app.pipeline.fonts.tounicode import _repair_pdf_tounicode_sync as _repair_pdf_tounicode_sync
+from app.pipeline.fonts.unembedded import unembedded_fonts
 from app.pipeline.language import bcp47_to_tesseract
 from app.pipeline.llm_operations import (
     await_llm_operation as _await_llm_operation,
@@ -545,6 +547,20 @@ def _warning_count(validation) -> int:
     return sum(_violation_weight(v) for v in validation.violations if v.severity != "error")
 
 
+async def _named_unembedded_fonts(validation, pdf_path: Path) -> list[dict[str, object]]:
+    """Name the fonts behind a 7.21.4.1-1 failure; veraPDF's report does not."""
+    if not any(
+        v.severity == "error" and str(v.rule_id).endswith(FONT_NOT_EMBEDDED_RULE_MARKER)
+        for v in validation.violations
+    ):
+        return []
+    try:
+        return await to_thread(unembedded_fonts, pdf_path)
+    except Exception:
+        logger.warning("Could not list unembedded fonts in %s", pdf_path.name, exc_info=True)
+        return []
+
+
 def _build_validation_payload(
     *,
     baseline_validation,
@@ -553,6 +569,7 @@ def _build_validation_payload(
     font_remediation: FontRemediation,
     tagging_result,
     llm_font_map_auto: dict[str, object] | None = None,
+    unembedded_fonts: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     baseline_has_verapdf_report = bool(baseline_validation.raw_report.get("report"))
     baseline_validator_name = (
@@ -650,6 +667,8 @@ def _build_validation_payload(
         },
         "changes": changes,
         "remediation": remediation_payload,
+        # Fonts the output shows text in without a program (7.21.4.1-1).
+        "unembedded_fonts": list(unembedded_fonts or []),
         "tagging": {
             "headings_tagged": tagging_result.headings_tagged,
             "figures_tagged": tagging_result.figures_tagged,
@@ -2756,6 +2775,7 @@ async def evaluate_candidate(
             font_remediation=font_remediation,
             tagging_result=tagging_result,
             llm_font_map_auto=llm_font_map_auto,
+            unembedded_fonts=await _named_unembedded_fonts(validation, Path(output_path)),
         ),
         fidelity_report={},
         tagging_result=tagging_result,
@@ -3029,6 +3049,7 @@ async def _retry_font_map_candidate(
         font_remediation=font_remediation,
         tagging_result=candidate.tagging_result,
         llm_font_map_auto=llm_font_map_auto,
+        unembedded_fonts=await _named_unembedded_fonts(candidate.validation, candidate.output_path),
     )
     return candidate, metadata_overrides
 
@@ -3603,6 +3624,7 @@ async def _run_tagging_and_validation(
                 "compliant": candidate.validation.compliant,
                 "font_remediation_attempted": bool(font_remediation.attempted),
                 "font_remediation_applied": bool(font_remediation.applied),
+                "unembedded_fonts": candidate.validation_report.get("unembedded_fonts", []),
             }
             await _update_step(
                 db,
