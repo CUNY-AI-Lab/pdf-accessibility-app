@@ -8,6 +8,7 @@ strips ``Authorization`` on the way in, so neither travels there.
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -22,10 +23,13 @@ logger = logging.getLogger(__name__)
 RUNNER_TOKEN_HEADER = "x-pdf-runner-token"
 JOB_TOKEN_HEADER = "x-pdf-job-token"
 TASK_KINDS = frozenset({"process", "review", "sync"})
-UPLOAD_ATTEMPTS = 3
+# R2 errors and dropped connections can last 15 s (issue #90). Five tries,
+# 2, 4, 8 and 16 s apart, ride out half a minute; the task deadline still wins.
+TRANSFER_ATTEMPTS = 5
+RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
-class UploadPhase(Enum):
+class TransferPhase(Enum):
     SENDING = "sending"
     BACKOFF = "backoff"
     ACKNOWLEDGED = "acknowledged"
@@ -33,30 +37,29 @@ class UploadPhase(Enum):
     LEASE_LOST = "lease_lost"
 
 
-UPLOAD_TRANSITIONS = {
-    UploadPhase.SENDING: {
-        UploadPhase.BACKOFF,
-        UploadPhase.ACKNOWLEDGED,
-        UploadPhase.FAILED,
-        UploadPhase.LEASE_LOST,
+TRANSFER_TRANSITIONS = {
+    TransferPhase.SENDING: {
+        TransferPhase.BACKOFF,
+        TransferPhase.ACKNOWLEDGED,
+        TransferPhase.FAILED,
+        TransferPhase.LEASE_LOST,
     },
-    UploadPhase.BACKOFF: {UploadPhase.SENDING, UploadPhase.FAILED},
-    UploadPhase.ACKNOWLEDGED: set(),
-    UploadPhase.FAILED: set(),
-    UploadPhase.LEASE_LOST: set(),
+    TransferPhase.BACKOFF: {TransferPhase.SENDING, TransferPhase.FAILED},
+    TransferPhase.ACKNOWLEDGED: set(),
+    TransferPhase.FAILED: set(),
+    TransferPhase.LEASE_LOST: set(),
 }
 
 
-def upload_transition(current: UploadPhase, target: UploadPhase) -> UploadPhase:
-    if target not in UPLOAD_TRANSITIONS[current]:
-        raise ValueError(f"Illegal upload transition: {current.value} -> {target.value}")
+def transfer_transition(current: TransferPhase, target: TransferPhase) -> TransferPhase:
+    if target not in TRANSFER_TRANSITIONS[current]:
+        raise ValueError(f"Illegal transfer transition: {current.value} -> {target.value}")
     return target
 
 
-def retryable_upload(exc: httpx.HTTPError) -> bool:
+def retryable_transfer(exc: httpx.HTTPError) -> bool:
     return isinstance(exc, httpx.TransportError) or (
-        isinstance(exc, httpx.HTTPStatusError)
-        and exc.response.status_code in {408, 425, 429, 500, 502, 503, 504}
+        isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in RETRYABLE_STATUSES
     )
 
 
@@ -155,13 +158,18 @@ class WorkerClient:
     async def download(self, task: Task, what: str, dest: Path) -> None:
         """Stream the task's input PDF or saved state to ``dest``."""
         dest.parent.mkdir(parents=True, exist_ok=True)
-        async with self._client.stream(
-            "GET", f"/tasks/{task.job_id}/{what}", headers=self._task_headers(task)
-        ) as response:
-            _raise_for_task(response)
-            with open(dest, "wb") as out:
-                async for chunk in response.aiter_bytes(1024 * 1024):
-                    out.write(chunk)
+
+        async def receive() -> None:
+            async with self._client.stream(
+                "GET", f"/tasks/{task.job_id}/{what}", headers=self._task_headers(task)
+            ) as response:
+                _raise_for_task(response)
+                # Every try writes the file from its first byte.
+                with open(dest, "wb") as out:
+                    async for chunk in response.aiter_bytes(1024 * 1024):
+                        out.write(chunk)
+
+        await self._transfer(task, f"Download of {what}", receive)
 
     async def progress(self, task: Task, event: dict[str, Any]) -> None:
         """Report a step event; an empty event only renews the lease."""
@@ -171,49 +179,69 @@ class WorkerClient:
         _raise_for_task(response)
 
     async def upload(self, task: Task, name: str, body: bytes | Path, content_type: str) -> None:
-        phase = UploadPhase.SENDING
         # Every retry sends exactly the same bytes, even if a caller's file changes.
         content = body.read_bytes() if isinstance(body, Path) else body
-        for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+
+        async def send() -> None:
+            response = await self._client.put(
+                f"/tasks/{task.job_id}/files/{name}",
+                content=content,
+                headers={**self._task_headers(task), "content-type": content_type},
+            )
+            _raise_for_task(response)
+
+        await self._transfer(task, f"Upload of {name}", send)
+
+    async def _transfer(
+        self, task: Task, label: str, attempt_once: Callable[[], Awaitable[None]]
+    ) -> None:
+        """Retry transient storage and network failures within the task's deadline.
+
+        A lost lease or a refused request ends the transfer at once.
+        """
+        phase = TransferPhase.SENDING
+        for attempt in range(1, TRANSFER_ATTEMPTS + 1):
             remaining = task.deadline_ms / 1000 - time.time()
             if remaining <= 0:
-                upload_transition(phase, UploadPhase.FAILED)
-                raise TimeoutError("Upload deadline passed")
+                transfer_transition(phase, TransferPhase.FAILED)
+                raise TimeoutError(f"{label} deadline passed")
             try:
                 async with asyncio.timeout(remaining):
-                    response = await self._client.put(
-                        f"/tasks/{task.job_id}/files/{name}",
-                        content=content,
-                        headers={**self._task_headers(task), "content-type": content_type},
-                    )
-                _raise_for_task(response)
-                upload_transition(phase, UploadPhase.ACKNOWLEDGED)
+                    await attempt_once()
+                transfer_transition(phase, TransferPhase.ACKNOWLEDGED)
                 return
             except TimeoutError:
-                upload_transition(phase, UploadPhase.FAILED)
+                transfer_transition(phase, TransferPhase.FAILED)
                 raise
             except LeaseLost:
-                upload_transition(phase, UploadPhase.LEASE_LOST)
+                transfer_transition(phase, TransferPhase.LEASE_LOST)
                 raise
             except (httpx.TransportError, httpx.HTTPStatusError) as exc:
-                if attempt == UPLOAD_ATTEMPTS or not retryable_upload(exc):
-                    upload_transition(phase, UploadPhase.FAILED)
+                if attempt == TRANSFER_ATTEMPTS or not retryable_transfer(exc):
+                    transfer_transition(phase, TransferPhase.FAILED)
                     raise
-                phase = upload_transition(phase, UploadPhase.BACKOFF)
+                phase = transfer_transition(phase, TransferPhase.BACKOFF)
                 delay = 2**attempt
                 remaining = task.deadline_ms / 1000 - time.time()
                 if delay >= remaining:
-                    upload_transition(phase, UploadPhase.FAILED)
-                    raise TimeoutError("Upload retry would exceed deadline") from exc
-                logger.warning("Upload of %s failed; retrying", name)
+                    transfer_transition(phase, TransferPhase.FAILED)
+                    raise TimeoutError(f"{label} retry would exceed deadline") from exc
+                logger.warning(
+                    "%s for job %s failed; retrying in %d s: %s", label, task.job_id, delay, exc
+                )
                 await asyncio.sleep(delay)
-                phase = upload_transition(phase, UploadPhase.SENDING)
+                phase = transfer_transition(phase, TransferPhase.SENDING)
 
     async def complete(self, task: Task, payload: dict[str, Any]) -> None:
-        response = await self._client.post(
-            f"/tasks/{task.job_id}/complete", json=payload, headers=self._task_headers(task)
-        )
-        _raise_for_task(response)
+        # The Worker keeps one receipt per lease: repeating a completion that
+        # already landed is acknowledged again, not applied twice.
+        async def send() -> None:
+            response = await self._client.post(
+                f"/tasks/{task.job_id}/complete", json=payload, headers=self._task_headers(task)
+            )
+            _raise_for_task(response)
+
+        await self._transfer(task, "Completion", send)
 
     async def fail(self, task: Task, error: str) -> None:
         response = await self._client.post(
