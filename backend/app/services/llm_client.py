@@ -263,6 +263,23 @@ def is_retryable_llm_exception(exc: BaseException) -> bool:
     return _is_retryable(exc)
 
 
+def model_service_failure(exc: BaseException) -> dict[str, object] | None:
+    """The error class and status when the model service, not the model, failed.
+
+    A transport failure or a 429/5xx after this client's retries means no
+    model answered; a later run may succeed. The exception text is not kept:
+    it can carry the relay URL or provider wording.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in RETRYABLE_STATUS_CODES or status >= 500:
+            return {"error": type(exc).__name__, "status": status}
+        return None
+    if isinstance(exc, httpx.TransportError):
+        return {"error": type(exc).__name__, "status": None}
+    return None
+
+
 def _retry_after_seconds(exc: BaseException) -> float | None:
     if not isinstance(exc, httpx.HTTPStatusError):
         return None

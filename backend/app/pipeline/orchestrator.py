@@ -11,7 +11,7 @@ from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pikepdf
 from sqlalchemy import select
@@ -27,7 +27,7 @@ from app.pipeline.alt_text import (
 )
 from app.pipeline.author_repairs import author_table_readability, repair_author_pdf
 from app.pipeline.author_structure import apply_author_structure, read_author_structure
-from app.pipeline.classify import classify_pdf
+from app.pipeline.classify import OCR_TEXT_CLASSIFICATIONS, classify_pdf
 from app.pipeline.fidelity import _table_semantics_risk, assess_fidelity
 
 # Keep the former font entry points importable; dependency patches belong in fonts.*.
@@ -132,11 +132,13 @@ from app.pipeline.fonts.rules import FONT_LANE_OCR_FORCE as FONT_LANE_OCR_FORCE
 from app.pipeline.fonts.rules import FONT_LANE_OCR_REDO as FONT_LANE_OCR_REDO
 from app.pipeline.fonts.rules import FONT_LANE_REPAIR_DICTS as FONT_LANE_REPAIR_DICTS
 from app.pipeline.fonts.rules import FONT_LANE_REPAIR_TOUNICODE as FONT_LANE_REPAIR_TOUNICODE
+from app.pipeline.fonts.rules import FONT_NOT_EMBEDDED_RULE_MARKER
 from app.pipeline.fonts.rules import FONT_RULE_FRAGMENT as FONT_RULE_FRAGMENT
 from app.pipeline.fonts.rules import FONT_UNICODE_RULE_MARKERS as FONT_UNICODE_RULE_MARKERS
 from app.pipeline.fonts.tounicode import _repair_pdf_tounicode as _repair_pdf_tounicode
 from app.pipeline.fonts.tounicode import _repair_pdf_tounicode_sync as _repair_pdf_tounicode_sync
-from app.pipeline.language import bcp47_to_tesseract
+from app.pipeline.fonts.unembedded import unembedded_fonts
+from app.pipeline.language import bcp47_to_tesseract, tesseract_languages_to_bcp47
 from app.pipeline.llm_operations import (
     await_llm_operation as _await_llm_operation,
 )
@@ -155,7 +157,7 @@ from app.pipeline.llm_operations import (
 from app.pipeline.llm_operations import (
     pretag_llm_operation_timeout_seconds as _pretag_llm_operation_timeout_seconds,
 )
-from app.pipeline.ocr import run_ocr
+from app.pipeline.ocr import FORCED_OCR_PAGES_KEY, run_ocr
 from app.pipeline.page_frame import PageFrame
 from app.pipeline.pdfium_text import PdfiumText
 from app.pipeline.structure import (
@@ -364,11 +366,22 @@ def _alt_text_step_result(
     reason: str | None = None,
     skipped_figure_count: int | None = None,
     figure_reclassification: dict[str, object] | None = None,
+    needs_description: int = 0,
+    service_failures: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
+    """approved + rejected + reclassified + needs_description + service_failed == count.
+
+    needs_description counts figures a model answered for but did not describe;
+    service_failures lists those left undescribed because no model answered.
+    """
+    service_failures = list(service_failures or [])
     result: dict[str, object] = {
         "count": count,
         "approved": approved,
         "rejected": rejected,
+        "needs_description": needs_description,
+        "service_failed": len(service_failures),
+        "service_failures": service_failures,
         "reviewable_changes": reviewable_changes,
         "reclassified": reclassified,
         "auto_approve_enabled": auto_approve_enabled,
@@ -545,6 +558,20 @@ def _warning_count(validation) -> int:
     return sum(_violation_weight(v) for v in validation.violations if v.severity != "error")
 
 
+async def _named_unembedded_fonts(validation, pdf_path: Path) -> list[dict[str, object]]:
+    """Name the fonts behind a 7.21.4.1-1 failure; veraPDF's report does not."""
+    if not any(
+        v.severity == "error" and str(v.rule_id).endswith(FONT_NOT_EMBEDDED_RULE_MARKER)
+        for v in validation.violations
+    ):
+        return []
+    try:
+        return await to_thread(unembedded_fonts, pdf_path)
+    except Exception:
+        logger.warning("Could not list unembedded fonts in %s", pdf_path.name, exc_info=True)
+        return []
+
+
 def _build_validation_payload(
     *,
     baseline_validation,
@@ -553,6 +580,7 @@ def _build_validation_payload(
     font_remediation: FontRemediation,
     tagging_result,
     llm_font_map_auto: dict[str, object] | None = None,
+    unembedded_fonts: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     baseline_has_verapdf_report = bool(baseline_validation.raw_report.get("report"))
     baseline_validator_name = (
@@ -650,6 +678,8 @@ def _build_validation_payload(
         },
         "changes": changes,
         "remediation": remediation_payload,
+        # Fonts the output shows text in without a program (7.21.4.1-1).
+        "unembedded_fonts": list(unembedded_fonts or []),
         "tagging": {
             "headings_tagged": tagging_result.headings_tagged,
             "figures_tagged": tagging_result.figures_tagged,
@@ -786,6 +816,60 @@ def _alt_text_entry_state(
     if auto_approve:
         return "approved", generated_text
     return status, generated_text
+
+
+class _FigureOutcomes(TypedDict):
+    approved: int
+    rejected: int
+    reclassified: int
+    needs_description: int
+    service_failures: list[dict[str, object]]
+
+
+def _record_figure_decisions(
+    db: AsyncSession,
+    job_id: str,
+    alt_texts: list,
+    figures: list,
+    *,
+    removed_indexes: list[int],
+    auto_approve: bool,
+) -> _FigureOutcomes:
+    """Add one AltTextEntry per kept figure and count where each figure ended."""
+    outcomes = _FigureOutcomes(
+        approved=0, rejected=0, reclassified=0, needs_description=0, service_failures=[],
+    )
+    figures_by_index = {figure.index: figure for figure in figures}
+    for alt in alt_texts:
+        fig = figures_by_index.get(alt.figure_index)
+        if fig is None:
+            continue
+        if not resolve_figure_for_storage(alt, removed_indexes):
+            outcomes["reclassified"] += 1
+            continue
+        status, generated_text = _alt_text_entry_state(
+            alt, caption=fig.caption, auto_approve=auto_approve,
+        )
+        if status == "approved":
+            outcomes["approved"] += 1
+        elif status == "rejected":
+            outcomes["rejected"] += 1
+        elif alt.service_failure:
+            outcomes["service_failures"].append(
+                {"figure_index": alt.figure_index, **alt.service_failure}
+            )
+        else:
+            outcomes["needs_description"] += 1
+        db.add(
+            AltTextEntry(
+                job_id=job_id,
+                figure_index=alt.figure_index,
+                image_path=str(fig.path),
+                generated_text=generated_text or None,
+                status=status,
+            )
+        )
+    return outcomes
 
 
 # A reclassified figure's region is covered by a Docling table only when the
@@ -1047,6 +1131,7 @@ async def _apply_pretag_grounded_text_resolutions(
         working_pdf,
         structure_json,
         target_limit=PRETAG_GROUNDED_TEXT_TARGET_LIMIT,
+        ocr_language=job.ocr_language,
     )
     suspicious_blocks = grounded.get("targets")
     if not isinstance(suspicious_blocks, list) or not suspicious_blocks:
@@ -2038,6 +2123,8 @@ async def _run_pipeline(
             # ── Step 2: OCR (conditional) ──
             current_step = "ocr"
             working_pdf = input_path
+            # 1-based pages whose text forced OCR recovered from drawn letters.
+            forced_ocr_pages: list[int] = []
 
             if classification.type in ("scanned", "mixed"):
                 await _update_step(db, job_id, "ocr", "running")
@@ -2061,6 +2148,7 @@ async def _run_pipeline(
 
                 if ocr_result.success:
                     working_pdf = ocr_result.output_path
+                    forced_ocr_pages = [page + 1 for page in classification.force_ocr_pages]
                     await _update_step(
                         db,
                         job_id,
@@ -2111,10 +2199,17 @@ async def _run_pipeline(
             await _update_step(db, job_id, "structure", "running")
             job_manager.emit_progress(job_id, step="structure", status="running")
 
+            ocr_text = classification.type in OCR_TEXT_CLASSIFICATIONS
             structure = await extract_structure(
                 working_pdf,
                 job_dir,
                 table_cell_matching=docling_table_cell_matching(classification.type),
+                ocr_languages=(
+                    tesseract_languages_to_bcp47(job.ocr_language or settings.ocr_language)
+                    if ocr_text
+                    else ()
+                ),
+                classified_language=classification.detected_language if ocr_text else None,
             )
             structure.document_json = apply_author_structure(structure.document_json, author_evidence)
             if structure.processed_pdf_path:
@@ -2332,6 +2427,9 @@ async def _run_pipeline(
             structure.document_json = apply_author_structure(structure.document_json, author_evidence)
             if author_evidence.get("author_candidate_audit"):
                 structure.document_json["author_candidate_audit"] = author_evidence["author_candidate_audit"]
+            if forced_ocr_pages:
+                # Fidelity asks for a spot-check of these pages' OCR text.
+                structure.document_json[FORCED_OCR_PAGES_KEY] = forced_ocr_pages
             elements = structure.document_json.get("elements", [])
             headings_count = sum(1 for el in elements if el.get("type") == "heading")
             tables_count = sum(1 for el in elements if el.get("type") == "table")
@@ -2457,38 +2555,14 @@ async def _run_pipeline(
                     await db.commit()
 
                 # Save figure semantics to database and continue directly into tagging.
-                approved_count = 0
-                rejected_count = 0
-                reclassified_count = 0
-                figures_by_index = {figure.index: figure for figure in structure.figures}
-                for alt in alt_texts:
-                    fig = figures_by_index.get(alt.figure_index)
-                    if fig is None:
-                        continue
-                    if not resolve_figure_for_storage(
-                        alt, figure_reclassification.get("removed_indexes", []),
-                    ):
-                        reclassified_count += 1
-                        continue
-                    status, generated_text = _alt_text_entry_state(
-                        alt,
-                        caption=fig.caption,
-                        auto_approve=settings.auto_approve_generated_alt_text,
-                    )
-
-                    if status == "approved":
-                        approved_count += 1
-                    elif status == "rejected":
-                        rejected_count += 1
-                    db.add(
-                        AltTextEntry(
-                            job_id=job_id,
-                            figure_index=alt.figure_index,
-                            image_path=str(fig.path),
-                            generated_text=generated_text or None,
-                            status=status,
-                        )
-                    )
+                figure_outcomes = _record_figure_decisions(
+                    db,
+                    job_id,
+                    alt_texts,
+                    structure.figures,
+                    removed_indexes=figure_reclassification.get("removed_indexes", []),
+                    auto_approve=settings.auto_approve_generated_alt_text,
+                )
                 await db.commit()
                 figure_change_specs = figure_applied_change_specs(
                     figures=structure.figures,
@@ -2502,10 +2576,8 @@ async def _run_pipeline(
                     "complete",
                     result=_alt_text_step_result(
                         count=len(alt_texts),
-                        approved=approved_count,
-                        rejected=rejected_count,
+                        **figure_outcomes,
                         reviewable_changes=len(figure_change_specs),
-                        reclassified=reclassified_count,
                         auto_approve_enabled=settings.auto_approve_generated_alt_text,
                         llm_usage=alt_text_llm_usage,
                         figure_reclassification=figure_reclassification,
@@ -2517,10 +2589,8 @@ async def _run_pipeline(
                     status="complete",
                     result=_alt_text_step_result(
                         count=len(alt_texts),
-                        approved=approved_count,
-                        rejected=rejected_count,
+                        **figure_outcomes,
                         reviewable_changes=len(figure_change_specs),
-                        reclassified=reclassified_count,
                         auto_approve_enabled=settings.auto_approve_generated_alt_text,
                         llm_usage=alt_text_llm_usage,
                     ),
@@ -2656,6 +2726,7 @@ async def _assess_candidate_fidelity(
         raw_validation_report=candidate.validation.raw_report,
         tagging_metrics=candidate.validation_report["tagging"],
         classification=job.classification,
+        ocr_language=job.ocr_language,
     )
     candidate.fidelity_report["adjudication_state"] = AdjudicationState.NOT_REQUESTED
     if adjudicate:
@@ -2697,6 +2768,7 @@ async def evaluate_candidate(
     on_tagged=None,
     on_validated=None,
     adjudicate: bool = True,
+    figure_service_failures: dict[int, dict[str, object]] | None = None,
 ) -> Candidate:
     """Tag, validate, build the report, assess fidelity, then adjudicate if needed.
 
@@ -2756,6 +2828,7 @@ async def evaluate_candidate(
             font_remediation=font_remediation,
             tagging_result=tagging_result,
             llm_font_map_auto=llm_font_map_auto,
+            unembedded_fonts=await _named_unembedded_fonts(validation, Path(output_path)),
         ),
         fidelity_report={},
         tagging_result=tagging_result,
@@ -2769,6 +2842,11 @@ async def evaluate_candidate(
                 "generated_text": entry.generated_text,
                 "edited_text": entry.edited_text,
                 "status": entry.status,
+                **(
+                    {"service_failure": figure_service_failures[entry.figure_index]}
+                    if figure_service_failures and entry.figure_index in figure_service_failures
+                    else {}
+                ),
             }
             for entry in alt_entries
         ],
@@ -3029,6 +3107,7 @@ async def _retry_font_map_candidate(
         font_remediation=font_remediation,
         tagging_result=candidate.tagging_result,
         llm_font_map_auto=llm_font_map_auto,
+        unembedded_fonts=await _named_unembedded_fonts(candidate.validation, candidate.output_path),
     )
     return candidate, metadata_overrides
 
@@ -3529,6 +3608,23 @@ async def _store_candidate_result(
     logger.info(f"Pipeline complete for job {job_id} with status={final_status}")
 
 
+async def _figure_service_failures(db: AsyncSession, job_id: str) -> dict[int, dict[str, object]]:
+    """Figures the alt-text step left undescribed because no model answered."""
+    step = await db.scalar(
+        select(JobStep).where(JobStep.job_id == job_id, JobStep.step_name == "alt_text")
+    )
+    try:
+        result = json.loads(step.result_json) if step is not None and step.result_json else None
+    except json.JSONDecodeError:
+        result = None
+    failures = result.get("service_failures") if isinstance(result, dict) else None
+    return {
+        failure["figure_index"]: {key: value for key, value in failure.items() if key != "figure_index"}
+        for failure in failures or []
+        if isinstance(failure, dict) and isinstance(failure.get("figure_index"), int)
+    }
+
+
 async def _run_tagging_and_validation(
     job_id: str,
     db: AsyncSession,
@@ -3603,6 +3699,7 @@ async def _run_tagging_and_validation(
                 "compliant": candidate.validation.compliant,
                 "font_remediation_attempted": bool(font_remediation.attempted),
                 "font_remediation_applied": bool(font_remediation.applied),
+                "unembedded_fonts": candidate.validation_report.get("unembedded_fonts", []),
             }
             await _update_step(
                 db,
@@ -3631,6 +3728,7 @@ async def _run_tagging_and_validation(
             baseline_validation=baseline_validation,
             font_remediation=font_remediation,
             llm_font_map_auto=llm_font_map_auto,
+            figure_service_failures=await _figure_service_failures(db, job_id),
         )
         candidate = await evaluate(
             input_path=working_pdf,

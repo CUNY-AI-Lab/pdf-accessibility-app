@@ -4,6 +4,7 @@ from pathlib import Path
 
 from app.config import Settings
 from app.models import Job
+from app.pipeline import ocr
 from app.pipeline.fonts.diagnostics import _inspect_font_diagnostics
 from app.pipeline.fonts.embedding import _embed_system_fonts, _rewrite_pdf_with_ghostscript_embed
 from app.pipeline.fonts.ocr_unicode import _recover_tounicode_by_ocr
@@ -21,6 +22,7 @@ from app.pipeline.fonts.rules import (
     FONT_UNICODE_RULE_MARKERS,
 )
 from app.pipeline.fonts.tounicode import _repair_pdf_tounicode
+from app.pipeline.language import tesseract_languages_to_bcp47
 from app.pipeline.ocr import run_ocr
 from app.pipeline.structure import extract_structure
 from app.pipeline.tagger import tag_pdf
@@ -327,7 +329,24 @@ async def _attempt_font_lane(
             try:
                 refresh_dir = job_dir / f"{lane}_structure"
                 refresh_dir.mkdir(parents=True, exist_ok=True)
-                refreshed_structure = await extract_structure(remediation_input, refresh_dir)
+                # The classify step's language, as the structure step recorded it.
+                language_evidence = (
+                    structure_json.get("language_evidence")
+                    if isinstance(structure_json, dict)
+                    else None
+                )
+                refreshed_structure = await extract_structure(
+                    remediation_input,
+                    refresh_dir,
+                    ocr_languages=tesseract_languages_to_bcp47(
+                        job.ocr_language or settings.ocr_language
+                    ),
+                    classified_language=(
+                        language_evidence.get("classify_language")
+                        if isinstance(language_evidence, dict)
+                        else None
+                    ),
+                )
                 candidate_structure_json = refreshed_structure.document_json
                 if isinstance(candidate_structure_json, dict):
                     original_elements = (
@@ -357,6 +376,11 @@ async def _attempt_font_lane(
                         preprocess_details["original_figures"] = original_figures
                         preprocess_details["refreshed_figures"] = refreshed_figures
                     else:
+                        # A rebuilt structure does not know which pages the
+                        # OCR step forced; keep their review advisory.
+                        forced_key = ocr.FORCED_OCR_PAGES_KEY
+                        if isinstance(structure_json, dict) and forced_key in structure_json:
+                            candidate_structure_json[forced_key] = structure_json[forced_key]
                         effective_structure_json = candidate_structure_json
                         preprocess_details["structure_refreshed"] = True
                         preprocess_details["structure_elements"] = len(

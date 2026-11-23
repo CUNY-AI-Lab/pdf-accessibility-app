@@ -21,6 +21,8 @@ from PIL import Image
 from rapidfuzz.distance import Levenshtein
 from rapidfuzz.fuzz import partial_ratio
 
+from app.pipeline.fonts.unembedded import describe_unembedded_font
+from app.pipeline.ocr import FORCED_OCR_PAGES_KEY
 from app.pipeline.pdfium_text import PdfiumText, pagination_artifact_indices
 from app.pipeline.tagger import is_placeholder_alt_text
 from app.services.candidate_state import CheckVerdict
@@ -844,11 +846,14 @@ def _reading_order_metrics(fragments: list[str], output_text: str) -> dict[str, 
     }
 
 
-def _grounded_text_risk(output_pdf: Path, structure_json: dict[str, Any]) -> dict[str, Any]:
+def _grounded_text_risk(
+    output_pdf: Path, structure_json: dict[str, Any], ocr_language: str | None = None
+) -> dict[str, Any]:
     return collect_grounded_text_candidates(
         output_pdf,
         structure_json,
         target_limit=GROUNDED_TEXT_TARGET_LIMIT,
+        ocr_language=ocr_language,
     )
 
 
@@ -1282,6 +1287,8 @@ class _FidelityInputs:
     tagged_table_count: int
     # Review ids of tables tagged as rows of the table before (see tagger_table_structure).
     continued_tables: frozenset[str]
+    # The job's Tesseract language spec, for OCR of block crops.
+    ocr_language: str | None = None
 
 
 @dataclass
@@ -1385,6 +1392,7 @@ def _build_fidelity_inputs(
     raw_validation_report: dict[str, Any] | None = None,
     tagging_metrics: dict[str, Any],
     classification: str | None,
+    ocr_language: str | None = None,
 ) -> _FidelityInputs:
     output_struct_counts = _output_struct_type_counts(output_pdf)
 
@@ -1498,7 +1506,20 @@ def _build_fidelity_inputs(
         table_count=table_count,
         tagged_table_count=tagged_table_count,
         continued_tables=continued_tables,
+        ocr_language=ocr_language,
     )
+
+
+def _unembedded_fonts(inputs: _FidelityInputs) -> list[dict[str, Any]]:
+    """Fonts the output shows text in without a program (see fonts.unembedded)."""
+    fonts = inputs.validation_report.get("unembedded_fonts")
+    return [font for font in fonts if isinstance(font, dict)] if isinstance(fonts, list) else []
+
+
+def _font_pages(fonts: list[dict[str, Any]]) -> list[int]:
+    return sorted({
+        page for font in fonts for page in font.get("pages") or [] if isinstance(page, int)
+    })
 
 
 def _check_compliance(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
@@ -1536,16 +1557,34 @@ def _check_compliance(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
             if rule_id and rule_id not in entry["rules"]:
                 entry["rules"].append(rule_id)
 
+        unembedded = _unembedded_fonts(inputs)
         for key, entry in grouped.items():
+            title = entry["title"]
+            detail = f"{entry['detail']} Remaining occurrences: {entry['count']}."
+            metadata: dict[str, Any] = {"rules": entry["rules"], "count": entry["count"]}
+            if entry["task_type"] == "font_text_fidelity" and unembedded:
+                # No font lane embedded a program for these fonts, so the
+                # source document has to supply one.
+                title = "Embed fonts in the source PDF"
+                fonts = "; ".join(describe_unembedded_font(font) for font in unembedded)
+                detail = (
+                    f"This font is not embedded in the PDF: {fonts}. Embed it in the source "
+                    "PDF, then upload the PDF again. "
+                    if len(unembedded) == 1
+                    else f"These fonts are not embedded in the PDF: {fonts}. Embed them in the "
+                    "source PDF, then upload the PDF again. "
+                ) + f"Remaining font errors: {entry['count']}."
+                metadata["unembedded_fonts"] = unembedded
+                metadata["pages_to_check"] = _font_pages(unembedded)
             out.add_task(
                 key,
                 task_type=entry["task_type"],
-                title=entry["title"],
-                detail=f"{entry['detail']} Remaining occurrences: {entry['count']}.",
+                title=title,
+                detail=detail,
                 severity="high",
                 blocking=True,
                 source="validation",
-                metadata={"rules": entry["rules"], "count": entry["count"]},
+                metadata=metadata,
             )
     else:
         out.checks.append(
@@ -2065,7 +2104,7 @@ def _check_tagged_text_coverage(inputs: _FidelityInputs, out: _FidelityCollector
 
 
 def _check_grounded_text_fidelity(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
-    grounded_text = _grounded_text_risk(inputs.output_pdf, inputs.structure_json)
+    grounded_text = _grounded_text_risk(inputs.output_pdf, inputs.structure_json, inputs.ocr_language)
     if grounded_text["target_count"] > 0:
         out.add_task(
             "review:content_fidelity:grounded_text",
@@ -2115,6 +2154,47 @@ def _check_grounded_text_fidelity(inputs: _FidelityInputs, out: _FidelityCollect
                 },
             }
         )
+
+
+def _check_forced_ocr_text(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
+    """Pages force-OCR'd because they draw their letters as outlines, or in
+    Type3 fonts that do not say which letters they are, got all their text
+    from OCR.
+
+    OCR there swaps look-alike characters (O and 0, l and 1, I and 1) and
+    raises none of the suspicious-text signals, so the pages get an advisory
+    spot-check. It never holds a release.
+    """
+    recorded = inputs.structure_json.get(FORCED_OCR_PAGES_KEY)
+    pages = sorted(
+        {page for page in recorded if isinstance(page, int) and page > 0}
+        if isinstance(recorded, list)
+        else set()
+    )
+    if not pages:
+        return
+    out.add_task(
+        "review:content_fidelity:forced_ocr_text",
+        task_type="content_fidelity",
+        title="Check text read by OCR from drawn letters",
+        detail=(
+            "These pages draw their letters as shapes, or in fonts that do not say which "
+            "letters they are, so their text was recovered by OCR. OCR can confuse "
+            "look-alike characters, such as O and 0 or l and 1. Check codes, numbers and "
+            "names against the page."
+        ),
+        severity="medium",
+        blocking=False,
+        metadata={"check": "forced_ocr_text", "pages_to_check": pages},
+    )
+    out.checks.append(
+        {
+            "check": "forced_ocr_text",
+            "status": "warning",
+            "message": "Pages drawn as shapes or in undecodable fonts have text recovered by OCR only.",
+            "metrics": {"forced_ocr_pages": len(pages)},
+        }
+    )
 
 
 def _check_reading_order(inputs: _FidelityInputs, out: _FidelityCollector) -> None:
@@ -2695,6 +2775,11 @@ def _check_figure_descriptions(inputs: _FidelityInputs, out: _FidelityCollector)
             {
                 "figure_index": entry["figure_index"],
                 "page": inputs.figure_pages.get(entry["figure_index"]),
+                **(
+                    {"model_service_failure": entry["service_failure"]}
+                    if isinstance(entry.get("service_failure"), dict)
+                    else {}
+                ),
             }
             for entry in inputs.alt_entries
             if isinstance(entry, dict)
@@ -2705,20 +2790,32 @@ def _check_figure_descriptions(inputs: _FidelityInputs, out: _FidelityCollector)
                 or is_placeholder_alt_text(entry.get("edited_text") or entry.get("generated_text"))
             )
         ]
+        # Figures left undescribed because the model service did not answer;
+        # a later run can describe them, so the person is told to upload again.
+        model_unavailable = sum("model_service_failure" in item for item in waiting_figures)
         if undescribed_figures:
+            detail = (
+                f"{len(undescribed_figures)} figure(s) have no description a screen reader "
+                "can announce. Add a description for each before distribution."
+            )
+            if model_unavailable:
+                detail = (
+                    f"{len(undescribed_figures)} figure(s) have no description a screen reader "
+                    f"can announce. The model service was unavailable for {model_unavailable} "
+                    "of them, so uploading the PDF again should describe those. Add a "
+                    "description for any figure still without one before distribution."
+                )
             out.add_task(
                 "review:alt_text:undescribed",
                 task_type="alt_text",
                 title="Describe figures that have no description",
-                detail=(
-                    f"{len(undescribed_figures)} figure(s) have no description a screen reader "
-                    "can announce. Add a description for each before distribution."
-                ),
+                detail=detail,
                 severity="high",
                 blocking=True,
                 metadata={
                     "check": "figure_descriptions",
                     "undescribed_figures": len(undescribed_figures),
+                    "figures_model_unavailable": model_unavailable,
                     "pages_to_check": sorted(
                         {
                             int(item["page"])
@@ -2737,6 +2834,7 @@ def _check_figure_descriptions(inputs: _FidelityInputs, out: _FidelityCollector)
                 "metrics": {
                     "undescribed_figures": len(undescribed_figures),
                     "figures_awaiting_description": len(waiting_figures),
+                    "figures_model_unavailable": model_unavailable,
                 },
             }
         )
@@ -2903,6 +3001,8 @@ def _check_font_text_fidelity(inputs: _FidelityInputs, out: _FidelityCollector) 
         set(font_rule_ids),
         output_pdf=inputs.output_pdf,
     )
+    # This task shares the compliance task's key; its pages replace those.
+    pages_to_check = sorted({*pages_to_check, *_font_pages(_unembedded_fonts(inputs))})
     has_concrete_font_review = bool(font_review_targets or pages_to_check or fonts_to_check)
     if remaining_font_errors > 0 or has_concrete_font_review:
         out.add_task(
@@ -2968,6 +3068,7 @@ def assess_fidelity(
     raw_validation_report: dict[str, Any] | None = None,
     tagging_metrics: dict[str, Any],
     classification: str | None,
+    ocr_language: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     inputs = _build_fidelity_inputs(
         input_pdf=input_pdf,
@@ -2979,6 +3080,7 @@ def assess_fidelity(
         raw_validation_report=raw_validation_report,
         tagging_metrics=tagging_metrics,
         classification=classification,
+        ocr_language=ocr_language,
     )
     out = _FidelityCollector()
     _check_compliance(inputs, out)
@@ -2986,6 +3088,7 @@ def assess_fidelity(
     _check_text_drift(inputs, out)
     _check_tagged_text_coverage(inputs, out)
     _check_grounded_text_fidelity(inputs, out)
+    _check_forced_ocr_text(inputs, out)
     _check_reading_order(inputs, out)
     _check_figure_coverage(inputs, out)
     _check_table_coverage(inputs, out)

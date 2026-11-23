@@ -362,6 +362,7 @@ def _suspicious_reading_blocks_from_page_blocks(
                         pdf_path,
                         page_number=page,
                         bbox=bbox,
+                        language=job.ocr_language,
                     )
                 )
             review_id = str(block.get("review_id") or "").strip()

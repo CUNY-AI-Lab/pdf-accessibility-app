@@ -830,7 +830,7 @@ def test_fidelity_flags_large_text_drift(monkeypatch, tmp_path):
 
 
 def test_grounded_text_risk_flags_spacing_issue(monkeypatch):
-    monkeypatch.setattr("app.services.text_grounding.extract_ocr_text_from_bbox", lambda output_pdf, page_number, bbox: "Data Book")
+    monkeypatch.setattr("app.services.text_grounding.extract_ocr_text_from_bbox", lambda output_pdf, page_number, bbox, **_kwargs: "Data Book")
 
     risk = _grounded_text_risk(
         Path("out.pdf"),
@@ -855,7 +855,7 @@ def test_grounded_text_risk_flags_spacing_issue(monkeypatch):
 
 def test_fidelity_warns_on_single_grounded_spacing_issue(monkeypatch):
     monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
-    monkeypatch.setattr("app.services.text_grounding.extract_ocr_text_from_bbox", lambda output_pdf, page_number, bbox: "Data Book")
+    monkeypatch.setattr("app.services.text_grounding.extract_ocr_text_from_bbox", lambda output_pdf, page_number, bbox, **_kwargs: "Data Book")
 
     report, tasks = assess_fidelity(
         input_pdf=Path("in.pdf"),
@@ -890,7 +890,7 @@ def test_fidelity_warns_on_single_grounded_spacing_issue(monkeypatch):
 def test_grounded_text_risk_skips_leaky_ocr_candidate(monkeypatch):
     monkeypatch.setattr(
         "app.services.text_grounding.extract_ocr_text_from_bbox",
-        lambda output_pdf, page_number, bbox: (
+        lambda output_pdf, page_number, bbox, **_kwargs: (
             "Heading text paragraph continues with neighboring content that should not belong to this block"
         ),
     )
@@ -923,7 +923,7 @@ def test_grounded_text_risk_skips_leaky_ocr_candidate(monkeypatch):
 def test_grounded_text_risk_skips_ocr_that_contains_native_plus_extra_text(monkeypatch):
     monkeypatch.setattr(
         "app.services.text_grounding.extract_ocr_text_from_bbox",
-        lambda output_pdf, page_number, bbox: "Internal Revenue Service data book 2024 additional surrounding text",
+        lambda output_pdf, page_number, bbox, **_kwargs: "Internal Revenue Service data book 2024 additional surrounding text",
     )
 
     risk = _grounded_text_risk(
@@ -947,7 +947,7 @@ def test_grounded_text_risk_skips_ocr_that_contains_native_plus_extra_text(monke
 def test_grounded_text_risk_skips_high_similarity_cleanup(monkeypatch):
     monkeypatch.setattr(
         "app.services.text_grounding.extract_ocr_text_from_bbox",
-        lambda output_pdf, page_number, bbox: "Français résumé",
+        lambda output_pdf, page_number, bbox, **_kwargs: "Français résumé",
     )
 
     risk = _grounded_text_risk(
@@ -971,7 +971,7 @@ def test_grounded_text_risk_skips_high_similarity_cleanup(monkeypatch):
 def test_fidelity_blocks_multiple_grounded_text_disagreements(monkeypatch):
     monkeypatch.setattr(fidelity, "_extract_pdf_text_sample", lambda path: "sample text " * 50)
 
-    def _fake_ocr(output_pdf, page_number, bbox):
+    def _fake_ocr(output_pdf, page_number, bbox, **_kwargs):
         if int(bbox["t"]) == 700:
             return "INTERNAL REVENUE SERVICE"
         return "October 1, 2023 to September 30, 2024"
