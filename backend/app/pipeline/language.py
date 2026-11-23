@@ -77,6 +77,17 @@ BCP47_TO_TESSERACT: dict[str, str] = {
 _BCP47_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 
 
+def tesseract_languages_to_bcp47(spec: str | None) -> list[str]:
+    """The BCP-47 tags of a Tesseract language spec such as "jpn+eng", primary
+    first. Packs that name no language (osd, equ) are left out."""
+    tags: list[str] = []
+    for code in str(spec or "").split("+"):
+        tag = ISO639_3_TO_BCP47.get(code.strip().lower())
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
 def normalize_lang_tag(value: str | None) -> str | None:
     """Normalise common language-name inputs to a safe BCP-47 tag."""
     raw = str(value or "").strip()
