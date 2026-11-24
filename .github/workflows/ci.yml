@@ -6,9 +6,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A newer push cancels a superseded run for the same pull request. Push and
+# manual runs each get their own group, so every main commit's check finishes.
 concurrency:
-  group: pdf-accessibility-ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: pdf-accessibility-ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
