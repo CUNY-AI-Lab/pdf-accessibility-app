@@ -195,7 +195,9 @@ Design (2026-10-27), in [architecture.md](architecture.md#version-2):
   succeed. The NML deployment was retired the same day: its
   container and volumes are removed, its secrets blanked, and its nginx
   redirects `/pdf-accessibility` to v2. Still open: a real sign-in and upload
-  on the deployed path, and the Gateway `tool` claim.
+  on the deployed path. Since 2026-11-25, Doorway's Gateway leg carries
+  `tool: pdf-accessibility` (cail-tools-admission#407, cail-gateway#243), so
+  the Gateway records this tool's model spend under its own name.
 
 ### 4. Reliability
 
